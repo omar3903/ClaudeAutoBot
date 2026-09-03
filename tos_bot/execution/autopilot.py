@@ -130,6 +130,15 @@ class AutoPilot:
             return True
         return bool(getattr(self.cfg, "allow_live", False))
 
+    def day_mode_active(self, market_open: bool) -> bool:
+        """True when the pilot is armed, cleared to act, day-trading is one of
+        its enabled types, and the regular session is open. The engine uses
+        this to scan (and refresh the account) much more often."""
+        return bool(
+            self.enabled and self._live_ok() and market_open
+            and "INTRADAY" in self.trade_types
+        )
+
     # ------------------------------------------------------------------ #
     def status(self) -> Dict[str, Any]:
         self._roll_day()

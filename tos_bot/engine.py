@@ -107,6 +107,7 @@ class TradingEngine:
 
         self._plays: Dict[str, Play] = {}
         self._last_scan_summary: Dict[str, Any] = {}
+        self._last_scan_elapsed: float = 0.0
         self._account: Optional[Account] = None
         self._armed = False
         self._reauth_hint: Dict[str, Any] = {}
@@ -278,8 +279,29 @@ class TradingEngine:
     # ------------------------------------------------------------------ #
     #  Background loops                                                  #
     # ------------------------------------------------------------------ #
+    def _autopilot_day_active(self) -> bool:
+        """Autopilot armed for day trades + regular session open -> the engine
+        scans (and refreshes the account) much more aggressively."""
+        try:
+            return self.autopilot.day_mode_active(clock.is_market_open())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _effective_scan_interval(self) -> int:
+        """Seconds to wait between scans. The normal cadence, unless Autopilot
+        is day-trading in an open session - then the fast cadence, but never
+        starting a new cycle before the last one finished (+ a 3s gap) and
+        never below the configured floor."""
+        sc = self.settings.config.scanner
+        base = int(sc.interval_seconds)
+        if not self._autopilot_day_active():
+            return base
+        target = int(getattr(sc, "autopilot_interval_seconds", 45) or 45)
+        floor = int(getattr(sc, "min_interval_seconds", 20) or 20)
+        eff = max(target, int(self._last_scan_elapsed) + 3)
+        return max(floor, eff)
+
     def _scan_loop(self) -> None:
-        interval = int(self.settings.config.scanner.interval_seconds)
         self._stop.wait(2.0)
         while not self._stop.is_set():
             triggered = self._scan_now.is_set()
@@ -289,6 +311,7 @@ class TradingEngine:
                     self._run_scan()
                 except Exception:  # noqa: BLE001
                     log.exception("scan cycle failed")
+            interval = self._effective_scan_interval()
             waited = 0
             while waited < interval and not self._stop.is_set() and not self._scan_now.is_set():
                 self._stop.wait(1.0)
@@ -323,7 +346,8 @@ class TradingEngine:
                 BUS.publish("account.snapshot", state=self.snapshot())
             except Exception:  # noqa: BLE001
                 log.exception("snapshot failed")
-            self._stop.wait(30.0)
+            # refresh the account far more often while Autopilot is day-trading
+            self._stop.wait(10.0 if self._autopilot_day_active() else 30.0)
 
     def _should_scan(self) -> bool:
         return clock.is_market_open()
@@ -340,6 +364,7 @@ class TradingEngine:
                 size_play(p, self._account, self.settings.config.risk)
             self._plays[p.id] = p
         self._last_scan_summary = result.summary()
+        self._last_scan_elapsed = float(getattr(result, "elapsed_s", 0.0) or 0.0)
 
         try:
             self.repo.record_scan(result,
@@ -698,6 +723,8 @@ class TradingEngine:
             "day_trade_limit": self.settings.config.account.max_day_trades_under_threshold,
             "pnl": pnl,
             "scan": self._last_scan_summary,
+            "scan_interval_s": self._effective_scan_interval(),
+            "scan_fast": self._autopilot_day_active(),
             "token": tok,
             "reauth_hint": self._reauth_hint,
         }

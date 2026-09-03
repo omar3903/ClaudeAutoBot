@@ -216,7 +216,48 @@ def test_engine_wires_autopilot_into_snapshot():
     eng = TradingEngine()
     snap = eng.snapshot()
     assert "autopilot" in snap and "trade_types" in snap["autopilot"]
+    assert "scan_interval_s" in snap and "scan_fast" in snap
     out = eng.set_autopilot(enabled=True, trade_types=["INTRADAY", "SWING"])
     assert out["ok"] and out["autopilot"]["enabled"] is True
     assert set(out["autopilot"]["trade_types"]) == {"INTRADAY", "SWING"}
     eng.set_autopilot(enabled=False)
+
+
+def test_day_mode_active_truth_table():
+    ap = AutoPilot(FakeEngine(), _cfg(enabled=False, trade_types=["INTRADAY"]), bus=SILENT)
+    assert ap.day_mode_active(market_open=True) is False          # disabled
+    ap.configure(enabled=True)
+    assert ap.day_mode_active(market_open=True) is True
+    assert ap.day_mode_active(market_open=False) is False         # session closed
+    ap.configure(trade_types=["SWING"])
+    assert ap.day_mode_active(market_open=True) is False          # day trades not enabled
+    # live gate: enabled in live without allow_live -> not active
+    eng_live = FakeEngine(mode="live")
+    ap_live = AutoPilot(eng_live, _cfg(enabled=True, allow_live=False, trade_types=["INTRADAY"]), bus=SILENT)
+    assert ap_live.day_mode_active(market_open=True) is False
+
+
+def test_effective_scan_interval_adapts_to_autopilot(monkeypatch):
+    from tos_bot.engine import TradingEngine
+    from tos_bot.util import clock
+    eng = TradingEngine()
+    base = eng.settings.config.scanner.interval_seconds
+    floor = eng.settings.config.scanner.min_interval_seconds
+    fast = eng.settings.config.scanner.autopilot_interval_seconds
+
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: True)
+
+    eng.set_autopilot(enabled=False)
+    assert eng._effective_scan_interval() == base                 # off -> normal cadence
+
+    eng.set_autopilot(enabled=True, trade_types=["INTRADAY"])
+    eng._last_scan_elapsed = 10.0
+    assert eng._effective_scan_interval() == fast                 # armed + open -> fast cadence
+    eng._last_scan_elapsed = 200.0                                # a slow cycle
+    assert eng._effective_scan_interval() == 203                  # ~back-to-back, not faster
+    eng._last_scan_elapsed = 0.0
+
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: False)
+    assert eng._effective_scan_interval() == base                 # session closed -> normal
+    eng.set_autopilot(enabled=False)
+    assert floor <= fast <= base

@@ -138,6 +138,11 @@ class RiskCfg(_Model):
 
 class ScannerCfg(_Model):
     interval_seconds: int = 300
+    # When Autopilot is armed for day trades and the regular session is open,
+    # the scanner runs on this faster cadence instead (self-throttled so a new
+    # cycle never starts before the previous one finishes + a small gap).
+    autopilot_interval_seconds: int = 45
+    min_interval_seconds: int = 20        # absolute floor, never scan faster than this
     universe: str = "nasdaq100"
     universe_file: str = "config/watchlist.txt"
     shortlist_size: int = 8

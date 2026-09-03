@@ -325,6 +325,15 @@ never auto-traded. Every decision is on the event bus
 (`autopilot.entered` / `.skipped` / `.blocked`) and eligible plays get a
 **🤖** marker in the table. `GET`/`POST /api/autopilot`.
 
+**Faster loop while day-trading.** When Autopilot is armed with `INTRADAY` in
+`trade_types` *and* the regular session is open, the engine drops from the
+normal `scanner.interval_seconds` (300) to `scanner.autopilot_interval_seconds`
+(45) — self-throttled so a new scan never starts before the previous cycle
+finished (+3 s) and never below `scanner.min_interval_seconds` (20). The account
+also re-syncs every ~10 s instead of ~30 s in this mode. The header button shows
+the live cadence (`Autopilot: day ⚡45s`). Outside those conditions everything
+returns to the normal cadence.
+
 ---
 
 ## Dashboard controls
@@ -420,6 +429,8 @@ The seven projection methods (Ch. 1) are in `tos_bot/valuation/projections.py`.
 
 Tune cadence and size in `config/config.yaml → scanner`, or override without
 editing it: `SCANNER_UNIVERSE`, `SCANNER_MAX_SYMBOLS`, `SCANNER_INTERVAL_SECONDS`.
+The cadence is `interval_seconds` normally and `autopilot_interval_seconds` when
+Autopilot is day-trading an open session (see the Autopilot section).
 
 ---
 

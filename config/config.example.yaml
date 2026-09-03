@@ -27,7 +27,13 @@ risk:
   round_lot: 1                         # share rounding
 
 scanner:
-  interval_seconds: 300                # rescan cadence ("every few minutes")
+  interval_seconds: 300                # normal rescan cadence ("every few minutes")
+  # When Autopilot is armed for day trades AND the regular session is open the
+  # scanner switches to this faster cadence, self-throttled so a new cycle never
+  # starts before the previous one has finished (+ a 3s gap) and never faster
+  # than min_interval_seconds. On the free yfinance feed keep this >= ~40.
+  autopilot_interval_seconds: 45
+  min_interval_seconds: 20             # absolute floor - never rescan faster than this
   # nasdaq | nasdaq100 | sp500 | file
   # "nasdaq" (the full ~4500 names) is only practical with an entitled real-time
   # feed (Schwab). On the free yfinance feed use nasdaq100 / sp500 / file so a

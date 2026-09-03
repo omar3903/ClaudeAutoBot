@@ -176,14 +176,21 @@ function renderAutopilot() {
   if (!btn) return;
   const on = !!ap.enabled;
   const eff = !!ap.effective;
+  const fast = !!(STATE || {}).scan_fast;
+  const ivl = (STATE || {}).scan_interval_s;
   const tt = (ap.trade_types || []).map(t => t.toLowerCase() === "intraday" ? "day" : "swing").join("+");
-  btn.textContent = on ? `Autopilot: ${tt || "on"}${ap.dry_run ? " · dry" : ""}` : "Autopilot: off";
+  btn.textContent = on
+    ? `Autopilot: ${tt || "on"}${ap.dry_run ? " · dry" : ""}${fast ? ` ⚡${ivl}s` : ""}`
+    : "Autopilot: off";
   btn.classList.toggle("on", on && eff);
   btn.classList.toggle("armed-paper", on && !eff);       // wants to run but paper-gated in live
   const caps = `${ap.open_auto_positions ?? 0}/${ap.max_auto_positions ?? 0} open · ${ap.auto_trades_today ?? 0}/${ap.max_auto_trades_per_day ?? 0} today`;
+  const scanline = fast
+    ? ` Scanning every ~${ivl}s while the session is open.`
+    : (on && eff ? ` Scanning every ${Math.round((ivl || 300) / 60)} min (fast cadence kicks in when the market opens).` : "");
   btn.title = on
     ? (eff
-      ? `Autopilot is taking entries: ${tt || "?"}, ≥ ${ap.min_reward_risk}:1, ≥ conf ${ap.min_confidence}. ${caps}. Exits are automatic. Click to turn off.`
+      ? `Autopilot is taking entries: ${tt || "?"}, ≥ ${ap.min_reward_risk}:1, ≥ conf ${ap.min_confidence}. ${caps}.${scanline} Exits are automatic. Click to turn off.`
       : (ap.blocked_note || "Autopilot is on but not routing (paper-only gate). Click to turn off."))
     : "Hands-off entry is OFF — you click every entry. Exits are automatic regardless. Click to turn on.";
   $("#autopilot-ctl").classList.toggle("live-warn", on && !eff);
