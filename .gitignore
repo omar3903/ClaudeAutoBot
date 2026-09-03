@@ -1,0 +1,30 @@
+# secrets / state - NEVER commit these
+.env
+config/config.yaml
+secrets/
+*.token.json
+*.token.json.bak
+*.token.json.enc
+token_key.bin
+data/cache/
+logs/
+*.sqlite
+*.sqlite3
+*.db
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

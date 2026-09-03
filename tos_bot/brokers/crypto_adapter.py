@@ -1,0 +1,69 @@
+"""Crypto exchange adapter - STUB.
+
+Planned implementation: ``ccxt`` (unified API over Coinbase / Kraken /
+Binance / ...). Crypto trades 24/7, has no PDT rule and no 60-day OAuth
+token (API key + secret + optional passphrase), so:
+
+* :class:`~tos_bot.risk.pdt_guard.PdtGuard` is bypassed for ``AssetClass.CRYPTO``
+* :class:`~tos_bot.auth.token_manager.TokenManager` is a no-op
+* the market clock is always "open"
+
+Every method raises :class:`NotSupported` until implemented.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from typing import List, Optional
+
+import pandas as pd
+
+from ..core.enums import AssetClass
+from ..core.models import Account, OrderRequest, OrderResult, Quote
+from .base import BrokerAdapter, NotSupported
+
+_TODO = "Crypto adapter not implemented yet - use BROKER=schwab or BROKER=paper."
+
+
+class CryptoBroker(BrokerAdapter):
+    name = "crypto"
+    asset_classes = (AssetClass.CRYPTO,)
+    supports_shorting = False          # spot only to start
+    supports_fractional = True
+
+    def __init__(self, exchange: str = "coinbase", token_manager=None, **ccxt_kwargs) -> None:
+        self.exchange_id = exchange
+        self._ccxt_kwargs = ccxt_kwargs
+        self._ex = None
+
+    def connect(self) -> None:
+        # import ccxt
+        # self._ex = getattr(ccxt, self.exchange_id)(self._ccxt_kwargs)
+        raise NotSupported(_TODO)
+
+    @property
+    def is_connected(self) -> bool:
+        return False
+
+    def market_is_open(self) -> bool:
+        return True                     # crypto never sleeps
+
+    def get_account(self) -> Account:
+        raise NotSupported(_TODO)
+
+    def get_quote(self, symbol: str) -> Quote:
+        raise NotSupported(_TODO)
+
+    def get_price_history(self, symbol: str, interval: str = "5m", lookback_days: int = 10,
+                          start: Optional[dt.datetime] = None, end: Optional[dt.datetime] = None,
+                          extended_hours: bool = False) -> pd.DataFrame:
+        raise NotSupported(_TODO)
+
+    def place_order(self, req: OrderRequest) -> OrderResult:
+        raise NotSupported(_TODO)
+
+    def cancel_order(self, order_id: str) -> None:
+        raise NotSupported(_TODO)
+
+    def get_order(self, order_id: str) -> OrderResult:
+        raise NotSupported(_TODO)

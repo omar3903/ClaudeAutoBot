@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tos-trader"
+version = "0.1.0"
+description = "Broker-agnostic, human-in-the-loop trading assistant (Schwab/tda-api, IBKR & crypto ready)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "omarabdeen123" }]
+dependencies = [
+  "numpy>=1.24", "pandas>=2.0", "pydantic>=2.6", "pydantic-settings>=2.2",
+  "PyYAML>=6.0", "python-dotenv>=1.0", "python-dateutil>=2.9", "pytz>=2024.1",
+  "tenacity>=8.2", "SQLAlchemy>=2.0", "PyMySQL>=1.1", "cryptography>=42.0",
+  "fastapi>=0.110", "uvicorn[standard]>=0.29", "jinja2>=3.1", "websockets>=12.0",
+  "yfinance>=0.2.40", "requests>=2.31",
+]
+
+[project.optional-dependencies]
+schwab = ["schwab-py>=1.4"]
+ibkr = ["ib_async>=1.0"]
+crypto = ["ccxt>=4.3"]
+headless-auth = ["playwright>=1.44", "keyring>=25.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+tos-trader = "run:main"
+
+[tool.setuptools]
+packages = ["tos_bot"]
+py-modules = ["run"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -m 'not slow'"
+markers = ["slow: end-to-end tests that boot the engine (run with -m slow)"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
