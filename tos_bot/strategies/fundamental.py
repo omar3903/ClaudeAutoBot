@@ -37,9 +37,13 @@ def _daily_atr(ctx: StrategyContext) -> float:
     return safe_last(ta.atr(ctx.daily, 14))
 
 
-def _clamp_target(price: float, target: float, side: Side, max_move: float = 0.6) -> float:
-    """Keep a valuation target within `max_move` of price so position sizing
-    stays sane; the full fair value is still reported in the evidence."""
+def _clamp_target(price: float, target: float, side: Side, max_move: float = 0.20) -> float:
+    """Keep a valuation target realistic for the hold window. A comps/DCF
+    re-rate rarely completes more than ~20% over 15-35 trading days, and an
+    implied fair value further out than that is usually a data problem (a bad
+    peer set or a distorted EBITDA), not a 40%-in-a-month opportunity - the
+    trade that lost on TTWO had a first target 39% away. The full unclamped
+    fair value still rides along in the evidence."""
     if side is Side.LONG:
         return min(target, price * (1.0 + max_move))
     return max(target, price * (1.0 - max_move))
@@ -93,12 +97,12 @@ class RelativeValueComps(Strategy):
         if sig["verdict"] == "undervalued_vs_peers" and fair > price:
             side = Side.LONG
             stop = price - self.params["stop_atr"] * atr
-            t1 = _clamp_target(price, (price + fair) / 2.0, side)
+            t1 = _clamp_target(price, (price + fair) / 2.0, side, 0.08)   # a realistic partial re-rate
             targets = [t1, _clamp_target(price, fair, side)]
         elif sig["verdict"] == "overvalued_vs_peers" and fair < price:
             side = Side.SHORT
             stop = price + self.params["stop_atr"] * atr
-            t1 = _clamp_target(price, (price + fair) / 2.0, side)
+            t1 = _clamp_target(price, (price + fair) / 2.0, side, 0.08)
             targets = [t1, _clamp_target(price, fair, side)]
         else:
             return []

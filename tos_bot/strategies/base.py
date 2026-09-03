@@ -180,10 +180,18 @@ class Strategy:
     expected_hold = (4.0, 10.0)
 
     #: geometry guard rails - a play outside these is almost always bad data
+    #: (or, for MIN_STOP, a stop tightened to fake a good reward:risk - the
+    #: exact anti-pattern Aziz warns about on p.66: "define a closer stop loss
+    #: to have a more favorable ratio? The answer is NO.")
     MAX_STOP_PCT = 0.25          # protective stop no further than 25% from entry
+    #: a protective stop *closer* than this to entry is noise, not a level -
+    #: it will be taken out by a normal wiggle (see the QCOM/DLTR 0.2% stops
+    #: that produced -3R fills). Widen to the floor, then re-check reward:risk.
+    MIN_STOP_PCT = {"INTRADAY": 0.006, "SWING": 0.015}
+    MIN_STOP_ATR = 0.9          # ...and at least this many intraday ATRs
     MAX_TARGET_PCT = {"INTRADAY": 0.15, "SWING": 0.45}
     MIN_TARGET_PCT = 0.002
-    RR_BOUNDS = (0.4, 25.0)
+    RR_BOUNDS = (0.4, 8.0)      # an intraday "RR 9:1" is a fake-tight-stop artifact
 
     def _mk_play(
         self,
@@ -216,6 +224,18 @@ class Strategy:
             stop = max(stop, entry - max_stop)
         else:
             stop = min(stop, entry + max_stop)
+
+        # widen a noise-tight stop to a real floor (% of price AND intraday ATR)
+        floor = entry * self.MIN_STOP_PCT.get(self.timeframe.value, 0.006)
+        if self.timeframe is Timeframe.INTRADAY:
+            try:
+                iatr = float(ta.atr(ctx.intraday, 14).iloc[-1])
+                if iatr == iatr and iatr > 0:      # not NaN
+                    floor = max(floor, self.MIN_STOP_ATR * iatr)
+            except Exception:  # noqa: BLE001
+                pass
+        if abs(entry - stop) < floor:
+            stop = entry - floor if side is Side.LONG else entry + floor
 
         # clamp / reject over-far targets
         max_t = entry * self.MAX_TARGET_PCT.get(self.timeframe.value, 0.4)

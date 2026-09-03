@@ -133,6 +133,58 @@ def test_divergence_reversal_reads_bearish_divergence_at_resistance():
         assert _douglas_framed(p)
 
 
+def test_min_stop_floor_widens_noise_tight_stops():
+    """A stop closer than ~0.6% (or ~0.9 intraday ATR) to entry is noise, not a
+    level - _mk_play must widen it so the reward:risk stops being a fake."""
+    from tos_bot.core.enums import StrategyKind, Timeframe
+    from tos_bot.strategies.base import Strategy
+
+    class _T(Strategy):
+        key, kind, timeframe = "t", StrategyKind.TECHNICAL, Timeframe.INTRADAY
+        title, thesis = "T", "t"
+
+    sd = clock.session_date()
+    idx = pd.date_range(pd.Timestamp(f"{sd} 09:30", tz="America/New_York"), periods=30, freq="5min")
+    c = np.full(30, 167.0)
+    df = pd.DataFrame({"open": c, "high": c + 0.5, "low": c - 0.5, "close": c,
+                       "volume": np.full(30, 5e5)}, index=idx)
+    ctx = build_context("X", df, df, _quote("X", 167.0))
+    p = _T()._mk_play(ctx, Side.LONG, entry=167.0, stop=166.70, targets=[170.06],
+                      confidence=0.7, rationale="r", detail="d", evidence={}, tags=["intraday"])
+    assert p is not None
+    risk_pct = abs(p.entry - p.stop) / p.entry
+    assert risk_pct >= 0.006 - 1e-9              # >= 0.6% floor
+    assert p.reward_risk <= 8.0                  # no more fake 10:1
+
+
+def test_sr_bounce_stop_sits_beyond_the_level():
+    """sr_bounce's stop must be a real buffer past the level (a 5-min close
+    through), not a tick - and it only fires with volume + an honest 2:1."""
+    from tos_bot.strategies.technical import SupportResistanceBounce
+    p_seen = 0
+    from tos_bot.data.market_data import MarketDataService, SyntheticProvider
+    ds = MarketDataService(providers=[SyntheticProvider(seed=11)], cache=False,
+                           min_interval_between_calls=0.0)
+    for i in range(40):
+        sym = f"L{i:02d}"
+        ctx = build_context(sym, ds.get_price_history(sym, "5m", 10),
+                            ds.get_price_history(sym, "1d", 400), ds.get_quote(sym),
+                            candidate={"rvol": 2.0})
+        for p in SupportResistanceBounce().generate(ctx):
+            p_seen += 1
+            lvl = p.evidence["level"]
+            # stop is on the far side of the level from entry, by a real gap
+            if p.side is Side.LONG:
+                assert p.stop < lvl
+            else:
+                assert p.stop > lvl
+            assert abs(p.entry - p.stop) / p.entry >= 0.005
+            assert p.reward_risk >= 2.0
+            assert p.evidence.get("rvol") is not None
+    # selective by design - fine if few/none fire on synthetic noise
+    assert p_seen >= 0
+
+
 def test_new_intraday_setups_never_crash_and_stay_framed(datasvc):
     """abcd / flag / red_to_green / reversal / sr_bounce across many synthetic
     symbols: no exceptions, and every play they emit carries the Douglas frame

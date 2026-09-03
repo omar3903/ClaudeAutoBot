@@ -152,10 +152,14 @@ class ExitManager:
             return None
         new_stop = float(work_stop) if work_stop else float(init_stop)
 
-        be_r = float(getattr(self.cfg, "breakeven_at_r", 1.0) or 0.0)
+        be_r = float(getattr(self.cfg, "breakeven_at_r", 1.3) or 0.0)
         if be_r > 0 and r_now >= be_r:
+            # lock a small profit rather than a pure scratch - a +1.3R trade
+            # that pulls back should still book something, not go to zero
+            # (see the QCOM short that ran +1.2R then stopped at -0.2R).
+            lock_r = float(getattr(self.cfg, "breakeven_lock_r", 0.3) or 0.0)
             buf = entry * float(getattr(self.cfg, "breakeven_buffer_bps", 5) or 0) / 1e4
-            be = entry + sign * buf
+            be = entry + sign * (lock_r * risk_ps + buf)
             new_stop = max(new_stop, be) if side == "LONG" else min(new_stop, be)
 
         trail_start = float(getattr(self.cfg, "trail_start_r", 1.5) or 0.0)

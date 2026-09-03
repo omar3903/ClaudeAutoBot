@@ -699,6 +699,11 @@ $("#ap-cfg").onclick = () => {
         <span><label>Max open positions</label><input type="number" id="ap-maxpos" min="0" max="10" step="1" value="${ap.max_auto_positions ?? 2}"></span>
         <span><label>Max per day</label><input type="number" id="ap-maxday" min="0" max="20" step="1" value="${ap.max_auto_trades_per_day ?? 3}"></span>
       </div>
+      <div class="ap-row">
+        <span><label>Max per strategy</label><input type="number" id="ap-maxstrat" min="1" max="10" step="1" value="${ap.max_per_strategy ?? 2}"></span>
+        <span><label>New per scan</label><input type="number" id="ap-maxcycle" min="1" max="10" step="1" value="${ap.max_new_per_cycle ?? 1}"></span>
+      </div>
+      <label><input type="checkbox" id="ap-cooldown" ${ap.cooldown_after_loss !== false ? "checked" : ""}> Cool off a ticker for the day after it stops out</label>
       <label><input type="checkbox" id="ap-dry" ${ap.dry_run ? "checked" : ""}> Dry run (log what it would do, place nothing)</label>
       <p class="muted">Live routing also needs <code>autopilot.allow_live: true</code> in config.yaml. Exits are automatic no matter what.</p>
     </div>`,
@@ -713,6 +718,9 @@ $("#ap-cfg").onclick = () => {
         min_reward_risk: parseFloat($("#ap-rr").value),
         max_auto_positions: parseInt($("#ap-maxpos").value, 10),
         max_auto_trades_per_day: parseInt($("#ap-maxday").value, 10),
+        max_per_strategy: parseInt($("#ap-maxstrat").value, 10),
+        max_new_per_cycle: parseInt($("#ap-maxcycle").value, 10),
+        cooldown_after_loss: $("#ap-cooldown").checked,
         dry_run: $("#ap-dry").checked
       });
     }
