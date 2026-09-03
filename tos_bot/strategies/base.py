@@ -14,9 +14,11 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from ..analysis import SupportResistance, find_levels
 from ..core.enums import AssetClass, Side, StrategyKind, Timeframe
 from ..core.models import Play, Quote
 from ..data.fundamentals import Financials
+from ..indicators import ta
 from ..util import clock
 
 
@@ -34,7 +36,10 @@ class StrategyContext:
     peers: Optional[List[Financials]] = None
     params: Dict[str, Any] = field(default_factory=dict)
     account_equity: float = 0.0
+    #: enrichment from the scanner (rvol, gap_pct, atr_pct, float_category, ...)
+    candidate: Dict[str, Any] = field(default_factory=dict)
     extras: Dict[str, Any] = field(default_factory=dict)
+    _sr: Optional[SupportResistance] = None
 
     # -- convenience accessors ------------------------------------------- #
     @property
@@ -49,6 +54,10 @@ class StrategyContext:
     def minutes_since_open(self) -> float:
         return clock.minutes_since_open(self.now)
 
+    @property
+    def time_of_day(self) -> str:
+        return clock.time_of_day(self.now)
+
     def enough_intraday(self, bars: int = 20) -> bool:
         return self.intraday is not None and len(self.intraday) >= bars
 
@@ -61,6 +70,47 @@ class StrategyContext:
         ny = self.intraday.index.tz_convert("America/New_York")
         return self.intraday[ny.date == clock.session_date(self.now)]
 
+    def prev_close(self) -> float:
+        if self.daily is None or len(self.daily) < 2:
+            return self.price
+        return float(self.daily["close"].iloc[-2])
+
+    def levels(self) -> SupportResistance:
+        if self._sr is None:
+            try:
+                self._sr = find_levels(self.daily, self.price, self.intraday)
+            except Exception:  # noqa: BLE001
+                self._sr = find_levels(pd.DataFrame(), self.price)
+        return self._sr
+
+    def daily_trend(self, lookback: int = 40) -> str:
+        """Murphy: an uptrend = higher highs *and* higher lows; downtrend the
+        mirror; else 'range'. Used to keep intraday longs aligned with the day."""
+        if not self.enough_daily(lookback + 5):
+            return "range"
+        d = self.daily.tail(lookback)
+        c = d["close"]
+        sma20 = ta.sma(c, 20).iloc[-1]
+        sma50 = ta.sma(c, 50).iloc[-1] if len(self.daily) >= 55 else sma20
+        px = float(c.iloc[-1])
+        half = len(d) // 2
+        hh = d["high"].iloc[half:].max() > d["high"].iloc[:half].max()
+        hl = d["low"].iloc[half:].min() > d["low"].iloc[:half].min()
+        if px > sma20 >= sma50 and hh and hl:
+            return "up"
+        if px < sma20 <= sma50 and (not hh) and (not hl):
+            return "down"
+        return "range"
+
+    def rvol(self) -> float:
+        v = self.candidate.get("rvol")
+        if v:
+            return float(v)
+        try:
+            return float(ta.rel_volume_intraday(self.intraday))
+        except Exception:  # noqa: BLE001
+            return 1.0
+
 
 def build_context(
     symbol: str,
@@ -71,11 +121,12 @@ def build_context(
     peers: Optional[List[Financials]] = None,
     params: Optional[Dict[str, Any]] = None,
     account_equity: float = 0.0,
+    candidate: Optional[Dict[str, Any]] = None,
 ) -> StrategyContext:
     return StrategyContext(
         symbol=symbol, intraday=intraday, daily=daily, quote=quote,
         fundamentals=fundamentals, peers=peers, params=params or {},
-        account_equity=account_equity,
+        account_equity=account_equity, candidate=candidate or {},
     )
 
 
@@ -110,6 +161,18 @@ class Strategy:
     #: may this setup be entered in pre/post-market too? (limit-only there)
     extended_hours_ok: bool = False
 
+    #: how the setup behaves across Aziz's intraday sessions (Ch. 7). Momentum /
+    #: breakout setups fade at Mid-day; reversal / mean-reversion setups are fine
+    #: then; trend setups are *better* Late-Morning -> Close. Scales confidence
+    #: only - never the geometry.  momentum | reversal | trend | swing
+    tod_profile: str = "momentum"
+    _TOD_WEIGHTS = {
+        "momentum": {"OPEN": 1.00, "LATE_MORNING": 1.00, "MIDDAY": 0.75, "CLOSE": 0.85, "OFF": 1.0},
+        "reversal": {"OPEN": 0.85, "LATE_MORNING": 1.00, "MIDDAY": 1.00, "CLOSE": 0.90, "OFF": 1.0},
+        "trend":    {"OPEN": 0.80, "LATE_MORNING": 1.00, "MIDDAY": 1.00, "CLOSE": 0.95, "OFF": 1.0},
+        "swing":    {"OPEN": 1.00, "LATE_MORNING": 1.00, "MIDDAY": 1.00, "CLOSE": 1.00, "OFF": 1.0},
+    }
+
     #: how long the trade is *expected* to take:  (typical, review-after).
     #: units are MINUTES for INTRADAY setups, TRADING DAYS for SWING setups.
     #: purely informational - it never touches the stop; it just flags a
@@ -135,6 +198,9 @@ class Strategy:
         evidence: Dict[str, Any],
         tags: Optional[List[str]] = None,
         ttl_minutes: int = 45,
+        invalidation: str = "",
+        edge_note: str = "",
+        probability: Optional[float] = None,
     ) -> Optional[Play]:
         if entry <= 0 or stop <= 0 or not targets:
             return None
@@ -180,14 +246,40 @@ class Strategy:
         hold_typ = float(self.params.get("hold_typical", hold_typ))
         hold_max = float(self.params.get("hold_max", hold_max))
 
-        explanation = self._compose_explanation(side, entry, stop, targets, rationale, detail)
+        # -- Aziz Ch. 7: an edge is worth less in the wrong session ------- #
+        tod = "OFF"
+        if self.timeframe is Timeframe.INTRADAY:
+            tod = clock.time_of_day(ctx.now)
+            mult = self._TOD_WEIGHTS.get(self.tod_profile, {}).get(tod, 1.0)
+            confidence = confidence * mult
+            evidence = {**evidence, "time_of_day": tod, "tod_weight": round(mult, 2)}
+        confidence = max(0.0, min(1.0, confidence))
+
+        # -- Douglas: state the edge as a probability, never a promise ---- #
+        if probability is None:
+            probability = 0.40 + 0.28 * confidence
+        probability = max(0.05, min(0.90, float(probability)))
+
+        risk_ps = abs(entry - stop)
+        if not invalidation:
+            side_word = "below" if side is Side.LONG else "above"
+            invalidation = (f"a 5-minute close {side_word} {stop:.2f} (the protective "
+                            f"stop / the technical level the idea rests on)")
+
+        explanation = self._compose_explanation(
+            side, entry, stop, targets, rationale, detail,
+            invalidation=invalidation, edge_note=edge_note,
+            probability=probability, tod=tod,
+        )
         play = Play(
             symbol=ctx.symbol, side=side, strategy=self.key, kind=self.kind,
             timeframe=self.timeframe, entry=round(entry, 4), stop=round(stop, 4),
             targets=[round(t, 4) for t in targets],
-            confidence=max(0.0, min(1.0, confidence)),
-            rationale=rationale, explanation=explanation, evidence=evidence,
-            tags=tags, asset_class=AssetClass.EQUITY, extended_hours_ok=ext_ok,
+            confidence=confidence,
+            rationale=rationale, explanation=explanation,
+            invalidation=invalidation, probability=round(probability, 3),
+            evidence=evidence, tags=tags, asset_class=AssetClass.EQUITY,
+            extended_hours_ok=ext_ok,
             expected_hold_typical=hold_typ, expected_hold_max=hold_max,
             expires_at=ctx.now.astimezone(dt.timezone.utc) + dt.timedelta(minutes=ttl_minutes),
         )
@@ -195,20 +287,52 @@ class Strategy:
 
     def _compose_explanation(
         self, side: Side, entry: float, stop: float, targets: List[float],
-        rationale: str, detail: str,
+        rationale: str, detail: str, invalidation: str = "", edge_note: str = "",
+        probability: float = 0.5, tod: str = "",
     ) -> str:
-        rr = abs(targets[0] - entry) / abs(entry - stop) if entry != stop else 0.0
-        d = "LONG (buy, profit if it rises)" if side is Side.LONG else \
-            "SHORT (sell/borrow, profit if it falls)"
-        return (
-            f"{self.title} - {d}\n\n"
-            f"What the setup means: {self.thesis}\n\n"
-            f"Why now: {detail}\n\n"
-            f"Plan: enter near {entry:.2f}, protective stop at {stop:.2f} "
-            f"(risk {abs(entry - stop):.2f}/share), first target {targets[0]:.2f} "
-            f"(reward:risk {rr:.1f}:1)."
-            + (f" Further targets: {', '.join(f'{t:.2f}' for t in targets[1:])}." if len(targets) > 1 else "")
+        """The hover pop-up. Framed the way Douglas (*Trading in the Zone*)
+        argues a trader must hold a position: it is one execution of an edge -
+        a higher probability of one thing over another - not a forecast. The
+        numbers up top are the plan; the paragraph at the bottom is how to
+        carry the trade without breaking the rules."""
+        risk_ps = abs(entry - stop)
+        risk_pct = (risk_ps / entry * 100.0) if entry else 0.0
+        rr = risk_ps and abs(targets[0] - entry) / risk_ps or 0.0
+        d = ("LONG - you buy, and profit if it rises" if side is Side.LONG
+             else "SHORT - you sell short, and profit if it falls")
+        tgt = f"first target {targets[0]:.2f}  (reward:risk {rr:.1f} : 1)"
+        if len(targets) > 1:
+            tgt += "; then " + ", ".join(f"{t:.2f}" for t in targets[1:])
+        when = tod.replace("_", "-").lower() if tod and tod != "OFF" else "this setup"
+
+        blocks = [
+            f"{self.title} - {d}",
+            f"THE EDGE (what tends to happen here): {self.thesis}",
+            f"RIGHT NOW ({when}): {detail}",
+        ]
+        if edge_note:
+            blocks.append(f"READING THE TAPE: {edge_note}")
+        blocks.append(
+            "THE PLAN\n"
+            f"   - enter near {entry:.2f}\n"
+            f"   - protective stop {stop:.2f}  ->  you risk {risk_ps:.2f}/share "
+            f"({risk_pct:.1f}% of price) to find out whether the edge pays\n"
+            f"   - {tgt}\n"
+            f"   - estimated odds the edge pays: ~{probability * 100:.0f}%  "
+            f"(a probability over many trades, not a call on this one)"
         )
+        blocks.append(
+            f"INVALIDATION: {invalidation}. If price gets there the reason for the "
+            f"trade is gone - the automatic exit handles it, no decision needed."
+        )
+        blocks.append(
+            "HOW TO HOLD IT (Douglas): this is one roll of an edge, not a prediction. "
+            "Wins and losses land randomly around it, so a textbook setup can still "
+            f"lose - that is normal, not a mistake. Accept the {risk_ps:.2f}/share loss "
+            "before you click; if you can't, skip the trade. Then leave it alone - "
+            "don't widen the stop and don't add size to be right."
+        )
+        return "\n\n".join(blocks)
 
 
 def swing_low(series: pd.Series, lookback: int = 10) -> float:

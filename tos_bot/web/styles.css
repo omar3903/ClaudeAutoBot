@@ -41,6 +41,25 @@ label{color:var(--muted)}
 .mode-switch .seg.active[data-mode="paper"]{background:var(--accent); color:#fff}
 .mode-switch .seg.active[data-mode="live"]{background:var(--short); color:#fff}
 .mode-switch .seg:disabled{opacity:.4}
+
+/* ---- autopilot control ---- */
+.autopilot-ctl{display:inline-flex; align-items:center; gap:4px}
+button.mini{padding:5px 8px; font-size:12px; line-height:1}
+.ap-btn{background:var(--bg3); color:var(--muted); border:1px solid var(--line); font-weight:600; padding:6px 12px}
+.ap-btn:hover{filter:none; color:var(--fg)}
+.ap-btn.on{background:var(--long); color:#fff; border-color:transparent}
+.ap-btn.armed-paper{background:var(--warn-bg); color:var(--warn); border-color:#3a3115}
+.autopilot-ctl.live-warn{outline:1px dashed var(--warn); outline-offset:2px; border-radius:8px}
+.ap-badge{margin-left:5px; font-size:11px; vertical-align:middle; filter:grayscale(.3)}
+.ap-badge.acted{filter:none}
+tbody tr.ap-eligible{box-shadow:inset 3px 0 0 var(--long)}
+tbody tr.ap-eligible.selected{box-shadow:inset 3px 0 0 var(--accent)}
+.ap-form{display:flex; flex-direction:column; gap:8px; font-size:12.5px}
+.ap-form label{color:var(--muted)}
+.ap-form input[type=range]{width:100%}
+.ap-form .ap-row{display:flex; gap:16px; flex-wrap:wrap}
+.ap-form .ap-row span{display:flex; flex-direction:column; gap:2px}
+.ap-form input[type=number]{width:90px}
 .pill{
   font-size:11px; padding:3px 9px; border-radius:20px; background:var(--bg3);
   border:1px solid var(--line); color:var(--muted); white-space:nowrap;

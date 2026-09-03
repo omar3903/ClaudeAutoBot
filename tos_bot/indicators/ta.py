@@ -231,3 +231,60 @@ def rel_volume_intraday(intraday: pd.DataFrame, lookback_days: int = 20) -> floa
         return 1.0
     avg = float(np.mean(ratios))
     return float(cur_vol / avg) if avg else 1.0
+
+
+# --------------------------------------------------------------------------- #
+#  Momentum structure / divergence  (Murphy: oscillator divergence is one of
+#  the most reliable reversal warnings)                                       #
+# --------------------------------------------------------------------------- #
+def consecutive_run(close: pd.Series) -> int:
+    """Signed count of the current run of higher/lower closes (e.g. +5 = five
+    up closes in a row, -3 = three down). Aziz's reversal setups key off '5+
+    consecutive candles one direction'."""
+    d = close.diff().to_numpy()
+    n = 0
+    for x in d[::-1]:
+        if x > 0 and n >= 0:
+            n += 1
+        elif x < 0 and n <= 0:
+            n -= 1
+        else:
+            break
+    return int(n)
+
+
+def _last_two_extremes(series: pd.Series, lookback: int, want_high: bool):
+    s = series.tail(lookback)
+    if len(s) < 6:
+        return None
+    arr = s.to_numpy()
+    idx = []
+    for i in range(2, len(arr) - 2):
+        w = arr[i - 2:i + 3]
+        if want_high and arr[i] == w.max():
+            idx.append(i)
+        if not want_high and arr[i] == w.min():
+            idx.append(i)
+    if len(idx) < 2:
+        return None
+    a, b = idx[-2], idx[-1]
+    return (float(arr[a]), float(arr[b]))
+
+
+def rsi_divergence(close: pd.Series, rsi_series: pd.Series, lookback: int = 40) -> str:
+    """'bullish' = price made a lower low but RSI made a higher low (down-move
+    losing steam); 'bearish' = price higher high, RSI lower high; else ''."""
+    p_low = _last_two_extremes(close, lookback, want_high=False)
+    r_low = _last_two_extremes(rsi_series, lookback, want_high=False)
+    if p_low and r_low and p_low[1] < p_low[0] and r_low[1] > r_low[0]:
+        return "bullish"
+    p_hi = _last_two_extremes(close, lookback, want_high=True)
+    r_hi = _last_two_extremes(rsi_series, lookback, want_high=True)
+    if p_hi and r_hi and p_hi[1] > p_hi[0] and r_hi[1] < r_hi[0]:
+        return "bearish"
+    return ""
+
+
+def macd_divergence(close: pd.Series, lookback: int = 40) -> str:
+    hist = macd(close)["hist"]
+    return rsi_divergence(close, hist, lookback)

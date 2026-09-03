@@ -75,6 +75,15 @@ function handleEvent(topic, p) {
       loadOpen(); break;
     case "broker.error":
       toast("Broker: " + (p.message || "error"), "bad"); break;
+    case "autopilot.config":
+      STATE.autopilot = p; renderAutopilot(); break;
+    case "autopilot.entered":
+      toast(`🤖 Autopilot entered ${p.side} ${p.symbol} x${p.qty} — ${p.strategy.replace(/_/g, " ")} (${p.count_today} today)`, "good");
+      loadOpen(); refreshState(); break;
+    case "autopilot.would_enter":
+      toast(`🤖 Autopilot (dry-run) would enter ${p.side} ${p.symbol} x${p.qty}`, "warn"); break;
+    case "autopilot.blocked":
+      toast("🤖 " + (p.reason || "Autopilot is blocked"), "warn"); break;
   }
 }
 
@@ -157,6 +166,27 @@ function renderTop() {
     $("#pill-token").title = JSON.stringify(tok, null, 1);
     if (tok.needs_reauth) showReauth({ status: tok });
   }
+
+  renderAutopilot();
+}
+
+function renderAutopilot() {
+  const ap = (STATE || {}).autopilot || {};
+  const btn = $("#ap-toggle");
+  if (!btn) return;
+  const on = !!ap.enabled;
+  const eff = !!ap.effective;
+  const tt = (ap.trade_types || []).map(t => t.toLowerCase() === "intraday" ? "day" : "swing").join("+");
+  btn.textContent = on ? `Autopilot: ${tt || "on"}${ap.dry_run ? " · dry" : ""}` : "Autopilot: off";
+  btn.classList.toggle("on", on && eff);
+  btn.classList.toggle("armed-paper", on && !eff);       // wants to run but paper-gated in live
+  const caps = `${ap.open_auto_positions ?? 0}/${ap.max_auto_positions ?? 0} open · ${ap.auto_trades_today ?? 0}/${ap.max_auto_trades_per_day ?? 0} today`;
+  btn.title = on
+    ? (eff
+      ? `Autopilot is taking entries: ${tt || "?"}, ≥ ${ap.min_reward_risk}:1, ≥ conf ${ap.min_confidence}. ${caps}. Exits are automatic. Click to turn off.`
+      : (ap.blocked_note || "Autopilot is on but not routing (paper-only gate). Click to turn off."))
+    : "Hands-off entry is OFF — you click every entry. Exits are automatic regardless. Click to turn on.";
+  $("#autopilot-ctl").classList.toggle("live-warn", on && !eff);
 }
 function setPill(sel, text, cls) {
   const el = $(sel); el.textContent = text;
@@ -194,11 +224,16 @@ function renderPlays() {
     if (p.id === SELECTED) tr.classList.add("selected");
     const done = isDone(p);
     if (done) tr.classList.add("done");
+    const ap = p.autopilot || {};
+    if (ap.eligible && !done) tr.classList.add("ap-eligible");
+    const apMark = ap.acted
+      ? '<span class="ap-badge acted" title="autopilot has handled this play">🤖</span>'
+      : (ap.eligible && !done ? '<span class="ap-badge" title="autopilot will take this entry on the next pass">🤖</span>' : "");
     const last = done
       ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
       : `<span class="info-dot">i</span>`;
     tr.innerHTML = `
-      <td class="sym">${p.symbol} ${sectorTag(p.sector)}${p.extended_hours_ok ? '<span class="ext" title="can be entered pre/post-market">ext</span>' : ''}</td>
+      <td class="sym">${p.symbol} ${sectorTag(p.sector)}${apMark}${p.extended_hours_ok ? '<span class="ext" title="can be entered pre/post-market">ext</span>' : ''}</td>
       <td><span class="side ${p.side}">${p.side}</span></td>
       <td>${p.strategy.replace(/_/g, " ")}</td>
       <td class="tf">${p.timeframe === "INTRADAY" ? "day" : "swing"}</td>
@@ -607,6 +642,75 @@ $("#btn-scan").onclick = async () => {
   await api("/api/scan/now", { method: "POST" });
   toast("Scan queued", "good");
   setTimeout(() => $("#btn-scan").disabled = false, 4000);
+};
+
+/* ---------- autopilot (hands-off entry) ---------- */
+async function postAutopilot(body) {
+  const r = await api("/api/autopilot", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (r.autopilot) { STATE.autopilot = r.autopilot; renderAutopilot(); }
+  if (r.note) toast(r.note, r.autopilot && r.autopilot.effective ? "good" : "warn");
+  else if (!r.ok) toast("Autopilot: " + (r.reason || "update failed"), "bad");
+  return r;
+}
+$("#ap-toggle").onclick = () => {
+  const ap = (STATE.autopilot || {});
+  if (ap.enabled) return postAutopilot({ enabled: false });
+  const live = (STATE.mode === "live");
+  openModal({
+    title: live ? "Turn on Autopilot in LIVE mode?" : "Turn on Autopilot?",
+    bodyHTML: `<div class="${live && !ap.allow_live ? "warn-box" : "muted"}">
+        ${live && !ap.allow_live
+      ? "Autopilot will arm for <b>paper only</b> — it will not route real orders until you set <code>autopilot.allow_live: true</code> in config/config.yaml."
+      : "The bot will <b>place entries for you</b> when a play clears the gate. Exits are already automatic. It stays inside the per-day and position caps and the 2:1 minimum."}
+      </div>
+      <p class="muted">Trade types: <b>${(ap.trade_types || ["INTRADAY"]).map(t => t === "INTRADAY" ? "day" : "swing").join(", ")}</b> ·
+      ≤ ${ap.max_auto_positions ?? 2} open · ≤ ${ap.max_auto_trades_per_day ?? 3}/day · ≥ conf ${ap.min_confidence ?? 0.62}.
+      Change these with the ⚙ button.</p>`,
+    okText: "Turn on", okClass: live && !ap.allow_live ? "danger" : "long",
+    onOk: () => postAutopilot({ enabled: true })
+  });
+};
+$("#ap-cfg").onclick = () => {
+  const ap = (STATE.autopilot || {});
+  const has = t => (ap.trade_types || []).includes(t) ? "checked" : "";
+  openModal({
+    title: "Autopilot settings",
+    bodyHTML: `<div class="ap-form">
+      <label>Auto-take these trade types</label>
+      <div class="ap-row">
+        <label><input type="checkbox" id="ap-day" ${has("INTRADAY")}> Day trades</label>
+        <label><input type="checkbox" id="ap-swing" ${has("SWING")}> Swing trades</label>
+      </div>
+      <label>Minimum confidence <b id="ap-conf-v">${ap.min_confidence ?? 0.62}</b></label>
+      <input type="range" id="ap-conf" min="0.4" max="0.9" step="0.01" value="${ap.min_confidence ?? 0.62}">
+      <label>Minimum reward : risk</label>
+      <input type="number" id="ap-rr" min="1" max="10" step="0.5" value="${ap.min_reward_risk ?? 2}">
+      <div class="ap-row">
+        <span><label>Max open positions</label><input type="number" id="ap-maxpos" min="0" max="10" step="1" value="${ap.max_auto_positions ?? 2}"></span>
+        <span><label>Max per day</label><input type="number" id="ap-maxday" min="0" max="20" step="1" value="${ap.max_auto_trades_per_day ?? 3}"></span>
+      </div>
+      <label><input type="checkbox" id="ap-dry" ${ap.dry_run ? "checked" : ""}> Dry run (log what it would do, place nothing)</label>
+      <p class="muted">Live routing also needs <code>autopilot.allow_live: true</code> in config.yaml. Exits are automatic no matter what.</p>
+    </div>`,
+    okText: "Save", okClass: "long",
+    onOk: async () => {
+      const types = [];
+      if ($("#ap-day").checked) types.push("INTRADAY");
+      if ($("#ap-swing").checked) types.push("SWING");
+      await postAutopilot({
+        trade_types: types.length ? types : ["INTRADAY"],
+        min_confidence: parseFloat($("#ap-conf").value),
+        min_reward_risk: parseFloat($("#ap-rr").value),
+        max_auto_positions: parseInt($("#ap-maxpos").value, 10),
+        max_auto_trades_per_day: parseInt($("#ap-maxday").value, 10),
+        dry_run: $("#ap-dry").checked
+      });
+    }
+  });
+  const cs = $("#ap-conf"); if (cs) cs.oninput = () => $("#ap-conf-v").textContent = cs.value;
 };
 $$("#f-long,#f-short,#f-intraday,#f-swing,#f-hide-done,#f-sector").forEach(c => c.onchange = renderPlays);
 

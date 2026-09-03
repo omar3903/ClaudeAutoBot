@@ -310,3 +310,24 @@ def minutes_to_close(ts: Optional[dt.datetime] = None) -> float:
         return 1e9
     close_dt = dt.datetime.combine(ts.date(), regular_close_time(ts.date()), tzinfo=NY)
     return max(0.0, (close_dt - ts).total_seconds() / 60.0)
+
+
+def time_of_day(ts: Optional[dt.datetime] = None) -> str:
+    """Aziz's intraday sessions - each favours different setups:
+        OPEN         09:30-10:30  ORB / bull-flag / VWAP, most volume
+        LATE_MORNING 10:30-12:00  VWAP reversal / best risk-reward
+        MIDDAY       12:00-15:00  reversal / MA-trend / S-R, thin & choppy
+        CLOSE        15:00-close  trend-follow the last hour (institutions)
+        OFF          not in the regular session
+    """
+    if current_session(ts) is not Session.REGULAR:
+        return "OFF"
+    m = minutes_since_open(ts)
+    if m < 60:
+        return "OPEN"
+    if m < 150:
+        return "LATE_MORNING"
+    to_close = minutes_to_close(ts)
+    if to_close <= 60:
+        return "CLOSE"
+    return "MIDDAY"

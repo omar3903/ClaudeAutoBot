@@ -205,6 +205,10 @@ class Play:
     score: float = 0.0                   # blended rank score assigned by the scanner
     rationale: str = ""
     explanation: str = ""
+    #: the price/behaviour that voids the idea - "if it gets here, the edge is gone"
+    invalidation: str = ""
+    #: rough probability this edge resolves in our favour (0..1), NOT a promise
+    probability: float = 0.5
     evidence: Dict[str, Any] = field(default_factory=dict)
     tags: List[str] = field(default_factory=list)
     asset_class: AssetClass = AssetClass.EQUITY
@@ -263,6 +267,8 @@ class Play:
             "score": round(self.score, 3),
             "rationale": self.rationale,
             "explanation": self.explanation,
+            "invalidation": self.invalidation,
+            "probability": round(self.probability, 3),
             "evidence": self.evidence,
             "tags": self.tags,
             "suggested_qty": self.suggested_qty,

@@ -137,6 +137,16 @@ def create_app() -> FastAPI:
         res = eng(app).reset_paper(float(cash) if cash is not None else None)
         return JSONResponse(res, status_code=200 if res.get("ok") else 400)
 
+    # ---- autopilot (hands-off entry) ---------------------- #
+    @app.get("/api/autopilot")
+    async def autopilot_state():
+        return eng(app).snapshot().get("autopilot", {})
+
+    @app.post("/api/autopilot")
+    async def set_autopilot(body: dict):
+        res = eng(app).set_autopilot(**(body or {}))
+        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+
     # ---- scan / strategies / auth -------------------------- #
     @app.post("/api/scan/now")
     async def scan_now():

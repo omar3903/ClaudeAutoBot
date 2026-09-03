@@ -1,4 +1,7 @@
 from .ta import (
+    macd_divergence,
+    rsi_divergence,
+    consecutive_run,
     adx,
     anchored_vwap,
     atr,
@@ -23,6 +26,9 @@ from .ta import (
 )
 
 __all__ = [
+    "macd_divergence",
+    "rsi_divergence",
+    "consecutive_run",
     "adx",
     "anchored_vwap",
     "atr",

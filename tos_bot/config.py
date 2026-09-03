@@ -184,6 +184,24 @@ class ExitManagerCfg(_Model):
     max_swing_hold_days: int = 10        # force-close stale swings (0 = off)
 
 
+class AutopilotCfg(_Model):
+    """Hands-off entry. Exits are ALREADY automatic (see ExitManagerCfg); this
+    is the switch that also lets the bot take the *entry* without your click.
+    Off by default, and paper-only until ``allow_live`` is deliberately set."""
+
+    enabled: bool = False                 # master switch (also toggled from the UI)
+    allow_live: bool = False              # HARD gate: never auto-route real orders unless true
+    trade_types: list = Field(default_factory=lambda: ["INTRADAY"])  # INTRADAY and/or SWING
+    min_confidence: float = 0.62          # skip plays the strategy isn't sure about
+    min_reward_risk: float = 2.0          # Aziz Rule 5 - never auto-take worse than 2:1
+    max_auto_positions: int = 2           # concurrent open autopilot trades
+    max_auto_trades_per_day: int = 3      # matches the sub-$25k PDT day-trade cap
+    max_open_risk_pct: float = 4.0        # sum of open autopilot $-risk vs equity
+    block_sectors: list = Field(default_factory=list)  # e.g. ["Energy"] to sit out a sector
+    require_catalyst: bool = False        # only auto-take plays tagged "catalyst"/"gap"
+    dry_run: bool = False                 # log what it WOULD do, place nothing
+
+
 class DatabaseCfg(_Model):
     echo_sql: bool = False
     pool_size: int = 5
@@ -206,6 +224,7 @@ class AppConfig(_Model):
     auth: AuthCfg = Field(default_factory=AuthCfg)
     execution: ExecutionCfg = Field(default_factory=ExecutionCfg)
     exit_manager: ExitManagerCfg = Field(default_factory=ExitManagerCfg)
+    autopilot: AutopilotCfg = Field(default_factory=AutopilotCfg)
     database: DatabaseCfg = Field(default_factory=DatabaseCfg)
     web: Dict[str, Any] = Field(default_factory=dict)
 

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from tos_bot.core.enums import Side
 from tos_bot.data.market_data import MarketDataService, SyntheticProvider
 from tos_bot.strategies import REGISTRY, build_context
 from tos_bot.strategies.registry import describe_all
+from tos_bot.util import clock
 
 
 @pytest.fixture(scope="module")
@@ -44,3 +47,112 @@ def test_every_strategy_runs_and_geometry_is_sane(datasvc):
                 assert p.explanation and len(p.explanation) > 40
     # synthetic data is noisy; we just need the pipeline to yield *something*
     assert total >= 1
+
+
+# --------------------------------------------------------------------------- #
+#  Aziz day-trade setups on purpose-built frames                             #
+# --------------------------------------------------------------------------- #
+def _session_intraday(bars_open, closes, *, vol=None):
+    """Build a tz-aware 5-minute frame for *today's* session so
+    ctx.today_intraday() picks it up."""
+    n = len(closes)
+    sd = clock.session_date()
+    start = pd.Timestamp(f"{sd} 09:30", tz="America/New_York")
+    idx = pd.date_range(start, periods=n, freq="5min")
+    closes = np.asarray(closes, float)
+    opens = np.concatenate([[bars_open], closes[:-1]])
+    high = np.maximum(opens, closes) + 0.05
+    low = np.minimum(opens, closes) - 0.05
+    v = np.asarray(vol if vol is not None else np.full(n, 5e5), float)
+    return pd.DataFrame({"open": opens, "high": high, "low": low, "close": closes,
+                         "volume": v}, index=idx)
+
+
+def _flat_daily(price=100.0, n=120):
+    idx = pd.date_range("2025-03-03", periods=n, freq="B", tz="America/New_York")
+    c = np.full(n, price)
+    return pd.DataFrame({"open": c, "high": c + 1, "low": c - 1, "close": c,
+                         "volume": np.full(n, 3e6)}, index=idx)
+
+
+def _quote(sym, last):
+    from tos_bot.core.models import Quote
+    return Quote(symbol=sym, bid=last - 0.02, ask=last + 0.02, last=last, volume=1e6)
+
+
+def _douglas_framed(play):
+    e = play.explanation
+    return ("HOW TO HOLD IT (Douglas)" in e and "INVALIDATION:" in e
+            and "THE PLAN" in e and 0.05 <= play.probability <= 0.90)
+
+
+def test_bull_flag_fires_on_a_textbook_flag():
+    from tos_bot.strategies.technical import MomentumFlag
+    # 12 quiet bars (so ATR(14) is defined), then a pole 100->103 over 5 bars,
+    # then a tight 3-bar flag. The live quote (103.25) breaks the flag high.
+    closes = ([99.8] * 12
+              + [100.2, 100.9, 101.6, 102.4, 103.0]     # pole  -> today.iloc[-8:-3]
+              + [102.9, 102.85, 102.95])                # flag  -> today.iloc[-3:]
+    vol = [3e5] * 12 + [4e5, 5e5, 6e5, 7e5, 9e5, 3e5, 3e5, 3e5]
+    intr = _session_intraday(99.8, closes, vol=vol)
+    daily = _flat_daily(101.0)
+    ctx = build_context("FLAG", intr, daily, _quote("FLAG", 103.25),
+                        candidate={"rvol": 2.0})
+    plays = MomentumFlag().generate(ctx)
+    assert plays, "a clean bull flag breakout should produce a play"
+    p = plays[0]
+    assert p.side is Side.LONG
+    assert p.stop < p.entry < p.targets[0]
+    assert p.reward_risk >= 1.5
+    assert _douglas_framed(p)
+    assert "flag" in "".join(p.tags)
+
+
+def test_divergence_reversal_reads_bearish_divergence_at_resistance():
+    from tos_bot.strategies.technical import DivergenceReversal
+    # price grinds to a higher high while momentum rolls over
+    n = 90
+    ramp = np.concatenate([
+        np.linspace(100, 108, 30),
+        np.linspace(108, 103, 15),
+        np.linspace(103, 111, 30),     # HIGHER high
+        np.linspace(111, 109, 15),
+    ])
+    idx = pd.date_range("2025-02-03", periods=n, freq="B", tz="America/New_York")
+    close = ramp + np.random.default_rng(2).normal(0, 0.05, n)
+    daily = pd.DataFrame({"open": close, "high": close + 0.6, "low": close - 0.6,
+                          "close": close, "volume": np.full(n, 4e6)}, index=idx)
+    intr = _session_intraday(close[-1], [close[-1]] * 6)
+    ctx = build_context("DIV", intr, daily, _quote("DIV", float(close[-1])))
+    plays = DivergenceReversal().generate(ctx)
+    # divergence detection is strict; when it fires the geometry + framing must hold
+    for p in plays:
+        assert p.side in (Side.LONG, Side.SHORT)
+        if p.side is Side.SHORT:
+            assert p.targets[0] < p.entry < p.stop
+        assert _douglas_framed(p)
+
+
+def test_new_intraday_setups_never_crash_and_stay_framed(datasvc):
+    """abcd / flag / red_to_green / reversal / sr_bounce across many synthetic
+    symbols: no exceptions, and every play they emit carries the Douglas frame
+    and legal geometry."""
+    keys = ["abcd_pattern", "bull_bear_flag", "red_to_green",
+            "intraday_reversal", "sr_bounce"]
+    seen = 0
+    for i in range(40):
+        sym = f"N{i:02d}"
+        ctx = build_context(sym,
+                            datasvc.get_price_history(sym, "5m", 10),
+                            datasvc.get_price_history(sym, "1d", 400),
+                            datasvc.get_quote(sym))
+        for k in keys:
+            for p in REGISTRY[k]().generate(ctx):
+                seen += 1
+                if p.side is Side.LONG:
+                    assert p.stop < p.entry < p.targets[0]
+                else:
+                    assert p.targets[0] < p.entry < p.stop
+                assert _douglas_framed(p)
+                assert p.invalidation
+    assert seen >= 0  # smoke: the point is "no crash + assertions hold when they do fire"

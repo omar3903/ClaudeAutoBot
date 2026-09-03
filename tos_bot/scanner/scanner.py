@@ -18,7 +18,7 @@ import logging
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
 
 from ..core.eventbus import BUS
@@ -193,9 +193,11 @@ class Scanner:
                     except Exception:  # noqa: BLE001
                         intr = daily            # fall back to daily; swing setups don't care
                 q = quote_cache.get(sym) or None
+                _c = cand_by_sym.get(sym)
                 ctx = build_context(
                     sym, intr, daily, q, params={"valuation": _valuation_params(self.settings)},
                     account_equity=equity,
+                    candidate=asdict(_c) if _c is not None else None,
                 )
                 src = intr if intr is not daily else daily
                 spark = [round(float(x), 3) for x in src["close"].tail(60).tolist()]

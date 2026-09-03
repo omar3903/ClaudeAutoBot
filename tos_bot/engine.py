@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -34,6 +35,7 @@ from .core.enums import PlayStatus
 from .core.models import Account, Play
 from .data.fundamentals import YFinanceFundamentals
 from .data.market_data import MarketDataService, SyntheticProvider, YFinanceProvider
+from .execution.autopilot import AutoPilot
 from .execution.executor import Executor
 from .execution.exit_manager import ExitManager
 from .execution.order_builder import plan_order
@@ -49,7 +51,9 @@ from .util.logging_setup import setup_logging
 
 log = logging.getLogger(__name__)
 
-_RUNTIME_PATH = PROJECT_ROOT / "data" / "runtime.json"
+# where the paper/live mode + autopilot knobs persist between runs.
+# Overridable (tests point it at a temp file so a run never rewrites the user's).
+_RUNTIME_PATH = Path(os.getenv("TOS_RUNTIME_PATH") or (PROJECT_ROOT / "data" / "runtime.json"))
 _LIVE_BROKERS = {"schwab", "tda", "ibkr", "crypto"}
 
 
@@ -108,6 +112,11 @@ class TradingEngine:
         self._reauth_hint: Dict[str, Any] = {}
         self._live_blockers: List[str] = []
 
+        # hands-off entry (exits are already automatic via ExitManager)
+        self.autopilot = AutoPilot(self, self.settings.config.autopilot,
+                                   bus=BUS, persist=self._save_runtime)
+        self.autopilot.load_runtime(self._read_runtime().get("autopilot", {}))
+
         self._stop = threading.Event()
         self._threads: List[threading.Thread] = []
         self._scan_now = threading.Event()
@@ -121,22 +130,29 @@ class TradingEngine:
     # ------------------------------------------------------------------ #
     #  Runtime state file                                               #
     # ------------------------------------------------------------------ #
-    def _load_runtime_mode(self, default: str) -> str:
+    def _read_runtime(self) -> Dict[str, Any]:
         try:
             if _RUNTIME_PATH.exists():
-                m = json.loads(_RUNTIME_PATH.read_text()).get("mode")
-                if m in ("paper", "live"):
-                    return m
+                d = json.loads(_RUNTIME_PATH.read_text())
+                if isinstance(d, dict):
+                    return d
         except Exception:  # noqa: BLE001
             pass
-        return default
+        return {}
 
-    def _save_runtime_mode(self) -> None:
+    def _load_runtime_mode(self, default: str) -> str:
+        m = self._read_runtime().get("mode")
+        return m if m in ("paper", "live") else default
+
+    def _save_runtime(self) -> None:
         try:
             _RUNTIME_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _RUNTIME_PATH.write_text(json.dumps({"mode": self.mode}, indent=2))
+            payload = {"mode": self.mode}
+            if getattr(self, "autopilot", None) is not None:
+                payload["autopilot"] = self.autopilot.to_runtime()
+            _RUNTIME_PATH.write_text(json.dumps(payload, indent=2))
         except Exception:  # noqa: BLE001
-            log.debug("could not persist runtime mode", exc_info=True)
+            log.debug("could not persist runtime state", exc_info=True)
 
     # ------------------------------------------------------------------ #
     #  Broker construction                                              #
@@ -335,6 +351,12 @@ class TradingEngine:
                     plays=[self._decorate(p) for p in list(self._plays.values())[:80]],
                     scan=self._last_scan_summary)
 
+        # hands-off entry: let the pilot act on the fresh plays (no-op unless armed)
+        try:
+            self.autopilot.consider(self._plays)
+        except Exception:  # noqa: BLE001
+            log.exception("autopilot pass failed")
+
     # ------------------------------------------------------------------ #
     #  Account / arming                                                 #
     # ------------------------------------------------------------------ #
@@ -480,6 +502,27 @@ class TradingEngine:
         self.repo.update_trade_risk(trade_id, managed_exit=bool(on))
         return {"ok": True, "trade_id": trade_id, "managed_exit": bool(on)}
 
+    # ---- autopilot (hands-off entry) --------------------------------- #
+    def set_autopilot(self, **kw: Any) -> Dict[str, Any]:
+        """Toggle / tune hands-off entry from the dashboard. Exits are already
+        automatic; this governs whether the bot also takes the entry."""
+        want_on = kw.get("enabled")
+        st = self.autopilot.configure(**kw)
+        note = ""
+        if want_on and self.mode == "live" and not st["allow_live"]:
+            note = ("Autopilot will NOT place live orders: set  autopilot.allow_live: "
+                    "true  in config/config.yaml first. It is armed for paper only.")
+        elif want_on and st["effective"]:
+            tt = ", ".join(t.lower() for t in st["trade_types"])
+            note = (f"Autopilot ON ({tt}). It will enter up to {st['max_auto_positions']} "
+                    f"positions / {st['max_auto_trades_per_day']} per day at "
+                    f">= {st['min_reward_risk']:.0f}:1 and >= {st['min_confidence']:.2f} "
+                    f"confidence. Exits stay automatic.")
+        elif want_on is False:
+            note = "Autopilot OFF - back to click-to-enter. Open trades keep their automatic exits."
+        BUS.publish("autopilot.config", **st)
+        return {"ok": True, "autopilot": st, "note": note}
+
     def refresh_account_now(self) -> Dict[str, Any]:
         self._refresh_account()
         self._check_arm()
@@ -543,7 +586,7 @@ class TradingEngine:
             prev = self.mode
             self.mode = mode
             self._bind_trading_broker()
-            self._save_runtime_mode()
+            self._save_runtime()
             self._refresh_account()
             self._check_arm()
             log.warning("mode switched %s -> %s by %s", prev, self.mode, operator)
@@ -586,6 +629,10 @@ class TradingEngine:
     def _decorate(self, p: Play) -> Dict[str, Any]:
         row = p.to_row()
         row["executable_hint"] = p.suggested_qty > 0 and self._armed
+        try:
+            self.autopilot.decorate_play(row)
+        except Exception:  # noqa: BLE001
+            pass
         return row
 
     def snapshot(self) -> Dict[str, Any]:
@@ -618,6 +665,7 @@ class TradingEngine:
                 "flatten_intraday_before_close_min": em.flatten_intraday_before_close_min,
                 "max_swing_hold_days": em.max_swing_hold_days,
             },
+            "autopilot": self.autopilot.status(),
             "data_source": data_src,
             "data_is_real": data_src != "synthetic",
             "live": {

@@ -13,6 +13,11 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_TMPDB}"
 os.environ["BROKER"] = "paper"
 os.environ["OPEN_BROWSER_ON_START"] = "0"
 os.environ["PAPER_PERSIST"] = "0"          # tests never touch data/paper_state.json
+# tests never rewrite the user's data/runtime.json (mode + autopilot knobs)
+_TMP_RUNTIME = os.path.join(tempfile.gettempdir(), "tos_trader_pytest_runtime.json")
+if os.path.exists(_TMP_RUNTIME):
+    os.remove(_TMP_RUNTIME)
+os.environ["TOS_RUNTIME_PATH"] = _TMP_RUNTIME
 
 
 @pytest.fixture(scope="session", autouse=True)

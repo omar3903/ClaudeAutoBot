@@ -6,13 +6,23 @@ adapters stubbed in).
 
 It scans the Nasdaq every few minutes, ranks a short list of names, and shows
 **long / short "plays"** with a plain-English explanation on hover and the
-stock's **sector** next to the ticker. Nothing is ever routed to a broker until
-you click **Execute ✓ Yes**. Approved trades then run an **automatic exit
+stock's **sector** next to the ticker. By default nothing is routed to a broker
+until you click **Execute ✓ Yes**; an optional **Autopilot** toggle lets the
+bot take the entry too, inside hard caps (paper-only until you deliberately
+allow live). Every open trade — clicked or auto — then runs an **automatic exit
 strategy** (stop / target / break-even / trailing / end-of-day flatten) with no
-further input, and each one carries an **expected time-to-exit** so a position
-that overstays its welcome gets flagged for a manual look. Every idea and every
+further input, and carries an **expected time-to-exit** so a position that
+overstays its welcome gets flagged for a manual look. Every idea and every
 executed trade (with its realised P/L) is written to MySQL or a local SQLite
 file.
+
+The play explanations and the day-trade / swing recognition are modelled on
+four books: **Aziz, *How to Day Trade for a Living*** (the intraday setups and
+"stocks in play" filters), **Douglas, *Trading in the Zone*** (every play is
+framed as *an edge with a probability*, not a prediction), **Murphy, *Technical
+Analysis of the Financial Markets*** (horizontal S/R, oscillator divergence,
+volume confirmation) and **Pignataro, *Financial Modeling and Valuation*** (the
+DCF / comps overlay).
 
 - **Paper ↔ Live toggle:** flip the whole app between a **paper** account
   (simulated fills against *real* market data, starts at **$100,000**, no
@@ -22,10 +32,18 @@ file.
 - **Data + brokerage:** a `BrokerAdapter` abstraction with a live **Schwab**
   adapter (`schwab-py`), a legacy `tda-api` reference adapter, **Interactive
   Brokers** and **crypto** stubs, and the **paper** adapter above.
-- **Strategies:** 8 technical day-trade / swing setups + 3 valuation setups
-  derived from *Pignataro, Financial Modeling and Valuation* (2nd ed.): comps
-  (EV/EBITDA vs peers), a UFCF DCF (CAPM/WACC, exit-multiple **and** perpetuity
-  terminal value), and a blended "football-field" fair-value band.
+- **Strategies:** 13 technical day-trade / swing setups (Aziz's ABCD, bull/bear
+  flag, VWAP, opening-range, red-to-green, top/bottom reversal, horizontal S/R;
+  Murphy/Connors divergence & mean-reversion) + 3 valuation setups from
+  *Pignataro* (comps, a UFCF DCF with exit-multiple **and** perpetuity terminal
+  value, a blended "football-field" band). Intraday setups are **weighted by
+  time of day** — momentum fades at midday, reversals hold up, trends improve
+  into the close.
+- **Autopilot (hands-off entry):** a header toggle that lets the bot place the
+  entry itself for plays that clear a strict gate (your chosen trade types, a
+  confidence floor, ≥ 2:1 reward:risk, per-day and concurrent-position caps,
+  aggregate open-risk cap). **Paper-only** until you set
+  `autopilot.allow_live: true` in `config.yaml`. Exits are automatic either way.
 - **Guard rails (live mode):** a $2,000 equity floor and a rolling 5-session
   Pattern-Day-Trader counter (3-day-trade cap under $25k) that block or warn
   *before* you confirm. In paper mode nothing is blocked — the counters are
@@ -279,10 +297,42 @@ is **purely informational**: it never moves the stop or closes anything.
 
 ---
 
+## Autopilot — hands-off entry
+
+`tos_bot/execution/autopilot.py`. The exit side is *already* automatic (above);
+Autopilot is the switch that also lets the bot take the **entry** with no click.
+After each scan it walks the fresh plays and, for any that clear the gate, calls
+the exact same approve/execute path as the **Execute ✓ Yes** button.
+
+Toggle and tune it from the header (**Autopilot: off / day / day+swing**, plus a
+⚙ settings pop-up). Defaults live in `config/config.yaml → autopilot`:
+
+| gate | default | key |
+|---|---|---|
+| master switch | off | `enabled` (UI toggle) |
+| **route real orders** | **off** | `allow_live` — *config-file only*; with it off, the UI toggle arms Autopilot for **paper only** even in Live mode, and says so |
+| which trade types it may take | `["INTRADAY"]` | `trade_types` (Day / Swing checkboxes) |
+| minimum strategy confidence | 0.62 | `min_confidence` |
+| minimum reward : risk | 2.0 | `min_reward_risk` (Aziz Rule 5) |
+| concurrent open auto positions | 2 | `max_auto_positions` |
+| auto trades per session | 3 | `max_auto_trades_per_day` (≈ the sub-$25k PDT cap) |
+| aggregate open auto $-risk | 4 % of equity | `max_open_risk_pct` |
+| sit out a sector / require a catalyst / dry-run | off | `block_sectors`, `require_catalyst`, `dry_run` |
+
+It still passes through every existing check — session validity, position
+sizing, the PDT guard, the $2,000 live floor. Fundamental (valuation) plays are
+never auto-traded. Every decision is on the event bus
+(`autopilot.entered` / `.skipped` / `.blocked`) and eligible plays get a
+**🤖** marker in the table. `GET`/`POST /api/autopilot`.
+
+---
+
 ## Dashboard controls
 
 * **↻ Refresh** — re-pull account, positions and fills right now
   (`POST /api/account/refresh`).
+* **Autopilot: off / day / …** + **⚙** — turn hands-off entry on/off and pick
+  trade types, confidence floor, and caps (see the Autopilot section above).
 * **Reconcile** (paper only) — rebuild the paper broker's positions from the
   open trades in the database, e.g. after a mis-click
   (`POST /api/paper/reconcile`).
@@ -297,18 +347,41 @@ is **purely informational**: it never moves the stop or closes anything.
 Toggle each one and tune its params/weight in `config/config.yaml → strategies`.
 Hover any play in the UI for its thesis; the **Strategies** button lists them all.
 
+**How the explanation is framed (Douglas).** Every play's hover text reads:
+the *edge* (what tends to happen at this setup) → what's true *right now* →
+**the plan** (entry, stop with the $-per-share you risk "to find out", target,
+reward:risk, and an *estimated ~P%* — a probability over many trades, not a call
+on this one) → the **invalidation** price → a short reminder that wins and
+losses land randomly around an edge, so decide the loss is acceptable *before*
+you click and then leave the stop alone. `Play.probability` and
+`Play.invalidation` are persisted with every play.
+
 ### Technical (`tos_bot/strategies/technical.py`)
+
+Intraday setups carry a `tod_profile` (`momentum` / `reversal` / `trend`) that
+scales confidence by Aziz's session clock — e.g. a momentum breakout is
+discounted ~25 % at midday, a reversal is not.
 
 | key | timeframe | idea |
 |---|---|---|
-| `opening_range_breakout` | intraday | break of the first N-min high/low, above/below VWAP, on relative volume |
-| `vwap_reclaim` | intraday | reclaim / loss of session VWAP after time on the other side |
+| `abcd_pattern` | intraday | hard push A→B, pullback to a **higher low C**; enter near C (stop = loss of C), target the B retest and measured move |
+| `bull_bear_flag` | intraday | near-vertical pole + tight sideways flag; enter on the flag break, target ≈ one more pole-length |
+| `opening_range_breakout` | intraday | break of the first N-min range **only when that range < the daily ATR**, VWAP-side stop, target = next level |
+| `vwap_reclaim` | intraday | a **5-min close** back across session VWAP after ≥ 3 bars on the other side; target = next level |
+| `red_to_green` | intraday | gapped stock grinding back to the **prior-day close** on rising volume; target = that close, stop = nearest technical level |
+| `intraday_reversal` | intraday | 5+ candles one way **+** 5-min RSI extreme **+** at a daily level **+** an indecision / opposite candle (Aziz's top/bottom reversal) |
+| `sr_bounce` | intraday | price into a strength-ranked **horizontal** S/R level with a confirming candle; target = next level |
 | `ema_pullback_trend` | intraday | first pullback to the 20-EMA inside a 9/20/50 stacked trend |
+| `gap_and_go` | intraday | ≥ 2 % gap holding the right side of the opening VWAP on ≥ 2× volume |
 | `rsi2_mean_reversion` | swing | Connors RSI(2) < 10 above the 200-SMA (long) / > 90 below it (short) |
 | `bollinger_fade` | swing | close outside the 2σ band while ADX < 20 (range regime) |
 | `atr_channel_breakout` | swing | close beyond a Keltner/ATR channel with ADX rising through 20 |
-| `gap_and_go` | intraday | ≥ 2 % gap holding the right side of the opening VWAP on ≥ 2× volume |
+| `divergence_reversal` | swing | RSI / MACD-histogram divergence **at a horizontal level** (Murphy) |
 | `week52_breakout` | swing | push to a new 52-week high/low on volume expansion |
+
+Shared chart-reading primitives live in `tos_bot/analysis/` — `levels.py`
+(horizontal S/R clustering: swing pivots, prior-day close, round numbers,
+pre-market H/L) and `candles.py` (doji / hammer / shooting-star / engulfing).
 
 ### Valuation — from *Pignataro, Financial Modeling and Valuation* (2nd ed.)
 
@@ -375,13 +448,14 @@ tos_bot/
   config.py                .env + config.yaml loader
   engine.py                the conductor (scan / sync / snapshot loops)
   core/                    enums + framework-free dataclasses + event bus
-  indicators/ta.py         vectorised TA (no TA-Lib)
+  indicators/ta.py         vectorised TA (no TA-Lib) incl. divergence / run-length
+  analysis/                horizontal S/R clustering + candlestick reads (Aziz / Murphy)
   data/                    universe loader, market data (broker→yfinance→synthetic), fundamentals
   valuation/               EV, multiples, DCF, football field, projections   (Pignataro)
-  strategies/              base + registry + technical.py + fundamental.py
+  strategies/              base (Douglas-framed explanations) + registry + technical.py + fundamental.py
   scanner/                 pre-filter + cycle orchestration
   risk/                    position sizing + PDT guard
-  execution/               order_builder (session-aware plan) + executor + exit_manager
+  execution/               order_builder + executor + exit_manager + autopilot (hands-off entry)
   util/clock.py            sessions + NYSE holiday / half-day calendar to 2028
   auth/token_manager.py    access-token refresh + 60-day rotation + audit
   brokers/                 base + paper + schwab + tda + ibkr/crypto stubs
@@ -394,9 +468,14 @@ tests/                     pytest  (fast by default; `-m slow` for the e2e)
 ## Tests
 
 ```bash
-pytest              # fast unit tests
+pytest              # 75 fast unit tests
 pytest -m slow      # boots the engine, runs scan → approve → close on paper
 ```
+
+Coverage includes the analysis primitives (`test_analysis.py`), the Autopilot
+gate — trade-type filter, confidence/RR floors, position & per-day caps, the
+paper-only-in-live hard gate, dry-run (`test_autopilot.py`) — and the new Aziz
+setups on purpose-built frames (`test_strategies.py`).
 
 ## Roadmap
 
