@@ -1,4 +1,4 @@
-# secrets / state - NEVER commit these
+# NEVER commit these
 .env
 config/config.yaml
 secrets/

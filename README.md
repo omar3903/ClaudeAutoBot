@@ -1,4 +1,4 @@
-# tos-trader
+# ThinkOrSwim/Schwab AutoTrading Bot
 
 A **broker-agnostic, human-in-the-loop** trading assistant for a small account.
 
@@ -212,6 +212,65 @@ Thresholds live in `config/config.yaml → account`.
 
 ---
 
+## Market sessions, order types & holidays
+
+`tos_bot/util/clock.py` knows the four sessions and the NYSE calendar
+(full-day holidays **and** 1:00 pm half-days) through 2028.
+
+* **Session-aware execution.** You can only send an order when a session can
+  accept it:
+  * **Regular hours** → the order type from `execution.default_order_type`
+    (`LIMIT` / `MARKET` / `STOP_LIMIT`), with a native broker OCO bracket.
+  * **Pre-market / after-hours** → **limit only**, and only for setups flagged
+    extended-hours-eligible (all swing/valuation setups, plus `gap_and_go`).
+    No native stop is possible, so the auto exit manager holds it instead.
+  * **Closed** (overnight / weekend / holiday) → execution is blocked; the
+    dashboard shows the exact reason and when the market next opens.
+* Every play's order card shows the **concrete order** — "LIMIT (regular
+  hours)", "pre-market limit", "after-hours limit", "MARKET", "STOP_LIMIT" —
+  with the limit price, stop trigger, TIF and protection mode.
+* The header pill shows the live status ("Pre-market — closes into regular at
+  09:30 ET", "Closed — Thanksgiving Day", "Regular hours (half day)"), and
+  `GET /api/market` returns the full breakdown incl. the next holiday.
+
+---
+
+## Automatic exit strategy
+
+`tos_bot/execution/exit_manager.py` runs every few seconds on every open
+trade — **entries need your click, exits never do**:
+
+| rule | default | config key |
+|---|---|---|
+| cut losses at the working stop | on | — |
+| take profit at the target | on | — |
+| move stop to **break-even** (+buffer) once green | +1.0 R | `breakeven_at_r` |
+| **trail** the stop, keeping a fraction of the open R | from +1.5 R, lock 50% | `trail_start_r`, `trail_lock_ratio` |
+| **flatten day trades** before the (holiday-aware) close | 10 min before | `flatten_intraday_before_close_min` |
+| force-close **stale swings** | 10 days | `max_swing_hold_days` |
+
+The stop only ever ratchets in your favour and never through the last price.
+R is always measured against the **original** stop (`trades.initial_stop_price`),
+not a trailed one. Each open position has an **Auto exit** toggle in the
+blotter (`POST /api/trades/{id}/managed`) if you want to hand-manage one.
+Tune everything in `config/config.yaml → exit_manager` (`enabled: false`
+turns it off entirely).
+
+---
+
+## Dashboard controls
+
+* **↻ Refresh** — re-pull account, positions and fills right now
+  (`POST /api/account/refresh`).
+* **Reconcile** (paper only) — rebuild the paper broker's positions from the
+  open trades in the database, e.g. after a mis-click
+  (`POST /api/paper/reconcile`).
+* A play you've executed shows a **✓ executed** badge and can't be fired
+  again — re-opening it shows the linked trade, not the button (the engine
+  also refuses a second submit server-side).
+
+---
+
 ## Strategy catalogue
 
 Toggle each one and tune its params/weight in `config/config.yaml → strategies`.
@@ -301,7 +360,8 @@ tos_bot/
   strategies/              base + registry + technical.py + fundamental.py
   scanner/                 pre-filter + cycle orchestration
   risk/                    position sizing + PDT guard
-  execution/               order builder + executor (fills → trade log)
+  execution/               order_builder (session-aware plan) + executor + exit_manager
+  util/clock.py            sessions + NYSE holiday / half-day calendar to 2028
   auth/token_manager.py    access-token refresh + 60-day rotation + audit
   brokers/                 base + paper + schwab + tda + ibkr/crypto stubs
   persistence/             SQLAlchemy models, repository, schema.sql
@@ -322,5 +382,6 @@ pytest -m slow      # boots the engine, runs scan → approve → close on paper
 - real-time streaming quotes (Schwab streamer / IBKR ticks) instead of REST polls
 - per-strategy backtester + walk-forward on the persisted play log
 - options plays (the Schwab adapter already exposes the option-chain endpoint)
-- MAE/MFE capture on open trades; equity-curve chart in the dashboard
+- ATR-based trailing stop option in the exit manager (currently R-based)
+- equity-curve chart in the dashboard
 - IBKR and crypto adapters fleshed out

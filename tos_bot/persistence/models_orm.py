@@ -96,8 +96,16 @@ class Trade(Base):
     quantity: Mapped[float] = mapped_column(MONEY, default=0)
     entry_price: Mapped[float] = mapped_column(MONEY, default=0)
     entry_time: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, index=True)
+    order_type: Mapped[str] = mapped_column(sa.String(16), default="LIMIT")
+    order_session: Mapped[str] = mapped_column(sa.String(12), default="REGULAR")  # REGULAR / EXTENDED
+    #: working protective levels - the exit manager moves these
     stop_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
     target_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
+    #: the levels the play was entered with - never mutated (basis for R math)
+    initial_stop_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
+    initial_target_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
+    hwm_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)  # favourable extreme
+    managed_exit: Mapped[bool] = mapped_column(sa.Boolean, default=True)     # auto exit manager on?
 
     exit_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
     exit_time: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True, index=True)

@@ -135,6 +135,8 @@ class OrderRequest:
     tif: TimeInForce = TimeInForce.DAY
     asset_class: AssetClass = AssetClass.EQUITY
     is_entry: bool = True                 # entry vs. exit leg
+    #: "REGULAR" (RTH only) | "EXTENDED" (pre/post, limit-only) | "SEAMLESS" (both)
+    session: str = "REGULAR"
     # Optional bracket children (attached after entry fills, or as OCO)
     take_profit: Optional[float] = None
     stop_loss: Optional[float] = None
@@ -206,6 +208,8 @@ class Play:
     evidence: Dict[str, Any] = field(default_factory=dict)
     tags: List[str] = field(default_factory=list)
     asset_class: AssetClass = AssetClass.EQUITY
+    #: may this idea be entered in the pre / post-market session too?
+    extended_hours_ok: bool = False
 
     # sizing hints (filled by the risk module)
     suggested_qty: int = 0
@@ -219,6 +223,7 @@ class Play:
     created_at: datetime = field(default_factory=_utcnow)
     expires_at: Optional[datetime] = None
     scan_run_id: Optional[str] = None
+    trade_id: Optional[str] = None          # set once this play becomes a trade
 
     # ---- convenience ---------------------------------------------------- #
     @property
@@ -258,7 +263,9 @@ class Play:
             "suggested_qty": self.suggested_qty,
             "dollar_risk": round(self.dollar_risk, 2),
             "notional": round(self.notional, 2),
+            "extended_hours_ok": self.extended_hours_ok,
             "status": self.status.value,
+            "trade_id": self.trade_id,
             "created_at": self.created_at.isoformat(),
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
         }

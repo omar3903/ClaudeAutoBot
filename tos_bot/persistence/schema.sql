@@ -1,5 +1,6 @@
 -- tos-trader MySQL schema  (generated - source of truth is tos_bot/persistence/models_orm.py)
--- Canonical setup:  python scripts/init_db.py   (creates tables + indexes on the configured DB)
+-- Canonical setup:  python scripts/init_db.py   (creates tables + indexes; also auto-adds
+--                   any new columns to an existing database on every start)
 -- Manual setup:
 --   CREATE DATABASE tos_trader CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 --   CREATE USER 'tos'@'%' IDENTIFIED BY 'CHANGE_ME';
@@ -20,7 +21,7 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
 	realized_pl_day NUMERIC(20, 6) NOT NULL, 
 	PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-CREATE INDEX  ix_account_snapshots_ts ON account_snapshots (ts);
+CREATE INDEX ix_account_snapshots_ts ON account_snapshots (ts);
 
 CREATE TABLE IF NOT EXISTS order_audit (
 	id INTEGER NOT NULL AUTO_INCREMENT, 
@@ -35,9 +36,9 @@ CREATE TABLE IF NOT EXISTS order_audit (
 	message VARCHAR(400) NOT NULL, 
 	PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-CREATE INDEX  ix_order_audit_trade_id ON order_audit (trade_id);
-CREATE INDEX  ix_order_audit_play_id ON order_audit (play_id);
-CREATE INDEX  ix_order_audit_ts ON order_audit (ts);
+CREATE INDEX ix_order_audit_ts ON order_audit (ts);
+CREATE INDEX ix_order_audit_play_id ON order_audit (play_id);
+CREATE INDEX ix_order_audit_trade_id ON order_audit (trade_id);
 
 CREATE TABLE IF NOT EXISTS scan_runs (
 	id VARCHAR(32) NOT NULL, 
@@ -52,7 +53,7 @@ CREATE TABLE IF NOT EXISTS scan_runs (
 	elapsed_s FLOAT NOT NULL, 
 	PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-CREATE INDEX  ix_scan_runs_started_at ON scan_runs (started_at);
+CREATE INDEX ix_scan_runs_started_at ON scan_runs (started_at);
 
 CREATE TABLE IF NOT EXISTS token_audit (
 	id INTEGER NOT NULL AUTO_INCREMENT, 
@@ -64,7 +65,7 @@ CREATE TABLE IF NOT EXISTS token_audit (
 	detail VARCHAR(400) NOT NULL, 
 	PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-CREATE INDEX  ix_token_audit_ts ON token_audit (ts);
+CREATE INDEX ix_token_audit_ts ON token_audit (ts);
 
 CREATE TABLE IF NOT EXISTS play_logs (
 	id VARCHAR(32) NOT NULL, 
@@ -94,12 +95,12 @@ CREATE TABLE IF NOT EXISTS play_logs (
 	PRIMARY KEY (id), 
 	FOREIGN KEY(scan_run_id) REFERENCES scan_runs (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-CREATE INDEX  ix_play_logs_strategy ON play_logs (strategy);
-CREATE INDEX  ix_play_logs_symbol ON play_logs (symbol);
-CREATE INDEX  ix_play_logs_scan_run_id ON play_logs (scan_run_id);
-CREATE INDEX  ix_play_logs_created_at ON play_logs (created_at);
-CREATE INDEX  ix_play_logs_status ON play_logs (status);
-CREATE INDEX  ix_play_logs_score ON play_logs (score);
+CREATE INDEX ix_play_logs_symbol ON play_logs (symbol);
+CREATE INDEX ix_play_logs_scan_run_id ON play_logs (scan_run_id);
+CREATE INDEX ix_play_logs_created_at ON play_logs (created_at);
+CREATE INDEX ix_play_logs_score ON play_logs (score);
+CREATE INDEX ix_play_logs_status ON play_logs (status);
+CREATE INDEX ix_play_logs_strategy ON play_logs (strategy);
 
 CREATE TABLE IF NOT EXISTS trades (
 	id VARCHAR(32) NOT NULL, 
@@ -114,8 +115,14 @@ CREATE TABLE IF NOT EXISTS trades (
 	quantity NUMERIC(20, 6) NOT NULL, 
 	entry_price NUMERIC(20, 6) NOT NULL, 
 	entry_time DATETIME, 
+	order_type VARCHAR(16) NOT NULL, 
+	order_session VARCHAR(12) NOT NULL, 
 	stop_price NUMERIC(20, 6), 
 	target_price NUMERIC(20, 6), 
+	initial_stop_price NUMERIC(20, 6), 
+	initial_target_price NUMERIC(20, 6), 
+	hwm_price NUMERIC(20, 6), 
+	managed_exit BOOL NOT NULL, 
 	exit_price NUMERIC(20, 6), 
 	exit_time DATETIME, 
 	exit_reason VARCHAR(24) NOT NULL, 
@@ -133,14 +140,14 @@ CREATE TABLE IF NOT EXISTS trades (
 	PRIMARY KEY (id), 
 	FOREIGN KEY(play_id) REFERENCES play_logs (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-CREATE INDEX  ix_trades_exit_time ON trades (exit_time);
-CREATE INDEX  ix_trades_session_date ON trades (session_date);
-CREATE INDEX  ix_trades_entry_time ON trades (entry_time);
-CREATE INDEX  ix_trades_status ON trades (status);
-CREATE INDEX  ix_trades_strategy ON trades (strategy);
-CREATE INDEX  ix_trades_symbol ON trades (symbol);
-CREATE INDEX  ix_trades_play_id ON trades (play_id);
-CREATE INDEX  ix_trades_is_day_trade ON trades (is_day_trade);
+CREATE INDEX ix_trades_play_id ON trades (play_id);
+CREATE INDEX ix_trades_session_date ON trades (session_date);
+CREATE INDEX ix_trades_status ON trades (status);
+CREATE INDEX ix_trades_entry_time ON trades (entry_time);
+CREATE INDEX ix_trades_strategy ON trades (strategy);
+CREATE INDEX ix_trades_exit_time ON trades (exit_time);
+CREATE INDEX ix_trades_is_day_trade ON trades (is_day_trade);
+CREATE INDEX ix_trades_symbol ON trades (symbol);
 
 CREATE TABLE IF NOT EXISTS fills (
 	id INTEGER NOT NULL AUTO_INCREMENT, 
@@ -155,5 +162,5 @@ CREATE TABLE IF NOT EXISTS fills (
 	PRIMARY KEY (id), 
 	FOREIGN KEY(trade_id) REFERENCES trades (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-CREATE INDEX  ix_fills_ts ON fills (ts);
-CREATE INDEX  ix_fills_trade_id ON fills (trade_id);
+CREATE INDEX ix_fills_trade_id ON fills (trade_id);
+CREATE INDEX ix_fills_ts ON fills (ts);

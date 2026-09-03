@@ -35,6 +35,8 @@ from .core.models import Account, Play
 from .data.fundamentals import YFinanceFundamentals
 from .data.market_data import MarketDataService, SyntheticProvider, YFinanceProvider
 from .execution.executor import Executor
+from .execution.exit_manager import ExitManager
+from .execution.order_builder import plan_order
 from .persistence.db import init_db
 from .persistence.repository import Repository
 from .risk.pdt_guard import PdtGuard
@@ -96,6 +98,7 @@ class TradingEngine:
         self._trading_broker: Optional[BrokerAdapter] = None
 
         self.executor: Optional[Executor] = None
+        self.exit_manager: Optional[ExitManager] = None
         self.pdt: Optional[PdtGuard] = None
 
         self._plays: Dict[str, Play] = {}
@@ -202,6 +205,13 @@ class TradingEngine:
         else:
             self.executor.rebind(self._trading_broker)
 
+        # the automatic exit strategy - quotes come from the active trading broker
+        self.exit_manager = ExitManager(
+            self.repo, self.executor,
+            quote_fn=lambda s: self._trading_broker.get_quote(s),
+            cfg=self.settings.config.exit_manager, bus=BUS,
+        )
+
     # ------------------------------------------------------------------ #
     def start(self) -> None:
         log.info("engine starting  (mode=%s, live_target=%s, app_mode=%s)",
@@ -275,6 +285,14 @@ class TradingEngine:
                     self.executor.sync_open_orders()
             except Exception:  # noqa: BLE001
                 log.exception("order sync failed")
+            try:
+                if self.exit_manager:
+                    acted = self.exit_manager.run_once()
+                    if acted:
+                        self._refresh_account()
+                        BUS.publish("account.snapshot", state=self.snapshot())
+            except Exception:  # noqa: BLE001
+                log.exception("exit manager tick failed")
             self._stop.wait(4.0)
 
     def _snapshot_loop(self) -> None:
@@ -344,6 +362,9 @@ class TradingEngine:
     # ------------------------------------------------------------------ #
     #  Operator actions (called by the API)                             #
     # ------------------------------------------------------------------ #
+    #: play statuses that must never be re-executed
+    _DONE_STATUSES = {"ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED", "ERROR"}
+
     def assess_play(self, play_id: str) -> Dict[str, Any]:
         p = self._plays.get(play_id)
         if not p:
@@ -354,9 +375,22 @@ class TradingEngine:
             return {"ok": False, "reason": "no account data"}
         size_play(p, acc, self.settings.config.risk)
         decision = self.pdt.assess(acc, p)
+
+        session = clock.current_session()
+        plan = plan_order(p, session, self.settings.config.execution)
+        already_done = p.status.value in self._DONE_STATUSES
+
         rr_ok = p.reward_risk >= self.settings.config.risk.min_reward_risk or p.kind.value == "FUNDAMENTAL"
-        can = decision.allowed and p.suggested_qty > 0 and self._armed and rr_ok
-        reasons = []
+        can = (
+            not already_done and plan.get("executable", False)
+            and decision.allowed and p.suggested_qty > 0 and self._armed and rr_ok
+        )
+        reasons: List[str] = []
+        if already_done:
+            reasons.append(f"already {p.status.value.lower()}"
+                           + (f" - trade {p.trade_id}" if p.trade_id else ""))
+        if not plan.get("executable", False):
+            reasons.append(plan.get("reason", "not executable in this session"))
         if not self._armed:
             reasons.append(f"engine not armed - live equity below "
                            f"${self.settings.config.account.min_start_equity:,.0f} floor")
@@ -366,36 +400,62 @@ class TradingEngine:
             reasons.append("position size rounds to zero for this risk budget")
         if not rr_ok:
             reasons.append(f"reward:risk {p.reward_risk:.1f} below minimum")
+
         return {
-            "ok": True, "can_execute": can, "reasons": reasons,
-            "mode": self.mode,
+            "ok": True, "can_execute": can, "already_executed": already_done,
+            "reasons": reasons, "mode": self.mode, "session": session.value,
             "play": self._decorate(p),
             "pdt": decision.as_dict(),
+            "order_plan": plan,
             "order_preview": {
                 "side": p.side.entry_action, "qty": p.suggested_qty,
-                "type": self.settings.config.execution.default_order_type,
-                "limit_hint": p.entry, "bracket": self.settings.config.execution.bracket_orders,
+                "order_type": plan.get("order_type"),
+                "session_label": plan.get("session_label"),
+                "limit_price": plan.get("limit_price"), "stop_price": plan.get("stop_price"),
+                "tif": plan.get("tif", "DAY"),
+                "bracket_mode": plan.get("bracket_mode"),
                 "take_profit": p.primary_target, "stop_loss": p.stop,
+                "exit_manager": bool(self.settings.config.exit_manager.enabled),
                 "est_cost": round(p.notional, 2), "est_risk": round(p.dollar_risk, 2),
+                "note": plan.get("note", ""),
                 "routes_to": ("SIMULATED (paper)" if self.broker.paper
                               else f"LIVE {self.broker.name.upper()}"),
             },
         }
 
     def approve_play(self, play_id: str, operator: str = "operator") -> Dict[str, Any]:
-        pre = self.assess_play(play_id)
-        if not pre.get("ok"):
-            return pre
-        if not pre["can_execute"]:
-            return {"ok": False, "reason": "; ".join(pre["reasons"]) or "not executable"}
-        p = self._plays[play_id]
-        p.status = PlayStatus.ACCEPTED
-        self.repo.set_play_status(p.id, "ACCEPTED", operator)
-        out = self.executor.execute_play(p, self._account)
-        self.repo.set_play_status(p.id, p.status.value, operator)
-        BUS.publish("play.decided", play_id=p.id, decision="approved", result=out)
-        self._refresh_account()
-        return {"ok": out.get("ok", False), **out}
+        with self._switch_lock:
+            p = self._plays.get(play_id)
+            if p is None:
+                return {"ok": False, "reason": "play not found (it may have expired)"}
+            if p.status.value in self._DONE_STATUSES:
+                return {"ok": False, "reason": f"already {p.status.value.lower()}"
+                        + (f" - trade {p.trade_id}" if p.trade_id else ""),
+                        "already_executed": True, "trade_id": p.trade_id}
+
+            pre = self.assess_play(play_id)
+            if not pre.get("ok"):
+                return pre
+            if not pre["can_execute"]:
+                return {"ok": False, "reason": "; ".join(pre["reasons"]) or "not executable"}
+
+            p.status = PlayStatus.ACCEPTED
+            self.repo.set_play_status(p.id, "ACCEPTED", operator)
+            try:
+                out = self.executor.execute_play(p, self._account, plan=pre["order_plan"])
+            except Exception as e:  # noqa: BLE001
+                p.status = PlayStatus.ERROR
+                self.repo.set_play_status(p.id, "ERROR", operator)
+                log.exception("execute_play crashed")
+                BUS.publish("play.decided", play_id=p.id, decision="error", result={"reason": str(e)})
+                return {"ok": False, "reason": f"execution error: {e}"}
+            if not out.get("ok"):
+                p.status = PlayStatus.PROPOSED     # let them try again once the reason clears
+            self.repo.set_play_status(p.id, p.status.value, operator)
+            BUS.publish("play.decided", play_id=p.id, decision="approved", result=out,
+                        play=self._decorate(p))
+            self._refresh_account()
+            return {"ok": out.get("ok", False), **out}
 
     def reject_play(self, play_id: str, operator: str = "operator") -> Dict[str, Any]:
         p = self._plays.get(play_id)
@@ -408,7 +468,56 @@ class TradingEngine:
     def close_position(self, trade_id: str, reason: str = "manual") -> Dict[str, Any]:
         out = self.executor.close_trade(trade_id, reason=reason)
         self._refresh_account()
+        BUS.publish("account.snapshot", state=self.snapshot())
         return out
+
+    def set_trade_managed(self, trade_id: str, on: bool) -> Dict[str, Any]:
+        self.repo.update_trade_risk(trade_id, managed_exit=bool(on))
+        return {"ok": True, "trade_id": trade_id, "managed_exit": bool(on)}
+
+    def refresh_account_now(self) -> Dict[str, Any]:
+        self._refresh_account()
+        self._check_arm()
+        if self.executor:
+            try:
+                self.executor.sync_open_orders()
+            except Exception:  # noqa: BLE001
+                pass
+        snap = self.snapshot()
+        BUS.publish("account.snapshot", state=snap)
+        return {"ok": True, "state": snap}
+
+    def reconcile_paper(self) -> Dict[str, Any]:
+        """Rebuild the paper broker's positions from the OPEN trades in the
+        database - fixes any drift (e.g. from a double-submit)."""
+        if not self.broker.paper:
+            return {"ok": False, "reason": "only available in paper mode"}
+        pb = self._ensure_paper_broker()
+        from .core.models import Position
+        book: Dict[str, list] = {}
+        for t in self.repo.open_trades():
+            sym = t["symbol"]
+            qty = float(t["quantity"]) * (1 if t["side"] == "LONG" else -1)
+            px = float(t["entry_price"])
+            b = book.setdefault(sym, [0.0, 0.0])
+            b[0] += qty
+            b[1] += qty * px
+        new_positions = {}
+        for sym, (q, notional) in book.items():
+            if abs(q) < 1e-9:
+                continue
+            new_positions[sym] = Position(symbol=sym, quantity=q,
+                                          avg_price=abs(notional / q) if q else 0.0)
+        before = {p.symbol: p.quantity for p in pb.get_account().positions}
+        pb._positions = new_positions            # type: ignore[attr-defined]
+        pb._save_state()                         # type: ignore[attr-defined]
+        self.executor.rebind(pb)
+        self._refresh_account()
+        after = {s: p.quantity for s, p in new_positions.items()}
+        BUS.publish("account.snapshot", state=self.snapshot())
+        log.warning("paper positions reconciled from DB: %s -> %s", before, after)
+        return {"ok": True, "before": before, "after": after,
+                "note": "paper positions rebuilt from open trades in the database"}
 
     def trigger_scan(self) -> Dict[str, Any]:
         self._scan_now.set()
@@ -486,6 +595,7 @@ class TradingEngine:
                 "needs_reauth": False} if paper
                else self.token_manager.status().as_dict())
         data_src = self.md.providers[0].name if self.md.providers else "none"
+        em = self.settings.config.exit_manager
         return {
             "ts": clock.now_ny().isoformat(),
             "broker": self.broker.name if self._trading_broker else "paper",
@@ -494,6 +604,15 @@ class TradingEngine:
             "connected": self.broker.is_connected if self._trading_broker else False,
             "armed": self._armed,
             "market_open": clock.is_market_open(),
+            "market": clock.market_status(),
+            "exit_manager": {
+                "enabled": bool(em.enabled),
+                "breakeven_at_r": em.breakeven_at_r,
+                "trail_start_r": em.trail_start_r,
+                "trail_lock_ratio": em.trail_lock_ratio,
+                "flatten_intraday_before_close_min": em.flatten_intraday_before_close_min,
+                "max_swing_hold_days": em.max_swing_hold_days,
+            },
             "data_source": data_src,
             "data_is_real": data_src != "synthetic",
             "live": {

@@ -84,11 +84,23 @@ auth:
   backup_old_tokens: true             # timestamped copy before each rotation
 
 execution:
-  default_order_type: "LIMIT"
+  default_order_type: "LIMIT"          # LIMIT | MARKET | STOP_LIMIT  (regular hours)
   limit_offset_bps: 5                  # cross the spread by this when marketable-limit
   time_in_force: "DAY"
-  bracket_orders: true                # attach stop + target as an OCO child
-  confirm_required: true              # UI must click Yes; engine never sends without it
+  bracket_orders: true                # attach stop + target as an OCO child (regular hours)
+  confirm_required: true              # UI must click Yes; engine never sends an ENTRY without it
+  allow_extended_hours: true          # permit pre/post-market entries (limit-only) at all
+
+exit_manager:
+  # Automatic exit strategy - runs every few seconds, no manual input.
+  # Entries need your click; exits never do.
+  enabled: true
+  breakeven_at_r: 1.0                 # move the stop to entry once the trade is +1R (0 = off)
+  breakeven_buffer_bps: 5            # ...nudged this far past entry so a wick doesn't scratch it
+  trail_start_r: 1.5                 # begin trailing once past this R (0 = no trailing)
+  trail_lock_ratio: 0.5             # keep the stop at this fraction of the open R
+  flatten_intraday_before_close_min: 10   # force-close day trades this many min before the bell
+  max_swing_hold_days: 10           # force-close swing trades held longer than this (0 = off)
 
 database:
   echo_sql: false

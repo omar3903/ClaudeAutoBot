@@ -35,12 +35,19 @@ def trade_to_dict(t: Trade) -> Dict[str, Any]:
         "status": t.status, "quantity": _f(t.quantity),
         "entry_price": _f(t.entry_price),
         "entry_time": t.entry_time.isoformat() if t.entry_time else None,
+        "order_type": getattr(t, "order_type", None),
+        "order_session": getattr(t, "order_session", None),
         "stop_price": _f(t.stop_price), "target_price": _f(t.target_price),
+        "initial_stop_price": _f(getattr(t, "initial_stop_price", None)),
+        "initial_target_price": _f(getattr(t, "initial_target_price", None)),
+        "hwm_price": _f(getattr(t, "hwm_price", None)),
+        "managed_exit": bool(getattr(t, "managed_exit", True)),
         "exit_price": _f(t.exit_price),
         "exit_time": t.exit_time.isoformat() if t.exit_time else None,
         "exit_reason": t.exit_reason, "fees": _f(t.fees),
         "realized_pl": _f(t.realized_pl), "realized_pl_pct": _f(t.realized_pl_pct),
-        "r_multiple": _f(t.r_multiple), "is_day_trade": bool(t.is_day_trade),
+        "r_multiple": _f(t.r_multiple), "mae": _f(t.mae), "mfe": _f(t.mfe),
+        "is_day_trade": bool(t.is_day_trade),
         "session_date": t.session_date.isoformat() if t.session_date else None,
         "notes": t.notes,
     }
@@ -102,16 +109,26 @@ class Repository:
     def open_trade(
         self, play: Play, fill_price: float, fill_qty: float, broker: str,
         broker_order_id: str = "", commission: float = 0.0,
+        order_type: str = "LIMIT", order_session: str = "REGULAR",
     ) -> str:
         tid = f"trd_{play.id.split('_', 1)[-1]}"
         now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
+            existing = s.get(Trade, tid)
+            if existing is not None:
+                # a play produces exactly one trade - a repeat call is a
+                # double-submit; ignore it rather than crash on the PK.
+                log.warning("open_trade: %s already exists (%s) - ignoring repeat submit",
+                            tid, existing.status)
+                return tid
             s.add(Trade(
                 id=tid, play_id=play.id, symbol=play.symbol, side=play.side.value,
                 strategy=play.strategy, kind=play.kind.value, timeframe=play.timeframe.value,
                 broker=broker, status="OPEN", quantity=fill_qty, entry_price=fill_price,
-                entry_time=now, stop_price=play.stop,
-                target_price=play.primary_target, fees=commission,
+                entry_time=now, order_type=order_type, order_session=order_session,
+                stop_price=play.stop, target_price=play.primary_target,
+                initial_stop_price=play.stop, initial_target_price=play.primary_target,
+                hwm_price=fill_price, managed_exit=True, fees=commission,
                 session_date=clock.session_date(),
                 is_day_trade=(play.timeframe.value == "INTRADAY"),
             ))
@@ -121,8 +138,34 @@ class Repository:
             row = s.get(PlayLog, play.id)
             if row:
                 row.status = "FILLED"
-        log.info("trade opened %s %s x%s @ %.4f", tid, play.symbol, fill_qty, fill_price)
+        log.info("trade opened %s %s x%s @ %.4f (%s/%s)", tid, play.symbol, fill_qty,
+                 fill_price, order_type, order_session)
         return tid
+
+    def update_trade_risk(
+        self, trade_id: str, *, stop_price: Optional[float] = None,
+        target_price: Optional[float] = None, hwm_price: Optional[float] = None,
+        mae: Optional[float] = None, mfe: Optional[float] = None,
+        note_append: Optional[str] = None, managed_exit: Optional[bool] = None,
+    ) -> None:
+        with session_scope() as s:
+            t = s.get(Trade, trade_id)
+            if t is None or t.status == "CLOSED":
+                return
+            if stop_price is not None:
+                t.stop_price = stop_price
+            if target_price is not None:
+                t.target_price = target_price
+            if hwm_price is not None:
+                t.hwm_price = hwm_price
+            if mae is not None:
+                t.mae = mae
+            if mfe is not None:
+                t.mfe = mfe
+            if managed_exit is not None:
+                t.managed_exit = managed_exit
+            if note_append:
+                t.notes = ((t.notes + " | ") if t.notes else "") + note_append
 
     def add_fill(self, trade_id: str, side: str, leg: str, qty: float, price: float,
                  commission: float = 0.0, broker_order_id: str = "") -> None:
@@ -152,7 +195,9 @@ class Repository:
             t.realized_pl = pl
             basis = float(t.entry_price) * qty
             t.realized_pl_pct = (pl / basis * 100.0) if basis else None
-            risk_ps = abs(float(t.entry_price) - float(t.stop_price)) if t.stop_price else 0.0
+            # R is measured against the ORIGINAL stop, not a trailed one
+            ref_stop = getattr(t, "initial_stop_price", None) or t.stop_price
+            risk_ps = abs(float(t.entry_price) - float(ref_stop)) if ref_stop else 0.0
             t.r_multiple = (pl / (risk_ps * qty)) if risk_ps and qty else None
             # day-trade if entry and exit fall on the same NY session
             if t.entry_time:

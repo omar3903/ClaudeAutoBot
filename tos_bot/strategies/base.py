@@ -107,6 +107,9 @@ class Strategy:
         return {"key": self.key, "title": self.title, "kind": self.kind.value,
                 "timeframe": self.timeframe.value, "thesis": self.thesis}
 
+    #: may this setup be entered in pre/post-market too? (limit-only there)
+    extended_hours_ok: bool = False
+
     #: geometry guard rails - a play outside these is almost always bad data
     MAX_STOP_PCT = 0.25          # protective stop no further than 25% from entry
     MAX_TARGET_PCT = {"INTRADAY": 0.15, "SWING": 0.45}
@@ -158,6 +161,14 @@ class Strategy:
         if not (self.RR_BOUNDS[0] <= rr <= self.RR_BOUNDS[1]):
             return None
 
+        tags = tags or []
+        # Swing setups (and explicit gap/catalyst plays) can be entered in the
+        # pre / post-market session; pure intraday structure setups cannot.
+        ext_ok = (
+            self.extended_hours_ok
+            or self.timeframe is Timeframe.SWING
+            or any(t in ("gap", "catalyst") for t in tags)
+        )
         explanation = self._compose_explanation(side, entry, stop, targets, rationale, detail)
         play = Play(
             symbol=ctx.symbol, side=side, strategy=self.key, kind=self.kind,
@@ -165,7 +176,7 @@ class Strategy:
             targets=[round(t, 4) for t in targets],
             confidence=max(0.0, min(1.0, confidence)),
             rationale=rationale, explanation=explanation, evidence=evidence,
-            tags=tags or [], asset_class=AssetClass.EQUITY,
+            tags=tags, asset_class=AssetClass.EQUITY, extended_hours_ok=ext_ok,
             expires_at=ctx.now.astimezone(dt.timezone.utc) + dt.timedelta(minutes=ttl_minutes),
         )
         return play

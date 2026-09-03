@@ -65,7 +65,39 @@ class _DB:
         if self.engine is None:
             self.init()
         Base.metadata.create_all(self.engine)
+        self._add_missing_columns()
         log.info("schema ensured on %s", self.dialect or self.url)
+
+    def _add_missing_columns(self) -> None:
+        """Lightweight forward-only migration: ADD COLUMN for any mapped column
+        not yet in the live table. Never drops or alters. Covers SQLite + MySQL
+        so an existing dev database picks up new fields without a rebuild."""
+        from sqlalchemy import inspect as _inspect
+
+        insp = _inspect(self.engine)
+        try:
+            existing_tables = set(insp.get_table_names())
+        except Exception:  # noqa: BLE001
+            return
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue
+            have = {c["name"] for c in insp.get_columns(table.name)}
+            for col in table.columns:
+                if col.name in have:
+                    continue
+                coltype = col.type.compile(dialect=self.engine.dialect)
+                default = ""
+                if col.default is not None and getattr(col.default, "is_scalar", False):
+                    val = col.default.arg
+                    default = f" DEFAULT {val!r}" if isinstance(val, str) else f" DEFAULT {val}"
+                ddl = f'ALTER TABLE {table.name} ADD COLUMN {col.name} {coltype}{default}'
+                try:
+                    with self.engine.begin() as conn:
+                        conn.exec_driver_sql(ddl)
+                    log.info("migrated: %s", ddl)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("could not add column %s.%s: %s", table.name, col.name, e)
 
     def session(self) -> Session:
         if self.SessionLocal is None:

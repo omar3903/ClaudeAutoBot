@@ -166,11 +166,22 @@ class AuthCfg(_Model):
 
 
 class ExecutionCfg(_Model):
-    default_order_type: str = "LIMIT"
+    default_order_type: str = "LIMIT"     # LIMIT | MARKET | STOP_LIMIT (regular hours)
     limit_offset_bps: float = 5.0
     time_in_force: str = "DAY"
     bracket_orders: bool = True
     confirm_required: bool = True
+    allow_extended_hours: bool = True     # let pre/post-market entries through at all
+
+
+class ExitManagerCfg(_Model):
+    enabled: bool = True
+    breakeven_at_r: float = 1.0           # move stop to entry once +1R  (0 = off)
+    breakeven_buffer_bps: float = 5.0     # nudge it just past entry
+    trail_start_r: float = 1.5            # begin trailing past this R  (0 = off)
+    trail_lock_ratio: float = 0.5        # keep the stop at this fraction of open R
+    flatten_intraday_before_close_min: int = 10   # close day trades before the bell
+    max_swing_hold_days: int = 10        # force-close stale swings (0 = off)
 
 
 class DatabaseCfg(_Model):
@@ -194,6 +205,7 @@ class AppConfig(_Model):
     valuation: ValuationCfg = Field(default_factory=ValuationCfg)
     auth: AuthCfg = Field(default_factory=AuthCfg)
     execution: ExecutionCfg = Field(default_factory=ExecutionCfg)
+    exit_manager: ExitManagerCfg = Field(default_factory=ExitManagerCfg)
     database: DatabaseCfg = Field(default_factory=DatabaseCfg)
     web: Dict[str, Any] = Field(default_factory=dict)
 

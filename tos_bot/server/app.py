@@ -91,9 +91,28 @@ def create_app() -> FastAPI:
         res = eng(app).close_position(trade_id, reason="manual")
         return JSONResponse(res, status_code=200 if res.get("ok") else 400)
 
+    @app.post("/api/trades/{trade_id}/managed")
+    async def set_managed(trade_id: str, body: dict):
+        return eng(app).set_trade_managed(trade_id, bool((body or {}).get("on", True)))
+
     @app.get("/api/pnl")
     async def pnl():
         return eng(app).repo.pnl_summary()
+
+    # ---- account / market ------------------------------------ #
+    @app.post("/api/account/refresh")
+    async def account_refresh():
+        return eng(app).refresh_account_now()
+
+    @app.get("/api/market")
+    async def market():
+        from ..util import clock as _clock
+        return _clock.market_status()
+
+    @app.post("/api/paper/reconcile")
+    async def paper_reconcile():
+        res = eng(app).reconcile_paper()
+        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
 
     @app.get("/api/equity-curve")
     async def equity_curve():
