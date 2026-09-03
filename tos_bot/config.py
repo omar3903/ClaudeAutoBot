@@ -181,9 +181,10 @@ class ExecutionCfg(_Model):
 
 class ExitManagerCfg(_Model):
     enabled: bool = True
-    breakeven_at_r: float = 1.0           # move stop to entry once +1R  (0 = off)
-    breakeven_buffer_bps: float = 5.0     # nudge it just past entry
-    trail_start_r: float = 1.5            # begin trailing past this R  (0 = off)
+    breakeven_at_r: float = 1.3           # tighten the stop once the trade is +this R  (0 = off)
+    breakeven_lock_r: float = 0.3         # ...to lock +this R of profit, not a pure scratch
+    breakeven_buffer_bps: float = 5.0     # plus this nudge past the lock point
+    trail_start_r: float = 2.0            # begin trailing past this R  (0 = off)
     trail_lock_ratio: float = 0.5        # keep the stop at this fraction of open R
     flatten_intraday_before_close_min: int = 10   # close day trades before the bell
     max_swing_hold_days: int = 10        # force-close stale swings (0 = off)
@@ -202,6 +203,11 @@ class AutopilotCfg(_Model):
     max_auto_positions: int = 2           # concurrent open autopilot trades
     max_auto_trades_per_day: int = 3      # matches the sub-$25k PDT day-trade cap
     max_open_risk_pct: float = 4.0        # sum of open autopilot $-risk vs equity
+    # anti-concentration / anti-chop - no pile-on in one strategy, no burst of
+    # entries, no name flipped long<->short minutes apart
+    max_per_strategy: int = 2            # concurrent open auto trades from ONE strategy key
+    max_new_per_cycle: int = 1          # new auto entries per scan cycle (no bursts)
+    cooldown_after_loss: bool = True    # don't re-enter a name that stopped out earlier today
     block_sectors: list = Field(default_factory=list)  # e.g. ["Energy"] to sit out a sector
     require_catalyst: bool = False        # only auto-take plays tagged "catalyst"/"gap"
     dry_run: bool = False                 # log what it WOULD do, place nothing

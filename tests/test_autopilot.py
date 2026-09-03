@@ -23,9 +23,13 @@ class FakeRepo:
     def __init__(self):
         self._open = []
         self.held = set()
+        self._closed = []                       # for cooldown_after_loss
 
     def open_trades(self):
         return list(self._open)
+
+    def recent_trades(self, limit=100):
+        return list(self._closed)[:limit]
 
     def get_open_trade_for_symbol(self, sym):
         return {"symbol": sym} if sym in self.held else None
@@ -40,6 +44,7 @@ class FakeEngine:
         self.approved = []
         self.can_execute = True
         self.est_risk = 200.0
+        self._plays = {}                        # pid -> Play, populated by _run
 
     def assess_play(self, pid):
         self.assess_calls.append(pid)
@@ -53,9 +58,12 @@ class FakeEngine:
     def approve_play(self, pid, operator="operator"):
         self.approved.append((pid, operator))
         tid = f"trade_{pid}"
+        pl = self._plays.get(pid)
         # an open position whose $-risk equals est_risk (entry 100, stop 80, x10)
         self.repo._open.append({
-            "id": tid, "symbol": "X", "entry_price": 100.0,
+            "id": tid, "symbol": getattr(pl, "symbol", "X"),
+            "strategy": getattr(pl, "strategy", "opening_range_breakout"),
+            "entry_price": 100.0,
             "initial_stop_price": 100.0 - self.est_risk / 10.0, "quantity": 10,
         })
         return {"ok": True, "trade_id": tid}
@@ -70,6 +78,8 @@ def _cfg(**over):
         min_confidence=0.6, min_reward_risk=2.0, max_auto_positions=2,
         max_auto_trades_per_day=3, max_open_risk_pct=4.0, block_sectors=[],
         require_catalyst=False, dry_run=False,
+        # cap tests below isolate one cap at a time; keep these wide open
+        max_per_strategy=99, max_new_per_cycle=99, cooldown_after_loss=False,
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -86,7 +96,11 @@ def mkplay(sym="AAA", *, tf=Timeframe.INTRADAY, conf=0.75, entry=100.0, stop=98.
 
 
 def _run(ap, *plays):
-    return ap.consider({p.id: p for p in plays})
+    d = {p.id: p for p in plays}
+    eng = getattr(ap, "engine", None)
+    if eng is not None and hasattr(eng, "_plays"):
+        eng._plays.update(d)
+    return ap.consider(d)
 
 
 # --------------------------------------------------------------------------- #
@@ -167,6 +181,53 @@ def test_open_risk_cap():
     ap = AutoPilot(eng, _cfg(max_open_risk_pct=4.0, max_auto_positions=9), bus=SILENT)
     _run(ap, *[mkplay(sym=f"S{i}") for i in range(4)])
     assert len(eng.approved) == 2              # 200 + 200 == 400 ok; 3rd would be 600 > 400
+
+
+def test_max_new_per_cycle_prevents_bursts():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(max_new_per_cycle=1, max_auto_positions=9,
+                             max_auto_trades_per_day=9), bus=SILENT)
+    _run(ap, *[mkplay(sym=f"S{i}") for i in range(5)])
+    assert len(eng.approved) == 1             # only one entry this cycle
+    _run(ap, *[mkplay(sym=f"T{i}") for i in range(5)])
+    assert len(eng.approved) == 2             # one more next cycle
+
+
+def test_max_per_strategy_cap():
+    eng = FakeEngine()
+    # already holding two 'sr_bounce' auto trades
+    eng.repo._open += [
+        {"id": "t1", "symbol": "AA", "strategy": "sr_bounce", "entry_price": 100.0,
+         "initial_stop_price": 98.0, "quantity": 10},
+        {"id": "t2", "symbol": "BB", "strategy": "sr_bounce", "entry_price": 100.0,
+         "initial_stop_price": 98.0, "quantity": 10},
+    ]
+    ap = AutoPilot(eng, _cfg(max_per_strategy=2, max_auto_positions=9), bus=SILENT)
+    ap._auto_trade_ids |= {"t1", "t2"}
+    p = mkplay(sym="CC")
+    p.strategy = "sr_bounce"
+    _run(ap, p)
+    assert eng.approved == []                 # 3rd sr_bounce blocked
+    q = mkplay(sym="DD"); q.strategy = "vwap_reclaim"
+    _run(ap, q)
+    assert eng.approved_ids() == [q.id]       # a different strategy still goes
+
+
+def test_cooldown_after_loss_skips_a_stopped_name():
+    eng = FakeEngine()
+    from tos_bot.util import clock
+    eng.repo._closed = [{
+        "symbol": "AAA", "status": "CLOSED",
+        "session_date": clock.session_date().isoformat(),
+        "realized_pl": -100.0,
+    }]
+    ap = AutoPilot(eng, _cfg(cooldown_after_loss=True), bus=SILENT)
+    _run(ap, mkplay(sym="AAA"))
+    assert eng.approved == []
+    # a winner earlier today does NOT trigger the cooldown
+    eng.repo._closed[0]["realized_pl"] = 50.0
+    _run(ap, mkplay(sym="AAA"))
+    assert eng.approved_ids() and eng.approved_ids()[0].startswith("play_")
 
 
 def test_live_mode_paper_only_gate():

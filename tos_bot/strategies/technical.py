@@ -258,6 +258,18 @@ class EmaPullbackTrend(Strategy):
         up = safe_last(f) > safe_last(s) > safe_last(t) and price > safe_last(t)
         dn = safe_last(f) < safe_last(s) < safe_last(t) and price < safe_last(t)
 
+        # conviction from how cleanly the trend is stacked + how it aligns with
+        # the daily trend + volume (so a textbook pullback can clear the
+        # autopilot gate, and a marginal one cannot - it used to be a flat 0.60).
+        sep = abs(safe_last(f) - safe_last(t)) / atr if atr else 0.0
+        rvol = ctx.rvol()
+        trend = ctx.daily_trend()
+
+        def _conf(long: bool) -> float:
+            aligned = (long and trend == "up") or ((not long) and trend == "down")
+            return min(0.82, 0.50 + 0.06 * min(3.0, sep) + 0.08 * aligned
+                       + 0.05 * (rvol >= 1.3))
+
         if up and near_slow and last["close"] >= last["open"]:
             entry = price
             stop = min(float(last["low"]), safe_last(s) - 1.0 * atr)
@@ -265,10 +277,11 @@ class EmaPullbackTrend(Strategy):
             targets = [swing_high(ctx.intraday["high"], 12), entry + 2.0 * rr]
             detail = (
                 f"Fast/slow/trend EMAs stacked bullishly ({safe_last(f):.2f} > "
-                f"{safe_last(s):.2f} > {safe_last(t):.2f}); price pulled back into "
-                f"the {self.params['slow']}-EMA and printed an up bar."
+                f"{safe_last(s):.2f} > {safe_last(t):.2f}, {sep:.1f} ATR of "
+                f"separation); price pulled back into the {self.params['slow']}-EMA "
+                f"and printed an up bar on {rvol:.1f}x volume."
             )
-            return self._wrap(ctx, Side.LONG, entry, stop, targets, 0.6, detail, f, s, t, atr)
+            return self._wrap(ctx, Side.LONG, entry, stop, targets, _conf(True), detail, f, s, t, atr)
 
         if dn and near_slow and last["close"] <= last["open"]:
             entry = price
@@ -277,10 +290,10 @@ class EmaPullbackTrend(Strategy):
             targets = [swing_low(ctx.intraday["low"], 12), entry - 2.0 * rr]
             detail = (
                 f"EMAs stacked bearishly ({safe_last(f):.2f} < {safe_last(s):.2f} "
-                f"< {safe_last(t):.2f}); price rallied into the "
-                f"{self.params['slow']}-EMA and rolled over."
+                f"< {safe_last(t):.2f}, {sep:.1f} ATR of separation); price rallied "
+                f"into the {self.params['slow']}-EMA and rolled over on {rvol:.1f}x volume."
             )
-            return self._wrap(ctx, Side.SHORT, entry, stop, targets, 0.6, detail, f, s, t, atr)
+            return self._wrap(ctx, Side.SHORT, entry, stop, targets, _conf(False), detail, f, s, t, atr)
         return []
 
     def _wrap(self, ctx, side, entry, stop, targets, conf, detail, f, s, t, atr):
@@ -974,61 +987,91 @@ class SupportResistanceBounce(Strategy):
         "especially with an indecision candle and volume - tends to bounce to "
         "the next level (Aziz, Strategy 7)."
     )
-    default_params = {"touch_pct": 0.25, "min_strength": 0.45}
+    # touch_pct: how close to the level counts as "at" it.
+    # min_strength: the level must be this well-established (0..1).
+    # min_rvol: Aziz Ch.7 - a level only matters when volume confirms it; a
+    #           quiet drift into a line is not a trade.
+    # buffer_pct / buffer_atr: the stop sits this far BEYOND the level (a 5-min
+    #           close-through), never a tick past it.
+    # min_rr: no play unless the next level pays this against the real stop.
+    default_params = {"touch_pct": 0.20, "min_strength": 0.58, "min_rvol": 1.3,
+                      "buffer_pct": 0.006, "buffer_atr": 1.0, "min_rr": 2.0}
 
     def generate(self, ctx: StrategyContext) -> List[Play]:
-        if not ctx.enough_intraday(12) or not ctx.enough_daily(20):
+        if not ctx.enough_intraday(14) or not ctx.enough_daily(20):
             return []
         today = ctx.today_intraday()
-        if today is None or len(today) < 4:
+        if today is None or len(today) < 6:
             return []
         atr = safe_last(ta.atr(ctx.intraday, 14))
         if _nan(atr) or atr <= 0:
             return []
         price = ctx.price
+        rvol = ctx.rvol()
+        trend = ctx.daily_trend()
         sr = ctx.levels()
         here = sr.at(price, self.params["touch_pct"] / 100.0)
         if here is None or here.strength < self.params["min_strength"]:
             return []
+        # a level with no volume behind it is just a line (Aziz p.219)
+        if rvol < self.params["min_rvol"] and len(here.sources) < 3:
+            return []
         cndl = read_row(today, -2)
 
+        # the stop sits a real buffer BEYOND the level, and always clears the
+        # gap between the current price and the level itself.
+        buf = max(self.params["buffer_pct"] * price,
+                  self.params["buffer_atr"] * atr)
+
         if here.kind == "support" and (cndl.is_reversal_up or cndl.indecision):
+            if trend == "down":                       # don't buy support in a daily downtrend
+                return []
             nxt = sr.nearest_above(price)
             if nxt is None:
                 return []
             entry = price
-            stop = here.price - max(0.35 * atr, 0.04)
+            stop = here.price - buf - max(0.0, price - here.price)
             targets = [nxt.price, nxt.price + 0.5 * atr]
             side = Side.LONG
         elif here.kind == "resistance" and (cndl.is_reversal_down or cndl.indecision):
+            if trend == "up":                         # don't short resistance in a daily uptrend
+                return []
             nxt = sr.nearest_below(price)
             if nxt is None:
                 return []
             entry = price
-            stop = here.price + max(0.35 * atr, 0.04)
+            stop = here.price + buf + max(0.0, here.price - price)
             targets = [nxt.price, nxt.price - 0.5 * atr]
             side = Side.SHORT
         else:
             return []
 
-        conf = 0.46 + 0.30 * here.strength
+        # honest reward:risk against the buffered stop - Aziz Rule 5: if it
+        # isn't there, move on.
+        rr = abs(targets[0] - entry) / abs(entry - stop) if entry != stop else 0.0
+        if rr < self.params["min_rr"]:
+            return []
+
+        conf = min(0.80, 0.40 + 0.30 * here.strength + 0.06 * (rvol >= 1.5)
+                   + 0.04 * (len(here.sources) >= 3))
         detail = (
             f"Price {price:.2f} is at the {here.kind} {here.price:.2f} "
-            f"(strength {here.strength:.2f}; {'/'.join(here.sources)}) and the last "
-            f"closed 5-min bar was a {cndl.name.replace('_', ' ')}. Next level is "
-            f"{targets[0]:.2f}."
+            f"(strength {here.strength:.2f}; {'/'.join(here.sources)}) on {rvol:.1f}x "
+            f"volume, and the last closed 5-min bar was a "
+            f"{cndl.name.replace('_', ' ')}. Next level is {targets[0]:.2f} "
+            f"({rr:.1f}:1 against a stop a full {abs(entry - stop):.2f} beyond the level)."
         )
-        note = ("Buy/short as close to the level as possible for a small stop. "
-                "Take profit at the next level - if there is no clear next level, "
-                "use the nearest half- or whole-dollar.")
-        inval = f"a 5-minute close through {here.price:.2f}"
+        note = ("Enter as close to the level as you can. The stop is a 5-minute "
+                "CLOSE through the level, not a tick - a wick into the line is the "
+                "setup, not the invalidation. Take profit at the next level.")
+        inval = f"a 5-minute close through {here.price:.2f} to {stop:.2f}"
         p = self._mk_play(
             ctx, side, entry, stop, targets, conf,
-            rationale=f"bounce at {here.kind} {here.price:.2f}",
+            rationale=f"bounce at {here.kind} {here.price:.2f}, {rvol:.1f}x vol",
             detail=detail,
             evidence={"level": round(here.price, 2), "kind": here.kind,
                       "strength": round(here.strength, 2), "sources": here.sources,
-                      "atr": round(atr, 3)},
+                      "rvol": round(rvol, 2), "daily_trend": trend, "atr": round(atr, 3)},
             tags=["intraday", "reversal", "level"],
             edge_note=note, invalidation=inval,
         )

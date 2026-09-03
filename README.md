@@ -269,10 +269,14 @@ trade — **entries need your click, exits never do**:
 |---|---|---|
 | cut losses at the working stop | on | — |
 | take profit at the target | on | — |
-| move stop to **break-even** (+buffer) once green | +1.0 R | `breakeven_at_r` |
-| **trail** the stop, keeping a fraction of the open R | from +1.5 R, lock 50% | `trail_start_r`, `trail_lock_ratio` |
+| tighten the stop to **lock a small profit** once green | at +1.3 R, lock +0.3 R | `breakeven_at_r`, `breakeven_lock_r` |
+| **trail** the stop, keeping a fraction of the open R | from +2.0 R, lock 50% | `trail_start_r`, `trail_lock_ratio` |
 | **flatten day trades** before the (holiday-aware) close | 10 min before | `flatten_intraday_before_close_min` |
 | force-close **stale swings** | 10 days | `max_swing_hold_days` |
+
+> The break-even waits for +1.3 R, so a trade that runs and then wobbles isn't
+> killed at entry, and it tightens to *+0.3 R locked* rather than a pure
+> scratch; trailing starts later (+2 R).
 
 The stop only ever ratchets in your favour and never through the last price.
 R is always measured against the **original** stop (`trades.initial_stop_price`),
@@ -317,6 +321,9 @@ Toggle and tune it from the header (**Autopilot: off / day / day+swing**, plus a
 | concurrent open auto positions | 2 | `max_auto_positions` |
 | auto trades per session | 3 | `max_auto_trades_per_day` (≈ the sub-$25k PDT cap) |
 | aggregate open auto $-risk | 4 % of equity | `max_open_risk_pct` |
+| concurrent auto trades from **one** strategy | 2 | `max_per_strategy` |
+| new auto entries **per scan cycle** | 1 | `max_new_per_cycle` |
+| **cool off** a ticker after it stops out today | on | `cooldown_after_loss` |
 | sit out a sector / require a catalyst / dry-run | off | `block_sectors`, `require_catalyst`, `dry_run` |
 
 It still passes through every existing check — session validity, position
@@ -324,6 +331,10 @@ sizing, the PDT guard, the $2,000 live floor. Fundamental (valuation) plays are
 never auto-traded. Every decision is on the event bus
 (`autopilot.entered` / `.skipped` / `.blocked`) and eligible plays get a
 **🤖** marker in the table. `GET`/`POST /api/autopilot`.
+
+> `max_per_strategy`, `max_new_per_cycle` and `cooldown_after_loss` guard against
+> a pile-on: every auto trade from the *same* strategy, a burst of positions in
+> one mid-day chop, or a ticker entered long *then* short minutes apart. They stop the pile-on.
 
 **Faster loop while day-trading.** When Autopilot is armed with `INTRADAY` in
 `trade_types` *and* the regular session is open, the engine drops from the
@@ -371,6 +382,12 @@ Intraday setups carry a `tod_profile` (`momentum` / `reversal` / `trend`) that
 scales confidence by Aziz's session clock — e.g. a momentum breakout is
 discounted ~25 % at midday, a reversal is not.
 
+**Every play's stop is floored.** A protective stop closer than ~0.6 % of price
+(or ~0.9 intraday ATRs) is noise, not a level — `_mk_play` widens it to that
+floor and *then* re-checks reward:risk, so a stop can't be tightened to fake a
+good ratio (Aziz p.66). A stop only 0.2 % wide gets hit by normal noise and
+fills well past it; such plays now either carry an honest stop or don't exist.
+
 | key | timeframe | idea |
 |---|---|---|
 | `abcd_pattern` | intraday | hard push A→B, pullback to a **higher low C**; enter near C (stop = loss of C), target the B retest and measured move |
@@ -379,7 +396,7 @@ discounted ~25 % at midday, a reversal is not.
 | `vwap_reclaim` | intraday | a **5-min close** back across session VWAP after ≥ 3 bars on the other side; target = next level |
 | `red_to_green` | intraday | gapped stock grinding back to the **prior-day close** on rising volume; target = that close, stop = nearest technical level |
 | `intraday_reversal` | intraday | 5+ candles one way **+** 5-min RSI extreme **+** at a daily level **+** an indecision / opposite candle (Aziz's top/bottom reversal) |
-| `sr_bounce` | intraday | price into a strength-ranked **horizontal** S/R level with a confirming candle; target = next level |
+| `sr_bounce` | intraday | price into a strong **horizontal** S/R level (≥ 0.58 strength) **on ≥ 1.3× volume**, confirming candle, not against the daily trend; stop a full buffer *beyond* the level (a 5-min close-through), and only if the next level still pays ≥ 2:1 |
 | `ema_pullback_trend` | intraday | first pullback to the 20-EMA inside a 9/20/50 stacked trend |
 | `gap_and_go` | intraday | ≥ 2 % gap holding the right side of the opening VWAP on ≥ 2× volume |
 | `rsi2_mean_reversion` | swing | Connors RSI(2) < 10 above the 200-SMA (long) / > 90 below it (short) |

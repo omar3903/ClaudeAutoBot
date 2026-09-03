@@ -47,6 +47,9 @@ class AutoPilot:
         self.min_reward_risk: float = float(cfg.min_reward_risk)
         self.max_auto_positions: int = int(cfg.max_auto_positions)
         self.max_auto_trades_per_day: int = int(cfg.max_auto_trades_per_day)
+        self.max_per_strategy: int = int(getattr(cfg, "max_per_strategy", 2))
+        self.max_new_per_cycle: int = int(getattr(cfg, "max_new_per_cycle", 1))
+        self.cooldown_after_loss: bool = bool(getattr(cfg, "cooldown_after_loss", True))
         self.dry_run: bool = bool(cfg.dry_run)
 
         self._acted: set[str] = set()          # play ids already handled
@@ -67,6 +70,9 @@ class AutoPilot:
             "min_reward_risk": self.min_reward_risk,
             "max_auto_positions": self.max_auto_positions,
             "max_auto_trades_per_day": self.max_auto_trades_per_day,
+            "max_per_strategy": self.max_per_strategy,
+            "max_new_per_cycle": self.max_new_per_cycle,
+            "cooldown_after_loss": self.cooldown_after_loss,
             "dry_run": self.dry_run,
             "day": self._day,
             "count_today": self._count_today,
@@ -82,9 +88,12 @@ class AutoPilot:
         for k in ("min_confidence", "min_reward_risk"):
             if isinstance(d.get(k), (int, float)):
                 setattr(self, k, float(d[k]))
-        for k in ("max_auto_positions", "max_auto_trades_per_day"):
+        for k in ("max_auto_positions", "max_auto_trades_per_day",
+                  "max_per_strategy", "max_new_per_cycle"):
             if isinstance(d.get(k), int):
                 setattr(self, k, int(d[k]))
+        if "cooldown_after_loss" in d:
+            self.cooldown_after_loss = bool(d["cooldown_after_loss"])
         self.dry_run = bool(d.get("dry_run", self.dry_run))
         # only restore the day counter if it is still the same session
         if d.get("day") == clock.session_date().isoformat():
@@ -111,6 +120,12 @@ class AutoPilot:
             self.max_auto_positions = max(0, int(kw["max_auto_positions"]))
         if isinstance(kw.get("max_auto_trades_per_day"), int):
             self.max_auto_trades_per_day = max(0, int(kw["max_auto_trades_per_day"]))
+        if isinstance(kw.get("max_per_strategy"), int):
+            self.max_per_strategy = max(1, int(kw["max_per_strategy"]))
+        if isinstance(kw.get("max_new_per_cycle"), int):
+            self.max_new_per_cycle = max(1, int(kw["max_new_per_cycle"]))
+        if "cooldown_after_loss" in kw:
+            self.cooldown_after_loss = bool(kw["cooldown_after_loss"])
         self._persist()
         self.bus.publish("autopilot.config", **self.status())
         log.info("autopilot reconfigured: %s", self.status())
@@ -156,6 +171,9 @@ class AutoPilot:
             "min_reward_risk": round(self.min_reward_risk, 2),
             "max_auto_positions": self.max_auto_positions,
             "max_auto_trades_per_day": self.max_auto_trades_per_day,
+            "max_per_strategy": self.max_per_strategy,
+            "max_new_per_cycle": self.max_new_per_cycle,
+            "cooldown_after_loss": self.cooldown_after_loss,
             "open_auto_positions": open_auto,
             "auto_trades_today": self._count_today,
             "mode": getattr(self.engine, "mode", "paper"),
@@ -198,11 +216,15 @@ class AutoPilot:
         acct = getattr(self.engine, "_account", None)
         equity = float(getattr(acct, "equity", 0.0) or 0.0)
         actions: List[Dict[str, Any]] = []
+        taken = 0                              # new entries opened this cycle
 
         # highest-conviction first
         ordered = sorted(plays.values(), key=lambda p: getattr(p, "score", 0.0), reverse=True)
         for p in ordered:
             if p.id in self._acted:
+                continue
+            if taken >= self.max_new_per_cycle:
+                self._last_reason[p.id] = f"one entry per scan cycle (max_new_per_cycle={self.max_new_per_cycle})"
                 continue
             gate = self._pre_gate(p, equity)
             if gate is not None:
@@ -213,8 +235,14 @@ class AutoPilot:
             if self._count_today >= self.max_auto_trades_per_day:
                 self._last_reason[p.id] = f"daily auto-trade cap ({self.max_auto_trades_per_day}) reached"
                 continue
-            if len(self._open_auto_trades()) >= self.max_auto_positions:
+            opens = self._open_auto_trades()
+            if len(opens) >= self.max_auto_positions:
                 self._last_reason[p.id] = f"max concurrent auto positions ({self.max_auto_positions}) reached"
+                continue
+            same_strat = sum(1 for t in opens if t.get("strategy") == p.strategy)
+            if same_strat >= self.max_per_strategy:
+                self._last_reason[p.id] = (f"already holding {same_strat} auto "
+                                           f"'{p.strategy}' (max_per_strategy={self.max_per_strategy})")
                 continue
 
             # full engine assessment (session validity, PDT, sizing, arm, RR)
@@ -239,6 +267,7 @@ class AutoPilot:
 
             self._acted.add(p.id)
             if self.dry_run:
+                taken += 1
                 actions.append({"play_id": p.id, "symbol": p.symbol, "action": "would_enter",
                                 "qty": pre["order_preview"]["qty"], "risk": est_risk})
                 self.bus.publish("autopilot.would_enter", play_id=p.id, symbol=p.symbol,
@@ -252,6 +281,7 @@ class AutoPilot:
             out = self.engine.approve_play(p.id, operator="autopilot")
             if out.get("ok"):
                 self._count_today += 1
+                taken += 1
                 tid = out.get("trade_id") or getattr(p, "trade_id", None)
                 if tid:
                     self._auto_trade_ids.add(tid)
@@ -300,6 +330,18 @@ class AutoPilot:
                 return f"already holding {p.symbol}"
         except Exception:  # noqa: BLE001
             pass
+        # cooldown: a name that already stopped out today is not a re-entry -
+        # going straight back in turns one loss into long<->short chop.
+        if self.cooldown_after_loss:
+            try:
+                today = clock.session_date().isoformat()
+                for t in self.engine.repo.recent_trades(60):
+                    if (t.get("symbol") == p.symbol and t.get("status") == "CLOSED"
+                            and str(t.get("session_date") or "").startswith(today)
+                            and float(t.get("realized_pl") or 0.0) < 0):
+                        return f"{p.symbol} already stopped out today - cooling off"
+            except Exception:  # noqa: BLE001
+                pass
         return None
 
     # ------------------------------------------------------------------ #
