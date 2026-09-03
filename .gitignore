@@ -7,6 +7,8 @@ secrets/
 *.token.json.enc
 token_key.bin
 data/cache/
+data/paper_state.json
+data/runtime.json
 logs/
 *.sqlite
 *.sqlite3

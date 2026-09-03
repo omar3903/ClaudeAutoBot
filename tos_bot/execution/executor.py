@@ -38,6 +38,14 @@ class Executor:
         self._pending: Dict[str, _Pending] = {}
         self._open_by_symbol: Dict[str, str] = {}   # symbol -> trade_id
 
+    def rebind(self, broker: BrokerAdapter) -> None:
+        """Point at a different broker (paper <-> live switch). In-flight
+        order tracking is broker-specific, so it is dropped; open trades in
+        the database are untouched."""
+        self.broker = broker
+        self._pending.clear()
+        self._open_by_symbol.clear()
+
     # ------------------------------------------------------------------ #
     def execute_play(self, play: Play, account: Account) -> Dict[str, Any]:
         qty = int(play.suggested_qty or 0)

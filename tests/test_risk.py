@@ -68,3 +68,13 @@ def test_pdt_ignored_above_25k():
     g = PdtGuard(ACC_CFG)
     d = g.assess(_acct(30000, round_trips=9), _play(tf=Timeframe.INTRADAY))
     assert d.allowed
+
+
+def test_paper_mode_never_blocks():
+    g = PdtGuard(ACC_CFG, paper=True)
+    # below the $2000 floor AND over the day-trade cap -> still allowed in paper
+    d = g.assess(_acct(500, round_trips=9), _play(tf=Timeframe.INTRADAY))
+    assert d.allowed
+    assert "paper" in d.reason.lower()
+    # counter is still surfaced so the operator can see it
+    assert d.day_trades_used == 9

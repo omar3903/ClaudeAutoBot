@@ -12,6 +12,7 @@ if os.path.exists(_TMPDB):
 os.environ["DATABASE_URL"] = f"sqlite:///{_TMPDB}"
 os.environ["BROKER"] = "paper"
 os.environ["OPEN_BROWSER_ON_START"] = "0"
+os.environ["PAPER_PERSIST"] = "0"          # tests never touch data/paper_state.json
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -32,7 +33,7 @@ def md():
 @pytest.fixture
 def paper(md):
     from tos_bot.brokers.paper_adapter import PaperBroker
-    b = PaperBroker(starting_cash=5000.0, data_service=md)
+    b = PaperBroker(starting_cash=5000.0, data_service=md, persist=False)
     b.connect()
     return b
 

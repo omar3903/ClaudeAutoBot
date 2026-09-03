@@ -56,6 +56,10 @@ function handleEvent(topic, p) {
       showReauth(p); toast("Broker re-authentication required", "bad"); break;
     case "auth.reauth_ok":
       hideReauth(); toast("Broker re-authenticated", "good"); break;
+    case "broker.switched":
+      STATE = p.state || STATE; renderTop();
+      toast(p.mode === "live" ? "LIVE mode — orders are real now" : "Paper mode", p.mode === "live" ? "bad" : "good");
+      loadOpen(); break;
     case "broker.error":
       toast("Broker: " + (p.message || "error"), "bad"); break;
   }
@@ -66,10 +70,28 @@ function refreshState() { api("/api/state").then(s => { STATE = s; renderTop(); 
 /* ---------- top bar ---------- */
 function renderTop() {
   const s = STATE || {};
-  $("#mode-tag").textContent = s.mode || "suggest";
-  setPill("#pill-broker", (s.broker || "?") + (s.connected ? " • live" : " • off"),
-    s.connected ? "good" : "bad");
+  $("#mode-tag").textContent = s.app_mode || "suggest";
+
+  // paper / live segmented toggle
+  const live = s.live || {};
+  $$("#mode-switch .seg").forEach(b => {
+    b.classList.toggle("active", b.dataset.mode === s.mode);
+    if (b.dataset.mode === "live") {
+      b.disabled = !live.available;
+      b.title = live.available
+        ? (live.ready ? `Live: ${live.target}${live.account_hint ? " …" + live.account_hint : ""}`
+          : "Live not ready: " + (live.blockers || []).join("; "))
+        : "No live broker configured (set SCHWAB_* in .env)";
+    }
+  });
+  $("#btn-reset-paper").classList.toggle("hidden", s.mode !== "paper");
+
   setPill("#pill-market", s.market_open ? "market open" : "market closed", s.market_open ? "good" : "");
+  const src = (s.data_source || "?").replace("broker:", "");
+  setPill("#pill-data", "data: " + src, s.data_is_real ? "good" : "warn");
+  $("#pill-data").title = s.data_is_real
+    ? "Real quotes/candles from " + src
+    : "Synthetic data — add SCHWAB_* keys (real-time) or install yfinance (delayed)";
   setPill("#pill-armed", s.armed ? "armed" : "disarmed", s.armed ? "good" : "warn");
 
   const a = s.account || {};
@@ -78,17 +100,23 @@ function renderTop() {
   $("#a-cash").textContent = usd(a.cash);
   const dt = s.day_trades_5d ?? 0, lim = s.day_trade_limit ?? 3;
   const dtEl = $("#a-dt");
-  dtEl.textContent = `${dt} / ${lim}`;
-  dtEl.style.color = dt >= lim ? "var(--short)" : dt >= lim - 1 ? "var(--warn)" : "var(--fg)";
+  dtEl.textContent = s.mode === "paper" ? `${dt}` : `${dt} / ${lim}`;
+  dtEl.style.color = (s.mode !== "paper" && dt >= lim) ? "var(--short)"
+    : (s.mode !== "paper" && dt >= lim - 1) ? "var(--warn)" : "var(--fg)";
   const today = (s.pnl || {}).realized_today ?? 0;
   const pe = $("#a-pnl-today"); pe.textContent = usd(today);
   pe.style.color = today > 0 ? "var(--long)" : today < 0 ? "var(--short)" : "var(--fg)";
 
   const tok = s.token || {};
-  setPill("#pill-token", "token: " + (tok.message ? shorten(tok.message, 26) : "ok"),
-    tok.needs_reauth ? "bad" : tok.needs_rotation ? "warn" : "good");
-  $("#pill-token").title = JSON.stringify(tok, null, 1);
-  if (tok.needs_reauth) showReauth({ status: tok });
+  if (s.mode === "paper") {
+    setPill("#pill-token", "paper acct", "good");
+    $("#pill-token").title = "Paper account — no OAuth token needed";
+  } else {
+    setPill("#pill-token", "token: " + (tok.message ? shorten(tok.message, 24) : "ok"),
+      tok.needs_reauth ? "bad" : tok.needs_rotation ? "warn" : "good");
+    $("#pill-token").title = JSON.stringify(tok, null, 1);
+    if (tok.needs_reauth) showReauth({ status: tok });
+  }
 }
 function setPill(sel, text, cls) {
   const el = $(sel); el.textContent = text;
@@ -189,6 +217,7 @@ async function selectPlay(id) {
     <div class="order-card">
       <h4>Order preview</h4>
       <div class="kv">
+        <span>Routes to</span><span><b style="color:${(op.routes_to || "").includes("LIVE") ? "var(--short)" : "var(--accent)"}">${op.routes_to || (a.mode === "live" ? "LIVE" : "SIMULATED (paper)")}</b></span>
         <span>Action</span><span>${op.side} ${op.qty} ${p.symbol}</span>
         <span>Type</span><span>${op.type} @ ~${num(op.limit_hint)}</span>
         <span>Bracket</span><span>${op.bracket ? `TP ${num(op.take_profit)} / SL ${num(op.stop_loss)}` : "none"}</span>
@@ -372,6 +401,64 @@ function showReauth(p) {
   };
 }
 function hideReauth() { $("#reauth-banner").classList.add("hidden"); }
+
+/* ---------- generic modal ---------- */
+function openModal({ title, bodyHTML, okText = "Confirm", okClass = "danger", onOk }) {
+  $("#modal-title").textContent = title;
+  $("#modal-body").innerHTML = bodyHTML;
+  const ok = $("#modal-ok");
+  ok.textContent = okText;
+  ok.className = okClass;
+  ok.onclick = async () => { closeModal(); await onOk(); };
+  $("#modal-cancel").onclick = closeModal;
+  $("#modal").onclick = e => { if (e.target.id === "modal") closeModal(); };
+  $("#modal").classList.remove("hidden");
+  setTimeout(() => { const i = $("#modal-body input"); if (i) i.focus(); }, 50);
+}
+function closeModal() { $("#modal").classList.add("hidden"); }
+
+/* ---------- paper / live toggle ---------- */
+$$("#mode-switch .seg").forEach(b => b.onclick = async () => {
+  const target = b.dataset.mode;
+  if (target === (STATE.mode || "paper")) return;
+  if (target === "paper") {
+    const r = await api("/api/broker", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "paper" }) });
+    toast(r.ok ? "Switched to Paper" : ("Switch failed: " + (r.reason || "")), r.ok ? "good" : "bad");
+    return;
+  }
+  const live = STATE.live || {};
+  if (!live.ready) {
+    toast("Live not ready — " + (live.blockers || ["configure SCHWAB_* in .env"]).join("; "), "bad");
+    return;
+  }
+  const hint = live.account_hint ? " ending …" + live.account_hint : "";
+  openModal({
+    title: "Switch to LIVE trading?",
+    bodyHTML: `<div class="warn-box">Orders you approve will be sent to your <b>real ${live.target || "broker"} account${hint}</b> and use real money.</div>
+      <p class="muted">The engine still never trades on its own — every order still needs your click. The $${(STATE.account && STATE.account.min_start_equity || 2000).toLocaleString()} equity floor and the 3-day-trade PDT cap apply in live mode.</p>`,
+    okText: "Go Live", okClass: "danger",
+    onOk: async () => {
+      const r = await api("/api/broker", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "live" }) });
+      if (!r.ok) toast("Could not go live: " + ((r.blockers || [r.reason]).join("; ")), "bad");
+    }
+  });
+});
+
+$("#btn-reset-paper").onclick = () => {
+  const cur = (STATE.account && STATE.account.paper_start_cash) || 100000;
+  openModal({
+    title: "Reset paper account",
+    bodyHTML: `<p>Wipe the paper cash, positions and session P/L, and start again from:</p>
+      <p><label>$ </label><input type="number" id="reset-amt" value="${cur}" min="1000" step="1000" /></p>
+      <p class="muted">Trade history in the database is kept for the record.</p>`,
+    okText: "Reset", okClass: "danger",
+    onOk: async () => {
+      const amt = parseFloat($("#reset-amt") ? $("#reset-amt").value : cur) || cur;
+      const r = await api("/api/paper/reset", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cash: amt }) });
+      toast(r.ok ? r.note : "Reset failed", r.ok ? "good" : "bad");
+    }
+  });
+};
 
 $("#btn-scan").onclick = async () => {
   $("#btn-scan").disabled = true;

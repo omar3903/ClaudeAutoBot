@@ -99,6 +99,25 @@ def create_app() -> FastAPI:
     async def equity_curve():
         return {"points": eng(app).repo.equity_curve()}
 
+    # ---- broker mode (paper <-> live) --------------------- #
+    @app.get("/api/broker")
+    async def broker_state():
+        s = eng(app).snapshot()
+        return {"mode": s["mode"], "broker": s["broker"], "live": s["live"],
+                "data_source": s["data_source"], "data_is_real": s["data_is_real"],
+                "armed": s["armed"], "app_mode": s["app_mode"]}
+
+    @app.post("/api/broker")
+    async def set_broker(body: dict):
+        res = eng(app).set_mode((body or {}).get("mode", ""))
+        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+
+    @app.post("/api/paper/reset")
+    async def paper_reset(body: dict):
+        cash = (body or {}).get("cash")
+        res = eng(app).reset_paper(float(cash) if cash is not None else None)
+        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+
     # ---- scan / strategies / auth -------------------------- #
     @app.post("/api/scan/now")
     async def scan_now():

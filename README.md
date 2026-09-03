@@ -7,17 +7,22 @@ It scans the Nasdaq every few minutes, ranks a short list of names, and shows
 ever routed to a broker until you click **Execute ✓ Yes**. Every idea and every
 executed trade (with its realised P/L) is written to MySQL.
 
+- **Paper ↔ Live toggle:** flip the whole app between a **paper** account
+  (simulated fills against *real* market data, starts at **$100,000**, no
+  equity floor) and **live** Schwab from a switch in the dashboard header —
+  no restart, no `.env` edit. Schwab has no sandbox of its own, so this is
+  how you paper-trade a Schwab workflow.
 - **Data + brokerage:** a `BrokerAdapter` abstraction with a live **Schwab**
   adapter (`schwab-py`), a legacy `tda-api` reference adapter, **Interactive
-  Brokers** and **crypto** stubs, and a fully working **paper** adapter that
-  needs zero credentials.
+  Brokers** and **crypto** stubs, and the **paper** adapter above.
 - **Strategies:** 8 technical day-trade / swing setups + 3 valuation setups
   derived from *Pignataro, Financial Modeling and Valuation* (2nd ed.): comps
   (EV/EBITDA vs peers), a UFCF DCF (CAPM/WACC, exit-multiple **and** perpetuity
   terminal value), and a blended "football-field" fair-value band.
-- **Guard rails:** a $2,000 equity floor and a rolling 5-session Pattern-Day-
-  Trader counter (3-day-trade cap under $25k) that block or warn *before* you
-  confirm.
+- **Guard rails (live mode):** a $2,000 equity floor and a rolling 5-session
+  Pattern-Day-Trader counter (3-day-trade cap under $25k) that block or warn
+  *before* you confirm. In paper mode nothing is blocked — the counters are
+  still shown so you learn where the live rules would bite.
 - **Auth:** a token watchdog that keeps the access token fresh and, ~5 days
   before the refresh token's TTL (default **60 days**), backs up + deletes the
   old token and triggers a new grant — either a one-click prompt or an
@@ -60,14 +65,33 @@ cp config/config.example.yaml config/config.yaml
 python run.py
 ```
 
-The dashboard opens at `http://127.0.0.1:8787`. Click **Scan now**, hover a
-row to read the play, click it to see the order preview, then **Execute ✓ Yes**
-to fill it on the simulator. Close positions from the **Open positions** tab;
-realised P/L lands in **Trade history** and **P/L summary**.
+The dashboard opens at `http://127.0.0.1:8787` in **Paper** mode with a
+**$100,000** simulated account. Click **Scan now**, hover a row to read the
+play, click it to see the order preview (it says *Routes to: SIMULATED
+(paper)*), then **Execute ✓ Yes** to fill it against the live quote. Close
+positions from the **Open positions** tab; realised P/L lands in **Trade
+history** and **P/L summary**. **Reset paper** in the header wipes the paper
+cash/positions back to a balance you choose (trade history is kept).
 
-With `BROKER=paper` and no MySQL running, data falls back to a local SQLite
-file (`data/tos_trader.sqlite`) and, if `yfinance` is not installed, to a
-deterministic synthetic price feed — so it always runs.
+The paper account **persists** to `data/paper_state.json`, so it keeps
+tracking across restarts.
+
+**Data:** if you add the `SCHWAB_*` keys and authenticate, the app uses
+Schwab real-time quotes/candles **even in paper mode**. Otherwise it uses
+`yfinance` (delayed ~15 min) or, if that isn't installed, a deterministic
+synthetic feed. The header shows which (`data: schwab` / `yfinance` /
+`synthetic`).
+
+### Paper ↔ Live switch
+
+The header has a **Paper / Live** toggle. **Live** is greyed until the
+`SCHWAB_*` block is filled and `python scripts/authenticate.py` has run;
+switching to it pops a confirmation and, from then on, approved orders go to
+your **real Schwab account** and the $2,000 floor + PDT cap apply. The choice
+is remembered in `data/runtime.json`.
+
+With no MySQL configured, everything above still works — the database falls
+back to a local SQLite file (`data/tos_trader.sqlite`).
 
 ---
 
@@ -166,9 +190,11 @@ work while it is running.)
 
 ---
 
-## $2,000 floor & the Pattern-Day-Trader rule
+## $2,000 floor & the Pattern-Day-Trader rule  (live mode only)
 
-`tos_bot/risk/pdt_guard.py` runs on every **Assess** before you can confirm:
+`tos_bot/risk/pdt_guard.py` runs on every **Assess** before you can confirm.
+**In paper mode nothing below is enforced** — the day-trade tally is still
+shown, with a "(paper)" note, so you can see where live would stop you.
 
 - **Equity floor** — if account equity `< min_start_equity` ($2,000), *no new
   entries*, full stop.

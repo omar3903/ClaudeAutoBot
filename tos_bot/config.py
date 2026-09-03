@@ -38,7 +38,8 @@ class Secrets(BaseSettings):
         case_sensitive=False,
     )
 
-    broker: str = "paper"
+    broker: str = "paper"            # "paper" | "schwab" | "tda" | "ibkr" | "crypto"
+    live_broker: str = "schwab"      # which live broker the paper<->live toggle targets
 
     # Schwab
     schwab_api_key: str = ""
@@ -74,11 +75,23 @@ class Secrets(BaseSettings):
 
     # ---- derived helpers -------------------------------------------------- #
     @property
-    def token_path(self) -> Path:
+    def effective_live_broker(self) -> str:
+        """The live venue the paper<->live toggle targets. ``BROKER`` in .env
+        may name it directly; otherwise fall back to ``LIVE_BROKER``."""
+        return self.broker if self.broker != "paper" else self.live_broker
+
+    @property
+    def token_dir_path(self) -> Path:
         p = Path(self.token_dir)
-        if not p.is_absolute():
-            p = PROJECT_ROOT / p
-        return p / f"{self.broker}.token.json"
+        return p if p.is_absolute() else PROJECT_ROOT / p
+
+    def token_path_for(self, broker: str) -> Path:
+        return self.token_dir_path / f"{broker}.token.json"
+
+    @property
+    def token_path(self) -> Path:
+        # tokens always belong to the live broker, never to "paper"
+        return self.token_path_for(self.effective_live_broker)
 
     @property
     def token_key_path(self) -> Path:
@@ -105,7 +118,8 @@ class _Model(BaseModel):
 
 
 class AccountCfg(_Model):
-    min_start_equity: float = 2000.0
+    min_start_equity: float = 2000.0          # LIVE only - paper ignores this
+    paper_start_cash: float = 100000.0        # opening balance for the paper account
     pdt_equity_threshold: float = 25000.0
     max_day_trades_under_threshold: int = 3
     day_trade_warn_at: int = 2
@@ -217,6 +231,12 @@ def _apply_env_overrides(cfg: AppConfig) -> None:
         cfg.scanner.interval_seconds = int(iv)
     if os.getenv("APP_LOG_LEVEL"):
         cfg.app.log_level = os.environ["APP_LOG_LEVEL"]
+    pc = os.getenv("PAPER_START_CASH")
+    if pc:
+        try:
+            cfg.account.paper_start_cash = float(pc)
+        except ValueError:
+            pass
 
 
 @functools.lru_cache(maxsize=1)

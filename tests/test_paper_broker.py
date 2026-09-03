@@ -2,6 +2,28 @@ from __future__ import annotations
 
 from tos_bot.core.enums import OrderType, Side
 from tos_bot.core.models import OrderRequest
+from tos_bot.brokers.paper_adapter import PaperBroker
+
+
+def test_state_persists_across_restart(tmp_path, md):
+    sp = tmp_path / "paper_state.json"
+    b1 = PaperBroker(starting_cash=100000.0, data_service=md, persist=True, state_path=sp)
+    b1.connect()
+    b1.place_order(OrderRequest("PERS", Side.LONG, 7, OrderType.MARKET))
+    cash1 = b1.get_account().cash
+    assert sp.exists()
+
+    b2 = PaperBroker(starting_cash=100000.0, data_service=md, persist=True, state_path=sp)
+    b2.connect()
+    acc = b2.get_account()
+    assert acc.position("PERS") and acc.position("PERS").quantity == 7
+    assert abs(acc.cash - cash1) < 1.0        # cash carried over
+
+    b2.reset(50000.0)
+    assert b2.get_account().equity == 50000.0
+    b3 = PaperBroker(starting_cash=1.0, data_service=md, persist=True, state_path=sp)
+    b3.connect()
+    assert b3.get_account().cash == 50000.0   # reset persisted too
 
 
 def test_market_fill_and_position(paper):

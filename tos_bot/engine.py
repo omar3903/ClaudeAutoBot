@@ -1,27 +1,34 @@
 """The conductor.
 
-Owns the broker, scanner, executor, risk guard and token watchdog, and runs
-three background loops:
+Owns the broker(s), scanner, executor, risk guard and token watchdog, and
+runs three background loops:
 
     scan_loop      - every ``scanner.interval_seconds`` -> new short list of plays
     sync_loop      - a few seconds -> reconcile fills, drive the paper clock
     snapshot_loop  - ~30s -> write an account snapshot, broadcast state
 
-It never routes an order without an explicit :meth:`approve_play`, which the
-dashboard calls when the operator clicks "Yes".
+It runs in one of two **modes**, toggled at runtime from the dashboard and
+persisted to ``data/runtime.json``:
+
+    paper  - simulated fills against **real** market data (default; no floor,
+             starts from ``account.paper_start_cash``, default $100k)
+    live   - real orders through the configured live broker (``schwab``)
+
+It never routes an order without an explicit :meth:`approve_play`.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
-import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .auth.token_manager import AuthWatchdog, TokenManager
 from .brokers import get_broker
 from .brokers.base import BrokerAdapter
-from .config import Settings, get_settings
+from .config import PROJECT_ROOT, Settings, get_settings
 from .core.eventbus import BUS
 from .core.enums import PlayStatus
 from .core.models import Account, Play
@@ -40,6 +47,9 @@ from .util.logging_setup import setup_logging
 
 log = logging.getLogger(__name__)
 
+_RUNTIME_PATH = PROJECT_ROOT / "data" / "runtime.json"
+_LIVE_BROKERS = {"schwab", "tda", "ibkr", "crypto"}
+
 
 class TradingEngine:
     def __init__(self, settings: Optional[Settings] = None) -> None:
@@ -49,7 +59,7 @@ class TradingEngine:
         init_db()
         self.repo = Repository()
 
-        # market data: broker first (added after connect), then yfinance, then synthetic
+        # market data: (live broker) -> yfinance -> synthetic
         providers = []
         yfp = YFinanceProvider()
         if yfp.available:
@@ -60,47 +70,148 @@ class TradingEngine:
         self.fundamentals = YFinanceFundamentals()
         self.strategies = build_enabled_strategies(self.settings)
         self.scanner = Scanner(self.settings, self.md, self.fundamentals, self.strategies)
-        self.pdt = PdtGuard(self.settings.config.account, trade_repo=self.repo)
 
-        self.broker: BrokerAdapter = get_broker(
-            self.settings.secrets.broker,
-            **self._broker_kwargs(self.settings.secrets.broker),
-        )
         self.token_manager = TokenManager(self.settings, repo=self.repo, bus=BUS,
                                           on_reauth_required=self._on_reauth)
-        self.executor = Executor(self.broker, self.repo, self.settings.config.execution, bus=BUS)
+
+        # which live venue the toggle targets ("schwab" unless overridden)
+        sec_broker = self.settings.secrets.broker
+        self.live_name: Optional[str] = (
+            sec_broker if sec_broker in _LIVE_BROKERS
+            else (self.settings.secrets.live_broker if self.settings.secrets.live_broker in _LIVE_BROKERS
+                  else None)
+        )
+        # starting mode: runtime.json wins; else "live" if .env named a live broker
+        self.mode: str = self._load_runtime_mode(
+            default="live" if sec_broker in _LIVE_BROKERS else "paper"
+        )
+        if self.mode == "live" and not self.live_name:
+            self.mode = "paper"
+
+        self._paper_broker: Optional[BrokerAdapter] = None
+        self._live_broker: Optional[BrokerAdapter] = None
+        self._trading_broker: Optional[BrokerAdapter] = None
+
+        self.executor: Optional[Executor] = None
+        self.pdt: Optional[PdtGuard] = None
 
         self._plays: Dict[str, Play] = {}
         self._last_scan_summary: Dict[str, Any] = {}
         self._account: Optional[Account] = None
         self._armed = False
         self._reauth_hint: Dict[str, Any] = {}
+        self._live_blockers: List[str] = []
 
         self._stop = threading.Event()
         self._threads: List[threading.Thread] = []
         self._scan_now = threading.Event()
+        self._switch_lock = threading.RLock()
 
     # ------------------------------------------------------------------ #
-    def _broker_kwargs(self, name: str) -> dict:
-        if name == "paper":
-            return {"starting_cash": max(2000.0, self.settings.config.account.min_start_equity),
-                    "data_service": self.md}
-        return {"token_manager": self.token_manager}
+    @property
+    def broker(self) -> BrokerAdapter:
+        return self._trading_broker  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------ #
+    #  Runtime state file                                               #
+    # ------------------------------------------------------------------ #
+    def _load_runtime_mode(self, default: str) -> str:
+        try:
+            if _RUNTIME_PATH.exists():
+                m = json.loads(_RUNTIME_PATH.read_text()).get("mode")
+                if m in ("paper", "live"):
+                    return m
+        except Exception:  # noqa: BLE001
+            pass
+        return default
+
+    def _save_runtime_mode(self) -> None:
+        try:
+            _RUNTIME_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _RUNTIME_PATH.write_text(json.dumps({"mode": self.mode}, indent=2))
+        except Exception:  # noqa: BLE001
+            log.debug("could not persist runtime mode", exc_info=True)
+
+    # ------------------------------------------------------------------ #
+    #  Broker construction                                              #
+    # ------------------------------------------------------------------ #
+    def _ensure_paper_broker(self) -> BrokerAdapter:
+        if self._paper_broker is None:
+            import os
+
+            self._paper_broker = get_broker(
+                "paper",
+                starting_cash=self.settings.config.account.paper_start_cash,
+                data_service=self.md,
+                persist=os.getenv("PAPER_PERSIST", "1") != "0",
+            )
+            self._paper_broker.connect()
+        return self._paper_broker
+
+    def _ensure_live_broker(self) -> Optional[BrokerAdapter]:
+        """Build + connect the live broker once. Also used as the top market-
+        data provider even while trading on paper."""
+        if self._live_broker is not None:
+            return self._live_broker
+        self._live_blockers = []
+        if not self.live_name:
+            self._live_blockers.append("no live broker configured (BROKER / LIVE_BROKER in .env)")
+            return None
+
+        sec = self.settings.secrets
+        if self.live_name == "schwab" and not (sec.schwab_api_key and sec.schwab_app_secret):
+            self._live_blockers.append("SCHWAB_API_KEY / SCHWAB_APP_SECRET missing in .env")
+        if self.live_name in ("schwab", "tda") and not sec.token_path.exists():
+            self._live_blockers.append(
+                f"no OAuth token - run  python scripts/authenticate.py  (BROKER={self.live_name})"
+            )
+        if self._live_blockers:
+            return None
+
+        try:
+            b = get_broker(self.live_name, token_manager=self.token_manager)
+            b.connect()
+            self._live_broker = b
+            log.info("live broker '%s' connected", self.live_name)
+            return b
+        except Exception as e:  # noqa: BLE001
+            self._live_blockers.append(str(e))
+            log.warning("live broker unavailable: %s", e)
+            return None
+
+    def _bind_trading_broker(self) -> None:
+        """Point the executor + PDT guard at the broker for the current mode."""
+        if self.mode == "live":
+            lb = self._ensure_live_broker()
+            self._trading_broker = lb or self._ensure_paper_broker()
+            if lb is None:
+                self.mode = "paper"
+                log.warning("falling back to paper - live broker not ready: %s",
+                            "; ".join(self._live_blockers))
+        else:
+            self._trading_broker = self._ensure_paper_broker()
+
+        is_paper = self._trading_broker.paper
+        self.pdt = PdtGuard(self.settings.config.account, trade_repo=self.repo, paper=is_paper)
+        if self.executor is None:
+            self.executor = Executor(self._trading_broker, self.repo,
+                                     self.settings.config.execution, bus=BUS)
+        else:
+            self.executor.rebind(self._trading_broker)
 
     # ------------------------------------------------------------------ #
     def start(self) -> None:
-        log.info("engine starting  (broker=%s, mode=%s)",
-                 self.settings.secrets.broker, self.settings.config.app.mode)
-        try:
-            self.broker.connect()
-        except Exception as e:  # noqa: BLE001
-            log.error("broker connect failed: %s", e)
-            BUS.publish("broker.error", message=str(e))
+        log.info("engine starting  (mode=%s, live_target=%s, app_mode=%s)",
+                 self.mode, self.live_name, self.settings.config.app.mode)
 
-        # if a real broker connected, prefer its data feed
-        if self.broker.is_connected and not self.broker.paper:
-            self.md.providers.insert(0, _BrokerProvider(self.broker))
+        # a Schwab client (if creds exist) becomes the top data feed in BOTH
+        # modes, so paper fills happen against real quotes.
+        lb = self._ensure_live_broker()
+        if lb is not None and lb.is_connected:
+            self.md.providers.insert(0, _BrokerProvider(lb))
+            log.info("market data feed: %s (real)", lb.name)
 
+        self._bind_trading_broker()
         self._refresh_account()
         self._check_arm()
 
@@ -113,10 +224,10 @@ class TradingEngine:
             t.start()
 
         self._auth_watchdog = AuthWatchdog(
-            self.token_manager, broker_provider=lambda: self.broker,
+            self.token_manager, broker_provider=lambda: self._live_broker,
             interval_s=self.settings.config.auth.check_interval_seconds,
         )
-        if not self.broker.paper:
+        if self._live_broker is not None:
             self._auth_watchdog.start()
 
         BUS.publish("engine.started", state=self.snapshot())
@@ -127,10 +238,12 @@ class TradingEngine:
             self._auth_watchdog.stop()
         except Exception:  # noqa: BLE001
             pass
-        try:
-            self.broker.close()
-        except Exception:  # noqa: BLE001
-            pass
+        for b in (self._live_broker, self._paper_broker):
+            try:
+                if b:
+                    b.close()
+            except Exception:  # noqa: BLE001
+                pass
         log.info("engine stopped")
 
     # ------------------------------------------------------------------ #
@@ -138,7 +251,7 @@ class TradingEngine:
     # ------------------------------------------------------------------ #
     def _scan_loop(self) -> None:
         interval = int(self.settings.config.scanner.interval_seconds)
-        self._stop.wait(2.0)                       # let the UI come up first
+        self._stop.wait(2.0)
         while not self._stop.is_set():
             triggered = self._scan_now.is_set()
             self._scan_now.clear()
@@ -147,7 +260,6 @@ class TradingEngine:
                     self._run_scan()
                 except Exception:  # noqa: BLE001
                     log.exception("scan cycle failed")
-            # sleep the interval in 1s slices so a manual trigger stays responsive
             waited = 0
             while waited < interval and not self._stop.is_set() and not self._scan_now.is_set():
                 self._stop.wait(1.0)
@@ -156,7 +268,8 @@ class TradingEngine:
     def _sync_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                self.executor.sync_open_orders()
+                if self.executor:
+                    self.executor.sync_open_orders()
             except Exception:  # noqa: BLE001
                 log.exception("order sync failed")
             self._stop.wait(4.0)
@@ -175,12 +288,8 @@ class TradingEngine:
                 log.exception("snapshot failed")
             self._stop.wait(30.0)
 
-    # ------------------------------------------------------------------ #
     def _should_scan(self) -> bool:
-        # scan during RTH; also allow a warm-up 15 min before the open
-        if clock.is_market_open():
-            return True
-        return False
+        return clock.is_market_open()
 
     def _run_scan(self) -> None:
         self._refresh_account()
@@ -188,7 +297,6 @@ class TradingEngine:
             self.scanner.set_account(self._account)
         result = self.scanner.run_cycle()
 
-        # size + guard every play, keep them addressable by id
         self._plays = {}
         for p in result.plays:
             if self._account:
@@ -211,12 +319,16 @@ class TradingEngine:
     # ------------------------------------------------------------------ #
     def _refresh_account(self) -> None:
         try:
-            self._account = self.broker.get_account()
+            if self._trading_broker:
+                self._account = self._trading_broker.get_account()
         except Exception as e:  # noqa: BLE001
             log.debug("get_account failed: %s", e)
 
     def _check_arm(self) -> None:
         acc = self._account
+        if self.broker.paper:
+            self._armed = True                      # paper has no equity floor
+            return
         floor = self.settings.config.account.min_start_equity
         if acc and acc.equity >= floor:
             self._armed = True
@@ -224,7 +336,7 @@ class TradingEngine:
             self._armed = False
             if acc:
                 BUS.publish("engine.disarmed",
-                            reason=f"equity ${acc.equity:,.0f} < ${floor:,.0f} floor")
+                            reason=f"equity ${acc.equity:,.0f} < ${floor:,.0f} live floor")
 
     # ------------------------------------------------------------------ #
     #  Operator actions (called by the API)                             #
@@ -243,7 +355,8 @@ class TradingEngine:
         can = decision.allowed and p.suggested_qty > 0 and self._armed and rr_ok
         reasons = []
         if not self._armed:
-            reasons.append(f"engine not armed - equity below ${self.settings.config.account.min_start_equity:,.0f}")
+            reasons.append(f"engine not armed - live equity below "
+                           f"${self.settings.config.account.min_start_equity:,.0f} floor")
         if not decision.allowed:
             reasons.append(decision.reason)
         if p.suggested_qty <= 0:
@@ -252,6 +365,7 @@ class TradingEngine:
             reasons.append(f"reward:risk {p.reward_risk:.1f} below minimum")
         return {
             "ok": True, "can_execute": can, "reasons": reasons,
+            "mode": self.mode,
             "play": self._decorate(p),
             "pdt": decision.as_dict(),
             "order_preview": {
@@ -260,6 +374,8 @@ class TradingEngine:
                 "limit_hint": p.entry, "bracket": self.settings.config.execution.bracket_orders,
                 "take_profit": p.primary_target, "stop_loss": p.stop,
                 "est_cost": round(p.notional, 2), "est_risk": round(p.dollar_risk, 2),
+                "routes_to": ("SIMULATED (paper)" if self.broker.paper
+                              else f"LIVE {self.broker.name.upper()}"),
             },
         }
 
@@ -295,9 +411,44 @@ class TradingEngine:
         self._scan_now.set()
         return {"ok": True, "note": "scan queued"}
 
+    # ---- paper / live toggle ------------------------------------- #
+    def set_mode(self, mode: str, operator: str = "operator") -> Dict[str, Any]:
+        mode = (mode or "").lower()
+        if mode not in ("paper", "live"):
+            return {"ok": False, "reason": "mode must be 'paper' or 'live'"}
+        with self._switch_lock:
+            if mode == self.mode:
+                return {"ok": True, "mode": self.mode, "note": "already in that mode"}
+            if mode == "live":
+                if self._ensure_live_broker() is None:
+                    return {"ok": False, "reason": "live broker not ready",
+                            "blockers": self._live_blockers}
+            prev = self.mode
+            self.mode = mode
+            self._bind_trading_broker()
+            self._save_runtime_mode()
+            self._refresh_account()
+            self._check_arm()
+            log.warning("mode switched %s -> %s by %s", prev, self.mode, operator)
+            BUS.publish("broker.switched", mode=self.mode, prev=prev, state=self.snapshot())
+            return {"ok": True, "mode": self.mode,
+                    "note": ("Now routing REAL orders." if self.mode == "live"
+                             else "Back to simulated fills on real data.")}
+
+    def reset_paper(self, cash: Optional[float] = None) -> Dict[str, Any]:
+        pb = self._ensure_paper_broker()
+        amount = float(cash) if cash is not None else self.settings.config.account.paper_start_cash
+        pb.reset(amount)  # type: ignore[attr-defined]
+        if self.executor and self.broker.paper:
+            self.executor.rebind(pb)
+        self._refresh_account()
+        BUS.publish("account.snapshot", state=self.snapshot())
+        return {"ok": True, "cash": round(amount, 2),
+                "note": f"paper account reset to ${amount:,.0f}"}
+
     def reauthenticate(self) -> Dict[str, Any]:
-        if self.broker.paper:
-            return {"ok": True, "note": "paper broker needs no auth"}
+        if not self.live_name:
+            return {"ok": False, "reason": "no live broker configured"}
         self.token_manager.rotate_now("operator-initiated re-authentication")
         return {"ok": True, "note": "re-auth started - follow the console / browser prompt",
                 "hint": self._reauth_hint}
@@ -307,7 +458,7 @@ class TradingEngine:
         self._reauth_hint = {
             "message": "Broker re-authentication required.",
             "how": "Run  python scripts/authenticate.py  (opens a browser once), "
-                   "or click Re-authenticate to launch it.",
+                   "or click Re-authenticate.",
             "status": status.as_dict(),
         }
         log.warning("re-auth required: %s", status.message)
@@ -322,27 +473,44 @@ class TradingEngine:
 
     def snapshot(self) -> Dict[str, Any]:
         acc = self._account
+        paper = self.broker.paper if self._trading_broker else True
         pnl = {}
         try:
             pnl = self.repo.pnl_summary()
         except Exception:  # noqa: BLE001
             pass
-        tok = self.token_manager.status().as_dict() if not self.broker.paper else {
-            "exists": True, "broker": "paper", "message": "paper - no token", "needs_reauth": False,
-        }
+        tok = ({"exists": True, "broker": "paper", "message": "paper - no token",
+                "needs_reauth": False} if paper
+               else self.token_manager.status().as_dict())
+        data_src = self.md.providers[0].name if self.md.providers else "none"
         return {
             "ts": clock.now_ny().isoformat(),
-            "broker": self.broker.name,
-            "connected": self.broker.is_connected,
+            "broker": self.broker.name if self._trading_broker else "paper",
+            "mode": self.mode,                       # paper | live
+            "app_mode": self.settings.config.app.mode,  # suggest (never auto-trades)
+            "connected": self.broker.is_connected if self._trading_broker else False,
             "armed": self._armed,
             "market_open": clock.is_market_open(),
-            "mode": self.settings.config.app.mode,
+            "data_source": data_src,
+            "data_is_real": data_src != "synthetic",
+            "live": {
+                "target": self.live_name,
+                "available": bool(self.live_name),
+                "ready": self._live_broker is not None and self._live_broker.is_connected,
+                "blockers": self._live_blockers,
+                "account_hint": (self.settings.secrets.schwab_account_id[-4:]
+                                 if self.settings.secrets.schwab_account_id else None),
+            },
             "account": {
                 "equity": round(acc.equity, 2) if acc else None,
                 "cash": round(acc.cash, 2) if acc else None,
                 "buying_power": round(acc.buying_power, 2) if acc else None,
                 "is_cash_account": acc.is_cash_account if acc else None,
+                "realized_pl_session": (acc.raw.get("realized_pl") if acc and acc.raw else None),
+                "start_equity": (acc.raw.get("start_equity") if acc and acc.raw else None),
+                "floor_enforced": not paper,
                 "min_start_equity": self.settings.config.account.min_start_equity,
+                "paper_start_cash": self.settings.config.account.paper_start_cash,
                 "pdt_threshold": self.settings.config.account.pdt_equity_threshold,
             } if acc else None,
             "positions": [

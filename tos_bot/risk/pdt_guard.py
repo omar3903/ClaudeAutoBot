@@ -40,13 +40,16 @@ class PdtDecision:
 
 
 class PdtGuard:
-    def __init__(self, cfg, trade_repo=None) -> None:
+    def __init__(self, cfg, trade_repo=None, paper: bool = False) -> None:
         self.min_start_equity = float(cfg.min_start_equity)
         self.pdt_threshold = float(cfg.pdt_equity_threshold)
         self.max_dt = int(cfg.max_day_trades_under_threshold)
         self.warn_at = int(cfg.day_trade_warn_at)
         self.cash_account = bool(cfg.cash_account)
         self.repo = trade_repo
+        #: in paper mode nothing is blocked - the counters/warnings are kept
+        #: purely so the operator can see what live trading *would* do.
+        self.paper = bool(paper)
 
     # ------------------------------------------------------------------ #
     def day_trades_last_5_sessions(self, account: Account) -> int:
@@ -64,6 +67,20 @@ class PdtGuard:
         used = self.day_trades_last_5_sessions(account)
         cap = 999 if (self.cash_account or account.equity >= self.pdt_threshold) else self.max_dt
         remaining = max(0, cap - used)
+
+        # Paper mode: never block. Still show the day-trade tally + a note so
+        # the operator learns where the live rules would bite.
+        if self.paper:
+            if potential_dt and used >= self.warn_at:
+                warnings.append(
+                    f"(paper) {used} day trades this rolling week - live, a "
+                    f"sub-$25k account would be capped at {self.max_dt}."
+                )
+            return PdtDecision(
+                allowed=True, reason="paper - no restrictions",
+                day_trades_used=used, day_trades_remaining=remaining,
+                warnings=warnings, is_potential_day_trade=potential_dt,
+            )
 
         # 1) hard equity floor
         if account.equity < self.min_start_equity:

@@ -83,7 +83,7 @@ class TokenManager:
         self.bus = bus
         self.on_reauth_required = on_reauth_required
 
-        self.broker = settings.secrets.broker
+        self.broker = settings.secrets.effective_live_broker
         self.token_path: Path = settings.secrets.token_path
         self.meta_path: Path = self.token_path.with_suffix(".meta.json")
         self.backup_dir: Path = self.token_path.parent / "backups"

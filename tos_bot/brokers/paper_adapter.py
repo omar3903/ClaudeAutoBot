@@ -9,13 +9,16 @@ has something real to count.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import threading
 import uuid
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import pandas as pd
 
+from ..config import PROJECT_ROOT
 from ..core.enums import AssetClass, OrderType, Side, TimeInForce
 from ..core.models import Account, Fill, OrderRequest, OrderResult, Position, Quote
 from ..data.market_data import MarketDataService, SyntheticProvider
@@ -23,6 +26,8 @@ from ..util import clock
 from .base import BrokerAdapter, OrderRejected
 
 log = logging.getLogger(__name__)
+
+_STATE_PATH = PROJECT_ROOT / "data" / "paper_state.json"
 
 
 class _Order:
@@ -56,13 +61,15 @@ class PaperBroker(BrokerAdapter):
 
     def __init__(
         self,
-        starting_cash: float = 2000.0,
+        starting_cash: float = 100000.0,
         data_service: Optional[MarketDataService] = None,
         slippage_bps: float = 2.0,
         commission_per_share: float = 0.0,
         commission_min: float = 0.0,
         margin_multiplier: float = 2.0,
         always_fill_marketable: bool = True,
+        persist: bool = True,
+        state_path: Optional[Path] = None,
     ) -> None:
         self._cash = float(starting_cash)
         self._start_equity = float(starting_cash)
@@ -72,6 +79,8 @@ class PaperBroker(BrokerAdapter):
         self.commission_min = commission_min
         self.margin_multiplier = margin_multiplier
         self.always_fill_marketable = always_fill_marketable
+        self.persist = persist
+        self.state_path = state_path or _STATE_PATH
 
         self._positions: Dict[str, Position] = {}
         self._orders: Dict[str, _Order] = {}
@@ -83,8 +92,55 @@ class PaperBroker(BrokerAdapter):
 
     # -- connection -------------------------------------------------- #
     def connect(self) -> None:
+        if self.persist:
+            self._load_state()
         self._connected = True
-        log.info("paper broker ready - cash $%.2f", self._cash)
+        log.info("paper broker ready - cash $%.2f, equity $%.2f, %d position(s)",
+                 self._cash, self.get_account().equity, len(self._positions))
+
+    # -- persistence ------------------------------------------------- #
+    def _load_state(self) -> None:
+        try:
+            if not self.state_path.exists():
+                return
+            s = json.loads(self.state_path.read_text())
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not read paper state (%s) - starting fresh", e)
+            return
+        self._cash = float(s.get("cash", self._cash))
+        self._start_equity = float(s.get("start_equity", self._start_equity))
+        self._realized_pl = float(s.get("realized_pl", 0.0))
+        self._round_trips = [dt.date.fromisoformat(d) for d in s.get("round_trips", [])]
+        self._opened_today = {k: dt.date.fromisoformat(v)
+                              for k, v in (s.get("opened_today", {}) or {}).items()}
+        self._positions = {}
+        for p in s.get("positions", []):
+            self._positions[p["symbol"]] = Position(
+                symbol=p["symbol"], quantity=float(p["quantity"]),
+                avg_price=float(p["avg_price"]),
+                asset_class=AssetClass(p.get("asset_class", "EQUITY")),
+            )
+
+    def _save_state(self) -> None:
+        if not self.persist:
+            return
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.state_path.write_text(json.dumps({
+                "cash": round(self._cash, 6),
+                "start_equity": round(self._start_equity, 2),
+                "realized_pl": round(self._realized_pl, 6),
+                "round_trips": [d.isoformat() for d in self._round_trips],
+                "opened_today": {k: v.isoformat() for k, v in self._opened_today.items()},
+                "positions": [
+                    {"symbol": p.symbol, "quantity": p.quantity,
+                     "avg_price": p.avg_price, "asset_class": p.asset_class.value}
+                    for p in self._positions.values() if abs(p.quantity) > 1e-9
+                ],
+                "updated": clock.now_ny().isoformat(),
+            }, indent=2))
+        except Exception:  # noqa: BLE001
+            log.debug("paper state save failed", exc_info=True)
 
     @property
     def is_connected(self) -> bool:
@@ -281,6 +337,7 @@ class PaperBroker(BrokerAdapter):
         )
         log.info("FILL %s %s %s @ %.4f (cash $%.2f, realised $%.2f)",
                  req.side.value, qty, req.symbol, price, self._cash, self._realized_pl)
+        self._save_state()
 
     # -- polling (call every few seconds from the engine) ------ #
     def poll(self) -> List[OrderResult]:
@@ -333,3 +390,4 @@ class PaperBroker(BrokerAdapter):
             self._realized_pl = 0.0
             self._round_trips.clear()
             self._opened_today.clear()
+            self._save_state()
