@@ -82,11 +82,24 @@ def test_dcf_multiple_vs_perpetuity_and_verdict():
     res = dcf_fair_value(fin, DcfInputs(projection_years=5, perpetuity_growth=0.025))
     assert res.ok
     assert res.price_multiple > 0 and res.price_perpetuity > 0
-    assert res.verdict in ("undervalued", "fairly_valued", "overvalued")
+    assert res.verdict in ("undervalued", "fairly_valued", "overvalued", "ambiguous")
     # cheap name should read undervalued
     assert res.verdict == "undervalued"
+    assert res.ufcf_method == "nopat"          # EBIT-based, per the book's Amazon model
+    assert res.methods_agree and res.disagreement_ratio >= 1.0
+    assert res.sensitivity and "perp_g_-1pct" in res.sensitivity
     # WACC in a sane band
     assert 0.04 <= res.wacc <= 0.20
+
+
+def test_dcf_ambiguous_when_methods_conflict():
+    # a rich, fast-grower: exit-multiple TV says fine, perpetuity says overvalued
+    fin = _fin(price=120.0, revenue=[2e9, 3e9, 4.5e9, 7e9],
+               ebitda=[0.2e9, 0.35e9, 0.6e9, 1.0e9], ttm_ebitda=1.1e9)
+    res = dcf_fair_value(fin, DcfInputs())
+    assert res.ok
+    if not res.methods_agree:
+        assert res.verdict == "ambiguous"
 
 
 def test_dcf_rich_name_overvalued():

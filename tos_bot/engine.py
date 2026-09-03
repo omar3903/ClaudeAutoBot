@@ -416,6 +416,11 @@ class TradingEngine:
                 "bracket_mode": plan.get("bracket_mode"),
                 "take_profit": p.primary_target, "stop_loss": p.stop,
                 "exit_manager": bool(self.settings.config.exit_manager.enabled),
+                "expected_hold": (
+                    f"~{p.expected_hold_typical:.0f} min (review after {p.expected_hold_max:.0f})"
+                    if p.timeframe.value == "INTRADAY"
+                    else f"~{p.expected_hold_typical:.0f} trading days (review after {p.expected_hold_max:.0f})"
+                ),
                 "est_cost": round(p.notional, 2), "est_risk": round(p.dollar_risk, 2),
                 "note": plan.get("note", ""),
                 "routes_to": ("SIMULATED (paper)" if self.broker.paper

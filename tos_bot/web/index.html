@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>tos-trader</title>
+  <title>AutoTradeBot</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <div id="reauth-banner" class="banner hidden"></div>
 
   <header class="topbar">
-    <div class="brand">tos&#8209;trader <span class="tag" id="mode-tag">suggest</span></div>
+    <div class="brand">AutoTradeBot</div>
     <div class="mode-switch" id="mode-switch" title="Paper = simulated fills on real data. Live = real orders.">
       <button class="seg" data-mode="paper">Paper</button>
       <button class="seg" data-mode="live">Live</button>
@@ -18,7 +18,8 @@
     <div class="statuses">
       <span class="pill" id="pill-market">market</span>
       <span class="pill" id="pill-data" title="Where quotes &amp; candles come from">data</span>
-      <span class="pill" id="pill-armed">armed</span>
+      <span class="pill hidden" id="pill-armed"
+        title="LIVE only: the engine will route orders you approve. It disarms if account equity falls below the configured floor ($2,000).">armed</span>
     </div>
     <div class="acct">
       <div><label>Equity</label><b id="a-equity">&ndash;</b></div>
@@ -46,6 +47,8 @@
           <label><input type="checkbox" id="f-short" checked /> Short</label>
           <label><input type="checkbox" id="f-intraday" checked /> Intraday</label>
           <label><input type="checkbox" id="f-swing" checked /> Swing</label>
+          <label><input type="checkbox" id="f-hide-done" /> Hide executed</label>
+          <select id="f-sector" class="mini-select"><option value="">All sectors</option></select>
           <span class="muted" id="scan-meta"></span>
         </div>
       </div>

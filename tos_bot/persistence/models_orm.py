@@ -54,6 +54,7 @@ class PlayLog(Base):
     )
     created_at: Mapped[dt.datetime] = mapped_column(sa.DateTime, default=_utcnow, index=True)
     symbol: Mapped[str] = mapped_column(sa.String(16), index=True)
+    sector: Mapped[str] = mapped_column(sa.String(40), default="")
     side: Mapped[str] = mapped_column(sa.String(8))
     strategy: Mapped[str] = mapped_column(sa.String(48), index=True)
     kind: Mapped[str] = mapped_column(sa.String(16))
@@ -86,6 +87,7 @@ class Trade(Base):
         sa.String(32), sa.ForeignKey("play_logs.id", ondelete="SET NULL"), nullable=True, index=True
     )
     symbol: Mapped[str] = mapped_column(sa.String(16), index=True)
+    sector: Mapped[str] = mapped_column(sa.String(40), default="")
     side: Mapped[str] = mapped_column(sa.String(8))
     strategy: Mapped[str] = mapped_column(sa.String(48), index=True)
     kind: Mapped[str] = mapped_column(sa.String(16))
@@ -106,6 +108,10 @@ class Trade(Base):
     initial_target_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
     hwm_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)  # favourable extreme
     managed_exit: Mapped[bool] = mapped_column(sa.Boolean, default=True)     # auto exit manager on?
+    #: expected-exit overwatch (informational only - never drives the stop)
+    expected_exit_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
+    overwatch_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True, index=True)
+    overdue_notified: Mapped[bool] = mapped_column(sa.Boolean, default=False)
 
     exit_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
     exit_time: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True, index=True)

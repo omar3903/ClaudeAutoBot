@@ -1,4 +1,4 @@
-/* tos-trader dashboard - vanilla JS, no build step. */
+/* AutoTradeBot dashboard - vanilla JS, no build step. */
 "use strict";
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -57,6 +57,9 @@ function handleEvent(topic, p) {
     case "exit.stop_moved":
       toast(`${p.symbol}: stop → ${num(p.new_stop)} (${num(p.r, 1)}R locked)`, "good");
       loadOpen(); break;
+    case "trade.overdue":
+      toast("⏰ " + (p.msg || `${p.symbol} exit is overdue`), p.winning ? "good" : "bad");
+      loadOpen(); break;
     case "play.decided":
       if (p.play) mergePlay(p.play);
       if (p.decision === "approved" && p.result && !p.result.ok)
@@ -84,10 +87,20 @@ function mergePlay(row) {
 const DONE = new Set(["ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED", "ERROR"]);
 const isDone = p => DONE.has(p.status);
 
+const SECTOR_SHORT = {
+  "Technology": "Tech", "Communication Services": "Comm", "Consumer Discretionary": "Cons Disc",
+  "Consumer Staples": "Cons Stpl", "Consumer Cyclical": "Cons Disc", "Consumer Defensive": "Cons Stpl",
+  "Healthcare": "Health", "Health Care": "Health", "Financial Services": "Financials",
+  "Financials": "Financials", "Industrials": "Industr", "Energy": "Energy",
+  "Utilities": "Utilities", "Basic Materials": "Materials", "Materials": "Materials",
+  "Real Estate": "Real Est",
+};
+const sectorTag = sec => sec
+  ? `<span class="sector" title="${escapeHtml(sec)}">${escapeHtml(SECTOR_SHORT[sec] || sec)}</span>` : "";
+
 /* ---------- top bar ---------- */
 function renderTop() {
   const s = STATE || {};
-  $("#mode-tag").textContent = s.app_mode || "suggest";
 
   // paper / live segmented toggle
   const live = s.live || {};
@@ -116,7 +129,10 @@ function renderTop() {
   $("#pill-data").title = s.data_is_real
     ? "Real quotes/candles from " + src
     : "Synthetic data — add SCHWAB_* keys (real-time) or install yfinance (delayed)";
-  setPill("#pill-armed", s.armed ? "armed" : "disarmed", s.armed ? "good" : "warn");
+  // "armed" only means something in LIVE mode (the $2k floor); hide it in paper
+  const armedEl = $("#pill-armed");
+  armedEl.classList.toggle("hidden", s.mode === "paper");
+  if (s.mode !== "paper") setPill("#pill-armed", s.armed ? "armed" : "disarmed", s.armed ? "good" : "bad");
 
   const a = s.account || {};
   $("#a-equity").textContent = usd(a.equity);
@@ -151,12 +167,22 @@ const shorten = (s, n) => s && s.length > n ? s.slice(0, n - 1) + "…" : s;
 /* ---------- plays table ---------- */
 function filtered() {
   const fL = $("#f-long").checked, fS = $("#f-short").checked,
-    fI = $("#f-intraday").checked, fW = $("#f-swing").checked;
+    fI = $("#f-intraday").checked, fW = $("#f-swing").checked,
+    hideDone = $("#f-hide-done").checked, sec = $("#f-sector").value;
   return PLAYS.filter(p =>
     (p.side === "LONG" ? fL : fS) &&
-    (p.timeframe === "INTRADAY" ? fI : fW));
+    (p.timeframe === "INTRADAY" ? fI : fW) &&
+    (!hideDone || !isDone(p)) &&
+    (!sec || p.sector === sec));
+}
+function syncSectorFilter() {
+  const sel = $("#f-sector"), cur = sel.value;
+  const secs = [...new Set(PLAYS.map(p => p.sector).filter(Boolean))].sort();
+  sel.innerHTML = `<option value="">All sectors</option>` +
+    secs.map(s => `<option value="${escapeHtml(s)}"${s === cur ? " selected" : ""}>${escapeHtml(SECTOR_SHORT[s] || s)}</option>`).join("");
 }
 function renderPlays() {
+  syncSectorFilter();
   const rows = filtered();
   $("#plays-count").textContent = rows.length ? `(${rows.length})` : "";
   $("#plays-empty").classList.toggle("hidden", rows.length > 0);
@@ -172,7 +198,7 @@ function renderPlays() {
       ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
       : `<span class="info-dot">i</span>`;
     tr.innerHTML = `
-      <td class="sym">${p.symbol}${p.extended_hours_ok ? '<span class="ext" title="can be entered pre/post-market">ext</span>' : ''}</td>
+      <td class="sym">${p.symbol} ${sectorTag(p.sector)}${p.extended_hours_ok ? '<span class="ext" title="can be entered pre/post-market">ext</span>' : ''}</td>
       <td><span class="side ${p.side}">${p.side}</span></td>
       <td>${p.strategy.replace(/_/g, " ")}</td>
       <td class="tf">${p.timeframe === "INTRADAY" ? "day" : "swing"}</td>
@@ -252,7 +278,7 @@ async function selectPlay(id) {
        </div>`;
 
   body.innerHTML = `
-    <h3>${p.symbol} <span class="side ${p.side}">${p.side}</span>${executed ? ' <span class="badge good">executed</span>' : ''}</h3>
+    <h3>${p.symbol} ${sectorTag(p.sector)} <span class="side ${p.side}">${p.side}</span>${executed ? ' <span class="badge good">executed</span>' : ''}</h3>
     <div class="sub">${p.strategy.replace(/_/g, " ")} · ${p.timeframe} · conf ${num(p.confidence, 2)} · score ${num(p.score, 2)} · session ${a.session}</div>
     ${sparkSvg(p.evidence && p.evidence.spark, p)}
     <div class="explain">${escapeHtml(p.explanation || p.rationale)}</div>
@@ -277,7 +303,8 @@ async function selectPlay(id) {
         <span>Est. risk</span><span>${usd(op.est_risk)}</span>
       </div>
       ${op.note ? `<div class="muted" style="margin:6px 0">${escapeHtml(op.note)}</div>` : ""}
-      <div class="exit-box"><b>Automatic exit strategy:</b> ${exitLine}</div>
+      <div class="exit-box"><b>Automatic exit strategy:</b> ${exitLine}<br>
+        <b>Expected hold:</b> ${op.expected_hold || "—"} — past that it's flagged for a manual look, the stop is untouched.</div>
       ${pdt.warnings && pdt.warnings.length ? `<ul class="warnings">${pdt.warnings.map(w => `<li>${escapeHtml(w)}</li>`).join("")}</ul>` : ""}
       <div class="kv"><span>Day trades used</span><span>${pdt.day_trades_used ?? "?"} (${pdt.day_trades_remaining ?? "?"} left)</span></div>
       ${confirmBlock}
@@ -297,15 +324,19 @@ function renderEvidence(ev) {
       `</table><div class="muted">mean gap ${sig.mean_gap_pct}% → ${sig.verdict.replace(/_/g," ")}</div>`);
   }
   if (ev.dcf) {
-    const d = ev.dcf, as = d.assumptions || {};
-    blocks.push(`<h4>DCF</h4><div class="kv">
+    const d = ev.dcf, as = d.assumptions || {}, s = d.sensitivity || {};
+    const disagree = d.disagreement_ratio && d.disagreement_ratio > 1
+      ? `<div class="muted">exit-multiple vs perpetuity disagree ${d.disagreement_ratio}x — ${d.methods_agree ? "same direction, OK" : "conflicting → DCF treated as ambiguous"}</div>` : "";
+    const sens = Object.keys(s).length
+      ? `<div class="muted">sensitivity — g&nbsp;±1%: ${num(s["perp_g_-1pct"])} / ${num(s["perp_g_+1pct"])}; exit&nbsp;±20%: ${num(s["exit_mult_-20%"])} / ${num(s["exit_mult_+20%"])}</div>` : "";
+    blocks.push(`<h4>DCF <span class="muted" style="font-weight:400">(UFCF: ${as.ufcf_method || "?"})</span></h4><div class="kv">
       <span>WACC</span><span>${(as.wacc * 100).toFixed(1)}%</span>
       <span>Cost of equity</span><span>${(as.cost_of_equity * 100).toFixed(1)}%</span>
       <span>Exit multiple</span><span>${as.exit_multiple}x</span>
       <span>Perpetuity g</span><span>${(as.perpetuity_growth * 100).toFixed(1)}%</span>
       <span>Price (multiple)</span><span>${num(d.price_multiple)}</span>
       <span>Price (perpetuity)</span><span>${num(d.price_perpetuity)}</span>
-      <span>Blended fair value</span><span>${num(d.price_blended)} (${pct(d.upside_blended_pct)})</span></div>`);
+      <span>Blended fair value</span><span>${num(d.price_blended)} (${pct(d.upside_blended_pct)})</span></div>${disagree}${sens}`);
   }
   if (ev.football_field && ev.football_field.rows) {
     const f = ev.football_field;
@@ -373,9 +404,22 @@ async function loadOpen() {
   const pos = (STATE.positions || []);
   const el = $("#tab-open");
   if (!trades.length) { el.innerHTML = `<p class="muted" style="padding:10px">No open positions.</p>`; return; }
-  el.innerHTML = `<table><thead><tr><th>Symbol</th><th>Side</th><th>Strategy</th><th>Order</th>
+
+  // sector concentration of the open book
+  const byS = {};
+  let tot = 0;
+  trades.forEach(t => {
+    const notl = Math.abs((t.quantity || 0) * (t.entry_price || 0));
+    byS[t.sector || "Unknown"] = (byS[t.sector || "Unknown"] || 0) + notl; tot += notl;
+  });
+  const exp = tot ? Object.entries(byS).sort((a, b) => b[1] - a[1])
+    .map(([s, v]) => `<b>${SECTOR_SHORT[s] || s}</b> ${Math.round(v / tot * 100)}%`).join(" · ") : "";
+
+  el.innerHTML = (exp ? `<div class="exposure">Exposure: ${exp}</div>` : "") +
+    `<table><thead><tr><th>Symbol</th><th>Side</th><th>Strategy</th><th>Order</th>
     <th class="num">Qty</th><th class="num">Entry</th><th class="num">Mark</th>
     <th class="num">Unrealized</th><th class="num">Stop</th><th class="num">Target</th>
+    <th title="held vs expected time to exit — informational, does not affect the stop">Age / Expected</th>
     <th class="num" title="max favourable / adverse excursion">MFE / MAE</th>
     <th title="automatic exit manager">Auto&nbsp;exit</th><th></th></tr></thead><tbody>${
     trades.map(t => {
@@ -385,8 +429,15 @@ async function loadOpen() {
       const stopCell = moved
         ? `<span title="moved from ${num(t.initial_stop_price)}">${num(t.stop_price)} ▲</span>`
         : num(t.stop_price);
-      return `<tr>
-        <td class="sym">${t.symbol}</td><td><span class="side ${t.side}">${t.side}</span></td>
+      const ts = t.time_status || "on_track";
+      const barCls = ts === "overdue" ? "bad" : ts === "aging" ? "warn" : "ok";
+      const pctW = Math.min(100, t.time_used_pct ?? 0);
+      const timeCell = `<div class="timecell">
+        <span>${t.held_label || "–"}</span>
+        <span class="timebar"><i class="${barCls}" style="width:${pctW}%"></i></span>
+        ${ts === "overdue" ? '<span class="badge bad">⏰ overdue</span>' : ts === "aging" ? '<span class="badge warn">aging</span>' : ''}</div>`;
+      return `<tr class="${ts === "overdue" ? "row-overdue" : ""}">
+        <td class="sym">${t.symbol} ${sectorTag(t.sector)}</td><td><span class="side ${t.side}">${t.side}</span></td>
         <td>${(t.strategy || "").replace(/_/g, " ")}</td>
         <td class="muted">${t.order_type || "—"}${t.order_session === "EXTENDED" ? " · ext" : ""}</td>
         <td class="num">${num(t.quantity, 0)}</td>
@@ -395,6 +446,7 @@ async function loadOpen() {
         <td class="num ${upl >= 0 ? "pl-pos" : "pl-neg"}">${usd(upl)}</td>
         <td class="num">${stopCell}</td>
         <td class="num">${num(t.target_price)}</td>
+        <td>${timeCell}</td>
         <td class="num muted">${usd(t.mfe)} / ${usd(t.mae == null ? null : -t.mae)}</td>
         <td><label class="switch"><input type="checkbox" data-managed="${t.id}" ${t.managed_exit ? "checked" : ""}><span></span></label></td>
         <td><button class="danger" data-close="${t.id}">Close</button></td></tr>`;
@@ -556,7 +608,7 @@ $("#btn-scan").onclick = async () => {
   toast("Scan queued", "good");
   setTimeout(() => $("#btn-scan").disabled = false, 4000);
 };
-$$("#f-long,#f-short,#f-intraday,#f-swing").forEach(c => c.onchange = renderPlays);
+$$("#f-long,#f-short,#f-intraday,#f-swing,#f-hide-done,#f-sector").forEach(c => c.onchange = renderPlays);
 
 $("#btn-strategies").onclick = async () => {
   const { strategies } = await api("/api/strategies");

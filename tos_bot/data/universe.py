@@ -123,7 +123,7 @@ class UniverseLoader:
 
             r = requests.get(
                 "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-                timeout=20, headers={"User-Agent": "tos-trader/0.1"},
+                timeout=20, headers={"User-Agent": "AutoTradeBot/0.1"},
             )
             r.raise_for_status()
             import re

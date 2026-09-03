@@ -27,6 +27,7 @@ class OpeningRangeBreakout(Strategy):
     key = "opening_range_breakout"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.INTRADAY
+    expected_hold = (45.0, 120.0)   # minutes
     title = "Opening-Range Breakout"
     thesis = (
         "The high and low of the first few minutes frame the day's early "
@@ -104,6 +105,7 @@ class VwapReclaim(Strategy):
     key = "vwap_reclaim"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.INTRADAY
+    expected_hold = (60.0, 150.0)   # minutes
     title = "VWAP Reclaim / Loss"
     thesis = (
         "VWAP is where the average buyer today sits. When price spends time "
@@ -172,6 +174,7 @@ class EmaPullbackTrend(Strategy):
     key = "ema_pullback_trend"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.INTRADAY
+    expected_hold = (75.0, 180.0)   # minutes
     title = "Trend Pullback to Moving Average"
     thesis = (
         "In an established intraday trend (fast EMA over slow EMA over the "
@@ -240,6 +243,7 @@ class Rsi2MeanReversion(Strategy):
     key = "rsi2_mean_reversion"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.SWING
+    expected_hold = (3.0, 7.0)      # trading days
     title = "RSI(2) Mean Reversion"
     thesis = (
         "Larry Connors' setup: in a security above its 200-day average, a "
@@ -307,6 +311,7 @@ class BollingerFade(Strategy):
     key = "bollinger_fade"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.SWING
+    expected_hold = (4.0, 9.0)      # trading days
     title = "Bollinger Band Fade"
     thesis = (
         "In a range-bound market (low ADX), a close outside the 2-sigma "
@@ -371,6 +376,7 @@ class AtrChannelBreakout(Strategy):
     key = "atr_channel_breakout"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.SWING
+    expected_hold = (7.0, 15.0)     # trading days
     title = "Keltner / ATR Channel Breakout"
     thesis = (
         "A close beyond an ATR-based channel around the 20-EMA, while ADX is "
@@ -432,6 +438,7 @@ class GapAndGo(Strategy):
     key = "gap_and_go"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.INTRADAY
+    expected_hold = (40.0, 120.0)   # minutes
     title = "Gap & Go"
     thesis = (
         "A stock that gaps meaningfully on a news catalyst and then holds "
@@ -498,6 +505,7 @@ class Week52Breakout(Strategy):
     key = "week52_breakout"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.SWING
+    expected_hold = (8.0, 20.0)     # trading days
     title = "52-Week High/Low Momentum"
     thesis = (
         "Pignataro (Ch. 12) uses the 52-week high/low as a valuation anchor; "

@@ -59,7 +59,7 @@ class Secrets(BaseSettings):
     database_url: str = ""
     db_host: str = "127.0.0.1"
     db_port: int = 3306
-    db_name: str = "tos_trader"
+    db_name: str = "autotradebot"
     db_user: str = "tos"
     db_password: str = ""
     db_allow_sqlite_fallback: bool = True
@@ -107,7 +107,7 @@ class Secrets(BaseSettings):
         )
 
     def sqlite_fallback_url(self) -> str:
-        return f"sqlite:///{(PROJECT_ROOT / 'data' / 'tos_trader.sqlite').as_posix()}"
+        return f"sqlite:///{(PROJECT_ROOT / 'data' / 'autotradebot.sqlite').as_posix()}"
 
 
 # --------------------------------------------------------------------------- #

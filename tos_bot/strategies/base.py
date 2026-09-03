@@ -110,6 +110,12 @@ class Strategy:
     #: may this setup be entered in pre/post-market too? (limit-only there)
     extended_hours_ok: bool = False
 
+    #: how long the trade is *expected* to take:  (typical, review-after).
+    #: units are MINUTES for INTRADAY setups, TRADING DAYS for SWING setups.
+    #: purely informational - it never touches the stop; it just flags a
+    #: position as "aging" / "overdue - eyeball it".
+    expected_hold = (4.0, 10.0)
+
     #: geometry guard rails - a play outside these is almost always bad data
     MAX_STOP_PCT = 0.25          # protective stop no further than 25% from entry
     MAX_TARGET_PCT = {"INTRADAY": 0.15, "SWING": 0.45}
@@ -169,6 +175,11 @@ class Strategy:
             or self.timeframe is Timeframe.SWING
             or any(t in ("gap", "catalyst") for t in tags)
         )
+        hold_typ, hold_max = self.expected_hold
+        # allow a per-strategy config override
+        hold_typ = float(self.params.get("hold_typical", hold_typ))
+        hold_max = float(self.params.get("hold_max", hold_max))
+
         explanation = self._compose_explanation(side, entry, stop, targets, rationale, detail)
         play = Play(
             symbol=ctx.symbol, side=side, strategy=self.key, kind=self.kind,
@@ -177,6 +188,7 @@ class Strategy:
             confidence=max(0.0, min(1.0, confidence)),
             rationale=rationale, explanation=explanation, evidence=evidence,
             tags=tags, asset_class=AssetClass.EQUITY, extended_hours_ok=ext_ok,
+            expected_hold_typical=hold_typ, expected_hold_max=hold_max,
             expires_at=ctx.now.astimezone(dt.timezone.utc) + dt.timedelta(minutes=ttl_minutes),
         )
         return play

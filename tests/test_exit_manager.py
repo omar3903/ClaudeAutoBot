@@ -16,6 +16,9 @@ class FakeRepo:
     def update_trade_risk(self, tid, **kw):
         self._t[tid].update({k: v for k, v in kw.items() if v is not None})
 
+    def note_overdue(self, tid):
+        self._t[tid]["overdue_notified"] = True
+
     def get_trade(self, tid):
         return dict(self._t[tid]) if tid in self._t else None
 
@@ -112,3 +115,20 @@ def test_disabled_does_nothing():
     em, ex = _mk(repo, price=50.0, cfg=cfg)
     em.run_once()
     assert not ex.closed
+
+
+def test_overdue_notifies_once_and_does_not_close():
+    repo = FakeRepo([_trade(time_status="overdue", overdue_notified=False,
+                            initial_stop_price=98.0, stop_price=98.0, target_price=110.0)])
+    ex = FakeExecutor(repo)
+    events = []
+    cfg = SimpleNamespace(enabled=True, breakeven_at_r=1.0, breakeven_buffer_bps=5,
+                          trail_start_r=1.5, trail_lock_ratio=0.5,
+                          flatten_intraday_before_close_min=10, max_swing_hold_days=0)
+    from tos_bot.core.models import Quote
+    em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=101, ask=101, last=101),
+                     cfg=cfg, bus=SimpleNamespace(publish=lambda topic, **k: events.append(topic)))
+    em.run_once()
+    em.run_once()
+    assert events.count("trade.overdue") == 1     # one-shot
+    assert not ex.closed                           # overdue never force-closes

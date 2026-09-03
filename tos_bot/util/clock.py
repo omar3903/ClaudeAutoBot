@@ -240,6 +240,49 @@ def next_trading_day(d: dt.date) -> dt.date:
     return d
 
 
+def add_trading_days(ts: dt.datetime, n: float) -> dt.datetime:
+    """`ts` + `n` trading days (fractional ok). Time-of-day is preserved; only
+    whole trading days are stepped, then the fractional part is added as a
+    fraction of a 6.5h session."""
+    ts = _as_ny(ts)
+    whole = int(n)
+    frac = n - whole
+    d = ts.date()
+    step = 1 if whole >= 0 else -1
+    for _ in range(abs(whole)):
+        d += dt.timedelta(days=step)
+        while not is_trading_day(d):
+            d += dt.timedelta(days=step)
+    out = dt.datetime.combine(d, ts.timetz())
+    return out + dt.timedelta(hours=6.5 * frac)
+
+
+def trading_days_between(a: dt.datetime, b: dt.datetime) -> float:
+    """Approximate number of trading days between two instants (>= 0 if b > a).
+    Whole trading dates in the open interval + a same-day fraction of a 6.5h
+    session. Good enough for an 'is this trade overdue' gauge."""
+    a, b = _as_ny(a), _as_ny(b)
+    if b < a:
+        return -trading_days_between(b, a)
+    n = 0
+    d = a.date()
+    while d < b.date():
+        d += dt.timedelta(days=1)
+        if is_trading_day(d):
+            n += 1
+    # subtract the un-elapsed part of the first day, add the elapsed part of last
+    day_sec = 6.5 * 3600
+    if is_trading_day(a.date()):
+        secs_after_open = max(0.0, (a - dt.datetime.combine(a.date(), OPEN, tzinfo=NY)).total_seconds())
+        n -= min(1.0, secs_after_open / day_sec) if a.date() != b.date() else 0.0
+    if is_trading_day(b.date()) and a.date() != b.date():
+        secs_after_open = max(0.0, (b - dt.datetime.combine(b.date(), OPEN, tzinfo=NY)).total_seconds())
+        n += min(1.0, secs_after_open / day_sec)
+    elif a.date() == b.date():
+        n = max(0.0, (b - a).total_seconds() / day_sec)
+    return round(max(0.0, n), 3)
+
+
 @lru_cache(maxsize=64)
 def last_n_sessions(anchor: dt.date, n: int) -> tuple:
     days: List[dt.date] = []

@@ -24,13 +24,77 @@ from .models_orm import (
 log = logging.getLogger(__name__)
 
 
+def _expected_exit_times(entry: dt.datetime, timeframe: str, typ: float, mx: float):
+    """(expected_exit_at, overwatch_at) as naive-UTC datetimes."""
+    if typ <= 0 and mx <= 0:
+        return None, None
+    entry_utc = entry if entry.tzinfo else entry.replace(tzinfo=dt.timezone.utc)
+    if timeframe == "INTRADAY":
+        exp = entry_utc + dt.timedelta(minutes=typ or mx)
+        ow = entry_utc + dt.timedelta(minutes=mx or (typ * 2))
+        # a day trade's overwatch can't run past the exit manager's EOD flatten
+        ny_close = clock.regular_close_time(clock.session_date(entry_utc))
+        close_utc = dt.datetime.combine(
+            clock.session_date(entry_utc), ny_close, tzinfo=clock.NY
+        ).astimezone(dt.timezone.utc)
+        exp = min(exp, close_utc)
+        ow = min(ow, close_utc)
+    else:
+        exp = clock.add_trading_days(entry_utc, typ or mx)
+        ow = clock.add_trading_days(entry_utc, mx or (typ * 2))
+    return exp.astimezone(dt.timezone.utc).replace(tzinfo=None), \
+        ow.astimezone(dt.timezone.utc).replace(tzinfo=None)
+
+
+def _time_status(t: Trade) -> Dict[str, Any]:
+    """How the trade is doing against its expected timeline (informational)."""
+    if not t.entry_time or t.status == "CLOSED":
+        return {}
+    now = dt.datetime.utcnow()
+    et = t.entry_time
+    held_min = max(0.0, (now - et).total_seconds() / 60.0)
+    intraday = t.timeframe == "INTRADAY"
+    held_str = (f"{held_min:.0f}m" if intraday
+                else _dhm((now - et)))
+    exp, ow = t.expected_exit_at, t.overwatch_at
+    used_pct = None
+    status = "on_track"
+    if exp and ow and ow > et:
+        span = (ow - et).total_seconds()
+        used_pct = round(max(0.0, (now - et).total_seconds()) / span * 100.0, 1) if span else None
+        if now >= ow:
+            status = "overdue"
+        elif now >= exp:
+            status = "aging"
+    return {
+        "held_label": held_str,
+        "expected_exit_at": exp.isoformat() if exp else None,
+        "overwatch_at": ow.isoformat() if ow else None,
+        "time_used_pct": used_pct,
+        "time_status": status,
+    }
+
+
+def _dhm(td: dt.timedelta) -> str:
+    s = int(td.total_seconds())
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m = s // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
 def _f(x) -> Optional[float]:
     return None if x is None else float(x)
 
 
 def trade_to_dict(t: Trade) -> Dict[str, Any]:
     return {
-        "id": t.id, "play_id": t.play_id, "symbol": t.symbol, "side": t.side,
+        "id": t.id, "play_id": t.play_id, "symbol": t.symbol,
+        "sector": getattr(t, "sector", "") or "", "side": t.side,
         "strategy": t.strategy, "kind": t.kind, "timeframe": t.timeframe, "broker": t.broker,
         "status": t.status, "quantity": _f(t.quantity),
         "entry_price": _f(t.entry_price),
@@ -42,6 +106,7 @@ def trade_to_dict(t: Trade) -> Dict[str, Any]:
         "initial_target_price": _f(getattr(t, "initial_target_price", None)),
         "hwm_price": _f(getattr(t, "hwm_price", None)),
         "managed_exit": bool(getattr(t, "managed_exit", True)),
+        "overdue_notified": bool(getattr(t, "overdue_notified", False)),
         "exit_price": _f(t.exit_price),
         "exit_time": t.exit_time.isoformat() if t.exit_time else None,
         "exit_reason": t.exit_reason, "fees": _f(t.fees),
@@ -50,6 +115,7 @@ def trade_to_dict(t: Trade) -> Dict[str, Any]:
         "is_day_trade": bool(t.is_day_trade),
         "session_date": t.session_date.isoformat() if t.session_date else None,
         "notes": t.notes,
+        **_time_status(t),
     }
 
 
@@ -57,7 +123,8 @@ def play_to_dict(p: PlayLog) -> Dict[str, Any]:
     return {
         "id": p.id, "scan_run_id": p.scan_run_id,
         "created_at": p.created_at.isoformat() if p.created_at else None,
-        "symbol": p.symbol, "side": p.side, "strategy": p.strategy, "kind": p.kind,
+        "symbol": p.symbol, "sector": getattr(p, "sector", "") or "",
+        "side": p.side, "strategy": p.strategy, "kind": p.kind,
         "timeframe": p.timeframe, "entry": _f(p.entry), "stop": _f(p.stop),
         "targets": p.targets, "reward_risk": _f(p.reward_risk),
         "confidence": _f(p.confidence), "score": _f(p.score),
@@ -121,14 +188,21 @@ class Repository:
                 log.warning("open_trade: %s already exists (%s) - ignoring repeat submit",
                             tid, existing.status)
                 return tid
+            exp_exit, overwatch = _expected_exit_times(
+                now, play.timeframe.value,
+                float(getattr(play, "expected_hold_typical", 0.0) or 0.0),
+                float(getattr(play, "expected_hold_max", 0.0) or 0.0),
+            )
             s.add(Trade(
-                id=tid, play_id=play.id, symbol=play.symbol, side=play.side.value,
+                id=tid, play_id=play.id, symbol=play.symbol,
+                sector=getattr(play, "sector", "") or "", side=play.side.value,
                 strategy=play.strategy, kind=play.kind.value, timeframe=play.timeframe.value,
                 broker=broker, status="OPEN", quantity=fill_qty, entry_price=fill_price,
                 entry_time=now, order_type=order_type, order_session=order_session,
                 stop_price=play.stop, target_price=play.primary_target,
                 initial_stop_price=play.stop, initial_target_price=play.primary_target,
                 hwm_price=fill_price, managed_exit=True, fees=commission,
+                expected_exit_at=exp_exit, overwatch_at=overwatch,
                 session_date=clock.session_date(),
                 is_day_trade=(play.timeframe.value == "INTRADAY"),
             ))
@@ -166,6 +240,12 @@ class Repository:
                 t.managed_exit = managed_exit
             if note_append:
                 t.notes = ((t.notes + " | ") if t.notes else "") + note_append
+
+    def note_overdue(self, trade_id: str) -> None:
+        with session_scope() as s:
+            t = s.get(Trade, trade_id)
+            if t and not t.overdue_notified:
+                t.overdue_notified = True
 
     def add_fill(self, trade_id: str, side: str, leg: str, qty: float, price: float,
                  commission: float = 0.0, broker_order_id: str = "") -> None:
@@ -337,7 +417,8 @@ class Repository:
 def _play_row(p: Play) -> PlayLog:
     return PlayLog(
         id=p.id, scan_run_id=p.scan_run_id, created_at=_naive(p.created_at),
-        symbol=p.symbol, side=p.side.value, strategy=p.strategy, kind=p.kind.value,
+        symbol=p.symbol, sector=getattr(p, "sector", "") or "",
+        side=p.side.value, strategy=p.strategy, kind=p.kind.value,
         timeframe=p.timeframe.value, entry=p.entry, stop=p.stop, targets=p.targets,
         reward_risk=p.reward_risk, confidence=p.confidence, score=p.score,
         suggested_qty=p.suggested_qty, dollar_risk=p.dollar_risk, notional=p.notional,

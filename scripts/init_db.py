@@ -33,7 +33,7 @@ def main() -> None:
     print(f"target: {DB.url}  ({DB.dialect})")
 
     if args.drop:
-        if input("really DROP every tos-trader table? type 'yes': ").strip() != "yes":
+        if input("really DROP every AutoTradeBot table? type 'yes': ").strip() != "yes":
             sys.exit("aborted")
         Base.metadata.drop_all(eng)
         print("dropped.")

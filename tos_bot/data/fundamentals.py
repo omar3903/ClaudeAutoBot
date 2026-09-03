@@ -218,8 +218,11 @@ class YFinanceFundamentals(FundamentalsProvider):
         if bs is not None and not getattr(bs, "empty", True):
             mi = _row(bs, "Minority Interest")
             pf = _row(bs, "Preferred Stock", "Preferred Securities Outside Stock Equity")
+            cl = _row(bs, "Capital Lease Obligations", "Finance Lease Liabilities",
+                      "Long Term Capital Lease Obligation")
             fin.minority_interest = mi[-1] if mi else 0.0
             fin.preferred_equity = pf[-1] if pf else 0.0
+            fin.capital_leases = cl[-1] if cl else 0.0
             if math.isnan(fin.total_debt):
                 td = _row(bs, "Total Debt")
                 fin.total_debt = td[-1] if td else math.nan

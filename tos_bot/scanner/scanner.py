@@ -83,6 +83,9 @@ class Scanner:
         self._cursor = 0
         self._last_account: Optional[Account] = None
 
+        from ..data.sectors import SectorLookup
+        self._sectors = SectorLookup(use_yfinance=self.md.is_real)
+
     # ------------------------------------------------------------------ #
     def set_account(self, account: Account) -> None:
         self._last_account = account
@@ -253,9 +256,18 @@ class Scanner:
                 except Exception as e:  # noqa: BLE001
                     run.errors[sym] = f"fundamentals: {e}"
 
-        # -- stage 4: size + rank + shortlist ------------------------ #
+        # -- stage 4: sector tag, size, rank, shortlist ------------- #
         acct = self._last_account
+        sector_by_sym: Dict[str, str] = {}
         for p in all_plays:
+            if p.symbol not in sector_by_sym:
+                ctx = ctx_by_sym.get(p.symbol)
+                known = getattr(getattr(ctx, "fundamentals", None), "sector", "") or ""
+                try:
+                    sector_by_sym[p.symbol] = self._sectors.get(p.symbol, known or None)
+                except Exception:  # noqa: BLE001
+                    sector_by_sym[p.symbol] = known
+            p.sector = sector_by_sym[p.symbol]
             if acct is not None:
                 try:
                     size_play(p, acct, self.settings.config.risk)

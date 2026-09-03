@@ -34,6 +34,7 @@ class ExitManager:
         self.cfg = cfg
         self.bus = bus
         self._closing: set = set()          # trade ids we've already sent a close for
+        self._overdue_seen: set = set()     # trade ids we've already flagged as overdue
 
     # ------------------------------------------------------------------ #
     def run_once(self) -> List[Dict[str, Any]]:
@@ -103,6 +104,21 @@ class ExitManager:
         hwm = t.get("hwm_price") or entry
         hwm = max(hwm, px) if side == "LONG" else min(hwm, px)
         self.repo.update_trade_risk(t["id"], hwm_price=hwm, mae=mae, mfe=mfe)
+
+        # --- 0. expected-exit overwatch (informational, never closes) ----- #
+        if (t.get("time_status") == "overdue" and not t.get("overdue_notified")
+                and t["id"] not in self._overdue_seen):
+            self._overdue_seen.add(t["id"])
+            self.repo.note_overdue(t["id"])
+            winning = mfe > 0.5 * risk_ps if risk_ps else fav > 0
+            self.bus.publish(
+                "trade.overdue", trade_id=t["id"], symbol=sym, r=round(r_now, 2),
+                held=t.get("held_label"), winning=bool(winning),
+                msg=(f"{sym} {side} is past its expected exit "
+                     f"({t.get('held_label')} held, {r_now:+.1f}R now) - "
+                     f"{'let it run or take the gain' if winning else 'review it'}."),
+            )
+            log.info("OVERDUE %s %s: %s held, %.1fR", sym, side, t.get("held_label"), r_now)
 
         managed = bool(t.get("managed_exit", True))
 

@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tos-trader"
+name = "autotradebot"
 version = "0.1.0"
-description = "Broker-agnostic, human-in-the-loop trading assistant (Schwab/tda-api, IBKR & crypto ready)"
+description = "AutoTradeBot - broker-agnostic, human-in-the-loop trading assistant (Schwab, IBKR & crypto ready)"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -26,7 +26,7 @@ headless-auth = ["playwright>=1.44", "keyring>=25.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [project.scripts]
-tos-trader = "run:main"
+autotradebot = "run:main"
 
 [tool.setuptools]
 packages = ["tos_bot"]

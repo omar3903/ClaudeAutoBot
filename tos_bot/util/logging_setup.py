@@ -38,7 +38,7 @@ def setup_logging(level: str = "INFO") -> None:
     root.addHandler(console)
 
     fileh = logging.handlers.RotatingFileHandler(
-        log_dir / "tos_trader.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8"
+        log_dir / "autotradebot.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8"
     )
     fileh.setFormatter(fmt)
     root.addHandler(fileh)

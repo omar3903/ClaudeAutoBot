@@ -1,5 +1,5 @@
 # ===========================================================================
-# tos-trader configuration.  Copy to  config/config.yaml  and tune.
+# AutoTradeBot configuration.  Copy to  config/config.yaml  and tune.
 # Anything secret (keys, passwords) belongs in .env, not here.
 # ===========================================================================
 
@@ -66,12 +66,18 @@ strategies:
 
 valuation:
   # Inputs to the DCF / WACC engine (Pignataro Ch. 9). Overridable per run.
-  risk_free_rate: 0.042                 # 10Y Treasury
-  market_risk_premium: 0.055            # historical S&P premium over risk-free
+  # Update rf from treasury.gov (use the 10-30y rate) and the MRP from
+  # Damodaran's page (pages.stern.nyu.edu/~adamodar/) - both cited in the book.
+  risk_free_rate: 0.042                 # 10-30Y US Treasury
+  market_risk_premium: 0.055            # implied US equity risk premium (Damodaran)
   tax_rate: 0.21
-  midyear_convention: true
+  midyear_convention: true             # book's Amazon example uses end-of-year; this is the banking default
   terminal_method: "both"              # multiple | perpetuity | both  (report the pair)
   projection_method: "last_year"       # one of the seven: conservative|aggressive|average|last_year|repeat_cycle|yoy_growth|pct_of_line
+  # UFCF is the NOPAT method (EBIT*(1-t) + D&A + def.tax + non-cash + dNWC - CapEx),
+  # matching the book's Amazon model; falls back to the net-income form then reported FCF.
+  # When the exit-multiple and perpetuity terminal values disagree by > 2.5x the DCF
+  # verdict is "ambiguous" and dcf_fair_value_gap sits out (the book's growth-stock case).
 
 auth:
   # "delete and get the authentication token every 60 days"
@@ -108,6 +114,6 @@ database:
   record_rejected_plays: true         # keep every suggestion, not just executed ones
 
 web:
-  title: "tos-trader"
+  title: "AutoTradeBot"
   theme: "dark"
   refresh_ms: 2000

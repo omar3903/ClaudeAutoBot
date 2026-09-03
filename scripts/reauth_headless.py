@@ -8,11 +8,11 @@ TokenManager when  auth.auto_reauth: headless.
 SETUP (once):
     pip install playwright keyring
     playwright install chromium
-    python -c "import keyring; keyring.set_password('tos-trader','schwab_username','YOUR_USER')"
-    python -c "import keyring; keyring.set_password('tos-trader','schwab_password','YOUR_PASS')"
+    python -c "import keyring; keyring.set_password('autotradebot','schwab_username','YOUR_USER')"
+    python -c "import keyring; keyring.set_password('autotradebot','schwab_password','YOUR_PASS')"
 
 SECURITY: this script - which YOU own and run - is the only place a password
-is handled, and only via your keyring. tos-trader's own code never sees it.
+is handled, and only via your keyring. AutoTradeBot's own code never sees it.
 Many brokers also require 2FA; if so, headless auth cannot complete and you
 should keep  auth.auto_reauth: notify  instead.
 """
@@ -40,10 +40,10 @@ def main() -> int:
         print("pip install playwright keyring  &&  playwright install chromium")
         return 2
 
-    user = keyring.get_password("tos-trader", "schwab_username")
-    pw = keyring.get_password("tos-trader", "schwab_password")
+    user = keyring.get_password("autotradebot", "schwab_username")
+    pw = keyring.get_password("autotradebot", "schwab_password")
     if not (user and pw):
-        print("keyring entries tos-trader/schwab_username|schwab_password not set")
+        print("keyring entries autotradebot/schwab_username|schwab_password not set")
         return 2
 
     try:

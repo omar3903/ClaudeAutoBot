@@ -42,7 +42,7 @@ def main() -> None:
                 pass
         threading.Thread(target=_open, daemon=True).start()
 
-    print(f"\n  tos-trader -> {url}\n")
+    print(f"\n  AutoTradeBot -> {url}\n")
     import uvicorn
 
     uvicorn.run("tos_bot.server.app:app", host=args.host, port=args.port,

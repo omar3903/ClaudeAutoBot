@@ -51,6 +51,7 @@ class RelativeValueComps(Strategy):
     key = "relative_value_comps"
     kind = StrategyKind.FUNDAMENTAL
     timeframe = Timeframe.SWING
+    expected_hold = (15.0, 35.0)    # trading days
     title = "Relative Value vs. Peers (Comps)"
     thesis = (
         "Comparable Company Analysis (Pignataro Ch. 8/10): value a company by "
@@ -131,6 +132,7 @@ class DcfFairValueGap(Strategy):
     key = "dcf_fair_value_gap"
     kind = StrategyKind.FUNDAMENTAL
     timeframe = Timeframe.SWING
+    expected_hold = (20.0, 45.0)    # trading days
     title = "DCF Fair-Value Gap"
     thesis = (
         "Discounted Cash Flow (Pignataro Ch. 9): project unlevered free cash "
@@ -161,8 +163,8 @@ class DcfFairValueGap(Strategy):
             margin_of_safety=float(self.params["mos"]),
         )
         res = dcf_fair_value(fin, inp)
-        if not res.ok or res.verdict == "fairly_valued":
-            return []
+        if not res.ok or res.verdict in ("fairly_valued", "ambiguous"):
+            return []      # "ambiguous" = the two terminal-value methods disagree
         price = ctx.price
         fair = res.price_blended
 
@@ -205,6 +207,7 @@ class ValuationFootballField(Strategy):
     key = "valuation_football_field"
     kind = StrategyKind.FUNDAMENTAL
     timeframe = Timeframe.SWING
+    expected_hold = (18.0, 40.0)    # trading days
     title = "Football-Field Fair-Value Band"
     thesis = (
         "Pignataro's Conclusion (Ch. 12): overlay every method - 52-week "

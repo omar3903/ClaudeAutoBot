@@ -1,11 +1,18 @@
-# ThinkOrSwim/Schwab AutoTrading Bot
+# AutoTradeBot
 
-A **broker-agnostic, human-in-the-loop** trading assistant for a small account.
+A **broker-agnostic, human-in-the-loop** trading assistant for a small account
+(TD Ameritrade / thinkorswim &rarr; Schwab, with Interactive Brokers and crypto
+adapters stubbed in).
 
 It scans the Nasdaq every few minutes, ranks a short list of names, and shows
-**long / short "plays"** with a plain-English explanation on hover. Nothing is
-ever routed to a broker until you click **Execute ✓ Yes**. Every idea and every
-executed trade (with its realised P/L) is written to MySQL.
+**long / short "plays"** with a plain-English explanation on hover and the
+stock's **sector** next to the ticker. Nothing is ever routed to a broker until
+you click **Execute ✓ Yes**. Approved trades then run an **automatic exit
+strategy** (stop / target / break-even / trailing / end-of-day flatten) with no
+further input, and each one carries an **expected time-to-exit** so a position
+that overstays its welcome gets flagged for a manual look. Every idea and every
+executed trade (with its realised P/L) is written to MySQL or a local SQLite
+file.
 
 - **Paper ↔ Live toggle:** flip the whole app between a **paper** account
   (simulated fills against *real* market data, starts at **$100,000**, no
@@ -181,7 +188,7 @@ auth:
 **Unattended check on Windows** (Task Scheduler, every 6 h):
 
 ```bat
-schtasks /Create /TN "tos-trader token" /SC HOURLY /MO 6 ^
+schtasks /Create /TN "AutoTradeBot token" /SC HOURLY /MO 6 ^
   /TR "\"%CD%\.venv\Scripts\python.exe\" \"%CD%\scripts\authenticate.py\" --check" /F
 ```
 
@@ -256,6 +263,20 @@ blotter (`POST /api/trades/{id}/managed`) if you want to hand-manage one.
 Tune everything in `config/config.yaml → exit_manager` (`enabled: false`
 turns it off entirely).
 
+### Expected time-to-exit (overwatch)
+
+Every strategy declares how long its trade *should* take — minutes for
+intraday setups, trading days for swing/valuation ones (`Strategy.expected_hold`,
+overridable per strategy with `params.hold_typical` / `hold_max`). At fill,
+that's turned into `expected_exit_at` and `overwatch_at` on the trade (via the
+trading-day calendar, capped at the close for day trades).
+
+The blotter shows an **Age / Expected** bar per position — green while on
+track, amber once past the typical hold (**aging**), red once past the review
+threshold (**⏰ overdue**) — and you get a one-time toast when a trade goes
+overdue, noting its current R so you can tell "let it run" from "get out". This
+is **purely informational**: it never moves the stop or closes anything.
+
 ---
 
 ## Dashboard controls
@@ -296,7 +317,7 @@ Hover any play in the UI for its thesis; the **Strategies** button lists them al
 | key | book chapter | idea |
 |---|---|---|
 | `relative_value_comps` | Ch. 8 & 10 | EV/EBITDA, P/E, EV/Sales vs the **peer median**. Consistently cheaper ⇒ long; richer ⇒ short. Target = re-rate to the peer multiple. |
-| `dcf_fair_value_gap` | Ch. 9 | project UFCF (`NI + D&A + deferred tax + SBC + ΔWC − CapEx + A/T net interest`), discount at **WACC** (CAPM cost of equity `rf + β·MRP`), terminal value **both** ways — exit multiple **and** Gordon perpetuity `UFCF·(1+g)/(WACC−g)` — mid-year convention. Blended per-share vs price, beyond a margin of safety. |
+| `dcf_fair_value_gap` | Ch. 9 | project UFCF — **NOPAT method** `EBIT·(1−t) + D&A + deferred tax + non-cash + ΔNWC − CapEx` (the book's Amazon model; falls back to the net-income form, then reported FCF) — discount at **WACC** (CAPM `rf + β·MRP`, debt weight includes leases), terminal value **both** ways: exit multiple **and** Gordon perpetuity `UFCF·(1+g)/(WACC−g)`. Blended per-share vs price beyond a margin of safety; a `sensitivity` grid (g ±1 %, exit ±20 %) rides along. When the two terminal values disagree by > 2.5× — the growth-stock case the book calls out — the verdict is **`ambiguous`** and this strategy sits out. |
 | `valuation_football_field` | Ch. 12 | overlay 52-week range + comps range + both DCF ranges into one low/high band. Price below the band ⇒ long to the band edge / weighted fair value; above ⇒ short. |
 
 The seven projection methods (Ch. 1) are in `tos_bot/valuation/projections.py`.

@@ -37,7 +37,7 @@ def create_app() -> FastAPI:
         finally:
             engine.stop()
 
-    app = FastAPI(title="tos-trader", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="AutoTradeBot", version="0.1.0", lifespan=lifespan)
 
     def eng(app_: FastAPI) -> TradingEngine:
         return app_.state.engine

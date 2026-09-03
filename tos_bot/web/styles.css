@@ -33,11 +33,8 @@ label{color:var(--muted)}
   background:var(--bg2); border-bottom:1px solid var(--line); flex-wrap:wrap;
 }
 .brand{font-weight:700; font-size:15px; letter-spacing:.3px}
-.tag{
-  font-size:10px; text-transform:uppercase; letter-spacing:.8px; color:var(--accent2);
-  border:1px solid var(--accent2); border-radius:5px; padding:1px 6px; margin-left:6px;
-}
 .statuses{display:flex; gap:8px}
+.mini-select{background:var(--bg3); border:1px solid var(--line); color:var(--fg); border-radius:6px; padding:2px 6px; font:inherit; font-size:12px}
 .mode-switch{display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden}
 .mode-switch .seg{background:var(--bg3); color:var(--muted); border:none; border-radius:0; padding:6px 14px; font-weight:600}
 .mode-switch .seg:hover{filter:none; color:var(--fg)}
@@ -99,6 +96,9 @@ tbody tr.done:hover{opacity:.9}
 .badge.good{color:var(--ok); border-color:#1c3a24}
 .badge.bad{color:var(--short); border-color:#3a1c1c}
 .ext{font-size:9px; margin-left:4px; padding:1px 4px; border-radius:4px; background:#20304a; color:var(--accent); text-transform:uppercase; letter-spacing:.5px; vertical-align:middle}
+.sector{font-size:9.5px; padding:1px 5px; border-radius:4px; background:var(--bg3); border:1px solid var(--line); color:var(--muted); vertical-align:middle; white-space:nowrap}
+.exposure{font-size:11px; color:var(--muted); padding:6px 4px 2px}
+.exposure b{color:var(--fg); font-weight:600}
 .exit-box{background:#0f2119; border:1px solid #1c3a24; border-radius:8px; padding:9px 11px; margin:10px 0; font-size:12px; color:#9fd7ad}
 .switch{position:relative; display:inline-block; width:34px; height:18px; cursor:pointer}
 .switch input{opacity:0; width:0; height:0}
@@ -106,6 +106,11 @@ tbody tr.done:hover{opacity:.9}
 .switch span:before{content:""; position:absolute; width:12px; height:12px; left:2px; top:2px; background:var(--muted); border-radius:50%; transition:.15s}
 .switch input:checked + span{background:#16351f; border-color:#1c3a24}
 .switch input:checked + span:before{transform:translateX(16px); background:var(--ok)}
+.timecell{display:flex; align-items:center; gap:6px; white-space:nowrap; font-size:11px}
+.timebar{display:inline-block; width:52px; height:5px; background:var(--bg3); border-radius:3px; overflow:hidden}
+.timebar>i{display:block; height:100%}
+.timebar>i.ok{background:var(--ok)} .timebar>i.warn{background:var(--warn)} .timebar>i.bad{background:var(--short)}
+tr.row-overdue{box-shadow:inset 3px 0 0 var(--short)}
 
 /* ---- detail panel ---- */
 .detail h3{font-size:15px; margin-bottom:2px}

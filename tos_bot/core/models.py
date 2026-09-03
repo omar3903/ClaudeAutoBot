@@ -208,8 +208,12 @@ class Play:
     evidence: Dict[str, Any] = field(default_factory=dict)
     tags: List[str] = field(default_factory=list)
     asset_class: AssetClass = AssetClass.EQUITY
+    sector: str = ""                     # GICS sector of the underlying
     #: may this idea be entered in the pre / post-market session too?
     extended_hours_ok: bool = False
+    #: expected time to exit (minutes if intraday, trading days if swing)
+    expected_hold_typical: float = 0.0
+    expected_hold_max: float = 0.0
 
     # sizing hints (filled by the risk module)
     suggested_qty: int = 0
@@ -246,6 +250,7 @@ class Play:
         return {
             "id": self.id,
             "symbol": self.symbol,
+            "sector": self.sector,
             "side": self.side.value,
             "strategy": self.strategy,
             "kind": self.kind.value,
@@ -264,6 +269,9 @@ class Play:
             "dollar_risk": round(self.dollar_risk, 2),
             "notional": round(self.notional, 2),
             "extended_hours_ok": self.extended_hours_ok,
+            "expected_hold_typical": self.expected_hold_typical,
+            "expected_hold_max": self.expected_hold_max,
+            "expected_hold_unit": "min" if self.timeframe is Timeframe.INTRADAY else "d",
             "status": self.status.value,
             "trade_id": self.trade_id,
             "created_at": self.created_at.isoformat(),

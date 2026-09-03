@@ -96,7 +96,11 @@ class DcfResult:
 
     upside_blended_pct: float = math.nan
     verdict: str = "no_data"
+    ufcf_method: str = ""                    # "nopat" | "net_income" | "reported_fcf"
+    disagreement_ratio: float = math.nan     # price_multiple / price_perpetuity (>=1)
+    methods_agree: bool = True                # do both TV methods lean the same way?
     assumptions: Dict[str, float] = field(default_factory=dict)
+    sensitivity: Dict[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, object]:
         d = self.__dict__.copy()
@@ -109,28 +113,38 @@ class DcfResult:
 # --------------------------------------------------------------------------- #
 #  Core                                                                      #
 # --------------------------------------------------------------------------- #
-def _base_ufcf(fin: Financials, tax_rate: float) -> float:
-    ni = fin.last(fin.net_income)
-    da = fin.last(fin.dep_amort)
-    dtx = fin.last(fin.deferred_tax) if fin.deferred_tax else 0.0
-    sbc = fin.last(fin.sbc) if fin.sbc else 0.0
-    dwc = fin.last(fin.change_in_wc) if fin.change_in_wc else 0.0
-    capex = fin.last(fin.capex) if fin.capex else 0.0         # negative already
-    intr = fin.last(fin.interest_expense) if fin.interest_expense else 0.0
+def _base_ufcf(fin: Financials, tax_rate: float):
+    """Unlevered free cash flow, returned as (value, method).
 
+    Primary = the NOPAT method Pignataro's Amazon model actually uses
+    (Ch. 9, Table 9.3):
+        EBIT x (1 - tax) + D&A + deferred taxes + other non-cash + dNWC - CapEx
+    Fallbacks, in order: the net-income form (Ch. 9 p. 292 "simplified"),
+    then the provider's reported free cash flow.
+    """
     def z(x):
         return 0.0 if (x is None or math.isnan(x)) else float(x)
 
-    ni, da, dtx, sbc, dwc = map(z, (ni, da, dtx, sbc, dwc))
-    capex, intr = z(capex), abs(z(intr))
-    # capex sign: treat as an outflow regardless of source convention
-    capex_out = -abs(capex)
-    at_net_interest = intr * (1.0 - tax_rate)
-    if math.isnan(ni) or ni == 0.0:
-        # fall back to yfinance's freeCashflow if the statement build failed
-        if not math.isnan(fin.ttm_fcf):
-            return float(fin.ttm_fcf)
-    return ni + da + dtx + sbc + dwc + capex_out + at_net_interest
+    da = z(fin.last(fin.dep_amort))
+    dtx = z(fin.last(fin.deferred_tax)) if fin.deferred_tax else 0.0
+    sbc = z(fin.last(fin.sbc)) if fin.sbc else 0.0
+    dwc = z(fin.last(fin.change_in_wc)) if fin.change_in_wc else 0.0
+    capex_out = -abs(z(fin.last(fin.capex))) if fin.capex else 0.0
+
+    ebit = fin.ttm_ebit if not math.isnan(fin.ttm_ebit) else fin.last(fin.ebit)
+    if (ebit is None or math.isnan(ebit)) and not math.isnan(fin.ttm_ebitda) and da:
+        ebit = fin.ttm_ebitda - da
+    if ebit is not None and not math.isnan(ebit) and ebit != 0.0:
+        return ebit * (1.0 - tax_rate) + da + dtx + sbc + dwc + capex_out, "nopat"
+
+    ni = fin.last(fin.net_income)
+    intr = abs(z(fin.last(fin.interest_expense))) if fin.interest_expense else 0.0
+    if ni is not None and not math.isnan(ni) and ni != 0.0:
+        return ni + da + dtx + sbc + dwc + capex_out + intr * (1.0 - tax_rate), "net_income"
+
+    if not math.isnan(fin.ttm_fcf):
+        return float(fin.ttm_fcf), "reported_fcf"
+    return math.nan, "none"
 
 
 def _discount_periods(n: int, midyear: bool) -> List[float]:
@@ -147,7 +161,9 @@ def dcf_fair_value(fin: Financials, inp: DcfInputs) -> DcfResult:
     price = fin.price
     mc = fin.market_cap if not math.isnan(fin.market_cap) else price * shares
     net_debt = fin.net_debt
-    debt_value = max(0.0, fin.total_debt if not math.isnan(fin.total_debt) else 0.0)
+    # WACC debt weight = ST debt + LT debt + capital/finance leases (Pignataro p.317)
+    debt_value = max(0.0, (0.0 if math.isnan(fin.total_debt) else fin.total_debt)
+                     + (0.0 if math.isnan(fin.capital_leases) else fin.capital_leases))
 
     # --- cost of capital ------------------------------------------------ #
     beta = fin.beta if not math.isnan(fin.beta) else 1.1
@@ -164,7 +180,7 @@ def dcf_fair_value(fin: Financials, inp: DcfInputs) -> DcfResult:
     r.wacc, r.cost_of_equity, r.cost_of_debt = w, ke, kd
 
     # --- project UFCF ------------------------------------------------- #
-    base = _base_ufcf(fin, tax)
+    base, r.ufcf_method = _base_ufcf(fin, tax)
     r.base_ufcf = base
     if math.isnan(base) or base == 0.0:
         r.reason = "no usable free cash flow"
@@ -199,7 +215,9 @@ def dcf_fair_value(fin: Financials, inp: DcfInputs) -> DcfResult:
         cur_ev = enterprise_value(mc, net_debt, fin.minority_interest,
                                   fin.preferred_equity, fin.capital_leases)
         exit_mult = (cur_ev / cur_ebitda) if (cur_ebitda and cur_ebitda > 0) else 10.0
-        exit_mult = min(max(exit_mult, 4.0), 30.0)
+        # book uses the current market multiple; cap it so a 60x growth name
+        # doesn't produce a nonsense terminal value
+        exit_mult = min(max(exit_mult, 4.0), 45.0)
     final_ebitda = (cur_ebitda or 0.0) * (1.0 + (growth if base > 0 else 0.0)) ** inp.projection_years
 
     g = min(inp.perpetuity_growth, w - 0.01)
@@ -231,18 +249,54 @@ def dcf_fair_value(fin: Financials, inp: DcfInputs) -> DcfResult:
     r.price_blended = sum(prices) / len(prices)
     r.upside_blended_pct = (r.price_blended / price - 1.0) * 100.0 if price else math.nan
 
+    # --- do the two terminal-value methods agree? ------------------- #
+    # (Pignataro Ch. 9/12: for growth names the multiple method over-states and
+    #  the perpetuity method under-states - when they diverge a lot the DCF is
+    #  ambiguous and should not drive a confident call.)
+    if len(prices) == 2 and min(prices) > 0:
+        r.disagreement_ratio = round(max(prices) / min(prices), 2)
+        pm_dir = 1 if r.price_multiple >= price else -1
+        pp_dir = 1 if r.price_perpetuity >= price else -1
+        r.methods_agree = (pm_dir == pp_dir) and r.disagreement_ratio <= 2.5
+    else:
+        r.disagreement_ratio = 1.0
+        r.methods_agree = True
+
     mos = inp.margin_of_safety
-    if r.price_blended >= price * (1.0 + mos):
+    if not r.methods_agree:
+        r.verdict = "ambiguous"            # DCF inconclusive - strategy won't trade it
+    elif r.price_blended >= price * (1.0 + mos):
         r.verdict = "undervalued"          # long
     elif r.price_blended <= price * (1.0 - mos):
         r.verdict = "overvalued"           # short
     else:
         r.verdict = "fairly_valued"
+
+    # --- sensitivity (assumption swings, football-field style) ----- #
+    def _px_perp(gg):
+        tv = final_ufcf * (1.0 + gg) / (w - gg) if w > gg else math.nan
+        return _price(tv / disc_last) if not math.isnan(tv) else math.nan
+
+    def _px_mult(mm):
+        tv = final_ebitda * mm if final_ebitda > 0 else math.nan
+        return _price(tv / disc_last) if not math.isnan(tv) else math.nan
+
+    def _r2(x):
+        return round(x, 2) if (x is not None and not math.isnan(x)) else None
+
+    r.sensitivity = {
+        "perp_g_-1pct": _r2(_px_perp(max(0.0, g - 0.01))),
+        "perp_g_+1pct": _r2(_px_perp(min(w - 0.005, g + 0.01))),
+        "exit_mult_-20%": _r2(_px_mult(exit_mult * 0.8)),
+        "exit_mult_+20%": _r2(_px_mult(exit_mult * 1.2)),
+    }
+
     r.ok = True
     r.assumptions = {
         "beta": round(beta, 2), "tax_rate": round(tax, 3),
         "cost_of_equity": round(ke, 4), "cost_of_debt": round(kd, 4),
         "wacc": round(w, 4), "ufcf_growth": round(growth, 4),
+        "ufcf_method": r.ufcf_method,
         "perpetuity_growth": round(g, 4), "exit_multiple": round(exit_mult, 2),
         "projection_years": inp.projection_years,
         "midyear_convention": inp.midyear_convention,

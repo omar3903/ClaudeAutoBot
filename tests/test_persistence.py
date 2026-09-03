@@ -11,7 +11,21 @@ def _play(**kw):
     d.update(kw)
     p = Play(**d)
     p.suggested_qty = 10
+    p.expected_hold_typical = kw.get("expected_hold_typical", 60.0)
+    p.expected_hold_max = kw.get("expected_hold_max", 120.0)
     return p
+
+
+def test_expected_exit_times_recorded(repo):
+    p = _play(symbol="TIMED", timeframe=Timeframe.SWING,
+              expected_hold_typical=5.0, expected_hold_max=12.0)
+    repo.record_play(p)
+    tid = repo.open_trade(p, 100.0, 3, "paper")
+    t = repo.get_trade(tid)
+    assert t["expected_exit_at"] and t["overwatch_at"]
+    assert t["overwatch_at"] > t["expected_exit_at"]
+    assert t["time_status"] == "on_track"          # just opened
+    assert t["held_label"]
 
 
 def test_trade_lifecycle_and_pnl(repo):
