@@ -224,19 +224,31 @@ class MarketDataService:
         providers: Optional[List[PriceProvider]] = None,
         cache: bool = True,
         min_interval_between_calls: float = 0.15,
+        negative_cache_seconds: float = 1800.0,
     ) -> None:
         if providers is None:
-            providers = []
+            # Real feed if we have one, otherwise the synthetic demo feed - but
+            # NEVER both. Mixing them silently fabricates data for symbols the
+            # real feed can't return (e.g. a delisted ticker), which then turns
+            # into a fake "play". Offline demo only when yfinance is absent.
             yfp = YFinanceProvider()
-            if yfp.available:
-                providers.append(yfp)
-            providers.append(SyntheticProvider())
+            providers = [yfp] if yfp.available else [SyntheticProvider()]
         self.providers = providers
         self.cache = cache
         self._lock = threading.Lock()
         self._last_call = 0.0
         self._min_gap = min_interval_between_calls
         self._mem: Dict[str, tuple] = {}
+        self._neg: Dict[str, float] = {}          # symbol -> ts of last "no data"
+        self._neg_ttl = negative_cache_seconds
+
+    @property
+    def is_real(self) -> bool:
+        return any(getattr(p, "name", "") != "synthetic" for p in self.providers)
+
+    def _neg_hit(self, symbol: str) -> bool:
+        ts = self._neg.get(symbol)
+        return ts is not None and (time.time() - ts) < self._neg_ttl
 
     # -- cache plumbing --------------------------------------------- #
     def _key(self, symbol: str, interval: str, lookback_days: int, ext: bool) -> str:
@@ -289,6 +301,8 @@ class MarketDataService:
             cached = self._read_cache(key, ttl)
             if cached is not None:
                 return cached
+        if self._neg_hit(symbol):
+            raise RuntimeError(f"{symbol}: no data (negative-cached)")
 
         last_err: Optional[Exception] = None
         for prov in self.providers:
@@ -303,12 +317,15 @@ class MarketDataService:
             except Exception as e:  # noqa: BLE001
                 last_err = e
                 log.debug("provider %s failed for %s: %s", prov.name, symbol, e)
+        self._neg[symbol] = time.time()          # don't hammer a dead ticker
         raise RuntimeError(f"no market data for {symbol}: {last_err}")
 
     def get_daily(self, symbol: str, lookback_days: int = 400) -> pd.DataFrame:
         return self.get_price_history(symbol, "1d", lookback_days)
 
     def get_quote(self, symbol: str) -> Quote:
+        if self._neg_hit(symbol):
+            raise RuntimeError(f"{symbol}: no data (negative-cached)")
         last_err: Optional[Exception] = None
         for prov in self.providers:
             try:

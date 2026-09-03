@@ -59,13 +59,16 @@ class TradingEngine:
         init_db()
         self.repo = Repository()
 
-        # market data: (live broker) -> yfinance -> synthetic
-        providers = []
+        # market data feed: a real feed if we have one, else the synthetic demo
+        # feed - never both (see MarketDataService). A live broker, if it
+        # connects, is prepended in start().
         yfp = YFinanceProvider()
-        if yfp.available:
-            providers.append(yfp)
-        providers.append(SyntheticProvider())
-        self.md = MarketDataService(providers=providers)
+        self.md = MarketDataService(
+            providers=[yfp] if yfp.available else [SyntheticProvider()]
+        )
+        if not yfp.available:
+            log.warning("yfinance not installed - running on SYNTHETIC data. "
+                        "`pip install yfinance` for real (delayed) quotes.")
 
         self.fundamentals = YFinanceFundamentals()
         self.strategies = build_enabled_strategies(self.settings)

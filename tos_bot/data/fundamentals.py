@@ -157,7 +157,8 @@ class YFinanceFundamentals(FundamentalsProvider):
 
     # -------------------------------------------------------------- #
     def get(self, symbol: str) -> Financials:
-        if symbol in self._cache and time.time() - self._cache[symbol].as_of < 6 * 3600:
+        # fundamentals barely move intraday; cache hard to spare the yfinance quota
+        if symbol in self._cache and time.time() - self._cache[symbol].as_of < 12 * 3600:
             return self._cache[symbol]
         fin = Financials(symbol=symbol)
         if not self._ok:

@@ -28,10 +28,15 @@ risk:
 
 scanner:
   interval_seconds: 300                # rescan cadence ("every few minutes")
-  universe: "nasdaq"                   # nasdaq | nasdaq100 | sp500 | file
+  # nasdaq | nasdaq100 | sp500 | file
+  # "nasdaq" (the full ~4500 names) is only practical with an entitled real-time
+  # feed (Schwab). On the free yfinance feed use nasdaq100 / sp500 / file so a
+  # cycle finishes in a minute and does not get rate-limited.
+  universe: "nasdaq100"
   universe_file: "config/watchlist.txt"
-  shortlist_size: 6                    # how many names to focus on each cycle
-  max_symbols_scanned: 600             # hard cap per cycle to respect rate limits
+  shortlist_size: 8                    # how many names to focus on each cycle
+  max_symbols_scanned: 110            # cap per cycle (>= universe size => full sweep)
+  fundamentals_leaders: 8            # run the valuation strategies on this many top names
   prefilter:
     min_price: 3.0
     max_price: 600.0

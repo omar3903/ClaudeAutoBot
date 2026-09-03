@@ -138,10 +138,11 @@ class RiskCfg(_Model):
 
 class ScannerCfg(_Model):
     interval_seconds: int = 300
-    universe: str = "nasdaq"
+    universe: str = "nasdaq100"
     universe_file: str = "config/watchlist.txt"
-    shortlist_size: int = 6
-    max_symbols_scanned: int = 600
+    shortlist_size: int = 8
+    max_symbols_scanned: int = 110
+    fundamentals_leaders: int = 8
     prefilter: Dict[str, Any] = Field(default_factory=dict)
     bars: Dict[str, Any] = Field(default_factory=dict)
 

@@ -14,9 +14,9 @@ python-dateutil>=2.9
 pytz>=2024.1
 tenacity>=8.2            # retry/backoff for API calls
 
-# --- persistence (MySQL primary, SQLite fallback for dev) ---
+# --- persistence (SQLite works out of the box; MySQL optional) ---
 SQLAlchemy>=2.0
-PyMySQL>=1.1             # pure-python MySQL driver, no C build needed
+PyMySQL>=1.1             # only needed if you point DATABASE_URL at MySQL
 cryptography>=42.0       # Fernet encryption for the OAuth token file
 
 # --- web dashboard ---
@@ -29,8 +29,8 @@ websockets>=12.0
 yfinance>=0.2.40         # free fundamentals + backup price history
 requests>=2.31
 
-# --- brokerage adapters (install the one you use) ---
-schwab-py>=1.4           # LIVE adapter (successor to tda-api, same author)
+# --- brokerage adapters (NOT needed for paper mode - install when going live) ---
+# schwab-py>=1.4         # LIVE adapter: pip install schwab-py   (pin a version you've tested)
 # tda-api>=1.6           # legacy / reference only - TD Ameritrade API is decommissioned
 # ib_async>=1.0          # Interactive Brokers (later)
 # ccxt>=4.3              # crypto exchanges (later)

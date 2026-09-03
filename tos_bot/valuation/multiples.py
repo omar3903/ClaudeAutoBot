@@ -127,7 +127,13 @@ def relative_value_signal(
         tv, pv = getattr(target, fld), getattr(peer_median, fld)
         if math.isnan(tv) or math.isnan(pv) or pv <= 0 or tv <= 0:
             continue
-        gap = tv / pv - 1.0            # +0.30 => target 30% richer than peers
+        ratio = tv / pv
+        # a 10x-in-either-direction gap almost always means broken / non-
+        # comparable inputs (near-zero earnings blow P/E up). Drop it rather
+        # than let it dominate the blend.
+        if ratio > 8.0 or ratio < 0.125:
+            continue
+        gap = ratio - 1.0             # +0.30 => target 30% richer than peers
         gaps.append(gap)
         rows.append({"multiple": label, "target": round(tv, 2),
                      "peer_median": round(pv, 2), "gap_pct": round(gap * 100, 1)})

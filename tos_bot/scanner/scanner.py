@@ -149,7 +149,10 @@ class Scanner:
         with ThreadPoolExecutor(max_workers=8) as ex:
             for sym, cand, daily, quote, err in ex.map(_prefilter, slice_syms):
                 if err:
-                    run.errors[sym] = err
+                    # "no data" for a ticker (delisted, halted, not on the feed)
+                    # is routine, not an error worth surfacing.
+                    if "no data" not in err and "no market data" not in err and "no quote" not in err:
+                        run.errors[sym] = err
                     continue
                 if cand is not None:
                     cands.append(cand)
@@ -164,18 +167,37 @@ class Scanner:
         all_plays: List[Play] = []
         cand_by_sym = {c.symbol: c for c in cands}
 
+        # intraday setups need a *live* session - skip them when the market is
+        # closed (their "intraday" bars would just be yesterday's tail).
+        intraday_ok = clock.is_market_open()
+        active_tech = [s for s in self.tech
+                       if s.timeframe.value != "INTRADAY" or intraday_ok]
+        if not intraday_ok:
+            log.info("market closed - running %d swing setups only (skipping intraday)",
+                     len(active_tech))
+
+        # when the market is closed, skip the per-symbol intraday fetch entirely
+        # (no intraday setups run, and a daily sparkline is fine for swings)
+        need_intraday = intraday_ok
+
         def _run_tech(sym: str):
             try:
                 daily = daily_cache[sym]
-                intr = self.md.get_price_history(sym, intraday_iv, intraday_days)
-                q = quote_cache.get(sym) or self.md.get_quote(sym)
+                intr = daily
+                if need_intraday:
+                    try:
+                        intr = self.md.get_price_history(sym, intraday_iv, intraday_days)
+                    except Exception:  # noqa: BLE001
+                        intr = daily            # fall back to daily; swing setups don't care
+                q = quote_cache.get(sym) or None
                 ctx = build_context(
                     sym, intr, daily, q, params={"valuation": _valuation_params(self.settings)},
                     account_equity=equity,
                 )
-                spark = [round(float(x), 3) for x in intr["close"].tail(60).tolist()]
+                src = intr if intr is not daily else daily
+                spark = [round(float(x), 3) for x in src["close"].tail(60).tolist()]
                 out: List[Play] = []
-                for strat in self.tech:
+                for strat in active_tech:
                     try:
                         for p in strat.generate(ctx):
                             p.scan_run_id = run.run_id
@@ -193,7 +215,7 @@ class Scanner:
             futs = [ex.submit(_run_tech, c.symbol) for c in cands[: int(sc.max_symbols_scanned)]]
             for fut in as_completed(futs):
                 sym, plays, ctx, err = fut.result()
-                if err:
+                if err and "no data" not in err and "no market data" not in err:
                     run.errors[sym] = err
                 if ctx is not None:
                     ctx_by_sym[sym] = ctx
@@ -201,7 +223,9 @@ class Scanner:
 
         # -- stage 3: fundamentals for the leaders -------------------- #
         if self.fundamental and self.fund is not None:
-            leaders = _leaders_for_fundamentals(cands, all_plays, limit=max(12, sc.shortlist_size * 3))
+            n_leaders = int(getattr(sc, "fundamentals_leaders", 8) or 8)
+            peer_n = 6
+            leaders = _leaders_for_fundamentals(cands, all_plays, limit=n_leaders)
             for sym in leaders:
                 try:
                     ctx = ctx_by_sym.get(sym)
@@ -209,7 +233,7 @@ class Scanner:
                         continue
                     ctx.fundamentals = self.fund.get(sym)
                     if ctx.fundamentals and ctx.fundamentals.has_min_data():
-                        peer_syms = self.fund.peers(sym, limit=8)
+                        peer_syms = self.fund.peers(sym, limit=peer_n)
                         ctx.peers = [self.fund.get(p) for p in peer_syms]
                     spark = []
                     try:
