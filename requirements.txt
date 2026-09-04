@@ -29,10 +29,10 @@ websockets>=12.0
 yfinance>=0.2.40         # free fundamentals + backup price history
 requests>=2.31
 
-# --- brokerage adapters (NOT needed for paper mode - install when going live) ---
-# schwab-py>=1.4         # LIVE adapter: pip install schwab-py   (pin a version you've tested)
+# --- brokerage adapters (NOT needed for the built-in simulator) ---
+ib_async>=1.0.3         # Interactive Brokers, via a running IB Gateway / TWS (Python 3.10+)
+# schwab-py>=1.4         # Schwab live adapter: pip install schwab-py   (pin a tested version)
 # tda-api>=1.6           # legacy / reference only - TD Ameritrade API is decommissioned
-# ib_async>=1.0          # Interactive Brokers (later)
 # ccxt>=4.3              # crypto exchanges (later)
 
 # --- optional: unattended token re-authentication ---

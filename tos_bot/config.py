@@ -38,7 +38,7 @@ class Secrets(BaseSettings):
         case_sensitive=False,
     )
 
-    broker: str = "paper"            # "paper" | "schwab" | "tda" | "ibkr" | "crypto"
+    broker: str = "paper"            # "paper" | "schwab" | "ibkr" | "tda" | "crypto"
     live_broker: str = "schwab"      # which live broker the paper<->live toggle targets
 
     # Schwab
@@ -46,6 +46,17 @@ class Secrets(BaseSettings):
     schwab_app_secret: str = ""
     schwab_callback_url: str = "https://127.0.0.1:8182"
     schwab_account_id: str = ""
+
+    # Interactive Brokers (via ib_async -> IB Gateway / TWS; no OAuth token).
+    # The Paper/Live toggle picks the port: paper 4002, live 4001 (Gateway).
+    ibkr_host: str = "127.0.0.1"
+    ibkr_paper_port: int = 4002       # IB Gateway paper  (TWS paper = 7497)
+    ibkr_live_port: int = 4001        # IB Gateway live   (TWS live  = 7496)
+    ibkr_port: int = 0               # non-zero = force this port for BOTH modes
+    ibkr_client_id: int = 11         # any int unique to this app on the Gateway
+    ibkr_account_id: str = ""        # DUxxxxxxx (paper) / Uxxxxxxx (live); blank = first
+    ibkr_market_data: str = "auto"   # auto | live | delayed | delayed-frozen
+    ibkr_readonly: bool = False      # true = connect for data only, never send orders
 
     # Legacy TDA (reference only)
     tda_api_key: str = ""
