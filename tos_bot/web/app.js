@@ -134,10 +134,15 @@ function renderTop() {
     ? mk.label + (mk.next_holiday ? `\nNext holiday: ${mk.next_holiday.name} (${mk.next_holiday.date})` : "")
     : "";
   const src = (s.data_source || "?").replace("broker:", "");
-  setPill("#pill-data", "data: " + src, s.data_is_real ? "good" : "warn");
-  $("#pill-data").title = s.data_is_real
-    ? "Real quotes/candles from " + src
-    : "Synthetic data — add SCHWAB_* keys (real-time) or install yfinance (delayed)";
+  const mkt = (s.live || {}).market_data;
+  const delayed = mkt === "delayed" || src === "yfinance";
+  setPill("#pill-data", "data: " + src + (mkt === "delayed" ? " (delayed)" : ""),
+    (s.data_is_real && !delayed) ? "good" : s.data_is_real ? "warn" : "warn");
+  $("#pill-data").title = !s.data_is_real
+    ? "Synthetic data — start IB Gateway, add SCHWAB_* keys, or install yfinance"
+    : mkt === "delayed"
+      ? "IBKR delayed (~15 min) — no market-data subscription. Real fills, delayed prices."
+      : "Real-time quotes/candles from " + src;
   // "armed" only means something in LIVE mode (the $2k floor); hide it in paper
   const armedEl = $("#pill-armed");
   armedEl.classList.toggle("hidden", s.mode === "paper");
@@ -157,9 +162,19 @@ function renderTop() {
   pe.style.color = today > 0 ? "var(--long)" : today < 0 ? "var(--short)" : "var(--fg)";
 
   const tok = s.token || {};
-  if (s.mode === "paper") {
+  const ib = (s.live || {}).ibkr_session;
+  if (ib) {
+    // IBKR: no token — show the Gateway session instead
+    const cls = ib.connected ? "good" : ib.reconnecting ? "warn" : "bad";
+    setPill("#pill-token", "IBKR " + ib.mode + (ib.connected ? " ●" : ib.reconnecting ? " ↻" : " ✕"), cls);
+    $("#pill-token").title = ib.message
+      + `\nport ${ib.port} · ${ib.market_data} data`
+      + (ib.account ? ` · ${ib.account}` : "")
+      + (ib.connected ? "" : "\nStart IB Gateway / IBC — it auto-reconnects.");
+    if (!ib.connected && !ib.reconnecting) showReauth({ ibkr: ib });
+  } else if (s.mode === "paper") {
     setPill("#pill-token", "paper acct", "good");
-    $("#pill-token").title = "Paper account — no OAuth token needed";
+    $("#pill-token").title = "Simulator — no OAuth token needed";
   } else {
     setPill("#pill-token", "token: " + (tok.message ? shorten(tok.message, 24) : "ok"),
       tok.needs_reauth ? "bad" : tok.needs_rotation ? "warn" : "good");
@@ -555,6 +570,12 @@ function toast(text, cls) {
 function showReauth(p) {
   const b = $("#reauth-banner");
   b.classList.remove("hidden");
+  if (p.ibkr) {
+    b.innerHTML = `<span>⚠ IB Gateway session is down — ${escapeHtml(p.ibkr.message || "not connected")}.</span>
+      <span class="muted">Start IB Gateway / IBC. The bot reconnects on its own once it's up
+      (port ${p.ibkr.port}).</span>`;
+    return;
+  }
   b.innerHTML = `<span>⚠ Broker token needs re-authentication ${
     p.status && p.status.message ? "— " + escapeHtml(p.status.message) : ""}.</span>
     <button id="btn-reauth">Re-authenticate</button>

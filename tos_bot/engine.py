@@ -171,17 +171,62 @@ class TradingEngine:
             self._paper_broker.connect()
         return self._paper_broker
 
+    def _ibkr_port(self) -> int:
+        """Which IBKR port this mode wants: paper 4002 / live 4001 (Gateway),
+        unless IBKR_PORT pins one for both."""
+        sec = self.settings.secrets
+        if sec.ibkr_port:
+            return int(sec.ibkr_port)
+        return int(sec.ibkr_live_port if self.mode == "live" else sec.ibkr_paper_port)
+
     def _ensure_live_broker(self) -> Optional[BrokerAdapter]:
-        """Build + connect the live broker once. Also used as the top market-
-        data provider even while trading on paper."""
-        if self._live_broker is not None:
-            return self._live_broker
+        """Build + connect the venue adapter. It doubles as the top market-data
+        provider in **both** modes. For IBKR the paper/live *port* differs, so
+        this rebuilds when the mode changed."""
         self._live_blockers = []
         if not self.live_name:
             self._live_blockers.append("no live broker configured (BROKER / LIVE_BROKER in .env)")
             return None
 
         sec = self.settings.secrets
+
+        # ---- Interactive Brokers: no token, auth is the running Gateway ---- #
+        if self.live_name == "ibkr":
+            want_port = self._ibkr_port()
+            if self._live_broker is not None:
+                if int(getattr(self._live_broker, "port", 0)) == want_port and self._live_broker.is_connected:
+                    return self._live_broker
+                try:
+                    self._live_broker.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._live_broker = None
+            try:
+                from .brokers.ibkr_adapter import port_is_open
+            except Exception:  # noqa: BLE001
+                port_is_open = lambda *_a, **_k: True  # noqa: E731
+            if not port_is_open(sec.ibkr_host, want_port):
+                self._live_blockers.append(
+                    f"IB Gateway / TWS not reachable on {sec.ibkr_host}:{want_port} "
+                    f"({'live' if self.mode == 'live' else 'paper'}). Start it (or IBC) "
+                    f"with the API enabled. Guide: python scripts/ibkr_setup.py"
+                )
+                return None
+            try:
+                b = get_broker("ibkr", token_manager=self.token_manager,
+                               port=want_port, mode=self.mode)
+                b.connect()
+                self._live_broker = b
+                log.info("IBKR connected (%s, port %s)", self.mode, want_port)
+                return b
+            except Exception as e:  # noqa: BLE001
+                self._live_blockers.append(str(e))
+                log.warning("IBKR unavailable: %s", e)
+                return None
+
+        # ---- token brokers (Schwab / TDA) -------------------------------- #
+        if self._live_broker is not None:
+            return self._live_broker
         if self.live_name == "schwab" and not (sec.schwab_api_key and sec.schwab_app_secret):
             self._live_blockers.append("SCHWAB_API_KEY / SCHWAB_APP_SECRET missing in .env")
         if self.live_name in ("schwab", "tda") and not sec.token_path.exists():
@@ -203,7 +248,11 @@ class TradingEngine:
             return None
 
     def _bind_trading_broker(self) -> None:
-        """Point the executor + PDT guard at the broker for the current mode."""
+        """Point the executor + PDT guard at the broker for the current mode.
+
+        paper mode: IBKR's own paper account if that Gateway is up, else the
+        built-in simulator. live mode: the live venue, else fall back to paper.
+        """
         if self.mode == "live":
             lb = self._ensure_live_broker()
             self._trading_broker = lb or self._ensure_paper_broker()
@@ -211,10 +260,15 @@ class TradingEngine:
                 self.mode = "paper"
                 log.warning("falling back to paper - live broker not ready: %s",
                             "; ".join(self._live_blockers))
+        elif self.live_name == "ibkr":
+            # paper mode + IBKR configured -> trade the DU paper account directly
+            ib_paper = self._ensure_live_broker()
+            self._trading_broker = ib_paper or self._ensure_paper_broker()
         else:
             self._trading_broker = self._ensure_paper_broker()
 
-        is_paper = self._trading_broker.paper
+        # the paper/live TOGGLE is the source of truth for "is this real money"
+        is_paper = self.mode == "paper"
         self.pdt = PdtGuard(self.settings.config.account, trade_repo=self.repo, paper=is_paper)
         if self.executor is None:
             self.executor = Executor(self._trading_broker, self.repo,
@@ -229,17 +283,27 @@ class TradingEngine:
             cfg=self.settings.config.exit_manager, bus=BUS,
         )
 
+    def _sync_data_feed(self) -> None:
+        """Make the connected venue adapter the top market-data provider (real
+        exchange quotes/candles), dropping any stale broker provider first. The
+        IBKR paper/live port changes on a mode switch, so re-do this then."""
+        self.md.providers = [p for p in self.md.providers
+                             if not isinstance(p, _BrokerProvider)]
+        lb = self._live_broker
+        if lb is not None and lb.is_connected:
+            self.md.providers.insert(0, _BrokerProvider(lb))
+            log.info("market data feed: %s (real%s)", lb.name,
+                     ", delayed" if getattr(lb, "_data_is_delayed", False) else "")
+
     # ------------------------------------------------------------------ #
     def start(self) -> None:
         log.info("engine starting  (mode=%s, live_target=%s, app_mode=%s)",
                  self.mode, self.live_name, self.settings.config.app.mode)
 
-        # a Schwab client (if creds exist) becomes the top data feed in BOTH
-        # modes, so paper fills happen against real quotes.
-        lb = self._ensure_live_broker()
-        if lb is not None and lb.is_connected:
-            self.md.providers.insert(0, _BrokerProvider(lb))
-            log.info("market data feed: %s (real)", lb.name)
+        # the venue adapter (Schwab creds / a running IB Gateway) becomes the
+        # top data feed in BOTH modes, so paper fills happen against real quotes.
+        self._ensure_live_broker()
+        self._sync_data_feed()
 
         self._bind_trading_broker()
         self._refresh_account()
@@ -257,7 +321,9 @@ class TradingEngine:
             self.token_manager, broker_provider=lambda: self._live_broker,
             interval_s=self.settings.config.auth.check_interval_seconds,
         )
-        if self._live_broker is not None:
+        # IBKR / crypto have no OAuth token; the IBKR adapter self-heals its
+        # socket, so the token watchdog is a no-op there.
+        if self._live_broker is not None and self.live_name not in ("ibkr", "crypto"):
             self._auth_watchdog.start()
 
         BUS.publish("engine.started", state=self.snapshot())
@@ -337,6 +403,12 @@ class TradingEngine:
     def _snapshot_loop(self) -> None:
         while not self._stop.is_set():
             try:
+                # nudge IBKR back up if its Gateway session dropped (daily restart)
+                if self.live_name == "ibkr" and self._live_broker is not None:
+                    try:
+                        self._live_broker.refresh_if_needed()
+                    except Exception:  # noqa: BLE001
+                        pass
                 self._refresh_account()
                 if self._account:
                     self.repo.snapshot_account(
@@ -394,8 +466,8 @@ class TradingEngine:
 
     def _check_arm(self) -> None:
         acc = self._account
-        if self.broker.paper:
-            self._armed = True                      # paper has no equity floor
+        if self.mode == "paper":
+            self._armed = True                      # paper (sim or IBKR paper) has no equity floor
             return
         floor = self.settings.config.account.min_start_equity
         if acc and acc.equity >= floor:
@@ -561,10 +633,13 @@ class TradingEngine:
         return {"ok": True, "state": snap}
 
     def reconcile_paper(self) -> Dict[str, Any]:
-        """Rebuild the paper broker's positions from the OPEN trades in the
-        database - fixes any drift (e.g. from a double-submit)."""
-        if not self.broker.paper:
-            return {"ok": False, "reason": "only available in paper mode"}
+        """Rebuild the built-in simulator's positions from the OPEN trades in
+        the database - fixes drift (e.g. from a double-submit)."""
+        if not getattr(self._trading_broker, "paper", False):
+            return {"ok": False, "reason": (
+                "reconcile only applies to the built-in simulator. You're trading "
+                "the IBKR paper account - it keeps its own book." if self.live_name == "ibkr"
+                else "only available in paper (simulator) mode")}
         pb = self._ensure_paper_broker()
         from .core.models import Position
         book: Dict[str, list] = {}
@@ -604,13 +679,13 @@ class TradingEngine:
         with self._switch_lock:
             if mode == self.mode:
                 return {"ok": True, "mode": self.mode, "note": "already in that mode"}
-            if mode == "live":
-                if self._ensure_live_broker() is None:
-                    return {"ok": False, "reason": "live broker not ready",
-                            "blockers": self._live_blockers}
             prev = self.mode
-            self.mode = mode
-            self._bind_trading_broker()
+            self.mode = mode                       # set first: IBKR picks its port from this
+            self._bind_trading_broker()            # may knock mode back to "paper" if live isn't ready
+            if mode == "live" and self.mode != "live":
+                return {"ok": False, "reason": "live broker not ready",
+                        "blockers": self._live_blockers}
+            self._sync_data_feed()                 # IBKR paper<->live is a different port/feed
             self._save_runtime()
             self._refresh_account()
             self._check_arm()
@@ -621,6 +696,12 @@ class TradingEngine:
                              else "Back to simulated fills on real data.")}
 
     def reset_paper(self, cash: Optional[float] = None) -> Dict[str, Any]:
+        if not getattr(self._trading_broker, "paper", False):
+            return {"ok": False, "reason": (
+                "you're trading the IBKR paper account - reset its balance from "
+                "IBKR's Client Portal (Settings -> Paper Trading Account), not here."
+                if self.live_name == "ibkr" and self.mode == "paper"
+                else "not in simulator mode")}
         pb = self._ensure_paper_broker()
         amount = float(cash) if cash is not None else self.settings.config.account.paper_start_cash
         pb.reset(amount)  # type: ignore[attr-defined]
@@ -662,15 +743,29 @@ class TradingEngine:
 
     def snapshot(self) -> Dict[str, Any]:
         acc = self._account
-        paper = self.broker.paper if self._trading_broker else True
+        paper = self.mode == "paper"
         pnl = {}
         try:
             pnl = self.repo.pnl_summary()
         except Exception:  # noqa: BLE001
             pass
-        tok = ({"exists": True, "broker": "paper", "message": "paper - no token",
-                "needs_reauth": False} if paper
-               else self.token_manager.status().as_dict())
+        # IBKR has no OAuth token - report its Gateway session instead
+        ib_sess = None
+        if self.live_name == "ibkr" and self._live_broker is not None:
+            try:
+                ib_sess = self._live_broker.session_status()
+            except Exception:  # noqa: BLE001
+                ib_sess = None
+        if ib_sess is not None:
+            tok = {"exists": ib_sess["connected"], "broker": "ibkr",
+                   "message": ib_sess["message"],
+                   "needs_reauth": not ib_sess["connected"] and not ib_sess["reconnecting"],
+                   "ibkr": ib_sess}
+        elif paper:
+            tok = {"exists": True, "broker": "paper", "message": "paper - no token",
+                   "needs_reauth": False}
+        else:
+            tok = self.token_manager.status().as_dict()
         data_src = self.md.providers[0].name if self.md.providers else "none"
         em = self.settings.config.exit_manager
         return {
@@ -698,8 +793,15 @@ class TradingEngine:
                 "available": bool(self.live_name),
                 "ready": self._live_broker is not None and self._live_broker.is_connected,
                 "blockers": self._live_blockers,
-                "account_hint": (self.settings.secrets.schwab_account_id[-4:]
-                                 if self.settings.secrets.schwab_account_id else None),
+                "is_ibkr": self.live_name == "ibkr",
+                "ibkr_session": ib_sess,
+                "market_data": (ib_sess["market_data"] if ib_sess else
+                                ("delayed" if data_src == "yfinance" else
+                                 "live" if data_src not in ("synthetic", "none") else "none")),
+                "account_hint": (
+                    (ib_sess.get("account") or "")[-4:] if ib_sess and ib_sess.get("account")
+                    else self.settings.secrets.schwab_account_id[-4:]
+                    if self.settings.secrets.schwab_account_id else None),
             },
             "account": {
                 "equity": round(acc.equity, 2) if acc else None,

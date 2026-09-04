@@ -24,14 +24,18 @@ Analysis of the Financial Markets*** (horizontal S/R, oscillator divergence,
 volume confirmation) and **Pignataro, *Financial Modeling and Valuation*** (the
 DCF / comps overlay).
 
-- **Paper ↔ Live toggle:** flip the whole app between a **paper** account
-  (simulated fills against *real* market data, starts at **$100,000**, no
-  equity floor) and **live** Schwab from a switch in the dashboard header —
-  no restart, no `.env` edit. Schwab has no sandbox of its own, so this is
-  how you paper-trade a Schwab workflow.
-- **Data + brokerage:** a `BrokerAdapter` abstraction with a live **Schwab**
-  adapter (`schwab-py`), a legacy `tda-api` reference adapter, **Interactive
-  Brokers** and **crypto** stubs, and the **paper** adapter above.
+- **Paper ↔ Live toggle:** flip the whole app between **paper** and **live**
+  from a switch in the dashboard header — no restart, no `.env` edit. With
+  **Interactive Brokers** as the venue, paper mode routes to your real IBKR
+  **paper account** (port 4002) and live to your real account (4001); the
+  built-in $100k simulator is the offline fallback.
+- **Data + brokerage:** a `BrokerAdapter` abstraction with a full **Interactive
+  Brokers** adapter (`ib_async` → IB Gateway / TWS, live *and* paper, real
+  exchange quotes/volume/history, native bracket orders, auto-reconnect on the
+  daily Gateway restart), a **Schwab** adapter (`schwab-py`), a legacy
+  `tda-api` reference adapter, a **crypto** stub, and the **paper** simulator.
+  IBKR has **no OAuth token / no 60-day expiry** — "auth" is the Gateway
+  session; hands-off login is [IBC](https://github.com/IbcAlpha/IBC).
 - **Strategies:** 13 technical day-trade / swing setups (Aziz's ABCD, bull/bear
   flag, VWAP, opening-range, red-to-green, top/bottom reversal, horizontal S/R;
   Murphy/Connors divergence & mean-reversion) + 3 valuation setups from
@@ -101,19 +105,21 @@ cash/positions back to a balance you choose (trade history is kept).
 The paper account **persists** to `data/paper_state.json`, so it keeps
 tracking across restarts.
 
-**Data:** if you add the `SCHWAB_*` keys and authenticate, the app uses
-Schwab real-time quotes/candles **even in paper mode**. Otherwise it uses
-`yfinance` (delayed ~15 min) or, if that isn't installed, a deterministic
-synthetic feed. The header shows which (`data: schwab` / `yfinance` /
-`synthetic`).
+**Data:** with a running IB Gateway (or the `SCHWAB_*` keys) the app uses that
+venue's real quotes/candles **in both modes**. Otherwise it uses `yfinance`
+(delayed ~15 min) or, if that isn't installed, a deterministic synthetic feed.
+The header shows which (`data: broker:ibkr` / `schwab` / `yfinance` /
+`synthetic`), and whether the IBKR feed is real-time or `delayed` (no
+market-data subscription).
 
 ### Paper ↔ Live switch
 
-The header has a **Paper / Live** toggle. **Live** is greyed until the
-`SCHWAB_*` block is filled and `python scripts/authenticate.py` has run;
-switching to it pops a confirmation and, from then on, approved orders go to
-your **real Schwab account** and the $2,000 floor + PDT cap apply. The choice
-is remembered in `data/runtime.json`.
+The header has a **Paper / Live** toggle. With `LIVE_BROKER=ibkr` it maps to
+the Gateway port (**paper 4002 ↔ live 4001**); paper is your real IBKR paper
+account, live is your real account. **Live** is greyed until that venue is
+reachable; switching to it pops a confirmation and, from then on, approved
+orders are real and the $2,000 floor + PDT cap apply. The choice is remembered
+in `data/runtime.json`.
 
 With no MySQL configured, everything above still works — the database falls
 back to a local SQLite file (`data/tos_trader.sqlite`).
@@ -122,7 +128,54 @@ back to a local SQLite file (`data/tos_trader.sqlite`).
 
 ## Going live
 
-### 1. Schwab developer app
+### Option A — Interactive Brokers (recommended)
+
+IBKR gives you real exchange data and a real paper account through the same
+API. There is **no token and no 60-day expiry** — the API is a socket into a
+running **IB Gateway** (or TWS); IBKR force-restarts that once a day, and
+**[IBC](https://github.com/IbcAlpha/IBC)** makes the re-login hands-off. The
+adapter watches the socket and **auto-reconnects**, so an IBC restart is
+invisible; if the Gateway is genuinely down the header shows it.
+
+```bash
+pip install ib_async
+python scripts/ibkr_setup.py --guide     # the full walkthrough
+python scripts/ibkr_setup.py             # probe ports, connect read-only, report
+```
+
+1. **Client Portal → Settings** → enable your **paper account** (`DU…`). Tick
+   *"Share real-time market data subscriptions with paper account"*.
+2. **Market data** (optional): *Settings → Market Data Subscriptions* → e.g.
+   *US Securities Snapshot Bundle* (~$10/mo). Without it the bot runs on
+   15-minute delayed data and labels the feed `delayed`.
+3. **IB Gateway** → *Configure → Settings → API → Settings*: enable
+   *ActiveX and Socket Clients*, socket port **4002** (paper) / **4001**
+   (live), Trusted IP `127.0.0.1`, untick *Read-Only API*. Then
+   *Configure → Lock and Exit → Auto restart*.
+4. **IBC**: set `IbLoginId` / `IbPassword` / `TradingMode=paper` in its
+   `config.ini`, launch `StartGateway.bat`, and add a Windows "run at logon"
+   task so it survives reboots.
+5. `.env`:
+
+   ```dotenv
+   BROKER=paper
+   LIVE_BROKER=ibkr
+   IBKR_HOST=127.0.0.1
+   IBKR_PAPER_PORT=4002
+   IBKR_LIVE_PORT=4001
+   IBKR_CLIENT_ID=11
+   # IBKR_ACCOUNT_ID=DU1234567   # only if the login has several accounts
+   # IBKR_MARKET_DATA=auto       # auto | live | delayed | delayed-frozen
+   # IBKR_READONLY=0             # 1 = data only, never send orders
+   ```
+
+The Paper/Live toggle now switches ports for you. The header's session pill
+shows `connected` / `reconnecting` / `Gateway not reachable` instead of a
+token status.
+
+### Option B — Schwab
+
+#### 1. Schwab developer app
 
 1. Create an app at <https://developer.schwab.com> (the *Trader API* product).
 2. Add **`https://127.0.0.1:8182`** as an allowed callback URL.
@@ -142,7 +195,7 @@ back to a local SQLite file (`data/tos_trader.sqlite`).
    python scripts/authenticate.py
    ```
 
-### 2. MySQL
+### MySQL (optional — SQLite is the default)
 
 ```sql
 CREATE DATABASE tos_trader CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -166,7 +219,7 @@ python scripts/init_db.py            # creates all tables + indexes
 
 `tos_bot/persistence/schema.sql` has the raw DDL if you prefer to apply it by hand.
 
-### 3. Run
+### Run
 
 ```bash
 python run.py --host 127.0.0.1 --port 8787
@@ -174,10 +227,16 @@ python run.py --host 127.0.0.1 --port 8787
 
 ---
 
-## The 60-day token rotation
+## The 60-day token rotation (Schwab / TDA only)
+
+> **Interactive Brokers has no token and no 60-day clock** — its "auth" is the
+> IB Gateway login, which IBKR restarts daily. IBC handles the re-login; the
+> adapter auto-reconnects the socket. None of this section applies to
+> `LIVE_BROKER=ibkr`.
 
 The brief: *"delete and get the authentication token every 60 days
-automatically with little to no manual handling."*
+automatically with little to no manual handling."* (Schwab's real refresh
+token is ~7 days, so the watchdog rotates well inside that.)
 
 `tos_bot/auth/token_manager.py` + `AuthWatchdog`:
 
@@ -454,10 +513,11 @@ Autopilot is day-trading an open session (see the Autopilot section).
 ## Adding a broker later
 
 Implement `tos_bot/brokers/base.py::BrokerAdapter` and register it in
-`tos_bot/brokers/__init__.py::get_broker`. Stubs already map the interface:
+`tos_bot/brokers/__init__.py::get_broker`. Live adapters shipped:
+**`schwab_adapter.py`** (`schwab-py` + OAuth) and **`ibkr_adapter.py`**
+(`ib_async` → IB Gateway/TWS, own asyncio-loop thread, auto-reconnect, native
+brackets, live+paper by port). Still a stub:
 
-- **`ibkr_adapter.py`** → `ib_async` against TWS / IB Gateway. No OAuth token,
-  so the token watchdog is a no-op.
 - **`crypto_adapter.py`** → `ccxt` (Coinbase / Kraken / …). 24/7 market, no PDT,
   no token; `AssetClass.CRYPTO` bypasses `PdtGuard`.
 
@@ -469,7 +529,8 @@ Implement `tos_bot/brokers/base.py::BrokerAdapter` and register it in
 run.py                     boot engine + dashboard
 scripts/
   init_db.py               create the MySQL schema
-  authenticate.py          one-time / re-auth broker OAuth  (--check, --force-rotate)
+  ibkr_setup.py            IBKR connectivity doctor + setup guide  (--guide, --live)
+  authenticate.py          one-time / re-auth Schwab OAuth  (--check, --force-rotate)
   reauth_headless.py       unattended re-auth (Playwright + keyring, opt-in)
   run_scan_once.py         one scan cycle from the CLI
 tos_bot/
@@ -485,8 +546,8 @@ tos_bot/
   risk/                    position sizing + PDT guard
   execution/               order_builder + executor + exit_manager + autopilot (hands-off entry)
   util/clock.py            sessions + NYSE holiday / half-day calendar to 2028
-  auth/token_manager.py    access-token refresh + 60-day rotation + audit
-  brokers/                 base + paper + schwab + tda + ibkr/crypto stubs
+  auth/token_manager.py    Schwab access-token refresh + 60-day rotation + audit
+  brokers/                 base + paper (sim) + ibkr + schwab + tda + crypto stub
   persistence/             SQLAlchemy models, repository, schema.sql
   server/app.py            FastAPI REST + WebSocket
   web/                     the dashboard (index.html / styles.css / app.js)
@@ -496,20 +557,22 @@ tests/                     pytest  (fast by default; `-m slow` for the e2e)
 ## Tests
 
 ```bash
-pytest              # 75 fast unit tests
+pytest              # 98 fast unit tests
 pytest -m slow      # boots the engine, runs scan → approve → close on paper
 ```
 
 Coverage includes the analysis primitives (`test_analysis.py`), the Autopilot
 gate — trade-type filter, confidence/RR floors, position & per-day caps, the
-paper-only-in-live hard gate, dry-run (`test_autopilot.py`) — and the new Aziz
-setups on purpose-built frames (`test_strategies.py`).
+paper-only-in-live hard gate, dry-run (`test_autopilot.py`), the new Aziz
+setups on purpose-built frames (`test_strategies.py`), and the IBKR adapter's
+translation layer against a fake `ib_async.IB` (`test_ibkr_adapter.py`). The
+real Gateway path needs a running IB Gateway and isn't in CI.
 
 ## Roadmap
 
-- real-time streaming quotes (Schwab streamer / IBKR ticks) instead of REST polls
+- streaming IBKR ticks (`reqMktData` subscriptions) instead of snapshot polls
 - per-strategy backtester + walk-forward on the persisted play log
-- options plays (the Schwab adapter already exposes the option-chain endpoint)
+- options plays (IBKR + the Schwab option-chain endpoint)
 - ATR-based trailing stop option in the exit manager (currently R-based)
 - equity-curve chart in the dashboard
-- IBKR and crypto adapters fleshed out
+- crypto adapter (`ccxt`) fleshed out
