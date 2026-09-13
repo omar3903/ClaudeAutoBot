@@ -1,9 +1,10 @@
 """FastAPI app: REST + a WebSocket that streams engine events to the dashboard.
 
-Endpoints that touch secrets or start a broker sign-in are same-machine only
-(see :mod:`tos_bot.server.security`). Handlers that call into the engine are
-plain ``def``, so FastAPI runs them in its thread pool and a slow broker call
-never stalls the event loop that feeds the WebSocket.
+Endpoints that touch secrets, start a broker sign-in, exit every position or
+quit the app are same-machine only (see :mod:`tos_bot.server.security`).
+Handlers that call into the engine are plain ``def``, so FastAPI runs them in
+its thread pool and a slow broker call never stalls the event loop that feeds
+the WebSocket.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from ..config import get_settings
 from ..core.eventbus import BUS
 from ..data.sectors import SECTORS
 from ..engine import TradingEngine
+from ..scanner.filters import SIDES, TIMEFRAMES
 from .security import require_local
 
 log = logging.getLogger(__name__)
@@ -41,6 +43,15 @@ def create_app() -> FastAPI:
     async def lifespan(app: FastAPI):
         BUS.bind_loop(asyncio.get_running_loop())
         engine = TradingEngine(settings)
+
+        def shutdown() -> None:
+            hook = getattr(app.state, "shutdown", None)
+            if hook is not None:
+                hook()
+            else:
+                log.warning("quit finished - stop the server process to exit")
+
+        engine.on_shutdown = shutdown
         app.state.engine = engine
         # start() spawns its own daemon threads and returns quickly
         await asyncio.get_running_loop().run_in_executor(None, engine.start)
@@ -50,7 +61,8 @@ def create_app() -> FastAPI:
         finally:
             engine.stop()
 
-    app = FastAPI(title="AutoTradeBot", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="AutoTradeBot", version="0.3.0", lifespan=lifespan)
+    app.state.shutdown = None           # run.py wires this to the uvicorn server
 
     def eng() -> TradingEngine:
         return app.state.engine
@@ -89,6 +101,10 @@ def create_app() -> FastAPI:
         repo = eng().repo
         return {"trades": repo.open_trades() if status == "OPEN" else repo.recent_trades(limit)}
 
+    @app.post("/api/trades/close-all", dependencies=LOCAL_ONLY)
+    def close_all():
+        return _result(eng().close_all_positions())
+
     @app.get("/api/trades/{trade_id}")
     def trade(trade_id: str):
         t = eng().repo.get_trade(trade_id)
@@ -96,13 +112,20 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "trade not found")
         return t
 
+    @app.get("/api/trades/{trade_id}/record")
+    def trade_record(trade_id: str):
+        rec = eng().trade_record(trade_id)
+        if not rec:
+            raise HTTPException(404, "trade record not found (it may have been removed)")
+        return rec
+
     @app.post("/api/trades/{trade_id}/close")
     def close_trade(trade_id: str):
         return _result(eng().close_position(trade_id, reason="manual"))
 
     @app.post("/api/trades/{trade_id}/managed")
     def set_managed(trade_id: str, body: dict):
-        return eng().set_trade_managed(trade_id, bool((body or {}).get("on", True)))
+        return _result(eng().set_trade_managed(trade_id, bool((body or {}).get("on", True))))
 
     @app.get("/api/pnl")
     def pnl():
@@ -138,9 +161,14 @@ def create_app() -> FastAPI:
         cash = (body or {}).get("cash")
         return _result(eng().reset_paper(float(cash) if cash is not None else None))
 
-    @app.post("/api/paper/reconcile")
-    def paper_reconcile():
-        return _result(eng().reconcile_paper())
+    # ---- quitting (same machine only) ------------------------ #
+    @app.get("/api/quit", dependencies=LOCAL_ONLY)
+    def quit_preview():
+        return eng().quit_preview()
+
+    @app.post("/api/quit", dependencies=LOCAL_ONLY)
+    def quit_app(body: dict):
+        return _result(eng().begin_quit(close_all=bool((body or {}).get("close_all", True))))
 
     # ---- connections (same machine only) ---------------------- #
     @app.get("/api/setup", dependencies=LOCAL_ONLY)
@@ -174,14 +202,30 @@ def create_app() -> FastAPI:
     def auth_status():
         return eng().token_manager.status().as_dict()
 
-    # ---- sector filter --------------------------------------- #
-    @app.get("/api/filters/sectors")
-    def get_sectors():
-        return {"all": list(SECTORS), "selected": eng().sectors}
+    # ---- filters + strategies --------------------------------- #
+    @app.get("/api/filters")
+    def get_filters():
+        return {"filters": eng().filters.as_dict(), "all_sectors": list(SECTORS),
+                "sides": list(SIDES), "timeframes": list(TIMEFRAMES)}
 
-    @app.post("/api/filters/sectors")
-    def set_sectors(body: dict):
-        return _result(eng().set_sectors((body or {}).get("sectors") or []))
+    @app.post("/api/filters")
+    def set_filters(body: dict):
+        b = body or {}
+        return _result(eng().set_filters(sides=b.get("sides"), timeframes=b.get("timeframes"),
+                                         sectors=b.get("sectors")))
+
+    @app.get("/api/strategies")
+    def strategies():
+        return {"strategies": eng().strategy_state()}
+
+    @app.post("/api/strategies/reset")
+    def reset_strategies():
+        return _result(eng().reset_strategies())
+
+    @app.post("/api/strategies/{key}")
+    def set_strategy(key: str, body: dict):
+        b = body or {}
+        return _result(eng().set_strategy(key, enabled=b.get("enabled"), weight=b.get("weight")))
 
     # ---- autopilot (hands-off entry) ---------------------- #
     @app.get("/api/autopilot")
@@ -192,18 +236,14 @@ def create_app() -> FastAPI:
     def set_autopilot(body: dict):
         return _result(eng().set_autopilot(**(body or {})))
 
-    # ---- scan / strategies -------------------------------- #
+    # ---- scan --------------------------------------------- #
     @app.post("/api/scan/now")
     def scan_now():
-        return eng().trigger_scan()
+        return _result(eng().trigger_scan())
 
     @app.get("/api/scans")
     def scans():
         return {"last": eng().snapshot().get("scan", {})}
-
-    @app.get("/api/strategies")
-    def strategies():
-        return {"strategies": eng().strategy_catalog()}
 
     # ---- websocket ------------------------------------------- #
     @app.websocket("/ws")

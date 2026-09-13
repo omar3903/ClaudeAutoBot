@@ -1,4 +1,6 @@
-/* AutoTradeBot dashboard - vanilla JS, no build step. */
+/* AutoTradeBot dashboard - vanilla JS, no build step.
+   Whatever you change here (filters, strategies, routing, Autopilot) is saved on
+   the server, applied to the bot straight away and pushed to every open tab. */
 "use strict";
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -10,12 +12,17 @@ const post = (path, body = {}) => api(path, {
   method: "POST",
   headers: { "Content-Type": "application/json", ...LOCAL_HEADER },
   body: JSON.stringify(body),
-});
+}).catch(() => ({ ok: false, reason: "the app isn't reachable" }));
 
 let STATE = {};
 let PLAYS = [];
 let SELECTED = null;
+let DRAWER = null;               // what the side drawer shows: connections | strategies | record
 let CONN = null;                 // last /api/setup payload while Connections is open
+let STRATS = {};                 // strategy key -> catalog row (title, thesis, on/off, weight)
+let RECORD_ID = null;            // trade shown in the record drawer
+let STOPPED = false;             // the app has shut down
+let REFRESH_TIMER = null;
 
 /* ---------- formatting ---------- */
 const usd = v => (v == null || isNaN(v)) ? "–" :
@@ -26,6 +33,12 @@ const escapeHtml = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const shorten = (s, n) => s && s.length > n ? s.slice(0, n - 1) + "…" : s;
 const pretty = key => (key || "").replace(/_/g, " ");
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const fmtTime = s => {
+  if (!s) return "–";
+  const d = new Date(/[zZ]|[+-]\d\d:\d\d$/.test(s) ? s : s + "Z");     // the database stores UTC
+  return isNaN(d) ? s : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+};
 
 const SECTOR_SHORT = {
   "Technology": "Tech", "Communication Services": "Comm", "Consumer Discretionary": "Cons Disc",
@@ -34,23 +47,120 @@ const SECTOR_SHORT = {
   "Materials": "Materials", "Real Estate": "Real Est",
 };
 const sectorTag = sec => sec
-  ? `<span class="sector" title="${escapeHtml(sec)}">${escapeHtml(SECTOR_SHORT[sec] || sec)}</span>` : "";
+  ? `<span class="sector" data-term="sector" data-sector="${escapeHtml(sec)}">${escapeHtml(SECTOR_SHORT[sec] || sec)}</span>` : "";
+const sideBadge = side => `<span class="side ${side}" data-term="${side === "SHORT" ? "short" : "long"}">${side}</span>`;
+const tfLabel = tf => `<span data-term="${tf === "INTRADAY" ? "intraday" : "swing"}">${tf === "INTRADAY" ? "day" : "swing"}</span>`;
+const stratLabel = key => `<span data-term="strategy" data-key="${escapeHtml(key)}">${escapeHtml((STRATS[key] || {}).title || pretty(key))}</span>`;
 const VENUE_SHORT = { "paper": "simulator", "ibkr-paper": "IBKR paper", "ibkr-live": "IBKR live", "schwab": "Schwab" };
+
+/* ---------- small per-browser preferences ---------- */
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch { /* private mode */ } },
+};
 
 /* ---------- theme ---------- */
 function syncThemeButton() {
   const dark = document.documentElement.dataset.theme !== "light";
   $("#btn-theme").title = dark ? "Switch to light mode" : "Switch to dark mode";
 }
+function applyTheme(t) { document.documentElement.dataset.theme = t; syncThemeButton(); }
 $("#btn-theme").onclick = () => {
   const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-  document.documentElement.dataset.theme = next;
-  try { localStorage.setItem("atb-theme", next); } catch { /* private mode */ }
-  syncThemeButton();
+  store.set("atb-theme", next);
+  applyTheme(next);
 };
+// other tabs of this browser follow straight away
+window.addEventListener("storage", e => {
+  if (e.key === "atb-theme" && (e.newValue === "light" || e.newValue === "dark")) applyTheme(e.newValue);
+  if (e.key === "atb-hide-done") { $("#f-hide-done").checked = e.newValue === "1"; renderPlays(); }
+});
+
+/* ---------- what the terms mean (hover / focus) ---------- */
+const GLOSSARY = {
+  long: ["Long", "Buy first, sell later. You profit when the price rises above your entry; the stop sits below it and caps the loss."],
+  short: ["Short", "Sell borrowed shares first, buy them back later. You profit when the price falls; the stop sits above the entry. Losses grow if the price keeps rising, and it needs a margin account."],
+  intraday: ["Intraday (day trade)", "Opened and closed in the same session - held minutes to hours and flattened before the close. Under $25k, a live margin account gets 3 day trades per 5 sessions (the PDT rule)."],
+  swing: ["Swing", "Held for days to a few weeks to catch a bigger move. It carries overnight gap risk, but doesn't use up day trades."],
+  ext: ["Extended hours", "Can also be entered pre-market (4:00-9:30) or after hours (16:00-20:00), with limit orders only. Thinner trading means wider spreads."],
+  autopilot: ["Autopilot", "A bright robot means Autopilot will take this entry on its next pass; a dim one means it already has. Exits are automatic either way."],
+  executed: ["Executed", "An order has gone out for this play. It won't be sent twice - the position is under Open positions."],
+  hide_done: ["Hide executed", "Only changes this view: plays you've already sent drop out of the table. What the bot scans for isn't affected."],
+  symbol: ["Symbol", "The ticker and its sector. Hover a row for the reasoning; click it for the numbers and the order."],
+  side: ["Side", "LONG profits when the price rises, SHORT when it falls. Hover a badge for more."],
+  strategy_col: ["Strategy", "The setup that found the play. Hover a name for how it works; switch setups on or off under Strategies."],
+  tf: ["Timeframe", "day = intraday, closed the same session.\nswing = held for days to weeks."],
+  entry: ["Entry", "The price the order aims to get in at."],
+  stop: ["Stop", "Where the idea is proven wrong. Hitting it exits the trade, capping the loss near the $ risk shown."],
+  target: ["Target", "The first profit objective. The exit manager may trail the stop past it instead of selling right at it."],
+  rr: ["Reward : Risk", "Distance to the target divided by distance to the stop. 2.0 means a win pays twice what a stop-out costs."],
+  qty: ["Quantity", "Shares sized so a stop-out loses about your per-trade risk budget, capped by buying power."],
+  risk: ["$ Risk", "What you lose if the stop is hit: quantity × |entry − stop|, before slippage."],
+  score: ["Score", "The rank: the setup's confidence and reward:risk, times its strategy weight, plus a bump for unusual volume or a gap."],
+  mark: ["Mark", "The broker's current price for the position."],
+  unrealized: ["Unrealized", "Open profit or loss at the current mark."],
+  age: ["Age / Expected", "How long it's been held against how long this setup usually takes. Past the review time it's flagged for a look - the stop isn't touched."],
+  mfe: ["MFE / MAE", "The best and worst open P/L seen while holding (max favourable / adverse excursion)."],
+  auto_exit: ["Auto exit", "On: the exit manager handles the stop, target, break-even and trailing moves, and flattens day trades before the close. Off: you manage the exit."],
+};
+
+function termContent(el) {
+  const k = el.dataset.term;
+  if (k === "sector") {
+    const s = el.dataset.sector || "Unknown";
+    const sel = (STATE.filters || {}).sectors || [];
+    return [s, `This play's sector. ${sel.length ? `Only scanning and trading: ${sel.join(", ")}.` : "Every sector is being scanned."} Change it with the Sectors button.`];
+  }
+  if (k === "strategy") {
+    const s = STRATS[el.dataset.key];
+    if (!s) return [pretty(el.dataset.key), "A trading setup. Open Strategies for the full playbook."];
+    const how = `${s.timeframe === "INTRADAY" ? "Day trade" : "Swing"} · ${s.kind.toLowerCase()} · ${s.enabled ? `on, weight ${s.weight}` : "switched off"}`;
+    return [s.title, `${s.thesis}\n\n${how}`];
+  }
+  return GLOSSARY[k] || null;
+}
+
+const tip = $("#tooltip");
+let TIP_EL = null;
+function showTipAt(x, y, title, text) {
+  tip.innerHTML = `<div class="tt-title">${escapeHtml(title)}</div>${escapeHtml(text).replace(/\n/g, "<br>")}`;
+  tip.classList.remove("hidden");
+  placeTip(x, y);
+}
+function placeTip(x, y) {
+  const pad = 14, w = tip.offsetWidth, h = tip.offsetHeight;
+  let left = x + pad, top = y + pad;
+  if (left + w > innerWidth) left = Math.max(4, x - w - pad);
+  if (top + h > innerHeight) top = Math.max(4, y - h - pad);
+  tip.style.left = left + "px"; tip.style.top = top + "px";
+}
+function hideTip() { tip.classList.add("hidden"); }
+
+document.addEventListener("mouseover", e => {
+  const el = e.target.closest ? e.target.closest("[data-term]") : null;
+  if (el === TIP_EL) return;
+  TIP_EL = el;
+  if (!el) return;                                 // a row's own tooltip takes over
+  const c = termContent(el);
+  if (c) showTipAt(e.clientX, e.clientY, c[0], c[1]); else hideTip();
+});
+document.addEventListener("mousemove", e => {
+  if (TIP_EL && !tip.classList.contains("hidden")) placeTip(e.clientX, e.clientY);
+});
+document.addEventListener("mouseout", e => {
+  if (TIP_EL && !(e.relatedTarget && TIP_EL.contains(e.relatedTarget))) { TIP_EL = null; hideTip(); }
+});
+document.addEventListener("focusin", e => {
+  const el = e.target.closest ? e.target.closest("[data-term]") : null;
+  if (!el) return;
+  const c = termContent(el), r = el.getBoundingClientRect();
+  if (c) showTipAt(r.left, r.bottom, c[0], c[1]);
+});
+document.addEventListener("focusout", () => { if (!TIP_EL) hideTip(); });
 
 /* ---------- websocket ---------- */
 function connect() {
+  if (STOPPED) return;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.onmessage = ev => {
@@ -58,7 +168,7 @@ function connect() {
     try { msg = JSON.parse(ev.data); } catch { return; }
     handleEvent(msg.topic, msg.payload || {});
   };
-  ws.onclose = () => setTimeout(connect, 2000);
+  ws.onclose = () => { if (!STOPPED) setTimeout(connect, 2000); };
   ws.onerror = () => ws.close();
 }
 
@@ -87,8 +197,18 @@ function handleEvent(topic, p) {
       const how = p.reason ? ` [${p.reason}]` : "";
       toast(`${topic === "exit.triggered" ? "Auto-exit" : "Closed"} ${t.symbol}: ${usd(t.realized_pl)} (${pct(t.realized_pl_pct)})${how}`,
         (t.realized_pl || 0) >= 0 ? "good" : "bad");
+      if (t.id && t.id === RECORD_ID && DRAWER === "record") openRecord(t.id);
       loadOpen(); loadHistory(); loadStats(); refreshState(); break;
     }
+    case "trades.removed": {
+      const gone = p.trades || [];
+      toast(`Removed ${plural(gone.length, "open-trade record")} no longer held at ${p.venue_label || "the broker"}: ` +
+        gone.map(t => t.symbol).join(", "), "warn");
+      if (DRAWER === "record" && gone.some(t => t.id === RECORD_ID)) closeDrawer();
+      loadOpen(); refreshState(); break;
+    }
+    case "exit.not_held":
+      toast("Auto-exit skipped: " + (p.reason || "the broker doesn't show that position"), "warn"); break;
     case "exit.stop_moved":
       toast(`${p.symbol}: stop → ${num(p.new_stop)} (${num(p.r, 1)}R locked)`, "good");
       loadOpen(); break;
@@ -100,6 +220,21 @@ function handleEvent(topic, p) {
       if (p.decision === "approved" && p.result && !p.result.ok)
         toast("Order not sent: " + (p.result.reason || "rejected"), "bad");
       break;
+    case "filters.updated":
+      STATE.filters = p.filters; syncFilterControls(); renderPlays(); break;
+    case "strategies.updated":
+      indexStrategies(p.strategies);
+      if (DRAWER === "strategies") renderStrategies();
+      renderPlays(); break;
+    case "quit.requested":
+      openQuitDialog(p); break;
+    case "quit.started":
+    case "quit.progress":
+      STATE.quit = p.quit; renderLock();
+      if (topic === "quit.started") { closeModal(); loadOpen(); }
+      break;
+    case "quit.done":
+      showShutdown(p.note); break;
     case "auth.reauth_required":
       toast(p.reason || "Schwab needs you to sign in again", "bad"); refreshState(); break;
     case "auth.reauth_ok":
@@ -114,8 +249,6 @@ function handleEvent(topic, p) {
       if (p.mode !== p.prev)
         toast(p.mode === "live" ? "LIVE mode — orders are real now" : "Paper mode", p.mode === "live" ? "bad" : "good");
       break;
-    case "filters.sectors":
-      STATE.sectors = p.sectors || []; renderSectorsButton(); break;
     case "broker.error":
       toast("Broker: " + (p.message || "error"), "bad"); break;
     case "autopilot.config":
@@ -131,6 +264,7 @@ function handleEvent(topic, p) {
 }
 
 function refreshState() {
+  if (STOPPED) return;
   api("/api/state").then(s => { STATE = s; renderTop(); })
     .catch(() => { /* server restarting - the websocket reconnect catches up */ });
 }
@@ -153,9 +287,7 @@ function renderTop() {
       ? `Paper: ${(v.paper_platforms || {})[v.paper_platform] || "simulator"}`
       : `Live: ${(v.live_brokers || {})[v.live_broker] || "your broker"} — real orders`;
   });
-  const onSim = v.trading_on === "paper";
-  $("#btn-reset-paper").classList.toggle("hidden", !onSim);
-  $("#btn-reconcile").classList.toggle("hidden", !onSim);
+  $("#btn-reset-paper").classList.toggle("hidden", v.trading_on !== "paper");
 
   const mk = s.market || {};
   const sess = mk.session || (s.market_open ? "REGULAR" : "CLOSED");
@@ -193,9 +325,11 @@ function renderTop() {
   const c = s.connection || {};
   setPill("#pill-conn", c.label || "connection", c.cls);
   $("#pill-conn").title = `${c.detail || ""}\nClick to open Connections`;
+  if (s.strategies_on != null) $("#btn-strategies").textContent = `Strategies · ${s.strategies_on}`;
   renderBanner(c);
-  renderSectorsButton();
+  syncFilterControls();
   renderAutopilot();
+  renderLock();
 }
 
 function renderBanner(c) {
@@ -233,12 +367,155 @@ function setPill(sel, text, cls) {
   el.className = "pill" + (el.id === "pill-conn" ? " clickable" : "") + (cls ? " " + cls : "");
 }
 
+/* ---------- quitting: the lock while positions close ---------- */
+function renderLock() {
+  const q = (STATE || {}).quit;
+  document.body.classList.toggle("locked", !!q);
+  $("#btn-quit").disabled = !!q;
+  const b = $("#quit-banner");
+  if (!q) { b.classList.add("hidden"); return; }
+  const syms = (q.symbols || []).map(escapeHtml).join(", ");
+  b.innerHTML = q.left
+    ? `<span>⏻ Quitting — closing ${plural(q.left, "open position")}${syms ? ` (${syms})` : ""}. Nothing else can change until
+       ${q.left === 1 ? "it's" : "they're all"} out; then the app ${q.reset_sim ? "resets the simulator and " : ""}shuts down.
+       You can still exit positions yourself.</span>`
+    : `<span>⏻ Quitting — all positions are closed, finishing up…</span>`;
+  b.classList.remove("hidden");
+}
+
+$("#btn-quit").onclick = async () => {
+  let pv;
+  try { pv = await getLocal("/api/quit"); } catch { toast("The app isn't reachable", "bad"); return; }
+  if (pv.detail) { toast(pv.detail, "bad"); return; }
+  openQuitDialog(pv);
+};
+
+function posList(list) {
+  return `<ul class="pos-list">${(list || []).map(t =>
+    `<li>${escapeHtml(t.symbol)} — ${t.side === "SHORT" ? "short" : "long"} ${num(Math.abs(t.quantity), 0)} @ ${num(t.entry_price)}</li>`).join("")}</ul>`;
+}
+
+function openQuitDialog(pv) {
+  if (pv.quitting) { refreshState(); toast("Already closing positions before quitting", "warn"); return; }
+  const n = pv.left || 0;
+  const parked = (pv.parked || []).length
+    ? `<p class="muted">Not touched — held on another platform: ${pv.parked.map(t => `${escapeHtml(t.symbol)} (${VENUE_SHORT[t.venue] || escapeHtml(t.venue)})`).join(", ")}.</p>` : "";
+  if (pv.paper) {
+    openModal({
+      title: "Quit AutoTradeBot?",
+      bodyHTML: `${n ? `<p>Every open paper position on ${escapeHtml(pv.venue_label)} is closed first:</p>${posList(pv.positions)}` : "<p>No open paper positions.</p>"}
+        <p>${pv.resets_simulator ? `Then the simulator is reset to $${Number(pv.reset_cash || 0).toLocaleString()} and the app shuts down.` : "Then the app shuts down."}</p>
+        ${n ? '<p class="muted">Until the last position is out, nothing else can be changed.</p>' : ""}${parked}`,
+      okText: n ? "Close all & quit" : "Quit", okClass: "danger",
+      onOk: () => sendQuit(true),
+    });
+  } else if (n) {
+    openModal({
+      title: "Quit with LIVE positions open?",
+      bodyHTML: `<div class="warn-box">${plural(n, "live position")} open on <b>${escapeHtml(pv.venue_label)}</b>.</div>${posList(pv.positions)}
+        <p><b>Exit all &amp; quit</b> sends a market order for each and shuts down once they've all closed. Nothing else can change meanwhile.</p>
+        <p><b>Cancel</b> keeps them open and the app running, so their stops and targets stay managed.</p>${parked}`,
+      okText: "Exit all & quit", okClass: "danger", cancelText: "Cancel",
+      onOk: () => sendQuit(true),
+    });
+  } else {
+    openModal({
+      title: "Quit AutoTradeBot?",
+      bodyHTML: `<p>No open live positions — the app shuts down.</p>${parked}`,
+      okText: "Quit", okClass: "danger",
+      onOk: () => sendQuit(true),
+    });
+  }
+}
+
+async function sendQuit(closeAll) {
+  const r = await post("/api/quit", { close_all: closeAll });
+  toastResult(r);
+  if (r.quit) { STATE.quit = r.quit; renderLock(); }
+}
+
+function showShutdown(note) {
+  if (STOPPED) return;
+  STOPPED = true;
+  clearInterval(REFRESH_TIMER);
+  closeModal(); closeDrawer(); hideTip();
+  const d = document.createElement("div");
+  d.className = "shutdown";
+  d.innerHTML = `<div class="card"><h2>AutoTradeBot has shut down</h2>
+    <p>${escapeHtml(note || "")}</p>
+    <p class="muted">You can close this tab. Start it again with <code>python run.py</code>.</p></div>`;
+  document.body.appendChild(d);
+}
+
+/* ---------- filters: what the bot scans for and may trade ---------- */
+const FILTER_BOXES = {
+  "f-long": ["sides", "LONG"], "f-short": ["sides", "SHORT"],
+  "f-intraday": ["timeframes", "INTRADAY"], "f-swing": ["timeframes", "SWING"],
+};
+
+function syncFilterControls() {
+  const f = STATE.filters;
+  if (f) for (const [id, [group, val]] of Object.entries(FILTER_BOXES)) $("#" + id).checked = (f[group] || []).includes(val);
+  renderSectorsButton();
+}
+
+async function changeFilter(box) {
+  const [group] = FILTER_BOXES[box.id];
+  const picked = Object.entries(FILTER_BOXES)
+    .filter(([id, [g]]) => g === group && $("#" + id).checked).map(([, [, v]]) => v);
+  if (!picked.length) {
+    box.checked = true;
+    toast(group === "sides" ? "Keep Long or Short switched on" : "Keep Intraday or Swing switched on", "warn");
+    return;
+  }
+  const r = await post("/api/filters", { [group]: picked });
+  if (!r.ok) { syncFilterControls(); toast("Filter not changed: " + (r.reason || ""), "bad"); return; }
+  STATE.filters = r.filters; syncFilterControls(); renderPlays();
+  toast(r.note + (r.rescanning ? " Rescanning for the new plays…" : ""), "good");
+}
+Object.keys(FILTER_BOXES).forEach(id => { $("#" + id).onchange = e => changeFilter(e.target); });
+
+$("#f-hide-done").checked = store.get("atb-hide-done") === "1";
+$("#f-hide-done").onchange = e => { store.set("atb-hide-done", e.target.checked ? "1" : "0"); renderPlays(); };
+
+function renderSectorsButton() {
+  const sel = (STATE.filters || {}).sectors || [];
+  const b = $("#btn-sectors");
+  b.textContent = !sel.length ? "Sectors: all" : sel.length === 1 ? `Sector: ${SECTOR_SHORT[sel[0]] || sel[0]}` : `Sectors: ${sel.length}`;
+  b.classList.toggle("active-filter", sel.length > 0);
+  b.title = sel.length ? "Only scanning and trading: " + sel.join(", ") : "Scanning and trading every sector — click to narrow it down";
+}
+$("#btn-sectors").onclick = async () => {
+  let d;
+  try { d = await api("/api/filters"); } catch { toast("The app isn't reachable", "bad"); return; }
+  const all = d.all_sectors || [], selected = (d.filters || {}).sectors || [];
+  const on = new Set(selected.length ? selected : all);
+  openModal({
+    title: "Sectors to scan and trade",
+    bodyHTML: `<p class="muted">The scanner skips everything else, and plays outside these sectors can't be executed — by you or by Autopilot.</p>
+      <div class="sector-grid">${all.map(s =>
+        `<label><input type="checkbox" value="${escapeHtml(s)}" ${on.has(s) ? "checked" : ""}> ${escapeHtml(s)}</label>`).join("")}</div>
+      <div class="row-gap"><button class="ghost mini" id="sec-all">Select all</button><button class="ghost mini" id="sec-none">Clear</button></div>`,
+    okText: "Apply", okClass: "long",
+    onOk: async () => {
+      const picked = $$(".sector-grid input:checked").map(i => i.value);
+      if (!picked.length) { toast("Pick at least one sector", "bad"); return; }
+      const r = await post("/api/filters", { sectors: picked });
+      if (!r.ok) { toast("Couldn't save: " + (r.reason || ""), "bad"); return; }
+      STATE.filters = r.filters; renderSectorsButton(); renderPlays();
+      toast(r.note + (r.rescanning ? " Rescanning…" : ""), "good");
+    }
+  });
+  $("#sec-all").onclick = () => $$(".sector-grid input").forEach(i => { i.checked = true; });
+  $("#sec-none").onclick = () => $$(".sector-grid input").forEach(i => { i.checked = false; });
+};
+
 /* ---------- plays table ---------- */
 function filtered() {
-  const fL = $("#f-long").checked, fS = $("#f-short").checked,
-    fI = $("#f-intraday").checked, fW = $("#f-swing").checked, hideDone = $("#f-hide-done").checked;
-  return PLAYS.filter(p =>
-    (p.side === "LONG" ? fL : fS) && (p.timeframe === "INTRADAY" ? fI : fW) && (!hideDone || !isDone(p)));
+  const f = STATE.filters || {};
+  const sides = f.sides || ["LONG", "SHORT"], tfs = f.timeframes || ["INTRADAY", "SWING"];
+  const hideDone = $("#f-hide-done").checked;
+  return PLAYS.filter(p => sides.includes(p.side) && tfs.includes(p.timeframe) && (!hideDone || !isDone(p)));
 }
 function renderPlays() {
   const rows = filtered();
@@ -254,16 +531,16 @@ function renderPlays() {
     tr.classList.toggle("done", done);
     tr.classList.toggle("ap-eligible", !!ap.eligible && !done);
     const apMark = ap.acted
-      ? '<span class="ap-badge acted" title="autopilot has handled this play">🤖</span>'
-      : (ap.eligible && !done ? '<span class="ap-badge" title="autopilot will take this entry on the next pass">🤖</span>' : "");
+      ? '<span class="ap-badge acted" data-term="autopilot">🤖</span>'
+      : (ap.eligible && !done ? '<span class="ap-badge" data-term="autopilot">🤖</span>' : "");
     const last = done
-      ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
+      ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
       : `<span class="info-dot">i</span>`;
     tr.innerHTML = `
-      <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${apMark}${p.extended_hours_ok ? '<span class="ext" title="can be entered pre/post-market">ext</span>' : ""}</td>
-      <td><span class="side ${p.side}">${p.side}</span></td>
-      <td>${pretty(p.strategy)}</td>
-      <td class="tf">${p.timeframe === "INTRADAY" ? "day" : "swing"}</td>
+      <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${apMark}${p.extended_hours_ok ? '<span class="ext" data-term="ext">ext</span>' : ""}</td>
+      <td>${sideBadge(p.side)}</td>
+      <td>${stratLabel(p.strategy)}</td>
+      <td class="tf">${tfLabel(p.timeframe)}</td>
       <td class="num">${num(p.entry)}</td>
       <td class="num">${num(p.stop)}</td>
       <td class="num">${num((p.targets || [])[0])}</td>
@@ -273,24 +550,15 @@ function renderPlays() {
       <td class="num"><span class="score-bar"><i style="width:${Math.min(100, (p.score || 0) * 100)}%"></i></span></td>
       <td>${last}</td>`;
     tr.addEventListener("click", () => selectPlay(p.id));
-    tr.addEventListener("mousemove", e => showTip(e, pretty(p.strategy).toUpperCase(), (p.explanation || p.rationale || "").trim()));
+    tr.addEventListener("mousemove", e => {
+      if (e.target.closest("[data-term]")) return;      // the term's own explanation is showing
+      showTipAt(e.clientX, e.clientY, ((STRATS[p.strategy] || {}).title || pretty(p.strategy)).toUpperCase(),
+        (p.explanation || p.rationale || "").trim());
+    });
     tr.addEventListener("mouseleave", hideTip);
     body.appendChild(tr);
   }
 }
-
-/* ---------- hover tooltip ---------- */
-const tip = $("#tooltip");
-function showTip(e, title, text) {
-  tip.innerHTML = `<div class="tt-title">${escapeHtml(title)}</div>${escapeHtml(text)}`;
-  tip.classList.remove("hidden");
-  const pad = 14, w = tip.offsetWidth, h = tip.offsetHeight;
-  let x = e.clientX + pad, y = e.clientY + pad;
-  if (x + w > innerWidth) x = e.clientX - w - pad;
-  if (y + h > innerHeight) y = e.clientY - h - pad;
-  tip.style.left = x + "px"; tip.style.top = y + "px";
-}
-function hideTip() { tip.classList.add("hidden"); }
 
 /* ---------- detail / confirm ---------- */
 async function selectPlay(id) {
@@ -300,9 +568,8 @@ async function selectPlay(id) {
   const body = $("#detail-body");
   body.classList.remove("hidden");
   body.innerHTML = `<p class="muted">Assessing…</p>`;
-  let a;
-  try { a = await post(`/api/plays/${id}/assess`); }
-  catch { body.innerHTML = `<p class="reasons">Could not assess play.</p>`; return; }
+  const a = await post(`/api/plays/${id}/assess`);
+  if (SELECTED !== id) return;
   if (!a.ok) { body.innerHTML = `<p class="reasons">${escapeHtml(a.reason || "unavailable")}</p>`; return; }
 
   const p = a.play, op = a.order_preview, pdt = a.pdt || {}, em = (STATE.exit_manager || {});
@@ -317,25 +584,25 @@ async function selectPlay(id) {
   const confirmBlock = executed
     ? `<div class="reasons">${p.status === "ERROR" ? "⚠ last attempt errored — dismiss and rescan" : "✓ Already executed" + (p.trade_id ? ` — trade <code>${escapeHtml(p.trade_id)}</code>` : "")}</div>
        <div class="confirm-row">
-         ${p.trade_id ? `<button id="btn-goto-trade">Show in blotter</button>` : ""}
+         ${p.trade_id ? `<button id="btn-goto-trade">Show trade record</button>` : ""}
          <button class="ghost" id="btn-reject">Dismiss</button>
        </div>`
     : `${a.reasons && a.reasons.length ? `<div class="reasons">⚠ ${a.reasons.map(escapeHtml).join("<br>")}</div>` : ""}
        <div class="confirm-row">
-         <button class="${p.side === "LONG" ? "long" : "danger"}" id="btn-approve" ${a.can_execute ? "" : "disabled"}>Execute &#10003; Yes</button>
+         <button class="${p.side === "LONG" ? "long" : "danger"} lockable" id="btn-approve" ${a.can_execute ? "" : "disabled"}>Execute &#10003; Yes</button>
          <button class="ghost" id="btn-reject">Dismiss</button>
        </div>`;
 
   body.innerHTML = `
-    <h3>${escapeHtml(p.symbol)} ${sectorTag(p.sector)} <span class="side ${p.side}">${p.side}</span>${executed ? ' <span class="badge good">executed</span>' : ""}</h3>
-    <div class="sub">${pretty(p.strategy)} · ${p.timeframe} · conf ${num(p.confidence, 2)} · score ${num(p.score, 2)} · session ${a.session}</div>
+    <h3>${escapeHtml(p.symbol)} ${sectorTag(p.sector)} ${sideBadge(p.side)}${executed ? ' <span class="badge good" data-term="executed">executed</span>' : ""}</h3>
+    <div class="sub">${stratLabel(p.strategy)} · ${tfLabel(p.timeframe)} · conf ${num(p.confidence, 2)} · score ${num(p.score, 2)} · session ${a.session}</div>
     ${sparkSvg(p.evidence && p.evidence.spark, p)}
     <div class="explain">${escapeHtml(p.explanation || p.rationale)}</div>
     <div class="kv">
-      <span>Entry</span><span>${num(p.entry)}</span>
-      <span>Stop</span><span>${num(p.stop)} (${usd(-(Math.abs(p.entry - p.stop)))}/sh)</span>
-      <span>Target(s)</span><span>${(p.targets || []).map(t => num(t)).join(" → ")}</span>
-      <span>Reward : Risk</span><span>${num(p.reward_risk, 1)} : 1</span>
+      <span data-term="entry">Entry</span><span>${num(p.entry)}</span>
+      <span data-term="stop">Stop</span><span>${num(p.stop)} (${usd(-(Math.abs(p.entry - p.stop)))}/sh)</span>
+      <span data-term="target">Target(s)</span><span>${(p.targets || []).map(t => num(t)).join(" → ")}</span>
+      <span data-term="rr">Reward : Risk</span><span>${num(p.reward_risk, 1)} : 1</span>
     </div>
     ${renderEvidence(p.evidence || {})}
     <div class="order-card">
@@ -349,7 +616,7 @@ async function selectPlay(id) {
         <span>Time in force</span><span>${op.tif || "DAY"}</span>
         <span>Protection</span><span>${brModeTxt}</span>
         <span>Est. cost</span><span>${usd(op.est_cost)}</span>
-        <span>Est. risk</span><span>${usd(op.est_risk)}</span>
+        <span data-term="risk">Est. risk</span><span>${usd(op.est_risk)}</span>
       </div>
       ${op.note ? `<div class="muted" style="margin:6px 0">${escapeHtml(op.note)}</div>` : ""}
       <div class="exit-box"><b>Automatic exit strategy:</b> ${exitLine}<br>
@@ -360,7 +627,7 @@ async function selectPlay(id) {
     </div>`;
   const ap = $("#btn-approve"); if (ap) ap.onclick = () => approve(id);
   const rj = $("#btn-reject"); if (rj) rj.onclick = () => reject(id);
-  const gt = $("#btn-goto-trade"); if (gt) gt.onclick = () => $$(".tab")[0].click();
+  const gt = $("#btn-goto-trade"); if (gt) gt.onclick = () => openRecord(p.trade_id);
 }
 
 function renderEvidence(ev) {
@@ -443,11 +710,17 @@ $$(".tab").forEach(t => t.onclick = () => {
   ({ open: loadOpen, history: loadHistory, stats: loadStats })[t.dataset.tab]();
 });
 
+const isLive = () => STATE.mode === "live";
+const hereVenue = () => (STATE.venue || {}).trading_on || "paper";
+
 async function loadOpen() {
-  const { trades } = await api("/api/trades?status=OPEN");
+  if (STOPPED) return;
+  let trades;
+  try { ({ trades } = await api("/api/trades?status=OPEN")); } catch { return; }
   const pos = STATE.positions || [];
-  const here = (STATE.venue || {}).trading_on || "paper";
+  const here = hereVenue();
   const el = $("#tab-open");
+  $("#btn-exit-all").classList.toggle("hidden", !trades.some(t => (t.broker || "paper") === here));
   if (!trades.length) { el.innerHTML = `<p class="muted" style="padding:10px">No open positions.</p>`; return; }
 
   // sector concentration of the open book
@@ -461,12 +734,12 @@ async function loadOpen() {
     .map(([s, v]) => `<b>${escapeHtml(SECTOR_SHORT[s] || s)}</b> ${Math.round(v / tot * 100)}%`).join(" · ") : "";
 
   el.innerHTML = (exp ? `<div class="exposure">Exposure: ${exp}</div>` : "") +
-    `<table><thead><tr><th>Symbol</th><th>Side</th><th>Strategy</th><th>Order</th>
-    <th class="num">Qty</th><th class="num">Entry</th><th class="num">Mark</th>
-    <th class="num">Unrealized</th><th class="num">Stop</th><th class="num">Target</th>
-    <th title="held vs expected time to exit — informational, does not affect the stop">Age / Expected</th>
-    <th class="num" title="max favourable / adverse excursion">MFE / MAE</th>
-    <th title="automatic exit manager">Auto&nbsp;exit</th><th></th></tr></thead><tbody>${
+    `<table><thead><tr><th data-term="symbol">Symbol</th><th data-term="side">Side</th><th data-term="strategy_col">Strategy</th><th>Order</th>
+    <th class="num" data-term="qty">Qty</th><th class="num" data-term="entry">Entry</th><th class="num" data-term="mark">Mark</th>
+    <th class="num" data-term="unrealized">Unrealized</th><th class="num" data-term="stop">Stop</th><th class="num" data-term="target">Target</th>
+    <th data-term="age">Age / Expected</th>
+    <th class="num" data-term="mfe">MFE / MAE</th>
+    <th data-term="auto_exit">Auto&nbsp;exit</th><th></th></tr></thead><tbody>${
     trades.map(t => {
       const venue = t.broker || "paper";
       const parked = venue !== here;
@@ -482,9 +755,9 @@ async function loadOpen() {
         ${ts === "overdue" ? '<span class="badge bad">⏰ overdue</span>' : ts === "aging" ? '<span class="badge warn">aging</span>' : ""}</div>`;
       const parkedTag = parked
         ? ` <span class="badge warn" title="Opened on another platform. Its automatic exits pause until you switch back to it.">on ${VENUE_SHORT[venue] || escapeHtml(venue)}</span>` : "";
-      return `<tr class="${ts === "overdue" ? "row-overdue" : ""}">
-        <td class="sym">${escapeHtml(t.symbol)} ${sectorTag(t.sector)}${parkedTag}</td><td><span class="side ${t.side}">${t.side}</span></td>
-        <td>${pretty(t.strategy)}</td>
+      return `<tr class="clickable-row ${ts === "overdue" ? "row-overdue" : ""}" data-record="${escapeHtml(t.id)}">
+        <td class="sym">${escapeHtml(t.symbol)} ${sectorTag(t.sector)}${parkedTag}</td><td>${sideBadge(t.side)}</td>
+        <td>${stratLabel(t.strategy)}</td>
         <td class="muted">${t.order_type || "—"}${t.order_session === "EXTENDED" ? " · ext" : ""}</td>
         <td class="num">${num(t.quantity, 0)}</td>
         <td class="num">${num(t.entry_price)}</td>
@@ -494,40 +767,84 @@ async function loadOpen() {
         <td class="num">${num(t.target_price)}</td>
         <td>${timeCell}</td>
         <td class="num muted">${usd(t.mfe)} / ${usd(t.mae == null ? null : -t.mae)}</td>
-        <td><label class="switch"><input type="checkbox" data-managed="${t.id}" ${t.managed_exit ? "checked" : ""}><span></span></label></td>
-        <td><button class="danger" data-close="${t.id}" ${parked ? `disabled title="Switch back to ${VENUE_SHORT[venue] || venue} to close this"` : ""}>Close</button></td></tr>`;
+        <td class="no-row-click"><label class="switch lockable"><input type="checkbox" data-managed="${escapeHtml(t.id)}" ${t.managed_exit ? "checked" : ""}><span></span></label></td>
+        <td class="no-row-click"><button class="danger mini" data-exit="${escapeHtml(t.id)}" ${parked
+          ? `disabled title="Switch back to ${VENUE_SHORT[venue] || escapeHtml(venue)} to exit this"` : 'title="Exit this position at the market"'}>Exit</button></td></tr>`;
     }).join("")}</tbody></table>`;
-  $$("[data-close]", el).forEach(b => b.onclick = async () => {
-    b.disabled = true;
-    const r = await post(`/api/trades/${b.dataset.close}/close`);
-    if (!r.ok) { toast("Close failed: " + (r.reason || ""), "bad"); b.disabled = false; }
-  });
+
+  const byId = Object.fromEntries(trades.map(t => [t.id, t]));
+  $$("[data-exit]", el).forEach(b => b.onclick = () => confirmExit(byId[b.dataset.exit]));
   $$("[data-managed]", el).forEach(c => c.onchange = async () => {
-    await post(`/api/trades/${c.dataset.managed}/managed`, { on: c.checked });
+    const r = await post(`/api/trades/${c.dataset.managed}/managed`, { on: c.checked });
+    if (!r.ok) { c.checked = !c.checked; toast("Not changed: " + (r.reason || ""), "bad"); return; }
     toast(`Auto-exit ${c.checked ? "ON" : "OFF"} for that position`, c.checked ? "good" : "warn");
   });
+  $$("tr[data-record]", el).forEach(tr => tr.onclick = e => {
+    if (!e.target.closest(".no-row-click")) openRecord(tr.dataset.record);
+  });
 }
+
+function confirmExit(t, fromRecord = false) {
+  if (!t) return;
+  const venue = (STATE.venue || {}).trading_on_label || "your broker";
+  openModal({
+    title: `Exit ${t.symbol}?`,
+    bodyHTML: `${isLive() ? `<div class="warn-box">This sends a <b>real market order</b> to ${escapeHtml(venue)}.</div>` : ""}
+      <p>${t.side === "SHORT" ? "Buy back" : "Sell"} ${num(Math.abs(t.quantity), 0)} ${escapeHtml(t.symbol)} at the market and close the position.</p>
+      <p class="muted">Entered at ${num(t.entry_price)} · stop ${num(t.stop_price)} · target ${num(t.target_price)}.</p>`,
+    okText: "Exit position", okClass: "danger",
+    onOk: async () => {
+      const r = await post(`/api/trades/${t.id}/close`);
+      if (r.ok) toast(`Exit sent for ${t.symbol}${r.status && r.status !== "FILLED" ? ` (${r.status.toLowerCase()})` : ""}`, "good");
+      else toast(`Exit for ${t.symbol} failed: ${r.reason || ""}`, "bad");
+      loadOpen(); refreshState();
+      if (fromRecord && DRAWER === "record" && RECORD_ID === t.id) openRecord(t.id);
+    }
+  });
+}
+
+$("#btn-exit-all").onclick = async () => {
+  let trades;
+  try { ({ trades } = await api("/api/trades?status=OPEN")); } catch { toast("The app isn't reachable", "bad"); return; }
+  const here = hereVenue();
+  const mine = trades.filter(t => (t.broker || "paper") === here);
+  if (!mine.length) { toast("No open positions to exit", "warn"); return; }
+  const venue = (STATE.venue || {}).trading_on_label || "your broker";
+  openModal({
+    title: `Exit all ${plural(mine.length, "position")}?`,
+    bodyHTML: `${isLive() ? `<div class="warn-box">This sends <b>real market orders</b> to ${escapeHtml(venue)}.</div>` : ""}
+      ${posList(mine)}<p class="muted">Every close is sent at once, at the market.</p>`,
+    okText: "Exit all", okClass: "danger",
+    onOk: async () => { toastResult(await post("/api/trades/close-all")); loadOpen(); refreshState(); }
+  });
+};
+
 async function loadHistory() {
-  const { trades } = await api("/api/trades?limit=200");
+  if (STOPPED) return;
+  let trades;
+  try { ({ trades } = await api("/api/trades?limit=200")); } catch { return; }
   const closed = trades.filter(t => t.status === "CLOSED");
   const el = $("#tab-history");
   if (!closed.length) { el.innerHTML = `<p class="muted" style="padding:10px">No closed trades yet.</p>`; return; }
   el.innerHTML = `<table><thead><tr><th>Closed</th><th>Symbol</th><th>Side</th><th>Strategy</th>
     <th class="num">Entry</th><th class="num">Exit</th><th class="num">P/L</th><th class="num">P/L %</th>
     <th class="num">R</th><th>DT</th><th>Reason</th></tr></thead><tbody>${
-    closed.map(t => `<tr>
+    closed.map(t => `<tr class="clickable-row" data-record="${escapeHtml(t.id)}">
       <td>${(t.exit_time || "").slice(5, 16).replace("T", " ")}</td>
-      <td class="sym">${escapeHtml(t.symbol)}</td><td><span class="side ${t.side}">${t.side}</span></td>
-      <td>${pretty(t.strategy)}</td>
+      <td class="sym">${escapeHtml(t.symbol)}</td><td>${sideBadge(t.side)}</td>
+      <td>${stratLabel(t.strategy)}</td>
       <td class="num">${num(t.entry_price)}</td><td class="num">${num(t.exit_price)}</td>
       <td class="num ${t.realized_pl >= 0 ? "pl-pos" : "pl-neg"}">${usd(t.realized_pl)}</td>
       <td class="num ${t.realized_pl >= 0 ? "pl-pos" : "pl-neg"}">${pct(t.realized_pl_pct)}</td>
       <td class="num">${num(t.r_multiple, 2)}</td>
       <td>${t.is_day_trade ? "•" : ""}</td>
       <td class="muted">${escapeHtml(t.exit_reason || "")}</td></tr>`).join("")}</tbody></table>`;
+  $$("tr[data-record]", el).forEach(tr => tr.onclick = () => openRecord(tr.dataset.record));
 }
 async function loadStats() {
-  const s = await api("/api/pnl");
+  if (STOPPED) return;
+  let s;
+  try { s = await api("/api/pnl"); } catch { return; }
   const g = (label, val, cls) => `<div class="stat"><label>${label}</label><b class="${cls || ""}">${val}</b></div>`;
   const sign = v => v >= 0 ? "pl-pos" : "pl-neg";
   $("#tab-stats").innerHTML = `<div class="stat-grid">
@@ -545,6 +862,146 @@ async function loadStats() {
   </div>`;
 }
 
+/* ---------- trade record (open or closed) ---------- */
+async function openRecord(id) {
+  if (!id) return;
+  DRAWER = "record"; RECORD_ID = id; CONN = null;
+  if ($("#drawer").classList.contains("hidden")) openDrawer("Trade record", `<p class="muted">Loading…</p>`, true);
+  let rec;
+  try {
+    const res = await fetch(`/api/trades/${encodeURIComponent(id)}/record`);
+    rec = await res.json();
+    if (!res.ok) throw new Error(rec.detail || "Trade record not found.");
+  } catch (e) {
+    if (RECORD_ID === id) $("#drawer-body").innerHTML = `<p class="reasons">${escapeHtml(e.message || "Couldn't load the record.")}</p>`;
+    return;
+  }
+  if (DRAWER === "record" && RECORD_ID === id) renderRecord(rec);
+}
+
+function orderSummary(req) {
+  if (!req || typeof req !== "object") return "";
+  const parts = [req.side, req.quantity, req.symbol, req.order_type].filter(v => v != null && v !== "");
+  if (req.limit_price != null) parts.push(`@ ${num(req.limit_price)}`);
+  if (req.stop_price != null) parts.push(`stop ${num(req.stop_price)}`);
+  return parts.join(" ");
+}
+
+function renderRecord(rec) {
+  const t = rec.trade, p = rec.play || {}, bp = rec.broker_position;
+  const open = t.status === "OPEN";
+  const moved = t.initial_stop_price != null && Math.abs((t.stop_price ?? 0) - t.initial_stop_price) > 0.01;
+  $("#drawer-title").textContent = `${t.symbol} · ${open ? "open" : "closed"} trade`;
+  const fills = rec.fills || [], orders = rec.orders || [];
+  const atBroker = bp ? `${num(bp.quantity, 0)} @ ${num(bp.market_price)} · <span class="${bp.unrealized_pl >= 0 ? "pl-pos" : "pl-neg"}">${usd(bp.unrealized_pl)}</span>`
+    : rec.on_current_venue ? "not reported yet" : `held on ${escapeHtml(rec.venue_label)} — switch to it to manage`;
+  $("#drawer-body").innerHTML = `
+    <div class="sub">${sideBadge(t.side)} ${t.timeframe ? tfLabel(t.timeframe) + " ·" : ""} ${stratLabel(t.strategy)} · ${escapeHtml(rec.venue_label)} ${sectorTag(t.sector)}</div>
+    <div class="kv">
+      <span>Status</span><span>${open ? "OPEN" : `CLOSED${t.exit_reason ? ` (${escapeHtml(t.exit_reason)})` : ""}`}</span>
+      <span>Opened</span><span>${fmtTime(t.entry_time)}</span>
+      ${open ? "" : `<span>Closed</span><span>${fmtTime(t.exit_time)}</span>`}
+      <span>Quantity</span><span>${num(t.quantity, 0)}</span>
+      <span>Entry</span><span>${num(t.entry_price)}</span>
+      ${open ? "" : `<span>Exit</span><span>${num(t.exit_price)}</span>`}
+      <span>Stop</span><span>${num(t.stop_price)}${moved ? ` (moved from ${num(t.initial_stop_price)})` : ""}</span>
+      <span>Target</span><span>${num(t.target_price)}</span>
+      ${open ? `<span>At the broker</span><span>${atBroker}</span>`
+      : `<span>P/L</span><span class="${t.realized_pl >= 0 ? "pl-pos" : "pl-neg"}">${usd(t.realized_pl)} (${pct(t.realized_pl_pct)}) · ${num(t.r_multiple, 2)}R</span>`}
+      <span>Auto exit</span><span>${t.managed_exit ? "on" : "off"}</span>
+      <span>Trade id</span><span><code>${escapeHtml(t.id)}</code></span>
+    </div>
+    ${p.explanation || p.rationale ? `<h4>Why it was taken</h4><div class="explain">${escapeHtml(p.explanation || p.rationale)}</div>` : ""}
+    <h4>Fills</h4>
+    ${fills.length ? `<div class="table-wrap"><table class="rec-table"><thead><tr><th>Time</th><th>Leg</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th></tr></thead><tbody>${
+      fills.map(f => `<tr><td>${fmtTime(f.ts)}</td><td>${escapeHtml(f.leg)}</td><td>${escapeHtml(f.side)}</td>
+        <td class="num">${num(f.quantity, 0)}</td><td class="num">${num(f.price)}</td></tr>`).join("")}</tbody></table></div>`
+      : '<p class="muted">No fills stored.</p>'}
+    <h4>Orders sent</h4>
+    ${orders.length ? `<div class="table-wrap"><table class="rec-table"><thead><tr><th>Time</th><th>Action</th><th>Order</th><th>Result</th></tr></thead><tbody>${
+      orders.map(o => `<tr><td>${fmtTime(o.ts)}</td><td>${escapeHtml(o.action)}</td><td>${escapeHtml(orderSummary(o.request))}</td>
+        <td><span class="badge ${o.ok ? "good" : "bad"}">${o.ok ? "ok" : "failed"}</span> ${escapeHtml(o.message || "")}</td></tr>`).join("")}</tbody></table></div>`
+      : '<p class="muted">No broker orders stored.</p>'}
+    ${open ? `<div class="row-gap"><button class="danger" id="rec-exit" ${rec.on_current_venue ? "" : "disabled"}>Exit position</button></div>
+      <p class="muted small">If this position is closed or removed outside the app, or the paper account is reset, this open-trade record is
+      deleted once the broker confirms the position is gone.</p>` : ""}`;
+  const ex = $("#rec-exit");
+  if (ex) ex.onclick = () => confirmExit(t, true);
+}
+
+/* ---------- strategies: switch setups on/off, set their weight ---------- */
+function indexStrategies(rows) {
+  if (!rows) return;
+  STRATS = {};
+  rows.forEach(s => { STRATS[s.key] = s; });
+  STATE.strategies_on = rows.filter(s => s.enabled).length;
+  $("#btn-strategies").textContent = `Strategies · ${STATE.strategies_on}`;
+}
+async function loadStrategies() {
+  const d = await api("/api/strategies");
+  indexStrategies(d.strategies);
+}
+
+async function openStrategies() {
+  DRAWER = "strategies"; CONN = null; RECORD_ID = null;
+  openDrawer("Strategies", `<p class="muted">Loading…</p>`, true);
+  try { await loadStrategies(); } catch {
+    $("#drawer-body").innerHTML = `<p class="reasons">Couldn't load the strategies.</p>`; return;
+  }
+  if (DRAWER === "strategies") renderStrategies();
+}
+
+function stratCard(s) {
+  return `<div class="strat ${s.enabled ? "" : "off"}">
+    <div class="strat-head">
+      <label class="switch lockable" title="${s.enabled ? "On — click to switch off" : "Off — click to switch on"}">
+        <input type="checkbox" data-strat-toggle="${escapeHtml(s.key)}" ${s.enabled ? "checked" : ""}><span></span></label>
+      <div><div class="meta">${s.timeframe === "INTRADAY" ? "day trade" : "swing"} · ${escapeHtml(s.kind.toLowerCase())}${s.customized ? " · changed from config" : ""}</div>
+        <h4>${escapeHtml(s.title)}</h4></div>
+      <label class="weight lockable" title="Scales this setup's score — 1 is normal">weight
+        <input type="number" min="0.1" max="3" step="0.1" value="${s.weight}" data-strat-weight="${escapeHtml(s.key)}"></label>
+    </div>
+    <div class="thesis">${escapeHtml(s.thesis)}</div>
+  </div>`;
+}
+
+function renderStrategies() {
+  const rows = Object.values(STRATS);
+  const groups = [
+    ["Day trades", s => s.kind === "TECHNICAL" && s.timeframe === "INTRADAY"],
+    ["Swing trades", s => s.kind === "TECHNICAL" && s.timeframe !== "INTRADAY"],
+    ["Valuation (fundamental)", s => s.kind === "FUNDAMENTAL"],
+  ];
+  const on = rows.filter(s => s.enabled).length;
+  $("#drawer-body").innerHTML = `
+    <p class="muted">${on} of ${rows.length} setups on. A change applies to the next scan and to Autopilot straight away,
+      shows up in every open tab, and is remembered. Plays from a setup you switch off leave the board.</p>
+    ${groups.map(([name, test]) => {
+      const g = rows.filter(test);
+      return g.length ? `<div class="group-title">${name}</div>${g.map(stratCard).join("")}` : "";
+    }).join("")}
+    <div class="row-gap"><button class="ghost mini lockable" id="strat-reset">Reset to config.yaml</button></div>`;
+  $$("[data-strat-toggle]").forEach(c => c.onchange = () => updateStrategy(c.dataset.stratToggle, { enabled: c.checked }));
+  $$("[data-strat-weight]").forEach(i => i.onchange = () => {
+    const w = parseFloat(i.value);
+    if (!(w >= 0.1 && w <= 3)) { toast("Weight must be between 0.1 and 3", "bad"); renderStrategies(); return; }
+    updateStrategy(i.dataset.stratWeight, { weight: w });
+  });
+  $("#strat-reset").onclick = async () => {
+    const r = await post("/api/strategies/reset");
+    toastResult(r);
+    if (r.ok) { indexStrategies(r.strategies); renderStrategies(); }
+  };
+}
+
+async function updateStrategy(key, body) {
+  const r = await post(`/api/strategies/${encodeURIComponent(key)}`, body);
+  if (r.ok) { indexStrategies(r.strategies); toast(r.note + (r.rescanning ? " Rescanning…" : ""), "good"); }
+  else toast("Strategy not changed: " + (r.reason || ""), "bad");
+  if (DRAWER === "strategies") renderStrategies();
+}
+$("#btn-strategies").onclick = openStrategies;
+
 /* ---------- toasts, modal, drawer ---------- */
 function toast(text, cls) {
   const d = document.createElement("div");
@@ -555,13 +1012,14 @@ function toast(text, cls) {
 }
 const toastResult = r => toast(r.ok ? (r.note || "Done") : (r.reason || r.detail || "Failed"), r.ok ? "good" : "bad");
 
-function openModal({ title, bodyHTML, okText = "Confirm", okClass = "danger", onOk }) {
+function openModal({ title, bodyHTML, okText = "Confirm", okClass = "danger", cancelText = "Cancel", onOk }) {
   $("#modal-title").textContent = title;
   $("#modal-body").innerHTML = bodyHTML;
   const ok = $("#modal-ok");
   ok.textContent = okText;
   ok.className = okClass;
   ok.onclick = async () => { closeModal(); await onOk(); };
+  $("#modal-cancel").textContent = cancelText;
   $("#modal-cancel").onclick = closeModal;
   $("#modal").onclick = e => { if (e.target.id === "modal") closeModal(); };
   $("#modal").classList.remove("hidden");
@@ -575,7 +1033,7 @@ function openDrawer(title, html, wide = false) {
   $("#drawer-inner").classList.toggle("wide", wide);
   $("#drawer").classList.remove("hidden");
 }
-function closeDrawer() { $("#drawer").classList.add("hidden"); CONN = null; }
+function closeDrawer() { $("#drawer").classList.add("hidden"); DRAWER = null; CONN = null; RECORD_ID = null; }
 $("#drawer-close").onclick = closeDrawer;
 $("#drawer").onclick = e => { if (e.target.id === "drawer") closeDrawer(); };
 document.addEventListener("keydown", e => {
@@ -588,13 +1046,14 @@ function busy(btn, text) { if (!btn) return; btn.dataset.label = btn.textContent
 function unbusy(btn) { if (!btn) return; btn.textContent = btn.dataset.label || btn.textContent; btn.disabled = false; }
 
 /* ---------- connections: brokers, keys, sign-in ---------- */
-const connOpen = () => !!CONN && !$("#drawer").classList.contains("hidden");
+const connOpen = () => DRAWER === "connections" && !$("#drawer").classList.contains("hidden");
 
 async function openConnections() {
-  if (!connOpen()) openDrawer("Connections", `<p class="muted">Loading…</p>`, true);
+  if (!connOpen()) { DRAWER = "connections"; RECORD_ID = null; openDrawer("Connections", `<p class="muted">Loading…</p>`, true); }
   let d;
   try { d = await getLocal("/api/setup"); }
-  catch { $("#drawer-body").innerHTML = `<p class="reasons">Couldn't load connection settings.</p>`; return; }
+  catch { if (connOpen()) $("#drawer-body").innerHTML = `<p class="reasons">Couldn't load connection settings.</p>`; return; }
+  if (!connOpen()) return;                         // closed or replaced while loading
   if (d.detail) { $("#drawer-body").innerHTML = `<p class="reasons">${escapeHtml(d.detail)}</p>`; return; }
   CONN = d;
   renderConnections();
@@ -616,7 +1075,7 @@ function renderConnections() {
     <section class="conn">
       <h4>Where orders go</h4>
       <div class="conn-now">Right now <b>${v.mode === "live" ? "LIVE" : "paper"}</b> orders go to <b>${escapeHtml(v.trading_on_label)}</b>.</div>
-      <div class="conn-grid">
+      <div class="conn-grid lockable">
         <div><span class="group-label">Paper trades on</span>${radios("paper_platform", v.paper_platforms, v.paper_platform)}</div>
         <div><span class="group-label">Live trades on</span>${radios("live_broker", v.live_brokers, v.live_broker)}</div>
       </div>
@@ -752,36 +1211,6 @@ $("#btn-connections").onclick = openConnections;
 $("#pill-conn").onclick = openConnections;
 $("#pill-conn").onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openConnections(); } };
 
-/* ---------- sector filter (scan + execution) ---------- */
-function renderSectorsButton() {
-  const sel = STATE.sectors || [];
-  const b = $("#btn-sectors");
-  b.textContent = !sel.length ? "Sectors: all" : sel.length === 1 ? `Sector: ${SECTOR_SHORT[sel[0]] || sel[0]}` : `Sectors: ${sel.length}`;
-  b.classList.toggle("active-filter", sel.length > 0);
-  b.title = sel.length ? "Only scanning and trading: " + sel.join(", ") : "Scanning and trading every sector — click to narrow it down";
-}
-$("#btn-sectors").onclick = async () => {
-  const { all, selected } = await api("/api/filters/sectors");
-  const on = new Set(selected.length ? selected : all);
-  openModal({
-    title: "Sectors to scan and trade",
-    bodyHTML: `<p class="muted">The scanner skips everything else, and plays outside these sectors can't be executed — by you or by Autopilot.</p>
-      <div class="sector-grid">${all.map(s =>
-        `<label><input type="checkbox" value="${escapeHtml(s)}" ${on.has(s) ? "checked" : ""}> ${escapeHtml(s)}</label>`).join("")}</div>
-      <div class="row-gap"><button class="ghost mini" id="sec-all">Select all</button><button class="ghost mini" id="sec-none">Clear</button></div>`,
-    okText: "Apply", okClass: "long",
-    onOk: async () => {
-      const picked = $$(".sector-grid input:checked").map(i => i.value);
-      if (!picked.length) { toast("Pick at least one sector", "bad"); return; }
-      const r = await post("/api/filters/sectors", { sectors: picked });
-      toast(r.ok ? `${r.note} Rescanning…` : "Couldn't save: " + (r.reason || ""), r.ok ? "good" : "bad");
-      if (r.ok) { STATE.sectors = r.sectors; renderSectorsButton(); }
-    }
-  });
-  $("#sec-all").onclick = () => $$(".sector-grid input").forEach(i => { i.checked = true; });
-  $("#sec-none").onclick = () => $$(".sector-grid input").forEach(i => { i.checked = false; });
-};
-
 /* ---------- paper / live toggle ---------- */
 $$("#mode-switch .seg").forEach(b => b.onclick = async () => {
   const target = b.dataset.mode;
@@ -813,11 +1242,12 @@ $("#btn-reset-paper").onclick = () => {
     title: "Reset paper account",
     bodyHTML: `<p>Wipe the simulator's cash, positions and session P/L, and start again from:</p>
       <p><label>$ </label><input type="number" id="reset-amt" value="${cur}" min="1000" step="1000" /></p>
-      <p class="muted">Trade history in the database is kept for the record.</p>`,
+      <p class="muted">Closed-trade history is kept. The simulator's open positions are wiped, so their open-trade records are deleted.</p>`,
     okText: "Reset", okClass: "danger",
     onOk: async () => {
       const amt = parseFloat(($("#reset-amt") || {}).value) || cur;
       toastResult(await post("/api/paper/reset", { cash: amt }));
+      loadOpen();
     }
   });
 };
@@ -830,19 +1260,12 @@ $("#btn-refresh").onclick = async () => {
   setTimeout(() => unbusy(b), 800);
 };
 
-$("#btn-reconcile").onclick = () => openModal({
-  title: "Reconcile paper positions",
-  bodyHTML: `<p>Rebuild the simulator's positions so they match the sum of the <b>open trades</b> in the database.</p>
-    <p class="muted">Use this if a position looks off (e.g. after a double-submit). Trade history is untouched.</p>`,
-  okText: "Reconcile", okClass: "danger",
-  onOk: async () => { toastResult(await post("/api/paper/reconcile")); loadOpen(); }
-});
-
 $("#btn-scan").onclick = async () => {
-  $("#btn-scan").disabled = true;
-  await post("/api/scan/now");
-  toast("Scan queued", "good");
-  setTimeout(() => { $("#btn-scan").disabled = false; }, 4000);
+  const b = $("#btn-scan");
+  b.disabled = true;
+  const r = await post("/api/scan/now");
+  toast(r.ok ? "Scan queued" : "Not scanning: " + (r.reason || ""), r.ok ? "good" : "bad");
+  setTimeout(() => { b.disabled = false; }, 4000);
 };
 
 /* ---------- autopilot (hands-off entry) ---------- */
@@ -896,7 +1319,8 @@ $("#ap-cfg").onclick = () => {
       </div>
       <label><input type="checkbox" id="ap-cooldown" ${ap.cooldown_after_loss !== false ? "checked" : ""}> Cool off a ticker for the day after it stops out</label>
       <label><input type="checkbox" id="ap-dry" ${ap.dry_run ? "checked" : ""}> Dry run (log what it would do, place nothing)</label>
-      <p class="muted">Live routing also needs <code>autopilot.allow_live: true</code> in config.yaml. Sectors are set with the Sectors button. Exits are automatic no matter what.</p>
+      <p class="muted">Live routing also needs <code>autopilot.allow_live: true</code> in config.yaml. The Long / Short, Intraday / Swing and
+      Sectors filters and the Strategies panel apply to Autopilot too. Exits are automatic no matter what.</p>
     </div>`,
     okText: "Save", okClass: "long",
     onOk: async () => {
@@ -919,20 +1343,12 @@ $("#ap-cfg").onclick = () => {
   });
   const cs = $("#ap-conf"); if (cs) cs.oninput = () => { $("#ap-conf-v").textContent = cs.value; };
 };
-$$("#f-long,#f-short,#f-intraday,#f-swing,#f-hide-done").forEach(c => c.onchange = renderPlays);
-
-$("#btn-strategies").onclick = async () => {
-  const { strategies } = await api("/api/strategies");
-  CONN = null;
-  openDrawer("Strategy playbook", strategies.map(s => `
-    <div class="strat"><div class="meta">${s.kind} · ${s.timeframe}</div>
-    <h4>${escapeHtml(s.title)}</h4><div>${escapeHtml(s.thesis)}</div></div>`).join(""));
-};
 
 /* ---------- boot ---------- */
 syncThemeButton();
-api("/api/state").then(s => { STATE = s; renderTop(); });
-api("/api/plays").then(d => { PLAYS = d.plays || []; renderPlays(); });
+refreshState();
+loadStrategies().then(renderPlays).catch(() => { /* names fall back to their keys */ });
+api("/api/plays").then(d => { PLAYS = d.plays || []; renderPlays(); }).catch(() => { });
 loadOpen();
 connect();
-setInterval(refreshState, 15000);
+REFRESH_TIMER = setInterval(refreshState, 15000);

@@ -1,14 +1,21 @@
 """One scan cycle:
 
-    universe slice  ->  daily bars (cached)  ->  pre-filter
-        ->  intraday bars + strategies (technical)
-        ->  fundamentals + peers for the leaders  ->  strategies (fundamental)
-        ->  size every play, rank, keep the short list
+    universe slice  ->  sector filter  ->  daily bars  ->  pre-filter
+        ->  intraday bars + technical strategies
+        ->  fundamentals + peers for the leaders  ->  fundamental strategies
+        ->  size every play, apply the dashboard filters, rank, keep the short list
 
 The universe is scanned in rotating slices of ``max_symbols_scanned`` so that
 "all of the Nasdaq" is covered over several cycles without hammering the data
-provider. Every step is per-symbol try/except so one bad ticker cannot abort
-the cycle.
+provider.
+
+Where the time goes and what runs in parallel: bars arrive in one batched
+request per chunk of symbols (not one paced request per symbol), a last-price
+feed's quotes are read off those bars instead of fetched again, fundamentals
+are network round-trips so they're fetched concurrently, and the strategies
+(CPU-bound, so threads don't help) run in sequence. Each stage's wall time is
+in ``ScanResult.timings``.
+Every step is per-symbol try/except so one bad ticker cannot abort the cycle.
 """
 
 from __future__ import annotations
@@ -17,20 +24,22 @@ import datetime as dt
 import logging
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
 
+import pandas as pd
+
 from ..core.eventbus import BUS
-from ..core.models import Account, Play, ScanCandidate
+from ..core.models import Account, Play, Quote, ScanCandidate
 from ..data.fundamentals import FundamentalsProvider
-from ..data.market_data import MarketDataService
+from ..data.market_data import MarketDataService, quote_from_price
 from ..data.sectors import SectorLookup, sector_allowed
 from ..data.universe import UniverseLoader
 from ..risk.position_sizing import size_play
 from ..strategies.base import build_context
 from ..util import clock
-from .filters import passes_prefilter, rank_score
+from .filters import TradeFilters, passes_prefilter, rank_score
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +58,7 @@ class ScanResult:
     errors: Dict[str, str] = field(default_factory=dict)
     elapsed_s: float = 0.0
     sector_skipped: int = 0                                  # outside the Sectors filter
+    timings: Dict[str, float] = field(default_factory=dict)  # stage -> seconds
 
     def summary(self) -> dict:
         return {
@@ -63,10 +73,19 @@ class ScanResult:
             "shortlist": self.shortlist,
             "n_errors": len(self.errors),
             "elapsed_s": round(self.elapsed_s, 1),
+            "timings": {k: round(v, 2) for k, v in self.timings.items()},
         }
 
 
 class Scanner:
+    #: tickers with no known sector yet, looked up online per cycle while a
+    #: sector filter is on; the rest are skipped this cycle and resolved later
+    SECTOR_LOOKUPS_PER_CYCLE = 20
+    #: fundamentals are network round-trips, so these overlap well (19 s -> 11 s
+    #: for the leaders + peers). The strategies are CPU-bound pandas work where a
+    #: thread pool measured no faster under the GIL, so they run in sequence.
+    FUNDAMENTALS_WORKERS = 4
+
     def __init__(
         self,
         settings,
@@ -77,9 +96,7 @@ class Scanner:
         self.settings = settings
         self.md = market_data
         self.fund = fundamentals
-        self.strategies = strategies
-        self.tech = [s for s in strategies if s.kind.value == "TECHNICAL"]
-        self.fundamental = [s for s in strategies if s.kind.value == "FUNDAMENTAL"]
+        self.set_strategies(strategies)
 
         self._loader = UniverseLoader()
         self._universe: List[str] = []
@@ -87,10 +104,26 @@ class Scanner:
         self._last_account: Optional[Account] = None
 
         self._sectors = SectorLookup(use_yfinance=self.md.is_real)
-        #: only scan / trade these sectors ([] = all); the engine keeps it in sync
-        self.sectors_allowed: List[str] = []
+        #: what to look for (sides, timeframes, sectors). The engine replaces it
+        #: when the dashboard filters change; a cycle in flight keeps its copy.
+        self.filters = TradeFilters()
 
     # ------------------------------------------------------------------ #
+    def set_strategies(self, strategies: list) -> None:
+        """Swap the active setups (strategy panel). A cycle already running
+        finishes with the set it started with."""
+        self.strategies = list(strategies)
+        self._sets = ([s for s in self.strategies if s.kind.value == "TECHNICAL"],
+                      [s for s in self.strategies if s.kind.value == "FUNDAMENTAL"])
+
+    @property
+    def tech(self) -> list:
+        return self._sets[0]
+
+    @property
+    def fundamental(self) -> list:
+        return self._sets[1]
+
     def set_account(self, account: Account) -> None:
         self._last_account = account
 
@@ -116,11 +149,7 @@ class Scanner:
         self._cursor = end % len(u)
         return sl
 
-    #: tickers with no known sector yet, looked up online per cycle while a
-    #: sector filter is on; the rest are skipped this cycle and resolved later
-    SECTOR_LOOKUPS_PER_CYCLE = 20
-
-    def _in_sectors(self, symbols: List[str]) -> List[str]:
+    def _in_sectors(self, symbols: List[str], sectors) -> List[str]:
         budget = self.SECTOR_LOOKUPS_PER_CYCLE
         keep = []
         for sym in symbols:
@@ -131,9 +160,22 @@ class Scanner:
                     sec = self._sectors.get(sym)
                 except Exception:  # noqa: BLE001
                     sec = ""
-            if sector_allowed(sec, self.sectors_allowed):
+            if sector_allowed(sec, sectors):
                 keep.append(sym)
         return keep
+
+    def _quotes_for(self, daily_by_sym: Dict[str, pd.DataFrame]) -> Dict[str, Quote]:
+        """Quotes for the pre-filter. A feed whose quote is only a last price
+        (yfinance, the demo feed) has it read off the bars just downloaded; a
+        broker feed has real bid/ask, fetched concurrently."""
+        if self.md.quotes_are_synthetic:
+            out = {}
+            for sym, df in daily_by_sym.items():
+                q = _bar_quote(sym, df)
+                if q is not None:
+                    out[sym] = q
+            return out
+        return self.md.get_quotes(list(daily_by_sym))
 
     # ------------------------------------------------------------------ #
     def run_cycle(self) -> ScanResult:
@@ -141,14 +183,16 @@ class Scanner:
         sc = self.settings.config.scanner
         bars = sc.bars or {}
         pf = sc.prefilter or {}
+        filters = self.filters                      # one consistent view for the whole cycle
+        tech, fundamental = self._sets
         run = ScanResult(run_id=f"scan_{uuid.uuid4().hex[:10]}", started_at=clock.now_ny())
         BUS.publish("scan.started", run_id=run.run_id)
 
         self._ensure_universe()
         run.universe_size = len(self._universe)
         slice_syms = self._next_slice(int(sc.max_symbols_scanned))
-        if self.sectors_allowed:
-            in_sector = self._in_sectors(slice_syms)
+        if filters.sectors:
+            in_sector = self._in_sectors(slice_syms, filters.sectors)
             run.sector_skipped = len(slice_syms) - len(in_sector)
             slice_syms = in_sector
         run.scanned = len(slice_syms)
@@ -158,82 +202,70 @@ class Scanner:
         daily_days = int(bars.get("daily_lookback_days", 400))
         equity = self._last_account.equity if self._last_account else 0.0
 
-        # -- stage 1: daily bars + prefilter (parallel I/O) ------------- #
-        cands: List[ScanCandidate] = []
-
-        def _prefilter(sym: str):
-            try:
-                daily = self.md.get_price_history(sym, "1d", daily_days)
-                quote = None
-                try:
-                    quote = self.md.get_quote(sym)
-                except Exception:  # noqa: BLE001
-                    pass
-                cand = passes_prefilter(sym, daily, None, quote, pf)
-                return sym, cand, daily, quote, None
-            except Exception as e:  # noqa: BLE001
-                return sym, None, None, None, str(e)
-
-        daily_cache: Dict[str, object] = {}
-        quote_cache: Dict[str, object] = {}
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            for sym, cand, daily, quote, err in ex.map(_prefilter, slice_syms):
-                if err:
-                    # "no data" for a ticker (delisted, halted, not on the feed)
-                    # is routine, not an error worth surfacing.
-                    if "no data" not in err and "no market data" not in err and "no quote" not in err:
-                        run.errors[sym] = err
-                    continue
-                if cand is not None:
-                    cands.append(cand)
-                    daily_cache[sym] = daily
-                    quote_cache[sym] = quote
-        cands.sort(key=lambda c: (c.rvol, c.atr_pct), reverse=True)
-        run.prefiltered = len(cands)
-        run.candidates = cands
-        BUS.publish("scan.progress", run_id=run.run_id, stage="prefiltered", n=len(cands))
-
-        # -- stage 2: technical strategies on the survivors ------------ #
-        all_plays: List[Play] = []
-        cand_by_sym = {c.symbol: c for c in cands}
-
-        # intraday setups need a *live* session - skip them when the market is
-        # closed (their "intraday" bars would just be yesterday's tail).
+        # intraday setups need a *live* session - when the market is closed their
+        # "intraday" bars would just be yesterday's tail. Both kinds also have to
+        # be switched on in the filters.
         intraday_ok = clock.is_market_open()
-        active_tech = [s for s in self.tech
-                       if s.timeframe.value != "INTRADAY" or intraday_ok]
-        if not intraday_ok:
+        active_tech = [s for s in tech if s.timeframe.value in filters.timeframes
+                       and (s.timeframe.value != "INTRADAY" or intraday_ok)]
+        active_fund = [s for s in fundamental if s.timeframe.value in filters.timeframes]
+        if not intraday_ok and "INTRADAY" in filters.timeframes:
             log.info("market closed - running %d swing setups only (skipping intraday)",
                      len(active_tech))
 
-        # when the market is closed, skip the per-symbol intraday fetch entirely
-        # (no intraday setups run, and a daily sparkline is fine for swings)
-        need_intraday = intraday_ok
+        # -- stage 1: daily bars + prefilter ----------------------------- #
+        mark = time.time()
+        daily_by_sym = self.md.get_price_histories(slice_syms, "1d", daily_days) if slice_syms else {}
+        quotes = self._quotes_for(daily_by_sym)
+        cands: List[ScanCandidate] = []
+        for sym in slice_syms:
+            daily = daily_by_sym.get(sym)
+            if daily is None:
+                continue                            # no data (delisted, halted, not on the feed)
+            try:
+                cand = passes_prefilter(sym, daily, None, quotes.get(sym), pf)
+            except Exception as e:  # noqa: BLE001
+                run.errors[sym] = str(e)
+                continue
+            if cand is not None:
+                cands.append(cand)
+        cands.sort(key=lambda c: (c.rvol, c.atr_pct), reverse=True)
+        run.prefiltered = len(cands)
+        run.candidates = cands
+        run.timings["prices"] = time.time() - mark
+        BUS.publish("scan.progress", run_id=run.run_id, stage="prefiltered", n=len(cands))
+
+        # -- stage 2: technical strategies on the survivors -------------- #
+        cand_by_sym = {c.symbol: c for c in cands}
+        syms = [c.symbol for c in cands]
+        intraday_by_sym: Dict[str, pd.DataFrame] = {}
+        if syms and any(s.timeframe.value == "INTRADAY" for s in active_tech):
+            mark = time.time()
+            intraday_by_sym = self.md.get_price_histories(syms, intraday_iv, intraday_days)
+            run.timings["intraday_bars"] = time.time() - mark
 
         def _run_tech(sym: str):
             try:
-                daily = daily_cache[sym]
-                intr = daily
-                if need_intraday:
-                    try:
-                        intr = self.md.get_price_history(sym, intraday_iv, intraday_days)
-                    except Exception:  # noqa: BLE001
-                        intr = daily            # fall back to daily; swing setups don't care
-                q = quote_cache.get(sym) or None
+                daily = daily_by_sym[sym]
+                intr = intraday_by_sym.get(sym)
+                if intr is None or intr.empty:
+                    intr = daily                    # swing setups don't care
+                q = quotes.get(sym)
+                if intr is not daily and self.md.quotes_are_synthetic:
+                    q = _bar_quote(sym, intr) or q  # the last 5-minute bar beats the daily one
                 _c = cand_by_sym.get(sym)
                 ctx = build_context(
                     sym, intr, daily, q, params={"valuation": _valuation_params(self.settings)},
                     account_equity=equity,
                     candidate=asdict(_c) if _c is not None else None,
                 )
-                src = intr if intr is not daily else daily
-                spark = [round(float(x), 3) for x in src["close"].tail(60).tolist()]
+                spark = _spark(intr)
                 out: List[Play] = []
                 for strat in active_tech:
                     try:
                         for p in strat.generate(ctx):
                             p.scan_run_id = run.run_id
-                            p.score = rank_score(p, cand_by_sym.get(sym), strat.weight)
+                            p.score = rank_score(p, _c, strat.weight)
                             p.evidence.setdefault("spark", spark)
                             out.append(p)
                     except Exception as e:  # noqa: BLE001
@@ -242,50 +274,40 @@ class Scanner:
             except Exception as e:  # noqa: BLE001
                 return sym, [], None, str(e)
 
+        mark = time.time()
+        all_plays: List[Play] = []
         ctx_by_sym: Dict[str, object] = {}
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            futs = [ex.submit(_run_tech, c.symbol) for c in cands[: int(sc.max_symbols_scanned)]]
-            for fut in as_completed(futs):
-                sym, plays, ctx, err = fut.result()
-                if err and "no data" not in err and "no market data" not in err:
-                    run.errors[sym] = err
-                if ctx is not None:
-                    ctx_by_sym[sym] = ctx
-                all_plays.extend(plays)
+        for sym, plays, ctx, err in map(_run_tech, syms):
+            if err:
+                run.errors[sym] = err
+            if ctx is not None:
+                ctx_by_sym[sym] = ctx
+            all_plays.extend(plays)
+        run.timings["strategies"] = time.time() - mark
 
-        # -- stage 3: fundamentals for the leaders -------------------- #
-        if self.fundamental and self.fund is not None:
+        # -- stage 3: fundamentals for the leaders ----------------------- #
+        if active_fund and self.fund is not None and ctx_by_sym:
+            mark = time.time()
             n_leaders = int(getattr(sc, "fundamentals_leaders", 8) or 8)
-            peer_n = 6
-            leaders = _leaders_for_fundamentals(cands, all_plays, limit=n_leaders)
-            for sym in leaders:
-                try:
-                    ctx = ctx_by_sym.get(sym)
-                    if ctx is None:
-                        continue
-                    ctx.fundamentals = self.fund.get(sym)
-                    if ctx.fundamentals and ctx.fundamentals.has_min_data():
-                        peer_syms = self.fund.peers(sym, limit=peer_n)
-                        ctx.peers = [self.fund.get(p) for p in peer_syms]
-                    spark = []
+            leaders = [s for s in _leaders_for_fundamentals(cands, all_plays, limit=n_leaders)
+                       if s in ctx_by_sym]
+            for sym in self._load_fundamentals(leaders, ctx_by_sym, peer_n=6, errors=run.errors):
+                ctx = ctx_by_sym[sym]
+                spark = _spark(ctx.intraday)
+                for strat in active_fund:
                     try:
-                        spark = [round(float(x), 3) for x in ctx.intraday["close"].tail(60).tolist()]
-                    except Exception:  # noqa: BLE001
-                        pass
-                    for strat in self.fundamental:
-                        try:
-                            for p in strat.generate(ctx):
-                                p.scan_run_id = run.run_id
-                                p.score = rank_score(p, cand_by_sym.get(sym), strat.weight)
-                                if spark:
-                                    p.evidence.setdefault("spark", spark)
-                                all_plays.append(p)
-                        except Exception as e:  # noqa: BLE001
-                            log.debug("%s %s failed: %s", sym, strat.key, e)
-                except Exception as e:  # noqa: BLE001
-                    run.errors[sym] = f"fundamentals: {e}"
+                        for p in strat.generate(ctx):
+                            p.scan_run_id = run.run_id
+                            p.score = rank_score(p, cand_by_sym.get(sym), strat.weight)
+                            if spark:
+                                p.evidence.setdefault("spark", spark)
+                            all_plays.append(p)
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("%s %s failed: %s", sym, strat.key, e)
+            run.timings["fundamentals"] = time.time() - mark
 
-        # -- stage 4: sector tag, size, rank, shortlist ------------- #
+        # -- stage 4: sector tag, size, filter, rank, shortlist ---------- #
+        mark = time.time()
         acct = self._last_account
         sector_by_sym: Dict[str, str] = {}
         for p in all_plays:
@@ -305,7 +327,7 @@ class Scanner:
         min_rr = float(self.settings.config.risk.min_reward_risk)
         all_plays = [p for p in all_plays
                      if (p.reward_risk >= min_rr or p.kind.value == "FUNDAMENTAL")
-                     and sector_allowed(p.sector, self.sectors_allowed)]
+                     and filters.allows(p)]
         all_plays.sort(key=lambda p: p.score, reverse=True)
         run.plays = all_plays
 
@@ -316,6 +338,7 @@ class Scanner:
             if len(seen) >= int(sc.shortlist_size):
                 break
         run.shortlist = seen
+        run.timings["rank"] = time.time() - mark
 
         run.finished_at = clock.now_ny()
         run.elapsed_s = time.time() - t0
@@ -323,6 +346,65 @@ class Scanner:
         BUS.publish("scan.completed", run_id=run.run_id, summary=run.summary(),
                     plays=[p.to_row() for p in all_plays[:60]])
         return run
+
+    def _load_fundamentals(self, leaders: List[str], ctx_by_sym: Dict[str, object],
+                           peer_n: int, errors: Dict[str, str]) -> List[str]:
+        """Financials for the leaders, then one wave for all of their peers.
+        Each wave runs concurrently - the provider's limiter still spaces the
+        request starts, but the round-trips overlap. Returns the leaders loaded."""
+        fund = self.fund
+
+        def leader(sym: str):
+            try:
+                fin = fund.get(sym)
+                peers = list(fund.peers(sym, limit=peer_n)) if fin and fin.has_min_data() else []
+                return sym, fin, peers, None
+            except Exception as e:  # noqa: BLE001
+                return sym, None, [], e
+
+        def peer(sym: str):
+            try:
+                return sym, fund.get(sym)
+            except Exception as e:  # noqa: BLE001
+                log.debug("peer %s fundamentals failed: %s", sym, e)
+                return sym, None
+
+        loaded: List[str] = []
+        peers_of: Dict[str, List[str]] = {}
+        with ThreadPoolExecutor(max_workers=max(1, self.FUNDAMENTALS_WORKERS)) as ex:
+            for sym, fin, peers, err in ex.map(leader, leaders):
+                if err is not None:
+                    errors[sym] = f"fundamentals: {err}"
+                    continue
+                ctx_by_sym[sym].fundamentals = fin
+                peers_of[sym] = peers
+                loaded.append(sym)
+            wanted = list(dict.fromkeys(p for ps in peers_of.values() for p in ps))
+            got = {s: f for s, f in ex.map(peer, wanted) if f is not None}
+        for sym in loaded:
+            if peers_of.get(sym):
+                ctx_by_sym[sym].peers = [got[p] for p in peers_of[sym] if p in got]
+        return loaded
+
+
+def _bar_quote(symbol: str, bars: Optional[pd.DataFrame]) -> Optional[Quote]:
+    """A last-price quote from the newest bar."""
+    try:
+        last = bars.iloc[-1]
+        price = float(last["close"])
+        volume = float(last.get("volume", 0.0) or 0.0)
+    except Exception:  # noqa: BLE001
+        return None
+    if not price or price != price:
+        return None
+    return quote_from_price(symbol, price, volume)
+
+
+def _spark(bars: Optional[pd.DataFrame]) -> List[float]:
+    try:
+        return [round(float(x), 3) for x in bars["close"].tail(60).tolist()]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _valuation_params(settings) -> dict:

@@ -29,8 +29,19 @@ DCF / comps overlay).
   in with Schwab**: a local callback server catches Schwab's OAuth redirect and
   stores the token. IBKR has no token — its login is the running IB Gateway —
   so its panel tests the connection instead.
-- **Sector filter** — pick the sectors to scan *and* trade. The scanner skips the
-  rest, and plays outside them can't be executed by you or by Autopilot.
+- **Filters that drive the bot** — Long / Short, Intraday / Swing and Sectors
+  decide what the scanner looks for *and* what can be executed, by you or by
+  Autopilot. A change applies at once, updates every open tab and is remembered.
+- **Strategies panel** — switch each setup on or off and set its weight, live.
+- **Hover to learn** — every play type (long, short, intraday, swing, …), column
+  and strategy name explains itself on hover.
+- **Quitting never strands a position** — paper closes everything, resets the
+  simulator and shuts down; live asks whether to exit everything first or
+  cancel. Until the last position is out, nothing else can change. Any single
+  position can be exited on its own at any time.
+- **Trade records** — click a position (or a closed trade) for everything stored
+  about it: the plan, fills and broker orders. An open-trade record whose
+  position no longer exists at the broker is deleted automatically.
 - **Light / dark theme** — follows your OS setting; one click to switch.
 - **Strategies:** 13 technical day-trade / swing setups (Aziz's ABCD, bull/bear
   flag, VWAP, opening-range, red-to-green, top/bottom reversal, horizontal S/R;
@@ -68,10 +79,11 @@ python run.py
 The dashboard opens at `http://127.0.0.1:8787` in **Paper** mode on the built-in
 **$100,000** simulator. Click **Scan now**, hover a row to read the play, click
 it to see the order preview (*Routes to: SIMULATED (built-in)*), then **Execute
-✓ Yes** to fill it against the current quote. Close positions from **Open
+✓ Yes** to fill it against the current quote. **Exit** positions from **Open
 positions**; realised P/L lands in **Trade history** and **P/L summary**.
-**Reset paper** wipes the simulator back to a balance you choose (trade history
-is kept). The simulator persists to `data/paper_state.json`.
+**Reset paper** wipes the simulator back to a balance you choose (closed-trade
+history is kept). The simulator persists to `data/paper_state.json`. Stop the
+app with **Quit** or Ctrl+C — see [Quitting](#quitting).
 
 With no broker connected, market data comes from `yfinance` (delayed ~15 min).
 The header shows the source (`data: yfinance` / `broker:ibkr` / `broker:schwab`)
@@ -102,9 +114,14 @@ Three switches, all in the dashboard and remembered in `data/runtime.json`
   refused and tells you why.
 - Every trade is stamped with its venue (`paper`, `ibkr-paper`, `ibkr-live`,
   `schwab`). The exit manager only manages trades on the active venue, a manual
-  **Close** is refused for a position held elsewhere, and a platform or
+  **Exit** is refused for a position held elsewhere, and a platform or
   Paper/Live switch is refused while positions are open on the current venue —
   so an exit can never be sent to an account that doesn't hold the shares.
+- Before any exit the app asks the broker what it actually holds. If the
+  position is gone (closed in the broker's own app) or only the other side is
+  there, nothing is sent: selling shares you don't have would open a new short.
+  It also never sells more than the broker holds. If the broker can't answer,
+  the exit goes ahead, since a missed stop is the bigger risk.
   Positions parked on another platform show an **on IBKR paper**-style badge.
 
 ---
@@ -217,21 +234,74 @@ python scripts/init_db.py            # creates all tables + indexes
 
 ---
 
-## Sector filter
+## Filters, strategies and live changes
 
-**Sectors** (above the plays table) picks which of the 11 GICS sectors to scan
-and trade; "all" means no filter. The choice is remembered in
-`data/runtime.json` (default: `scanner.sectors` in `config.yaml`).
+The **Long / Short** and **Intraday / Swing** checkboxes and **Sectors** (above
+the plays table) are the bot's instructions, not just a view:
 
-- **Scan:** each cycle drops symbols outside the selection before any price data
-  is fetched. Sectors come from a bundled map, then a disk cache, then a
-  one-off `yfinance` lookup (at most 20 new tickers per cycle, so a filter never
-  stalls a scan); a ticker whose sector isn't known yet is skipped until it is.
-- **Execute:** a play outside the selection can't be executed, by you or by
-  Autopilot — the order card says why. Changing the selection clears
-  non-matching plays from the board and starts a rescan.
-- yfinance spellings are normalised (`Consumer Cyclical` → *Consumer
-  Discretionary*, `Financial Services` → *Financials*, …).
+- **Scan:** the scanner only runs setups of the switched-on timeframes, keeps
+  only plays on the switched-on sides, and drops symbols outside the selected
+  sectors before any price data is fetched. Sectors come from a bundled map,
+  then a disk cache, then a one-off `yfinance` lookup (at most 20 new tickers per
+  cycle, so a filter never stalls a scan); a ticker whose sector isn't known yet
+  is skipped until it is. yfinance spellings are normalised (`Consumer Cyclical`
+  → *Consumer Discretionary*, `Financial Services` → *Financials*, …).
+- **Execute:** a play the filters exclude can't be executed, by you or by
+  Autopilot — the order card says why.
+- **Live:** narrowing a filter clears non-matching plays from the board at once;
+  widening one starts a rescan. At least one side and one timeframe stay on.
+  **Hide executed** is the one view-only checkbox (remembered per browser).
+
+The **Strategies** button opens the playbook: an on/off switch and a **weight**
+(0.1–3, multiplies the setup's score) per setup, grouped into day-trade, swing
+and valuation. Switching a setup off removes its plays from the board; switching
+one on or changing a weight rescans. **Reset to config.yaml** drops your changes.
+
+Filters, strategy switches, Paper/Live and the platforms are saved in
+`data/runtime.json`, so they survive a restart (`config.yaml` supplies the
+defaults: `scanner.sectors`, `strategies`), and are pushed over the WebSocket so
+every open dashboard tab updates without a reload.
+
+---
+
+## Quitting
+
+**Quit** (header) or **Ctrl+C** in the terminal never walks away from open
+positions:
+
+| trading on | what happens |
+|---|---|
+| **Paper** | working entry orders are cancelled, every open paper position is closed at the market, the simulator is reset to `account.paper_start_cash`, and the app shuts down |
+| **Live, positions open** | a dialog lists them: **Exit all & quit** closes every one and shuts down once they're out; **Cancel** keeps them open and the app running, so their exits stay managed |
+| **Live, nothing open** | the app shuts down |
+
+While it closes out, a red banner shows what's left and the app is **locked**:
+routing, filters, strategies, Autopilot, scanning and new entries are refused
+(the API says why) — only exits go through. Closes that haven't filled are
+re-sent every 30 s. If the app is stopped mid-quit, the quit resumes on the next
+start. Ctrl+C in live mode asks in the dashboard; press it again within 10 s to
+force-quit (positions then stay open and **unmanaged**). Positions parked on
+another platform are listed and left alone.
+
+**Exit** (on each position) and **Exit all** (blotter header) close positions at
+the market at any time, including while quitting. In live mode the confirmation
+says it's a real order.
+
+## Trade records
+
+Click an open position or a closed trade for its **record**: status, entry and
+exit, stop moves, what the broker holds right now, why it was taken (the play's
+explanation), every fill and every order sent to the broker — with an **Exit**
+button while it's open.
+
+An **open-trade record is deleted** once its position no longer exists where it
+was opened — closed in the broker's own app, removed, or wiped by **Reset
+paper**. A wrong deletion would orphan a real position, so the check is strict:
+it only acts on a connected broker's fresh account snapshot, after the
+connection has been up a minute, for trades older than 90 s whose close isn't in
+flight, and after two misses in a row. A paper reset removes the simulator's
+records straight away. Each removal is logged and shown as a toast. Closed
+trades are never deleted, and the broker order audit log is always kept.
 
 ---
 
@@ -327,8 +397,9 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | **cool off** a ticker after it stops out today | on | `cooldown_after_loss` |
 | require a catalyst / dry-run | off | `require_catalyst`, `dry_run` |
 
-Sectors are set with the **Sectors** button and apply to Autopilot too. It
-still passes through every other check — session validity, position sizing, the
+The filters (sides, timeframes, sectors) and the Strategies panel apply to
+Autopilot too, and it takes no entries while the app is quitting. It still
+passes through every other check — session validity, position sizing, the
 PDT guard, the $2,000 live floor. Fundamental (valuation) plays are never
 auto-traded. Eligible plays get a **🤖** marker.
 
@@ -355,21 +426,30 @@ header button shows the cadence (`Autopilot: day ⚡45s`).
   (Gateway down, Schwab sign-in expiring).
 * **Connections** — paper platform, live broker, broker settings and keys,
   **Test paper / Test live** for IBKR, **Sign in with Schwab**, **Reconnect**.
-* **Sectors** — which sectors to scan and trade.
-* **◐** — light / dark theme (remembered per browser).
+* **Long / Short / Intraday / Swing** and **Sectors** — what the bot scans for
+  and may trade (see [Filters](#filters-strategies-and-live-changes)).
+* **Strategies** — switch setups on or off and weight them; the button shows how
+  many are on.
+* **◐** — light / dark theme (remembered per browser; other tabs follow).
 * **↻ Refresh** — re-pull account, positions and fills now.
 * **Autopilot** + **⚙** — hands-off entry and its caps.
-* **Reset paper** / **Reconcile** (simulator only) — reset the balance, or
-  rebuild simulator positions from the open trades in the database.
+* **Reset paper** (simulator only) — reset the balance; the wiped positions'
+  open-trade records are deleted.
+* **Exit** / **Exit all** — close one position, or all of them, at the market.
+* **Quit** — close out, then shut down (see [Quitting](#quitting)).
+* Hover a column name, a Long/Short or day/swing badge, a sector tag or a
+  strategy name for what it means; click a position or closed trade for its
+  record.
 * A play you've executed shows **✓ executed** and can't be fired again.
 
 ---
 
 ## Strategy catalogue
 
-Toggle each one and tune its params/weight in `config/config.yaml → strategies`
-(params there override the defaults in code). Hover any play in the UI for its
-thesis; the **Strategies** button lists them all.
+Switch each one on or off and set its weight in the **Strategies** panel; the
+defaults, params and weights live in `config/config.yaml → strategies` (params
+there override the defaults in code). Hover any play or strategy name for its
+thesis.
 
 **How the explanation is framed (Douglas).** Every play's hover text reads:
 the *edge* (what tends to happen at this setup) → what's true *right now* →
@@ -436,8 +516,21 @@ optional and the engine degrades gracefully.
 3. cheap **pre-filter** (price band, 20-day $-volume, ATR %, spread);
 4. survivors get intraday bars + the technical strategies;
 5. the leaders additionally get fundamentals + peers + the valuation strategies;
-6. every play is position-sized, ranked by a blended score, and the top
-   `shortlist_size` names become the focus list.
+6. every play is position-sized, filtered, ranked by a blended score, and the
+   top `shortlist_size` names become the focus list.
+
+**Where threads help** (measured on 87 symbols from yfinance). A cycle used to
+take ~47 s, mostly spent waiting between one paced request per symbol for daily
+bars, then another for its quote. Bars now come in one batched download per 40
+symbols (intraday bars too), and a last-price feed's quotes are read off those
+bars: that stage takes ~3 s. Fundamentals are network round-trips, so the
+leaders and then their peers are fetched concurrently (4 workers, with a shared
+rate limiter spacing the request starts): 19 s → 11 s. The strategies are
+CPU-bound pandas work where a thread pool measured no faster, so they run in
+sequence. A full cycle now takes ~16 s and finds the same plays. Each stage's
+time is in the scan summary (`timings`). Outside the scanner, the exit manager
+fetches every open position's quote at once, and **Exit all** and quitting send
+every close at once.
 
 Override without editing the config: `SCANNER_UNIVERSE`, `SCANNER_MAX_SYMBOLS`,
 `SCANNER_INTERVAL_SECONDS`.
@@ -458,7 +551,7 @@ paper + live by port) and `schwab_adapter.py` (`schwab-py`).
 ## Project layout
 
 ```
-run.py                     boot engine + dashboard
+run.py                     boot engine + dashboard (Ctrl+C follows the quit rules)
 scripts/
   init_db.py               create the MySQL schema
   ibkr_setup.py            IBKR connectivity doctor + setup guide  (--guide, --live)
@@ -467,7 +560,7 @@ scripts/
 tos_bot/
   config.py                .env + config.yaml loader
   secrets_store.py         the Connections panel's validated, allow-listed .env writer
-  engine.py                the conductor (routing, scan / sync / snapshot loops)
+  engine.py                the conductor (routing, live settings, quit, record checks, loops)
   core/                    enums + framework-free dataclasses + event bus
   indicators/ta.py         vectorised TA (no TA-Lib) incl. divergence / run-length
   analysis/                horizontal S/R clustering + candlestick reads (Aziz / Murphy)
@@ -477,7 +570,7 @@ tos_bot/
   scanner/                 pre-filter, sector filter + cycle orchestration
   risk/                    position sizing + PDT guard
   execution/               order_builder + executor + exit_manager + autopilot
-  util/                    clock (sessions + NYSE calendar to 2028), net, logging
+  util/                    clock (sessions + NYSE calendar to 2028), net, rate limiter, logging
   auth/                    schwab_login (one-click OAuth) + token_manager (7-day upkeep)
   brokers/                 base, venues (routing), paper (simulator), ibkr, schwab
   persistence/             SQLAlchemy models, repository, schema.sql
@@ -489,7 +582,7 @@ tests/                     pytest  (fast by default; `-m slow` for the e2e)
 ## Tests
 
 ```bash
-pytest              # 148 fast unit tests
+pytest              # 167 fast unit tests
 pytest -m slow      # boots the engine, runs scan → approve → close on paper
 ```
 
@@ -499,8 +592,10 @@ frames, the Autopilot gate, the exit manager, the IBKR adapter against a fake
 (`test_venues.py`, `test_venue_safety.py`, `test_engine_routing.py`), the `.env`
 writer (`test_secrets_store.py`), the same-machine guard (`test_security.py`),
 Schwab sign-in with a faked browser flow (`test_schwab_login.py`), token upkeep
-(`test_token_manager.py`) and the sector filter (`test_sectors.py`). Tests use a
-throwaway `.env`, database and runtime file, never yours. The real IB Gateway and
+(`test_token_manager.py`), the sector filter (`test_sectors.py`), live filter and
+strategy changes, quitting and the broker-vs-database record check
+(`test_live_controls.py`), and the batched / parallel paths (`test_threads.py`).
+Tests use a throwaway `.env`, database and runtime file, never yours. The real IB Gateway and
 Schwab login paths need your accounts and aren't exercised in tests.
 
 ## Roadmap

@@ -7,25 +7,31 @@ Providers, in preference order used by the engine:
 
 Strategies and the scanner depend on :class:`MarketDataService`, never on a
 provider directly, so swapping data sources changes one line.
+
+Many symbols at once: :meth:`MarketDataService.get_price_histories` serves the
+cache, then asks a provider that can batch (yfinance downloads dozens of
+tickers per request) and fetches anything left concurrently. Request starts
+are paced per provider (:class:`~tos_bot.util.ratelimit.RateLimiter`).
 """
 
 from __future__ import annotations
 
-import datetime as dt
 import datetime as _dt
 import hashlib
 import logging
 import pickle
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Optional, Protocol
+from typing import Dict, Iterable, List, Optional, Protocol
 
 import numpy as np
 import pandas as pd
 
 from ..config import PROJECT_ROOT
 from ..core.models import Quote
+from ..util.ratelimit import RateLimiter
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +48,7 @@ _YF_INTERVAL = {
     "1m": "1m", "5m": "5m", "10m": "15m", "15m": "15m", "30m": "30m",
     "1h": "60m", "1d": "1d", "1wk": "1wk",
 }
+_OHLCV = ["open", "high", "low", "close", "volume"]
 
 
 class PriceProvider(Protocol):
@@ -59,6 +66,8 @@ class PriceProvider(Protocol):
 # --------------------------------------------------------------------------- #
 class SyntheticProvider:
     name = "synthetic"
+    min_request_gap = 0.0
+    quotes_are_synthetic = True
 
     def __init__(self, seed: int = 7, base_price: float = 100.0) -> None:
         self._seed = seed
@@ -152,6 +161,12 @@ class SyntheticProvider:
 # --------------------------------------------------------------------------- #
 class YFinanceProvider:
     name = "yfinance"
+    #: Yahoo throttles aggressive clients - stagger request starts
+    min_request_gap = 0.15
+    #: its bid/ask are estimates around the last price, so a bar close is as good a quote
+    quotes_are_synthetic = True
+    #: tickers per batched download request
+    batch_size = 40
 
     def __init__(self) -> None:
         try:
@@ -165,6 +180,15 @@ class YFinanceProvider:
     def available(self) -> bool:
         return self._ok
 
+    @staticmethod
+    def _period(yf_int: str, lookback_days: int) -> str:
+        # yfinance caps intraday history; clamp the period accordingly
+        if yf_int == "1m":
+            return f"{min(lookback_days, 7)}d"
+        if yf_int in ("5m", "15m", "30m", "60m"):
+            return f"{min(lookback_days, 59)}d"
+        return f"{max(lookback_days, 5)}d"
+
     def history(
         self, symbol: str, interval: str, lookback_days: int, extended_hours: bool
     ) -> pd.DataFrame:
@@ -173,26 +197,47 @@ class YFinanceProvider:
         import yfinance as yf
 
         yf_int = _YF_INTERVAL.get(interval, "5m")
-        # yfinance caps intraday history; clamp period accordingly
-        if yf_int in ("1m",):
-            period = f"{min(lookback_days, 7)}d"
-        elif yf_int in ("5m", "15m", "30m", "60m"):
-            period = f"{min(lookback_days, 59)}d"
-        else:
-            period = f"{max(lookback_days, 5)}d"
         df = yf.download(
-            symbol, period=period, interval=yf_int, prepost=extended_hours,
-            auto_adjust=False, progress=False, threads=False,
+            symbol, period=self._period(yf_int, lookback_days), interval=yf_int,
+            prepost=extended_hours, auto_adjust=False, progress=False, threads=False,
         )
         if df is None or df.empty:
             raise RuntimeError(f"yfinance returned nothing for {symbol}")
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        df = df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        df.index = df.index.tz_convert("America/New_York")
-        return df.dropna()
+        df = _normalize(df)
+        if df.empty:
+            raise RuntimeError(f"yfinance returned nothing for {symbol}")
+        return df
+
+    def history_many(
+        self, symbols: List[str], interval: str, lookback_days: int, extended_hours: bool
+    ) -> Dict[str, pd.DataFrame]:
+        """One download request per ``batch_size`` tickers (yfinance fetches the
+        tickers inside a request in parallel). Tickers with no data are absent."""
+        if not self._ok:
+            raise RuntimeError("yfinance unavailable")
+        import yfinance as yf
+
+        yf_int = _YF_INTERVAL.get(interval, "5m")
+        out: Dict[str, pd.DataFrame] = {}
+        for i in range(0, len(symbols), self.batch_size):
+            chunk = symbols[i:i + self.batch_size]
+            df = yf.download(
+                chunk, period=self._period(yf_int, lookback_days), interval=yf_int,
+                prepost=extended_hours, auto_adjust=False, progress=False, threads=True,
+                group_by="ticker",
+            )
+            if df is None or df.empty:
+                continue
+            for sym in chunk:
+                sub = _frame_for(df, sym)
+                if sub is None:
+                    continue
+                sub = _normalize(sub)
+                if not sub.empty:
+                    out[sym] = sub
+        return out
 
     def quote(self, symbol: str) -> Quote:
         if not self._ok:
@@ -200,7 +245,7 @@ class YFinanceProvider:
         import yfinance as yf
 
         t = yf.Ticker(symbol)
-        last = bid = ask = vol = 0.0
+        last = vol = 0.0
         try:
             fi = t.fast_info
             last = float(fi.get("last_price") or fi.get("lastPrice") or 0.0)
@@ -210,9 +255,37 @@ class YFinanceProvider:
         if not last:
             h = self.history(symbol, "1m", 1, False)
             last = float(h["close"].iloc[-1])
-        sp = max(0.01, last * 0.0005)
-        return Quote(symbol=symbol, bid=bid or round(last - sp, 2),
-                     ask=ask or round(last + sp, 2), last=round(last, 4), volume=vol)
+        return quote_from_price(symbol, last, vol)
+
+
+def quote_from_price(symbol: str, last: float, volume: float = 0.0) -> Quote:
+    """A quote with an estimated spread, for feeds that only give a last price."""
+    sp = max(0.01, last * 0.0005)
+    return Quote(symbol=symbol, bid=round(last - sp, 2), ask=round(last + sp, 2),
+                 last=round(last, 4), volume=volume)
+
+
+def _frame_for(df: pd.DataFrame, symbol: str) -> Optional[pd.DataFrame]:
+    """One ticker's columns out of a multi-ticker download (either level order)."""
+    if not isinstance(df.columns, pd.MultiIndex):
+        return df
+    if symbol in df.columns.get_level_values(0):
+        return df[symbol]
+    if symbol in df.columns.get_level_values(1):
+        return df.xs(symbol, axis=1, level=1)
+    return None
+
+
+def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.rename(columns=lambda c: str(c).lower())
+    if any(c not in df.columns for c in _OHLCV):
+        return pd.DataFrame(columns=_OHLCV)
+    df = df[_OHLCV].dropna()
+    if df.empty:
+        return df
+    idx = df.index if df.index.tz is not None else df.index.tz_localize("UTC")
+    df.index = idx.tz_convert("America/New_York")
+    return df
 
 
 # --------------------------------------------------------------------------- #
@@ -225,6 +298,7 @@ class MarketDataService:
         cache: bool = True,
         min_interval_between_calls: float = 0.15,
         negative_cache_seconds: float = 1800.0,
+        max_workers: int = 8,
     ) -> None:
         if providers is None:
             # Real feed if we have one, otherwise the synthetic demo feed - but
@@ -235,9 +309,10 @@ class MarketDataService:
             providers = [yfp] if yfp.available else [SyntheticProvider()]
         self.providers = providers
         self.cache = cache
-        self._lock = threading.Lock()
-        self._last_call = 0.0
-        self._min_gap = min_interval_between_calls
+        self.max_workers = max_workers
+        self._default_gap = min_interval_between_calls
+        self._limiters: Dict[int, RateLimiter] = {}
+        self._limiters_lock = threading.Lock()
         self._mem: Dict[str, tuple] = {}
         self._neg: Dict[str, float] = {}          # symbol -> ts of last "no data"
         self._neg_ttl = negative_cache_seconds
@@ -246,9 +321,23 @@ class MarketDataService:
     def is_real(self) -> bool:
         return any(getattr(p, "name", "") != "synthetic" for p in self.providers)
 
+    @property
+    def quotes_are_synthetic(self) -> bool:
+        """True when the top feed's quote is just a last price with an estimated spread."""
+        return bool(self.providers) and bool(getattr(self.providers[0], "quotes_are_synthetic", False))
+
     def _neg_hit(self, symbol: str) -> bool:
         ts = self._neg.get(symbol)
         return ts is not None and (time.time() - ts) < self._neg_ttl
+
+    def _limiter_for(self, prov) -> RateLimiter:
+        with self._limiters_lock:
+            lim = self._limiters.get(id(prov))
+            if lim is None:
+                gap = getattr(prov, "min_request_gap", None)
+                lim = RateLimiter(self._default_gap if gap is None else gap)
+                self._limiters[id(prov)] = lim
+            return lim
 
     # -- cache plumbing --------------------------------------------- #
     def _key(self, symbol: str, interval: str, lookback_days: int, ext: bool) -> str:
@@ -279,12 +368,12 @@ class MarketDataService:
         except Exception:  # noqa: BLE001
             pass
 
-    def _throttle(self) -> None:
-        with self._lock:
-            wait = self._min_gap - (time.time() - self._last_call)
-            if wait > 0:
-                time.sleep(wait)
-            self._last_call = time.time()
+    def _store(self, symbol: str, interval: str, lookback_days: int, ext: bool,
+               df: pd.DataFrame) -> pd.DataFrame:
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        if self.cache:
+            self._write_cache(self._key(symbol, interval, lookback_days, ext), df)
+        return df
 
     # -- public api ---------------------------------------------- #
     def get_price_history(
@@ -307,18 +396,70 @@ class MarketDataService:
         last_err: Optional[Exception] = None
         for prov in self.providers:
             try:
-                self._throttle()
+                self._limiter_for(prov).wait()
                 df = prov.history(symbol, interval, lookback_days, extended_hours)
                 if df is not None and not df.empty:
-                    df = df[~df.index.duplicated(keep="last")].sort_index()
-                    if self.cache:
-                        self._write_cache(key, df)
-                    return df
+                    return self._store(symbol, interval, lookback_days, extended_hours, df)
             except Exception as e:  # noqa: BLE001
                 last_err = e
                 log.debug("provider %s failed for %s: %s", prov.name, symbol, e)
         self._neg[symbol] = time.time()          # don't hammer a dead ticker
         raise RuntimeError(f"no market data for {symbol}: {last_err}")
+
+    def get_price_histories(
+        self,
+        symbols: Iterable[str],
+        interval: str = "1d",
+        lookback_days: int = 400,
+        extended_hours: bool = False,
+    ) -> Dict[str, pd.DataFrame]:
+        """Many symbols at once: cache hits first, then one batched request per
+        chunk when the top provider can batch, then concurrent single fetches
+        for whatever is left. Symbols with no data are absent from the result."""
+        out: Dict[str, pd.DataFrame] = {}
+        ttl = _CACHE_TTL.get(interval, 300)
+        todo: List[str] = []
+        for sym in dict.fromkeys(symbols):
+            if self._neg_hit(sym):
+                continue
+            cached = (self._read_cache(self._key(sym, interval, lookback_days, extended_hours), ttl)
+                      if self.cache else None)
+            if cached is not None:
+                out[sym] = cached
+            else:
+                todo.append(sym)
+        if not todo:
+            return out
+
+        top = self.providers[0] if self.providers else None
+        if top is not None and hasattr(top, "history_many"):
+            try:
+                self._limiter_for(top).wait()
+                got = top.history_many(todo, interval, lookback_days, extended_hours)
+            except Exception as e:  # noqa: BLE001
+                log.debug("batched history failed on %s: %s", top.name, e)
+                got = {}
+            for sym, df in got.items():
+                out[sym] = self._store(sym, interval, lookback_days, extended_hours, df)
+            missed = [s for s in todo if s not in got]
+            if len(self.providers) == 1:
+                now = time.time()
+                for sym in missed:                # the only feed has nothing - remember that
+                    self._neg[sym] = now
+                return out
+            todo = missed
+
+        def one(sym: str) -> Optional[pd.DataFrame]:
+            try:
+                return self.get_price_history(sym, interval, lookback_days, extended_hours)
+            except Exception:  # noqa: BLE001
+                return None
+
+        with ThreadPoolExecutor(max_workers=max(1, min(self.max_workers, len(todo)))) as ex:
+            for sym, df in zip(todo, ex.map(one, todo)):
+                if df is not None:
+                    out[sym] = df
+        return out
 
     def get_daily(self, symbol: str, lookback_days: int = 400) -> pd.DataFrame:
         return self.get_price_history(symbol, "1d", lookback_days)
@@ -329,17 +470,23 @@ class MarketDataService:
         last_err: Optional[Exception] = None
         for prov in self.providers:
             try:
-                self._throttle()
+                self._limiter_for(prov).wait()
                 return prov.quote(symbol)
             except Exception as e:  # noqa: BLE001
                 last_err = e
         raise RuntimeError(f"no quote for {symbol}: {last_err}")
 
-    def get_quotes(self, symbols: List[str]) -> Dict[str, Quote]:
-        out: Dict[str, Quote] = {}
-        for s in symbols:
+    def get_quotes(self, symbols: Iterable[str]) -> Dict[str, Quote]:
+        """Quotes for many symbols, fetched concurrently. Failures are skipped."""
+        syms = [s for s in dict.fromkeys(symbols) if not self._neg_hit(s)]
+        if not syms:
+            return {}
+
+        def one(sym: str) -> Optional[Quote]:
             try:
-                out[s] = self.get_quote(s)
+                return self.get_quote(sym)
             except Exception:  # noqa: BLE001
-                continue
-        return out
+                return None
+
+        with ThreadPoolExecutor(max_workers=max(1, min(self.max_workers, len(syms)))) as ex:
+            return {s: q for s, q in zip(syms, ex.map(one, syms)) if q is not None}
