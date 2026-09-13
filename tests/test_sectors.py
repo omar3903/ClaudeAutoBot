@@ -45,7 +45,7 @@ class _Lookup:
 def test_scanner_filters_the_slice_within_a_lookup_budget():
     look = _Lookup({"AAPL": "Technology", "XOM": "Energy"},
                    {"NEW1": "Technology", "NEW2": "Technology"})
-    scanner = SimpleNamespace(_sectors=look, sectors_allowed=["Technology"], SECTOR_LOOKUPS_PER_CYCLE=1)
-    kept = Scanner._in_sectors(scanner, ["AAPL", "XOM", "NEW1", "NEW2"])
+    scanner = SimpleNamespace(_sectors=look, SECTOR_LOOKUPS_PER_CYCLE=1)
+    kept = Scanner._in_sectors(scanner, ["AAPL", "XOM", "NEW1", "NEW2"], ["Technology"])
     assert kept == ["AAPL", "NEW1"]                      # NEW2 is resolved on a later cycle
     assert look.fetched == ["NEW1"]

@@ -5,30 +5,38 @@ guard and the Schwab token watchdog, and runs three background loops:
 
     scan_loop      - every ``scanner.interval_seconds`` -> new short list of plays
     sync_loop      - a few seconds -> reconcile fills, run the automatic exits
-    snapshot_loop  - ~30s -> write an account snapshot, broadcast state
+    snapshot_loop  - ~30s -> account snapshot, broker-vs-database check, broadcast
 
-Where orders go is set by three dashboard switches, remembered in
-``data/runtime.json`` (the routing table lives in :mod:`tos_bot.brokers.venues`):
+Everything the user changes on the dashboard - where orders go, the filters,
+which strategies run, Autopilot - applies straight away to the scanner and the
+execution path, is remembered in ``data/runtime.json``, and is broadcast so
+every open tab updates.
+
+Where orders go (routing table in :mod:`tos_bot.brokers.venues`):
 
     mode            paper | live
     paper_platform  simulator | ibkr | schwab     what Paper trades on
     live_broker     ibkr | schwab                 what Live trades on
 
-It never routes an order without an explicit :meth:`approve_play` (or the
-opt-in Autopilot, inside its caps), and it refuses to change venue while
-positions are open on the current one - their exits would go to the wrong
-account.
+Safety rules: no order without an explicit :meth:`approve_play` (or the opt-in
+Autopilot, inside its caps); no venue change while positions are open on the
+current one; while quitting with positions open, nothing but exits may change;
+and an OPEN trade record is deleted only when a connected broker confirms the
+position no longer exists.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import secrets_store
 from .auth.schwab_login import SchwabLogin
@@ -45,7 +53,6 @@ from .core.eventbus import BUS
 from .core.models import Account, Play
 from .data.fundamentals import YFinanceFundamentals
 from .data.market_data import MarketDataService, SyntheticProvider, YFinanceProvider
-from .data.sectors import clean_sector_list, sector_allowed
 from .execution.autopilot import AutoPilot
 from .execution.executor import Executor
 from .execution.exit_manager import ExitManager
@@ -54,23 +61,32 @@ from .persistence.db import init_db
 from .persistence.repository import Repository
 from .risk.pdt_guard import PdtGuard
 from .risk.position_sizing import size_play
+from .scanner.filters import TradeFilters
 from .scanner.scanner import Scanner
-from .strategies import build_enabled_strategies
-from .strategies.registry import describe_all
+from .strategies.registry import REGISTRY, build_strategies, strategy_catalog
 from .util import clock
 from .util.logging_setup import setup_logging
 from .util.net import port_is_open
 
 log = logging.getLogger(__name__)
 
-# where the routing switches, sector filter + autopilot knobs persist between runs.
-# Overridable (tests point it at a temp file so a run never rewrites the user's).
+# where the dashboard's choices persist between runs. Overridable (tests point
+# it at a temp file so a run never rewrites the user's).
 _RUNTIME_PATH = Path(os.getenv("TOS_RUNTIME_PATH") or (PROJECT_ROOT / "data" / "runtime.json"))
 
 
 class TradingEngine:
     #: play statuses that must never be re-executed
     _DONE_STATUSES = {"ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED", "ERROR"}
+    #: an OPEN trade is only treated as gone at the broker after this many
+    #: consecutive checks, once it's older than the grace period and the
+    #: broker connection has been up long enough to have reported positions
+    _MISSING_CHECKS = 2
+    _MISSING_GRACE_S = 90.0
+    _CONNECTION_SETTLE_S = 60.0
+    #: while quitting, re-send closes that haven't taken this often
+    _QUIT_RETRY_S = 30.0
+    _WEIGHT_RANGE = (0.1, 3.0)
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self.settings = settings or get_settings()
@@ -86,16 +102,19 @@ class TradingEngine:
         if not yfp.available:
             log.warning("yfinance not installed - running on SYNTHETIC data. "
                         "`pip install yfinance` for real (delayed) quotes.")
-
         self.fundamentals = YFinanceFundamentals()
-        self.strategies = build_enabled_strategies(self.settings)
+
+        # the dashboard's remembered choices win over config.yaml / .env
+        rt = self._read_runtime()
+        self.filters = self._load_filters(rt)
+        self.strategy_overrides = self._clean_overrides(rt.get("strategies"))
+        self.strategies = build_strategies(self.settings, self.strategy_overrides)
         self.scanner = Scanner(self.settings, self.md, self.fundamentals, self.strategies)
+        self.scanner.filters = self.filters
 
         self.token_manager = TokenManager(self.settings, repo=self.repo, bus=BUS)
         self.schwab_login = SchwabLogin(self.settings, bus=BUS, on_success=self._on_schwab_login)
 
-        # routing switches + sector filter: the dashboard's choice (runtime.json) wins over .env
-        rt = self._read_runtime()
         sec = self.settings.secrets
         env_broker = (sec.broker or "paper").lower()
         self.paper_platform, self.live_broker = normalize(
@@ -105,13 +124,19 @@ class TradingEngine:
         mode = rt.get("mode")
         self.mode: str = mode if mode in ("paper", "live") else (
             "live" if env_broker in LIVE_BROKERS else "paper")
-        self.sectors: List[str] = clean_sector_list(
-            rt.get("sectors", self.settings.config.scanner.sectors))
-        self.scanner.sectors_allowed = self.sectors
+
+        #: set while quitting with positions still open - everything but exits is locked
+        self.quit_state: Optional[Dict[str, Any]] = rt.get("quit") if isinstance(rt.get("quit"), dict) else None
+        #: called once quitting has finished (the server wires this to its own shutdown)
+        self.on_shutdown: Optional[Callable[[], None]] = None
+        self._quit_lock = threading.Lock()
+        self._quit_retry_at = 0.0
+        self._quit_rounds = 0
 
         self._sim: Optional[BrokerAdapter] = None          # the built-in simulator
         self._venue: Optional[BrokerAdapter] = None        # the one broker connection held
         self._venue_plan = VenuePlan()
+        self._venue_since = 0.0
         self._venue_blockers: List[str] = []
         self._live_blockers: List[str] = []
         self._trading_broker: Optional[BrokerAdapter] = None
@@ -125,7 +150,9 @@ class TradingEngine:
         self._last_scan_summary: Dict[str, Any] = {}
         self._last_scan_elapsed: float = 0.0
         self._account: Optional[Account] = None
+        self._account_at = 0.0
         self._armed = False
+        self._missing: Dict[Tuple[str, str], int] = {}      # (venue, symbol) -> misses in a row
 
         # hands-off entry (exits are already automatic via ExitManager)
         self.autopilot = AutoPilot(self, self.settings.config.autopilot,
@@ -157,13 +184,38 @@ class TradingEngine:
             _RUNTIME_PATH.parent.mkdir(parents=True, exist_ok=True)
             payload: Dict[str, Any] = {
                 "mode": self.mode, "paper_platform": self.paper_platform,
-                "live_broker": self.live_broker, "sectors": self.sectors,
+                "live_broker": self.live_broker, "filters": self.filters.as_dict(),
+                "strategies": self.strategy_overrides,
             }
+            if self.quit_state:
+                payload["quit"] = self.quit_state
             if getattr(self, "autopilot", None) is not None:
                 payload["autopilot"] = self.autopilot.to_runtime()
             _RUNTIME_PATH.write_text(json.dumps(payload, indent=2))
         except Exception:  # noqa: BLE001
             log.debug("could not persist runtime state", exc_info=True)
+
+    def _load_filters(self, rt: Dict[str, Any]) -> TradeFilters:
+        f = rt.get("filters") if isinstance(rt.get("filters"), dict) else {}
+        sectors = f.get("sectors", rt.get("sectors", self.settings.config.scanner.sectors))
+        try:
+            return TradeFilters.build(f.get("sides"), f.get("timeframes"), sectors)
+        except ValueError:
+            return TradeFilters.build(sectors=sectors)
+
+    @staticmethod
+    def _clean_overrides(raw: Any) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        for key, ov in (raw or {}).items() if isinstance(raw, dict) else []:
+            if key in REGISTRY and isinstance(ov, dict):
+                clean = {}
+                if isinstance(ov.get("enabled"), bool):
+                    clean["enabled"] = ov["enabled"]
+                if isinstance(ov.get("weight"), (int, float)):
+                    clean["weight"] = float(ov["weight"])
+                if clean:
+                    out[key] = clean
+        return out
 
     # ------------------------------------------------------------------ #
     #  Broker connection + routing                                      #
@@ -222,7 +274,7 @@ class TradingEngine:
             self._venue_blockers = [str(e)]
             log.warning("%s (%s) unavailable: %s", plan.broker, plan.account, e)
             return None
-        self._venue, self._venue_plan = b, plan
+        self._venue, self._venue_plan, self._venue_since = b, plan, time.monotonic()
         log.info("connected to %s %s (%s)", plan.broker, plan.account,
                  "trading" if plan.trade else "data only")
         return b
@@ -254,6 +306,8 @@ class TradingEngine:
             self._trading_broker, self._trading_venue = venue, venue_id(plan)
         else:
             self._trading_broker, self._trading_venue = self._ensure_sim(), "paper"
+            if self._trading_venue == "paper":
+                self._venue_since = self._venue_since or time.monotonic()
 
         self.pdt = PdtGuard(self.settings.config.account, trade_repo=self.repo,
                             paper=self.mode == "paper")
@@ -269,6 +323,7 @@ class TradingEngine:
             quote_fn=lambda s: self._trading_broker.get_quote(s),
             cfg=self.settings.config.exit_manager, bus=BUS, venue=self._trading_venue,
         )
+        self._missing.clear()
         self._sync_data_feed()
 
     def _sync_data_feed(self) -> None:
@@ -276,6 +331,16 @@ class TradingEngine:
         self.md.providers = [p for p in self.md.providers if not isinstance(p, _BrokerProvider)]
         if self._venue is not None and self._venue.is_connected:
             self.md.providers.insert(0, _BrokerProvider(self._venue))
+
+    def _open_trades(self) -> List[Dict[str, Any]]:
+        try:
+            return self.repo.open_trades()
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _positions_here(self) -> List[Dict[str, Any]]:
+        """OPEN trades held on the venue orders currently go to."""
+        return [t for t in self._open_trades() if (t.get("broker") or "paper") == self._trading_venue]
 
     def _switch_blocked(self, target_venue: str) -> Optional[str]:
         """Refuse to move orders to another venue while positions are open on
@@ -293,6 +358,14 @@ class TradingEngine:
         return (f"You have {len(held)} open position(s) on {venue_label(self._trading_venue)} "
                 f"({syms}). Close them, or let their automatic exits finish, before switching.")
 
+    def _locked(self) -> Optional[str]:
+        """While quitting with positions open, only exits may happen."""
+        if not self.quit_state:
+            return None
+        n = len(self._positions_here())
+        return (f"Quitting: closing {n} open position{'' if n == 1 else 's'} first. "
+                "Nothing else can change until they're all closed.")
+
     def _after_switch(self, prev_mode: str, operator: str) -> None:
         self._save_runtime()
         self._refresh_account()
@@ -309,6 +382,8 @@ class TradingEngine:
         self._bind_trading_broker()
         self._refresh_account()
         self._check_arm()
+        if self.quit_state:
+            log.warning("resuming an unfinished quit - closing the remaining positions first")
 
         self._threads = [
             threading.Thread(target=self._scan_loop, name="scan-loop", daemon=True),
@@ -367,7 +442,7 @@ class TradingEngine:
         while not self._stop.is_set():
             triggered = self._scan_now.is_set()
             self._scan_now.clear()
-            if triggered or clock.is_market_open():
+            if (triggered or clock.is_market_open()) and not self.quit_state:
                 try:
                     self._run_scan()
                 except Exception:  # noqa: BLE001
@@ -391,6 +466,10 @@ class TradingEngine:
                     BUS.publish("account.snapshot", state=self.snapshot())
             except Exception:  # noqa: BLE001
                 log.exception("exit manager tick failed")
+            try:
+                self._check_quit_progress()
+            except Exception:  # noqa: BLE001
+                log.exception("quit progress check failed")
             self._stop.wait(4.0)
 
     def _snapshot_loop(self) -> None:
@@ -402,7 +481,8 @@ class TradingEngine:
                         self._venue.refresh_if_needed()
                     except Exception:  # noqa: BLE001
                         pass
-                self._refresh_account()
+                if self._refresh_account():
+                    self._reconcile_open_trades()
                 if self._account:
                     self.repo.snapshot_account(
                         self._account, self._trading_venue,
@@ -437,10 +517,11 @@ class TradingEngine:
         self._publish_plays()
 
         # hands-off entry: let the pilot act on the fresh plays (no-op unless armed)
-        try:
-            self.autopilot.consider(self._plays)
-        except Exception:  # noqa: BLE001
-            log.exception("autopilot pass failed")
+        if not self.quit_state:
+            try:
+                self.autopilot.consider(self._plays)
+            except Exception:  # noqa: BLE001
+                log.exception("autopilot pass failed")
 
     def _publish_plays(self) -> None:
         BUS.publish("plays.updated",
@@ -448,14 +529,17 @@ class TradingEngine:
                     scan=self._last_scan_summary)
 
     # ------------------------------------------------------------------ #
-    #  Account / arming                                                 #
+    #  Account / arming / broker-vs-database                           #
     # ------------------------------------------------------------------ #
-    def _refresh_account(self) -> None:
+    def _refresh_account(self) -> bool:
         try:
             if self._trading_broker:
                 self._account = self._trading_broker.get_account()
+                self._account_at = time.monotonic()
+                return True
         except Exception as e:  # noqa: BLE001
             log.debug("get_account failed: %s", e)
+        return False
 
     def _check_arm(self) -> None:
         acc = self._account
@@ -467,6 +551,54 @@ class TradingEngine:
         if acc and not self._armed:
             BUS.publish("engine.disarmed",
                         reason=f"equity ${acc.equity:,.0f} < ${floor:,.0f} live floor")
+
+    def _reconcile_open_trades(self, force: bool = False) -> List[Dict[str, Any]]:
+        """Delete OPEN trade records whose position no longer exists at the
+        broker that holds it - closed outside the app, removed, or wiped by a
+        paper reset. Only ever acts on a connected broker's fresh answer, and
+        (unless ``force``) only after repeated misses on an established
+        connection, so a slow or dropped feed can never erase a live position."""
+        broker, venue = self._trading_broker, self._trading_venue
+        if broker is None or not broker.is_connected or self._account is None:
+            return []
+        now = time.monotonic()
+        if now - self._account_at > 5.0:
+            return []                                     # stale account - don't judge
+        if not force and now - self._venue_since < self._CONNECTION_SETTLE_S:
+            return []
+        held = {p.symbol for p in self._account.positions if abs(p.quantity) > 1e-9}
+        trades = [t for t in self._open_trades() if (t.get("broker") or "paper") == venue]
+        busy = set(self.executor.pending_exit_trade_ids()) if self.executor else set()
+        busy |= set(getattr(self.exit_manager, "_closing", set()))
+
+        missing_now = set()
+        removed: List[Dict[str, Any]] = []
+        for t in trades:
+            sym = t["symbol"]
+            if sym in held:
+                self._missing.pop((venue, sym), None)
+                continue
+            if t["id"] in busy:
+                continue                                  # its close is still going through
+            if not force:
+                if _age_s(t.get("entry_time")) < self._MISSING_GRACE_S:
+                    continue
+                if (venue, sym) not in missing_now:
+                    missing_now.add((venue, sym))
+                    self._missing[(venue, sym)] = self._missing.get((venue, sym), 0) + 1
+                if self._missing[(venue, sym)] < self._MISSING_CHECKS:
+                    continue
+            if self.repo.delete_trade(t["id"]):
+                removed.append({"id": t["id"], "symbol": sym, "side": t["side"],
+                                "quantity": t["quantity"]})
+        for r in removed:
+            self._missing.pop((venue, r["symbol"]), None)
+        if removed:
+            log.warning("removed %d trade record(s) no longer held at %s: %s", len(removed), venue,
+                        ", ".join(r["symbol"] for r in removed))
+            BUS.publish("trades.removed", trades=removed, venue=venue,
+                        venue_label=venue_label(venue))
+        return removed
 
     # ------------------------------------------------------------------ #
     #  Operator actions (called by the API)                             #
@@ -486,9 +618,11 @@ class TradingEngine:
         plan = plan_order(p, session, self.settings.config.execution)
         already_done = p.status.value in self._DONE_STATUSES
         rr_ok = p.reward_risk >= self.settings.config.risk.min_reward_risk or p.kind.value == "FUNDAMENTAL"
-        in_sector = sector_allowed(p.sector, self.sectors)
 
         reasons: List[str] = []
+        locked = self._locked()
+        if locked:
+            reasons.append(locked)
         if already_done:
             reasons.append(f"already {p.status.value.lower()}"
                            + (f" - trade {p.trade_id}" if p.trade_id else ""))
@@ -503,8 +637,9 @@ class TradingEngine:
             reasons.append("position size rounds to zero for this risk budget")
         if not rr_ok:
             reasons.append(f"reward:risk {p.reward_risk:.1f} below minimum")
-        if not in_sector:
-            reasons.append(f"{p.sector or 'Unknown'} sector is switched off in the Sectors filter")
+        filtered = self.filters.refusal(p.side.value, p.timeframe.value, p.sector)
+        if filtered:
+            reasons.append(filtered)
         can = not reasons
 
         return {
@@ -535,6 +670,9 @@ class TradingEngine:
 
     def approve_play(self, play_id: str, operator: str = "operator") -> Dict[str, Any]:
         with self._switch_lock:
+            locked = self._locked()
+            if locked:
+                return {"ok": False, "reason": locked}
             p = self._plays.get(play_id)
             if p is None:
                 return {"ok": False, "reason": "play not found (it may have expired)"}
@@ -576,19 +714,74 @@ class TradingEngine:
         return {"ok": True}
 
     def close_position(self, trade_id: str, reason: str = "manual") -> Dict[str, Any]:
+        """Exit one position at the market - always allowed, including while quitting."""
         out = self.executor.close_trade(trade_id, reason=reason)
         self._refresh_account()
         BUS.publish("account.snapshot", state=self.snapshot())
         return out
 
+    def close_all_positions(self, reason: str = "manual-all") -> Dict[str, Any]:
+        held = self._positions_here()
+        if not held:
+            return {"ok": True, "note": "No open positions to exit.", "results": []}
+        results = self._close_all(held, reason=reason)
+        failed = [r for r in results if not r.get("ok")]
+        note = (f"Exit sent for {len(held) - len(failed)} of {len(held)} position(s)."
+                + (f" Not sent: {', '.join(r['symbol'] for r in failed)}." if failed else ""))
+        return {"ok": not failed, "note": note, "results": results}
+
+    def _close_all(self, trades: List[Dict[str, Any]], reason: str) -> List[Dict[str, Any]]:
+        """Send every close at once - the broker calls are independent, so a
+        thread per position turns N round-trips into about one."""
+        if not trades:
+            return []
+
+        def one(t: Dict[str, Any]) -> Dict[str, Any]:
+            try:
+                out = self.executor.close_trade(t["id"], reason=reason)
+            except Exception as e:  # noqa: BLE001
+                out = {"ok": False, "reason": str(e)}
+            return {"trade_id": t["id"], "symbol": t["symbol"], "ok": bool(out.get("ok")),
+                    "status": out.get("status"), "reason": out.get("reason", "")}
+
+        with ThreadPoolExecutor(max_workers=min(8, len(trades))) as ex:
+            results = list(ex.map(one, trades))
+        self._refresh_account()
+        BUS.publish("account.snapshot", state=self.snapshot())
+        return results
+
     def set_trade_managed(self, trade_id: str, on: bool) -> Dict[str, Any]:
+        locked = self._locked()
+        if locked:
+            return {"ok": False, "reason": locked}
         self.repo.update_trade_risk(trade_id, managed_exit=bool(on))
         return {"ok": True, "trade_id": trade_id, "managed_exit": bool(on)}
+
+    def trade_record(self, trade_id: str) -> Optional[Dict[str, Any]]:
+        """The stored record of one trade, plus what the broker holds for it now."""
+        rec = self.repo.trade_record(trade_id)
+        if rec is None:
+            return None
+        t = rec["trade"]
+        venue = t.get("broker") or "paper"
+        rec["venue_label"] = venue_label(venue)
+        rec["on_current_venue"] = venue == self._trading_venue
+        rec["broker_position"] = None
+        if t["status"] == "OPEN" and rec["on_current_venue"] and self._account is not None:
+            pos = next((p for p in self._account.positions if p.symbol == t["symbol"]), None)
+            if pos is not None:
+                rec["broker_position"] = {"quantity": pos.quantity,
+                                          "market_price": round(pos.market_price, 4),
+                                          "unrealized_pl": round(pos.unrealized_pl, 2)}
+        return rec
 
     # ---- autopilot (hands-off entry) --------------------------------- #
     def set_autopilot(self, **kw: Any) -> Dict[str, Any]:
         """Toggle / tune hands-off entry from the dashboard. Exits are already
         automatic; this governs whether the bot also takes the entry."""
+        locked = self._locked()
+        if locked:
+            return {"ok": False, "reason": locked}
         want_on = kw.get("enabled")
         st = self.autopilot.configure(**kw)
         note = ""
@@ -618,57 +811,224 @@ class TradingEngine:
         BUS.publish("account.snapshot", state=snap)
         return {"ok": True, "state": snap}
 
-    def _not_on_sim(self) -> Optional[Dict[str, Any]]:
-        if self._trading_venue == "paper":
-            return None
-        return {"ok": False, "reason": f"You're trading on {venue_label(self._trading_venue)} - "
-                                       "its balance and positions are kept by the broker."}
-
-    def reconcile_paper(self) -> Dict[str, Any]:
-        """Rebuild the simulator's positions from the OPEN trades in the database
-        - fixes drift (e.g. from a double-submit)."""
-        refusal = self._not_on_sim()
-        if refusal:
-            return refusal
-        pb = self._ensure_sim()
-        from .core.models import Position
-        book: Dict[str, list] = {}
-        for t in self.repo.open_trades():
-            if (t.get("broker") or "paper") != "paper":
-                continue
-            qty = float(t["quantity"]) * (1 if t["side"] == "LONG" else -1)
-            b = book.setdefault(t["symbol"], [0.0, 0.0])
-            b[0] += qty
-            b[1] += qty * float(t["entry_price"])
-        new_positions = {sym: Position(symbol=sym, quantity=q, avg_price=abs(notional / q))
-                         for sym, (q, notional) in book.items() if abs(q) > 1e-9}
-        before = {p.symbol: p.quantity for p in pb.get_account().positions}
-        pb._positions = new_positions            # type: ignore[attr-defined]
-        pb._save_state()                         # type: ignore[attr-defined]
-        self.executor.rebind(pb, venue="paper")
-        self._refresh_account()
-        after = {s: p.quantity for s, p in new_positions.items()}
-        BUS.publish("account.snapshot", state=self.snapshot())
-        log.warning("paper positions reconciled from DB: %s -> %s", before, after)
-        return {"ok": True, "before": before, "after": after,
-                "note": "paper positions rebuilt from open trades in the database"}
-
     def reset_paper(self, cash: Optional[float] = None) -> Dict[str, Any]:
-        refusal = self._not_on_sim()
-        if refusal:
-            return refusal
-        pb = self._ensure_sim()
+        locked = self._locked()
+        if locked:
+            return {"ok": False, "reason": locked}
+        if self._trading_venue != "paper":
+            return {"ok": False, "reason": f"You're trading on {venue_label(self._trading_venue)} - "
+                                           "its balance and positions are kept by the broker."}
         amount = float(cash) if cash is not None else self.settings.config.account.paper_start_cash
+        removed = self._reset_sim(amount)
+        BUS.publish("account.snapshot", state=self.snapshot())
+        note = f"Paper account reset to ${amount:,.0f}."
+        if removed:
+            note += f" Removed {len(removed)} open trade record(s) whose positions were wiped."
+        return {"ok": True, "cash": round(amount, 2), "removed": removed, "note": note}
+
+    def _reset_sim(self, amount: float) -> List[Dict[str, Any]]:
+        pb = self._ensure_sim()
+        if self.executor is not None:
+            self.executor.cancel_pending_entries()
         pb.reset(amount)  # type: ignore[attr-defined]
         self.executor.rebind(pb, venue="paper")
         self._refresh_account()
-        BUS.publish("account.snapshot", state=self.snapshot())
-        return {"ok": True, "cash": round(amount, 2),
-                "note": f"paper account reset to ${amount:,.0f}"}
+        # the simulator's positions are gone, so their OPEN trade records go too
+        return self._reconcile_open_trades(force=True)
 
     def trigger_scan(self) -> Dict[str, Any]:
+        locked = self._locked()
+        if locked:
+            return {"ok": False, "reason": locked}
         self._scan_now.set()
         return {"ok": True, "note": "scan queued"}
+
+    # ---- filters + strategies (live: next scan, execution, every tab) -- #
+    def set_filters(self, sides: Optional[List[str]] = None, timeframes: Optional[List[str]] = None,
+                    sectors: Optional[List[str]] = None) -> Dict[str, Any]:
+        locked = self._locked()
+        if locked:
+            return {"ok": False, "reason": locked}
+        cur = self.filters
+        try:
+            new = TradeFilters.build(cur.sides if sides is None else sides,
+                                     cur.timeframes if timeframes is None else timeframes,
+                                     cur.sectors if sectors is None else sectors)
+        except ValueError as e:
+            return {"ok": False, "reason": str(e)}
+        if new == cur:
+            return {"ok": True, "filters": new.as_dict(), "note": "No change.", "rescanning": False}
+        self.filters = new
+        self.scanner.filters = new
+        self._save_runtime()
+        before = len(self._plays)
+        self._plays = {k: p for k, p in self._plays.items() if new.allows(p)}
+        self._publish_plays()
+        BUS.publish("filters.updated", filters=new.as_dict())
+        # narrowing just trims the board; widening needs a scan to find the new plays
+        widened = (bool(set(new.sides) - set(cur.sides)) or bool(set(new.timeframes) - set(cur.timeframes))
+                   or (bool(cur.sectors) and (not new.sectors or bool(set(new.sectors) - set(cur.sectors)))))
+        if widened:
+            self._scan_now.set()
+        return {"ok": True, "filters": new.as_dict(), "removed_plays": before - len(self._plays),
+                "rescanning": widened, "note": new.describe()}
+
+    def strategy_state(self) -> List[Dict[str, Any]]:
+        return strategy_catalog(self.settings, self.strategy_overrides)
+
+    def set_strategy(self, key: str, enabled: Optional[bool] = None,
+                     weight: Optional[float] = None) -> Dict[str, Any]:
+        locked = self._locked()
+        if locked:
+            return {"ok": False, "reason": locked}
+        if key not in REGISTRY:
+            return {"ok": False, "reason": f"unknown strategy '{key}'"}
+        ov = dict(self.strategy_overrides.get(key, {}))
+        if enabled is not None:
+            ov["enabled"] = bool(enabled)
+        if weight is not None:
+            try:
+                w = float(weight)
+            except (TypeError, ValueError):
+                return {"ok": False, "reason": "weight must be a number"}
+            lo, hi = self._WEIGHT_RANGE
+            if not lo <= w <= hi:
+                return {"ok": False, "reason": f"weight must be between {lo} and {hi}"}
+            ov["weight"] = round(w, 2)
+        default = next(r for r in strategy_catalog(self.settings) if r["key"] == key)
+        if ov.get("enabled") == default["default_enabled"]:
+            ov.pop("enabled")
+        if "weight" in ov and abs(ov["weight"] - default["default_weight"]) < 1e-9:
+            ov.pop("weight")
+        overrides = {k: v for k, v in self.strategy_overrides.items() if k != key}
+        if ov:
+            overrides[key] = ov
+        rescan = weight is not None or bool(enabled)
+        self._apply_strategies(overrides, rescan=rescan)
+        row = next(r for r in self.strategy_state() if r["key"] == key)
+        return {"ok": True, "strategies": self.strategy_state(), "rescanning": rescan,
+                "note": f"{row['title']}: {'on' if row['enabled'] else 'off'}, weight {row['weight']:g}."}
+
+    def reset_strategies(self) -> Dict[str, Any]:
+        locked = self._locked()
+        if locked:
+            return {"ok": False, "reason": locked}
+        self._apply_strategies({}, rescan=True)
+        return {"ok": True, "strategies": self.strategy_state(),
+                "note": "Strategies reset to config.yaml.", "rescanning": True}
+
+    def _apply_strategies(self, overrides: Dict[str, Dict[str, Any]], rescan: bool) -> None:
+        self.strategy_overrides = overrides
+        self.strategies = build_strategies(self.settings, overrides)
+        self.scanner.set_strategies(self.strategies)
+        self._save_runtime()
+        active = {s.key for s in self.strategies}
+        self._plays = {k: p for k, p in self._plays.items() if p.strategy in active}
+        self._publish_plays()
+        BUS.publish("strategies.updated", strategies=self.strategy_state())
+        if rescan:
+            self._scan_now.set()
+
+    # ---- quitting ----------------------------------------------------- #
+    def quit_preview(self) -> Dict[str, Any]:
+        trades = self._open_trades()
+        brief = [{"id": t["id"], "symbol": t["symbol"], "side": t["side"],
+                  "quantity": t["quantity"], "entry_price": t["entry_price"],
+                  "venue": t.get("broker") or "paper"} for t in trades]
+        here = [b for b in brief if b["venue"] == self._trading_venue]
+        return {
+            "mode": self.mode, "paper": self.mode == "paper",
+            "venue": self._trading_venue, "venue_label": venue_label(self._trading_venue),
+            "positions": here, "left": len(here),
+            "parked": [b for b in brief if b["venue"] != self._trading_venue],
+            "resets_simulator": self.mode == "paper" and self._trading_venue == "paper",
+            "reset_cash": self.settings.config.account.paper_start_cash,
+            "quitting": bool(self.quit_state),
+        }
+
+    def request_quit_dialog(self) -> None:
+        """Ask the dashboard to show the quit choices (used by Ctrl+C in live)."""
+        BUS.publish("quit.requested", **self.quit_preview())
+
+    def begin_quit(self, close_all: bool = True, operator: str = "operator") -> Dict[str, Any]:
+        """Paper: close everything, reset the simulator, shut down. Live: close
+        everything and shut down once flat (``close_all=False`` cancels).
+        Until the last position is out, nothing but exits may change."""
+        with self._switch_lock:
+            if self.quit_state:
+                return {"ok": True, "note": "Already closing out before quitting.",
+                        "quit": self._quit_status()}
+            held = self._positions_here()
+            if self.mode == "live" and held and not close_all:
+                return {"ok": False, "reason": "Quit cancelled - your live positions stay open and managed."}
+            self.quit_state = {
+                "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "mode": self.mode, "venue": self._trading_venue, "by": operator,
+                "reset_sim": self.mode == "paper" and self._trading_venue == "paper",
+            }
+            self._quit_rounds = 1
+            self._save_runtime()
+            cancelled = self.executor.cancel_pending_entries() if self.executor else 0
+            log.warning("quit by %s: closing %d position(s) on %s, cancelled %d working entr%s",
+                        operator, len(held), self._trading_venue, cancelled,
+                        "y" if cancelled == 1 else "ies")
+            BUS.publish("quit.started", quit=self._quit_status())
+            results = self._close_all(held, reason="quit")
+            self._quit_retry_at = time.monotonic() + self._QUIT_RETRY_S
+        self._check_quit_progress()
+        failed = [r for r in results if not r["ok"]]
+        if not held:
+            note = "No open positions - shutting down."
+        elif failed:
+            note = (f"Exits sent for {len(held) - len(failed)} of {len(held)} positions; retrying "
+                    f"{', '.join(r['symbol'] for r in failed)}. The app stays locked until all are out.")
+        else:
+            note = f"Exit sent for {len(held)} position(s). Shutting down once they've all closed."
+        return {"ok": True, "note": note, "results": results, "quit": self._quit_status()}
+
+    def _quit_status(self) -> Optional[Dict[str, Any]]:
+        if not self.quit_state:
+            return None
+        left = self._positions_here()
+        return {**self.quit_state, "left": len(left), "symbols": sorted({t["symbol"] for t in left})}
+
+    def _check_quit_progress(self) -> None:
+        if not self.quit_state:
+            return
+        with self._quit_lock:
+            if not self.quit_state:
+                return
+            left = self._positions_here()
+            if left and time.monotonic() >= self._quit_retry_at:
+                # a simulator close can only fail on a missing quote; after a retry
+                # the reset wipes those positions anyway, so don't stay stuck
+                if self.quit_state.get("reset_sim") and self._quit_rounds >= 2:
+                    left = []
+                else:
+                    busy = self.executor.pending_exit_trade_ids()
+                    retry = [t for t in left if t["id"] not in busy]
+                    if retry:
+                        self._close_all(retry, reason="quit")
+                        self._quit_rounds += 1
+                    self._quit_retry_at = time.monotonic() + self._QUIT_RETRY_S
+                    left = self._positions_here()
+            if left:
+                BUS.publish("quit.progress", quit=self._quit_status())
+                return
+
+            state, self.quit_state = self.quit_state, None
+            note = "All positions are closed."
+            if state.get("reset_sim") and self._trading_venue == "paper":
+                cash = self.settings.config.account.paper_start_cash
+                self._reset_sim(cash)
+                self._plays = {}
+                note += f" Paper account reset to ${cash:,.0f}."
+            self._save_runtime()
+        log.warning("quit finished: %s", note)
+        BUS.publish("quit.done", note=note)
+        if self.on_shutdown is not None:
+            # give the "shut down" message a moment to reach the browser
+            threading.Timer(1.5, self.on_shutdown).start()
 
     # ---- routing: paper / live, platforms, connections ----------------- #
     def set_mode(self, mode: str, operator: str = "operator") -> Dict[str, Any]:
@@ -676,6 +1036,9 @@ class TradingEngine:
         if mode not in ("paper", "live"):
             return {"ok": False, "reason": "mode must be 'paper' or 'live'"}
         with self._switch_lock:
+            locked = self._locked()
+            if locked:
+                return {"ok": False, "reason": locked}
             if mode == self.mode:
                 return {"ok": True, "mode": self.mode, "note": "already in that mode"}
             blocked = self._switch_blocked(venue_id(plan_venue(mode, self.paper_platform, self.live_broker)))
@@ -701,6 +1064,9 @@ class TradingEngine:
         if live_broker is not None and live_broker not in LIVE_BROKERS:
             return {"ok": False, "reason": f"live broker must be one of {', '.join(LIVE_BROKERS)}"}
         with self._switch_lock:
+            locked = self._locked()
+            if locked:
+                return {"ok": False, "reason": locked}
             pp = paper_platform or self.paper_platform
             lb = live_broker or self.live_broker
             if (pp, lb) == (self.paper_platform, self.live_broker):
@@ -721,7 +1087,7 @@ class TradingEngine:
 
     def reconnect(self, operator: str = "reconnect") -> Dict[str, Any]:
         """Drop and re-open the broker connection - after starting the Gateway,
-        changing keys or signing in."""
+        changing keys or signing in. Allowed while quitting (exits may need it)."""
         with self._switch_lock:
             prev = self.mode
             self._close_venue()
@@ -797,21 +1163,6 @@ class TradingEngine:
                 except Exception:  # noqa: BLE001
                     pass
         return out
-
-    def set_sectors(self, sectors: List[str]) -> Dict[str, Any]:
-        """Only scan and trade these sectors ([] = all)."""
-        clean = clean_sector_list(sectors)
-        self.sectors = clean
-        self.scanner.sectors_allowed = clean
-        self._save_runtime()
-        before = len(self._plays)
-        self._plays = {k: p for k, p in self._plays.items() if sector_allowed(p.sector, clean)}
-        self._publish_plays()
-        BUS.publish("filters.sectors", sectors=clean)
-        self._scan_now.set()
-        return {"ok": True, "sectors": clean, "removed_plays": before - len(self._plays),
-                "note": "Scanning and trading every sector." if not clean
-                else f"Scanning and trading only: {', '.join(clean)}."}
 
     def setup_state(self) -> Dict[str, Any]:
         """Everything the Connections panel shows. Probes the IBKR ports, so
@@ -937,7 +1288,9 @@ class TradingEngine:
             "data_is_real": data_src != "synthetic",
             "venue": self._venue_state(),
             "connection": self._connection(),
-            "sectors": self.sectors,
+            "filters": self.filters.as_dict(),
+            "strategies_on": len(self.strategies),
+            "quit": self._quit_status(),
             "account": {
                 "equity": round(acc.equity, 2),
                 "cash": round(acc.cash, 2),
@@ -972,12 +1325,23 @@ class TradingEngine:
         p = self._plays.get(play_id)
         return self._decorate(p) if p else self.repo.get_play(play_id)
 
-    def strategy_catalog(self) -> List[Dict[str, str]]:
-        return describe_all()
+
+def _age_s(entry_time: Optional[str]) -> float:
+    """Seconds since a trade's (naive-UTC) entry time; infinite if unknown."""
+    if not entry_time:
+        return float("inf")
+    try:
+        et = dt.datetime.fromisoformat(entry_time).replace(tzinfo=None)
+    except ValueError:
+        return float("inf")
+    return (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - et).total_seconds()
 
 
 class _BrokerProvider:
     """Adapt a connected broker to the MarketDataService provider protocol."""
+
+    #: brokers pace their own API (IBKR's loop, Schwab's client) - no extra spacing here
+    min_request_gap = 0.0
 
     def __init__(self, broker: BrokerAdapter) -> None:
         self.broker = broker

@@ -6,7 +6,7 @@ import datetime as dt
 import logging
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from ..core.models import Account, Play
 from ..util import clock
@@ -310,6 +310,43 @@ class Repository:
             t = s.execute(select(Trade).where(Trade.symbol == symbol, Trade.status == "OPEN")
                           .order_by(Trade.entry_time.desc())).scalars().first()
             return trade_to_dict(t) if t else None
+
+    def delete_trade(self, trade_id: str) -> bool:
+        """Remove a trade and its fills. The order audit log is kept - it's the
+        record of what was actually sent to a broker."""
+        with session_scope() as s:
+            t = s.get(Trade, trade_id)
+            if t is None:
+                return False
+            s.delete(t)                       # fills go with it (cascade)
+        log.warning("trade record %s deleted", trade_id)
+        return True
+
+    def trade_record(self, trade_id: str) -> Optional[Dict[str, Any]]:
+        """Everything stored about one trade: the trade, the play that led to it,
+        its fills and the broker orders sent for it."""
+        with session_scope() as s:
+            t = s.get(Trade, trade_id)
+            if t is None:
+                return None
+            play = s.get(PlayLog, t.play_id) if t.play_id else None
+            fills = s.execute(select(Fill).where(Fill.trade_id == trade_id)
+                              .order_by(Fill.ts)).scalars().all()
+            cond = OrderAudit.trade_id == trade_id
+            if t.play_id:
+                cond = or_(cond, OrderAudit.play_id == t.play_id)
+            orders = s.execute(select(OrderAudit).where(cond).order_by(OrderAudit.ts)).scalars().all()
+            return {
+                "trade": trade_to_dict(t),
+                "play": play_to_dict(play) if play else None,
+                "fills": [{"ts": f.ts.isoformat() if f.ts else None, "leg": f.leg, "side": f.side,
+                           "quantity": _f(f.quantity), "price": _f(f.price),
+                           "commission": _f(f.commission), "broker_order_id": f.broker_order_id}
+                          for f in fills],
+                "orders": [{"ts": o.ts.isoformat() if o.ts else None, "action": o.action,
+                            "ok": bool(o.ok), "broker": o.broker, "message": o.message,
+                            "request": o.request} for o in orders],
+            }
 
     # -------------------------------------------------------------- #
     #  PDT counter                                                  #

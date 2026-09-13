@@ -52,11 +52,11 @@ def test_invalid_platform_is_rejected(engine):
 
 
 def test_sector_filter_is_normalised_persisted_and_shared_with_the_scanner(engine):
-    r = engine.set_sectors(["Energy", "Consumer Cyclical"])
-    assert r["ok"] and engine.sectors == ["Consumer Discretionary", "Energy"]
-    assert engine.scanner.sectors_allowed == engine.sectors
-    assert engine._read_runtime()["sectors"] == engine.sectors
-    assert engine.set_sectors([])["sectors"] == []
+    r = engine.set_filters(sectors=["Energy", "Consumer Cyclical"])
+    assert r["ok"] and r["filters"]["sectors"] == ["Consumer Discretionary", "Energy"]
+    assert engine.scanner.filters is engine.filters
+    assert engine._read_runtime()["filters"]["sectors"] == ["Consumer Discretionary", "Energy"]
+    assert engine.set_filters(sectors=[])["filters"]["sectors"] == []
 
 
 def test_bad_secret_input_is_rejected(engine):

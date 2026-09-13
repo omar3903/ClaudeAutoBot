@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from ..config import PROJECT_ROOT
+from ..util.ratelimit import RateLimiter
 
 log = logging.getLogger(__name__)
 
@@ -151,8 +152,8 @@ class YFinanceFundamentals(FundamentalsProvider):
         except Exception:  # noqa: BLE001
             self._ok = False
             log.warning("yfinance missing - fundamentals disabled")
-        self._throttle = throttle
-        self._last = 0.0
+        # paces request starts across the scanner's threads (never sleeps under a lock)
+        self._limiter = RateLimiter(throttle)
         self._cache: Dict[str, Financials] = {}
 
     # -------------------------------------------------------------- #
@@ -252,10 +253,7 @@ class YFinanceFundamentals(FundamentalsProvider):
 
     # -------------------------------------------------------------- #
     def _nap(self) -> None:
-        wait = self._throttle - (time.time() - self._last)
-        if wait > 0:
-            time.sleep(wait)
-        self._last = time.time()
+        self._limiter.wait()
 
 
 def _f(v) -> float:

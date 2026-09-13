@@ -71,3 +71,62 @@ def test_exit_manager_only_manages_trades_on_its_own_venue():
     em.venue = "paper"
     em.run_once()
     assert closed == ["t1"]
+
+
+# ---------------------------------------------------------------- only what's actually held
+from tos_bot.config import get_settings  # noqa: E402
+from tos_bot.core.models import Account, Position  # noqa: E402
+
+
+class _ClosingRepo(_Repo):
+    def close_trade(self, tid, exit_price, exit_reason=""):
+        self.t[tid].update(status="CLOSED", exit_price=exit_price, exit_reason=exit_reason)
+        return dict(self.t[tid])
+
+
+class _HoldingBroker(_Broker):
+    name = "paper"
+
+    def __init__(self, positions):
+        super().__init__()
+        self.positions = positions
+
+    def get_account(self):
+        return Account(account_id="SIM", positions=[Position(symbol=s, quantity=q, avg_price=100.0)
+                                                    for s, q in self.positions.items()])
+
+
+def _executor(broker):
+    return Executor(broker, _ClosingRepo([_trade()]), cfg=get_settings().config.execution,
+                    bus=SILENT, venue="paper")
+
+
+def test_no_exit_is_sent_for_shares_the_broker_does_not_hold():
+    for held in ({}, {"AAA": -10}):              # closed outside the app / only the other side
+        broker = _HoldingBroker(held)
+        r = _executor(broker).close_trade("t1")
+        assert not r["ok"] and r["not_held"] and broker.orders == []
+
+
+def test_an_exit_never_sells_more_than_the_broker_holds():
+    broker = _HoldingBroker({"AAA": 4})          # 6 of the 10 were sold elsewhere
+    r = _executor(broker).close_trade("t1")
+    assert r["ok"] and [o.quantity for o in broker.orders] == [4]
+
+
+def test_the_exit_still_goes_out_when_the_broker_cant_say():
+    broker = _Broker()                           # no account call available
+    broker.name = "paper"
+    r = _executor(broker).close_trade("t1")
+    assert r["ok"] and [o.quantity for o in broker.orders] == [10]
+
+
+def test_exit_manager_reports_a_missing_position_once():
+    events = []
+    bus = SimpleNamespace(publish=lambda topic, **kw: events.append(topic))
+    ex = SimpleNamespace(close_trade=lambda tid, reason="manual": {"ok": False, "not_held": True, "reason": "gone"})
+    em = ExitManager(_Repo([_trade()]), ex, quote_fn=lambda s: Quote(symbol=s, bid=90, ask=90, last=90),
+                     cfg=CFG, bus=bus, venue="paper")
+    for _ in range(3):
+        em.run_once()
+    assert events.count("exit.not_held") == 1 and "t1" not in em._closing

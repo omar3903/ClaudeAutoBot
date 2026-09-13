@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
-from typing import Optional
+from dataclasses import dataclass
+from typing import Iterable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 from ..core.models import Play, Quote, ScanCandidate
+from ..data.sectors import clean_sector_list, sector_allowed
 from ..indicators import ta
 
 
@@ -84,3 +86,62 @@ def rank_score(play: Play, cand: Optional[ScanCandidate], strategy_weight: float
 
     kind_bonus = 0.05 if play.kind.value == "FUNDAMENTAL" else 0.0
     return round(base + activity + kind_bonus, 4)
+
+
+# --------------------------------------------------------------------------- #
+#  What the bot scans for and may trade - set from the dashboard             #
+# --------------------------------------------------------------------------- #
+SIDES = ("LONG", "SHORT")
+TIMEFRAMES = ("INTRADAY", "SWING")
+
+
+@dataclass(frozen=True)
+class TradeFilters:
+    """Applied by the scanner (what it looks for) and at execution (what may be
+    entered, by you or Autopilot). The dashboard replaces it as a whole."""
+
+    sides: Tuple[str, ...] = SIDES
+    timeframes: Tuple[str, ...] = TIMEFRAMES
+    sectors: Tuple[str, ...] = ()                  # () = every sector
+
+    @classmethod
+    def build(cls, sides: Optional[Iterable[str]] = None,
+              timeframes: Optional[Iterable[str]] = None,
+              sectors: Optional[Iterable[str]] = None) -> "TradeFilters":
+        """Normalise dashboard input. At least one side and one timeframe stay on."""
+        s, t = _pick(sides, SIDES), _pick(timeframes, TIMEFRAMES)
+        if not s:
+            raise ValueError("Keep at least one of Long / Short switched on.")
+        if not t:
+            raise ValueError("Keep at least one of Intraday / Swing switched on.")
+        return cls(sides=s, timeframes=t, sectors=tuple(clean_sector_list(sectors)))
+
+    def refusal(self, side: str, timeframe: str, sector: Optional[str]) -> Optional[str]:
+        """Why a play with these traits is filtered out, or None if it's allowed."""
+        if side not in self.sides:
+            return f"{side.lower()} plays are switched off in the filters"
+        if timeframe not in self.timeframes:
+            return f"{'intraday' if timeframe == 'INTRADAY' else 'swing'} plays are switched off in the filters"
+        if not sector_allowed(sector, self.sectors):
+            return f"{sector or 'Unknown'} sector is switched off in the Sectors filter"
+        return None
+
+    def allows(self, play) -> bool:
+        return self.refusal(play.side.value, play.timeframe.value, play.sector) is None
+
+    def as_dict(self) -> dict:
+        return {"sides": list(self.sides), "timeframes": list(self.timeframes),
+                "sectors": list(self.sectors)}
+
+    def describe(self) -> str:
+        sides = " + ".join(x.lower() for x in self.sides)
+        tfs = " + ".join("intraday" if x == "INTRADAY" else "swing" for x in self.timeframes)
+        secs = ", ".join(self.sectors) if self.sectors else "every sector"
+        return f"Scanning and trading {sides} · {tfs} · {secs}."
+
+
+def _pick(values: Optional[Iterable[str]], allowed: Tuple[str, ...]) -> Tuple[str, ...]:
+    if values is None:
+        return tuple(allowed)
+    chosen = {str(v).strip().upper() for v in values}
+    return tuple(a for a in allowed if a in chosen)
