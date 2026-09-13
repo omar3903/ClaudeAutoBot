@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------
-# tos-trader requirements
-# Python 3.9+  (tested on 3.9 and 3.11)
+# AutoTradeBot requirements
+# Python 3.10+  (ib_async needs 3.10)
 # ---------------------------------------------------------------------------
 
 # --- core engine ---
@@ -17,7 +17,7 @@ tenacity>=8.2            # retry/backoff for API calls
 # --- persistence (SQLite works out of the box; MySQL optional) ---
 SQLAlchemy>=2.0
 PyMySQL>=1.1             # only needed if you point DATABASE_URL at MySQL
-cryptography>=42.0       # Fernet encryption for the OAuth token file
+cryptography>=42.0       # used by schwab-py / authlib for the Schwab sign-in
 
 # --- web dashboard ---
 fastapi>=0.110
@@ -29,15 +29,9 @@ websockets>=12.0
 yfinance>=0.2.40         # free fundamentals + backup price history
 requests>=2.31
 
-# --- brokerage adapters (NOT needed for the built-in simulator) ---
-ib_async>=1.0.3         # Interactive Brokers, via a running IB Gateway / TWS (Python 3.10+)
-# schwab-py>=1.4         # Schwab live adapter: pip install schwab-py   (pin a tested version)
-# tda-api>=1.6           # legacy / reference only - TD Ameritrade API is decommissioned
-# ccxt>=4.3              # crypto exchanges (later)
-
-# --- optional: unattended token re-authentication ---
-# playwright>=1.44       # headless broker login; run `playwright install chromium`
-# keyring>=25.0          # OS credential store for the automated re-auth path
+# --- brokers (the built-in simulator needs neither) ---
+ib_async>=1.0.3          # Interactive Brokers, via a running IB Gateway / TWS
+schwab-py>=1.5           # Charles Schwab / thinkorswim + the one-click sign-in
 
 # --- dev ---
 pytest>=8.0

@@ -27,8 +27,10 @@ log = logging.getLogger(__name__)
 
 
 class ExitManager:
-    def __init__(self, repo, executor, quote_fn: Callable[[str], Any], cfg, bus=BUS) -> None:
+    def __init__(self, repo, executor, quote_fn: Callable[[str], Any], cfg, bus=BUS,
+                 venue: Optional[str] = None) -> None:
         self.repo = repo
+        self.venue = venue                  # only manage trades held on this venue
         self.executor = executor
         self.quote_fn = quote_fn
         self.cfg = cfg
@@ -49,6 +51,8 @@ class ExitManager:
         for t in open_trades:
             if t["id"] in self._closing:
                 continue
+            if self.venue and (t.get("broker") or self.venue) != self.venue:
+                continue                    # held on another platform - its exit can't go here
             try:
                 r = self._manage(t)
                 if r:

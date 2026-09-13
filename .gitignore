@@ -1,5 +1,7 @@
 # NEVER commit these
 .env
+.env.*
+!.env.example
 config/config.yaml
 secrets/
 *.token.json

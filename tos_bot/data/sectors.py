@@ -18,13 +18,51 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Iterable, List, Optional
 
 from ..config import PROJECT_ROOT
 
 log = logging.getLogger(__name__)
 
 _CACHE_FILE = PROJECT_ROOT / "data" / "cache" / "sectors.json"
+
+#: the 11 GICS sectors in display order. Every sector the app stores or
+#: filters on is one of these - see canonical_sector().
+SECTORS = (
+    "Technology", "Communication Services", "Consumer Discretionary", "Consumer Staples",
+    "Healthcare", "Financials", "Industrials", "Energy", "Utilities", "Materials", "Real Estate",
+)
+# yfinance / older GICS spellings -> SECTORS
+_ALIASES = {
+    "information technology": "Technology",
+    "consumer cyclical": "Consumer Discretionary",
+    "consumer defensive": "Consumer Staples",
+    "health care": "Healthcare",
+    "financial services": "Financials",
+    "basic materials": "Materials",
+    "telecommunication services": "Communication Services",
+}
+
+
+def canonical_sector(name: Optional[str]) -> str:
+    """Map yfinance spellings onto SECTORS (Consumer Cyclical -> Consumer Discretionary)."""
+    n = (name or "").strip()
+    for s in SECTORS:
+        if s.lower() == n.lower():
+            return s
+    return _ALIASES.get(n.lower(), n)
+
+
+def clean_sector_list(values: Optional[Iterable[str]]) -> List[str]:
+    """Normalise a sector selection. Every sector (or none) means no filter: []."""
+    picked = {canonical_sector(v) for v in (values or [])}
+    chosen = [s for s in SECTORS if s in picked]
+    return [] if len(chosen) == len(SECTORS) else chosen
+
+
+def sector_allowed(sector: Optional[str], allowed: Optional[Iterable[str]]) -> bool:
+    """No filter allows everything; with one, an unknown sector is excluded."""
+    return not allowed or canonical_sector(sector) in allowed
 
 # Bundled - keeps the common names instant and offline.
 _STATIC: Dict[str, str] = {
@@ -109,6 +147,9 @@ _STATIC: Dict[str, str] = {
     "PLD": "Real Estate", "AMT": "Real Estate", "EQIX": "Real Estate", "CCI": "Real Estate",
     "PSA": "Real Estate", "SPG": "Real Estate", "O": "Real Estate", "CSGP": "Real Estate",
     "WELL": "Real Estate", "DLR": "Real Estate",
+    # nasdaq-100 names that fell outside the groups above
+    "CSCO": "Technology", "INTU": "Technology", "MELI": "Consumer Discretionary",
+    "DLTR": "Consumer Staples", "SIRI": "Communication Services",
 }
 
 
@@ -131,21 +172,31 @@ class SectorLookup:
         except Exception:  # noqa: BLE001
             pass
 
+    def peek(self, symbol: str) -> Optional[str]:
+        """Sector from the bundled map or disk cache only - never the network.
+        ``None`` means it hasn't been looked up yet."""
+        symbol = symbol.upper()
+        if symbol in _STATIC:
+            return _STATIC[symbol]
+        if symbol in self._cache:
+            return canonical_sector(self._cache[symbol])
+        return None
+
     def get(self, symbol: str, known: Optional[str] = None) -> str:
         symbol = symbol.upper()
+        known = canonical_sector(known)
         if known:                                   # from Financials - trust + cache it
             if self._cache.get(symbol) != known:
                 with self._lock:
                     self._cache[symbol] = known
                     self._save()
             return known
-        if symbol in _STATIC:
-            return _STATIC[symbol]
-        if symbol in self._cache:
-            return self._cache[symbol]
+        cached = self.peek(symbol)
+        if cached is not None:
+            return cached
         if not self.use_yfinance:
             return ""
-        sec = self._yf_sector(symbol)
+        sec = canonical_sector(self._yf_sector(symbol))
         with self._lock:
             self._cache[symbol] = sec
             self._save()

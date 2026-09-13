@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "autotradebot"
 version = "0.1.0"
-description = "AutoTradeBot - broker-agnostic, human-in-the-loop trading assistant (Schwab, IBKR & crypto ready)"
+description = "AutoTradeBot - human-in-the-loop trading assistant (IBKR, Schwab/thinkorswim, built-in simulator)"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "omarabdeen123" }]
 dependencies = [
@@ -15,15 +15,11 @@ dependencies = [
   "PyYAML>=6.0", "python-dotenv>=1.0", "python-dateutil>=2.9", "pytz>=2024.1",
   "tenacity>=8.2", "SQLAlchemy>=2.0", "PyMySQL>=1.1", "cryptography>=42.0",
   "fastapi>=0.110", "uvicorn[standard]>=0.29", "jinja2>=3.1", "websockets>=12.0",
-  "yfinance>=0.2.40", "requests>=2.31",
+  "yfinance>=0.2.40", "requests>=2.31", "ib_async>=1.0.3", "schwab-py>=1.5",
 ]
 
 [project.optional-dependencies]
-schwab = ["schwab-py>=1.4"]
-ibkr = ["ib_async>=1.0"]
-crypto = ["ccxt>=4.3"]
-headless-auth = ["playwright>=1.44", "keyring>=25.0"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "httpx>=0.27"]
 
 [project.scripts]
 autotradebot = "run:main"
@@ -40,4 +36,4 @@ filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"

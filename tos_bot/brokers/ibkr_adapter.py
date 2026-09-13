@@ -26,7 +26,6 @@ import asyncio
 import datetime as dt
 import logging
 import math
-import socket
 import threading
 import time
 from concurrent.futures import Future as _CFuture
@@ -37,6 +36,7 @@ import pandas as pd
 from ..config import get_settings
 from ..core.enums import AssetClass, OrderType, Side, TimeInForce
 from ..core.models import Account, Fill, OrderRequest, OrderResult, Position, Quote
+from ..util.net import port_is_open  # noqa: F401  (re-exported; tests patch it here)
 from .base import AuthError, BrokerAdapter, NotSupported, OrderRejected
 
 log = logging.getLogger(__name__)
@@ -52,15 +52,6 @@ _MDT = {"live": 1, "frozen": 2, "delayed": 3, "delayed-frozen": 4}
 _DELAYED_ERRS = {10167, 10168, 10197, 10089}
 # error codes that are just connection chatter, not failures
 _INFO_ERRS = {2104, 2106, 2107, 2108, 2158, 2100, 2150, 202}
-
-
-def port_is_open(host: str, port: int, timeout: float = 2.0) -> bool:
-    """Cheap 'is IB Gateway/TWS listening?' check with no ib_async import."""
-    try:
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            return True
-    except OSError:
-        return False
 
 
 # --------------------------------------------------------------------------- #

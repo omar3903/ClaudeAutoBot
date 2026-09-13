@@ -11,6 +11,11 @@ if os.path.exists(_TMPDB):
     os.remove(_TMPDB)
 os.environ["DATABASE_URL"] = f"sqlite:///{_TMPDB}"
 os.environ["BROKER"] = "paper"
+# never read (or let a test write) the real .env
+_TMP_ENV = os.path.join(tempfile.gettempdir(), "tos_trader_pytest.env")
+if os.path.exists(_TMP_ENV):
+    os.remove(_TMP_ENV)
+os.environ["ATB_ENV_PATH"] = _TMP_ENV
 os.environ["OPEN_BROWSER_ON_START"] = "0"
 os.environ["PAPER_PERSIST"] = "0"          # tests never touch data/paper_state.json
 # tests never rewrite the user's data/runtime.json (mode + autopilot knobs)

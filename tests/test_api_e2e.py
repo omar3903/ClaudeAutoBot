@@ -11,6 +11,12 @@ pytestmark = pytest.mark.slow
 
 @pytest.fixture
 def client(monkeypatch):
+    # The flow needs a tradable session. Pin the clock to mid regular-hours so
+    # this doesn't fail every night and weekend (and nothing auto-flattens).
+    from tos_bot.util import clock
+    monkeypatch.setattr(clock, "current_session", lambda ts=None: clock.Session.REGULAR)
+    monkeypatch.setattr(clock, "is_market_open", lambda ts=None: True)
+    monkeypatch.setattr(clock, "minutes_to_close", lambda ts=None: 240.0)
     monkeypatch.setenv("SCANNER_UNIVERSE", "nasdaq100")
     monkeypatch.setenv("SCANNER_MAX_SYMBOLS", "24")
     monkeypatch.setenv("SCANNER_INTERVAL_SECONDS", "9999")

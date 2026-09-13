@@ -76,7 +76,7 @@ def _cfg(**over):
     base = dict(
         enabled=True, allow_live=False, trade_types=["INTRADAY"],
         min_confidence=0.6, min_reward_risk=2.0, max_auto_positions=2,
-        max_auto_trades_per_day=3, max_open_risk_pct=4.0, block_sectors=[],
+        max_auto_trades_per_day=3, max_open_risk_pct=4.0,
         require_catalyst=False, dry_run=False,
         # cap tests below isolate one cap at a time; keep these wide open
         max_per_strategy=99, max_new_per_cycle=99, cooldown_after_loss=False,
@@ -145,12 +145,6 @@ def test_fundamental_plays_are_never_auto_traded():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(trade_types=["INTRADAY", "SWING"]), bus=SILENT)
     _run(ap, mkplay(kind=StrategyKind.FUNDAMENTAL, tf=Timeframe.SWING))
-    assert eng.approved == []
-
-
-def test_blocked_sector():
-    eng = FakeEngine()
-    _run(AutoPilot(eng, _cfg(block_sectors=["Energy"]), bus=SILENT), mkplay(sector="Energy"))
     assert eng.approved == []
 
 
