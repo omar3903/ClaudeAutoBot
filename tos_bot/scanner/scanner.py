@@ -25,6 +25,7 @@ from ..core.eventbus import BUS
 from ..core.models import Account, Play, ScanCandidate
 from ..data.fundamentals import FundamentalsProvider
 from ..data.market_data import MarketDataService
+from ..data.sectors import SectorLookup, sector_allowed
 from ..data.universe import UniverseLoader
 from ..risk.position_sizing import size_play
 from ..strategies.base import build_context
@@ -47,6 +48,7 @@ class ScanResult:
     shortlist: List[str] = field(default_factory=list)       # top-N symbols
     errors: Dict[str, str] = field(default_factory=dict)
     elapsed_s: float = 0.0
+    sector_skipped: int = 0                                  # outside the Sectors filter
 
     def summary(self) -> dict:
         return {
@@ -56,6 +58,7 @@ class ScanResult:
             "universe_size": self.universe_size,
             "scanned": self.scanned,
             "prefiltered": self.prefiltered,
+            "sector_skipped": self.sector_skipped,
             "n_plays": len(self.plays),
             "shortlist": self.shortlist,
             "n_errors": len(self.errors),
@@ -83,8 +86,9 @@ class Scanner:
         self._cursor = 0
         self._last_account: Optional[Account] = None
 
-        from ..data.sectors import SectorLookup
         self._sectors = SectorLookup(use_yfinance=self.md.is_real)
+        #: only scan / trade these sectors ([] = all); the engine keeps it in sync
+        self.sectors_allowed: List[str] = []
 
     # ------------------------------------------------------------------ #
     def set_account(self, account: Account) -> None:
@@ -112,6 +116,25 @@ class Scanner:
         self._cursor = end % len(u)
         return sl
 
+    #: tickers with no known sector yet, looked up online per cycle while a
+    #: sector filter is on; the rest are skipped this cycle and resolved later
+    SECTOR_LOOKUPS_PER_CYCLE = 20
+
+    def _in_sectors(self, symbols: List[str]) -> List[str]:
+        budget = self.SECTOR_LOOKUPS_PER_CYCLE
+        keep = []
+        for sym in symbols:
+            sec = self._sectors.peek(sym)
+            if sec is None and budget > 0:
+                budget -= 1
+                try:
+                    sec = self._sectors.get(sym)
+                except Exception:  # noqa: BLE001
+                    sec = ""
+            if sector_allowed(sec, self.sectors_allowed):
+                keep.append(sym)
+        return keep
+
     # ------------------------------------------------------------------ #
     def run_cycle(self) -> ScanResult:
         t0 = time.time()
@@ -124,6 +147,10 @@ class Scanner:
         self._ensure_universe()
         run.universe_size = len(self._universe)
         slice_syms = self._next_slice(int(sc.max_symbols_scanned))
+        if self.sectors_allowed:
+            in_sector = self._in_sectors(slice_syms)
+            run.sector_skipped = len(slice_syms) - len(in_sector)
+            slice_syms = in_sector
         run.scanned = len(slice_syms)
 
         intraday_iv = bars.get("intraday_interval", "5m")
@@ -276,7 +303,9 @@ class Scanner:
                 except Exception:  # noqa: BLE001
                     pass
         min_rr = float(self.settings.config.risk.min_reward_risk)
-        all_plays = [p for p in all_plays if p.reward_risk >= min_rr or p.kind.value == "FUNDAMENTAL"]
+        all_plays = [p for p in all_plays
+                     if (p.reward_risk >= min_rr or p.kind.value == "FUNDAMENTAL")
+                     and sector_allowed(p.sector, self.sectors_allowed)]
         all_plays.sort(key=lambda p: p.score, reverse=True)
         run.plays = all_plays
 

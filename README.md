@@ -1,20 +1,16 @@
 # AutoTradeBot
 
-A **broker-agnostic, human-in-the-loop** trading assistant for a small account
-(TD Ameritrade / thinkorswim &rarr; Schwab, with Interactive Brokers and crypto
-adapters stubbed in).
+A **human-in-the-loop** trading assistant for a small account.
 
 It scans the Nasdaq every few minutes, ranks a short list of names, and shows
 **long / short "plays"** with a plain-English explanation on hover and the
-stock's **sector** next to the ticker. By default nothing is routed to a broker
-until you click **Execute ✓ Yes**; an optional **Autopilot** toggle lets the
-bot take the entry too, inside hard caps (paper-only until you deliberately
-allow live). Every open trade — clicked or auto — then runs an **automatic exit
-strategy** (stop / target / break-even / trailing / end-of-day flatten) with no
-further input, and carries an **expected time-to-exit** so a position that
-overstays its welcome gets flagged for a manual look. Every idea and every
-executed trade (with its realised P/L) is written to MySQL or a local SQLite
-file.
+stock's **sector** next to the ticker. Nothing is routed to a broker until you
+click **Execute ✓ Yes** — or, if you switch it on, **Autopilot** takes the entry
+inside hard caps (paper-only until you deliberately allow live). Every open
+trade then runs an **automatic exit strategy** (stop / target / break-even /
+trailing / end-of-day flatten) with no further input, and carries an **expected
+time-to-exit** so a position that overstays gets flagged. Every idea and every
+executed trade (with its realised P/L) is written to SQLite or MySQL.
 
 The play explanations and the day-trade / swing recognition are modelled on
 four books: **Aziz, *How to Day Trade for a Living*** (the intraday setups and
@@ -24,63 +20,38 @@ Analysis of the Financial Markets*** (horizontal S/R, oscillator divergence,
 volume confirmation) and **Pignataro, *Financial Modeling and Valuation*** (the
 DCF / comps overlay).
 
-- **Paper ↔ Live toggle:** flip the whole app between **paper** and **live**
-  from a switch in the dashboard header — no restart, no `.env` edit. With
-  **Interactive Brokers** as the venue, paper mode routes to your real IBKR
-  **paper account** (port 4002) and live to your real account (4001); the
-  built-in $100k simulator is the offline fallback.
-- **Data + brokerage:** a `BrokerAdapter` abstraction with a full **Interactive
-  Brokers** adapter (`ib_async` → IB Gateway / TWS, live *and* paper, real
-  exchange quotes/volume/history, native bracket orders, auto-reconnect on the
-  daily Gateway restart), a **Schwab** adapter (`schwab-py`), a legacy
-  `tda-api` reference adapter, a **crypto** stub, and the **paper** simulator.
-  IBKR has **no OAuth token / no 60-day expiry** — "auth" is the Gateway
-  session; hands-off login is [IBC](https://github.com/IbcAlpha/IBC).
+- **Choose where trades go** — in the dashboard's **Connections** panel. Paper
+  trades on the **built-in $100k simulator**, your **IBKR paper account**, or
+  **thinkorswim / Schwab** real-time data with simulated fills. Live trades on
+  **Interactive Brokers** or **Charles Schwab**. No restart, no file editing.
+- **Keys and sign-in inside the app** — paste broker settings into Connections
+  (saved to your local `.env`; secrets are never shown again) and click **Sign
+  in with Schwab**: a local callback server catches Schwab's OAuth redirect and
+  stores the token. IBKR has no token — its login is the running IB Gateway —
+  so its panel tests the connection instead.
+- **Sector filter** — pick the sectors to scan *and* trade. The scanner skips the
+  rest, and plays outside them can't be executed by you or by Autopilot.
+- **Light / dark theme** — follows your OS setting; one click to switch.
 - **Strategies:** 13 technical day-trade / swing setups (Aziz's ABCD, bull/bear
   flag, VWAP, opening-range, red-to-green, top/bottom reversal, horizontal S/R;
   Murphy/Connors divergence & mean-reversion) + 3 valuation setups from
   *Pignataro* (comps, a UFCF DCF with exit-multiple **and** perpetuity terminal
   value, a blended "football-field" band). Intraday setups are **weighted by
-  time of day** — momentum fades at midday, reversals hold up, trends improve
-  into the close.
-- **Autopilot (hands-off entry):** a header toggle that lets the bot place the
-  entry itself for plays that clear a strict gate (your chosen trade types, a
-  confidence floor, ≥ 2:1 reward:risk, per-day and concurrent-position caps,
-  aggregate open-risk cap). **Paper-only** until you set
-  `autopilot.allow_live: true` in `config.yaml`. Exits are automatic either way.
+  time of day**.
+- **Autopilot (hands-off entry):** the bot places the entry itself for plays
+  that clear a strict gate (trade types, confidence floor, ≥ 2:1 reward:risk,
+  per-day, concurrent, per-strategy and open-risk caps). **Paper-only** until
+  you set `autopilot.allow_live: true` in `config.yaml`.
+- **Safe switching:** every trade remembers the platform it was opened on. Exits
+  are only ever sent there, and the app refuses to change platform while
+  positions are open on the current one.
 - **Guard rails (live mode):** a $2,000 equity floor and a rolling 5-session
   Pattern-Day-Trader counter (3-day-trade cap under $25k) that block or warn
-  *before* you confirm. In paper mode nothing is blocked — the counters are
-  still shown so you learn where the live rules would bite.
-- **Auth:** a token watchdog that keeps the access token fresh and, ~5 days
-  before the refresh token's TTL (default **60 days**), backs up + deletes the
-  old token and triggers a new grant — either a one-click prompt or an
-  unattended headless flow.
+  *before* you confirm.
 - **UI:** a local web dashboard (FastAPI + WebSocket) at `http://127.0.0.1:8787`.
 
 > ⚠️ **Not investment advice. Not audited. Trade paper first.** Markets can and
 > will lose you money faster than any backtest suggests.
-
----
-
-## ⚠️ Read this first: `tda-api` is end-of-life
-
-Your PDF documents `tda-api`, which wraps the **TD Ameritrade Developer API**.
-After Charles Schwab acquired TD Ameritrade, that platform was shut down —
-`api.tdameritrade.com` no longer issues OAuth tokens. The maintained successor,
-by the same author, is **[`schwab-py`](https://github.com/alexgolec/schwab-py)**,
-and its call surface mirrors `tda-api` almost line for line
-(`easy_client`, `get_price_history_every_five_minutes`, `place_order` + order
-templates, …).
-
-This project therefore:
-
-- puts everything behind `tos_bot/brokers/base.py::BrokerAdapter`;
-- ships **`schwab_adapter.py`** as the live path (`BROKER=schwab`);
-- keeps **`tda_adapter.py`** as a reference that still matches your docs, in
-  case you have confirmed legacy access (`BROKER=tda`);
-- ships **`paper_adapter.py`** so you can run the whole thing today with no
-  broker at all (`BROKER=paper`, the default).
 
 ---
 
@@ -89,111 +60,138 @@ This project therefore:
 ```bash
 python -m venv .venv && . .venv/Scripts/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env                                    # BROKER=paper is the default
+cp .env.example .env
 cp config/config.example.yaml config/config.yaml
 python run.py
 ```
 
-The dashboard opens at `http://127.0.0.1:8787` in **Paper** mode with a
-**$100,000** simulated account. Click **Scan now**, hover a row to read the
-play, click it to see the order preview (it says *Routes to: SIMULATED
-(paper)*), then **Execute ✓ Yes** to fill it against the live quote. Close
-positions from the **Open positions** tab; realised P/L lands in **Trade
-history** and **P/L summary**. **Reset paper** in the header wipes the paper
-cash/positions back to a balance you choose (trade history is kept).
+The dashboard opens at `http://127.0.0.1:8787` in **Paper** mode on the built-in
+**$100,000** simulator. Click **Scan now**, hover a row to read the play, click
+it to see the order preview (*Routes to: SIMULATED (built-in)*), then **Execute
+✓ Yes** to fill it against the current quote. Close positions from **Open
+positions**; realised P/L lands in **Trade history** and **P/L summary**.
+**Reset paper** wipes the simulator back to a balance you choose (trade history
+is kept). The simulator persists to `data/paper_state.json`.
 
-The paper account **persists** to `data/paper_state.json`, so it keeps
-tracking across restarts.
-
-**Data:** with a running IB Gateway (or the `SCHWAB_*` keys) the app uses that
-venue's real quotes/candles **in both modes**. Otherwise it uses `yfinance`
-(delayed ~15 min) or, if that isn't installed, a deterministic synthetic feed.
-The header shows which (`data: broker:ibkr` / `schwab` / `yfinance` /
-`synthetic`), and whether the IBKR feed is real-time or `delayed` (no
-market-data subscription).
-
-### Paper ↔ Live switch
-
-The header has a **Paper / Live** toggle. With `LIVE_BROKER=ibkr` it maps to
-the Gateway port (**paper 4002 ↔ live 4001**); paper is your real IBKR paper
-account, live is your real account. **Live** is greyed until that venue is
-reachable; switching to it pops a confirmation and, from then on, approved
-orders are real and the $2,000 floor + PDT cap apply. The choice is remembered
-in `data/runtime.json`.
-
-With no MySQL configured, everything above still works — the database falls
-back to a local SQLite file (`data/tos_trader.sqlite`).
+With no broker connected, market data comes from `yfinance` (delayed ~15 min).
+The header shows the source (`data: yfinance` / `broker:ibkr` / `broker:schwab`)
+and whether it's real-time or delayed. With no MySQL configured, the database is
+a local SQLite file.
 
 ---
 
-## Going live
+## Where orders go
 
-### Option A — Interactive Brokers (recommended)
+Three switches, all in the dashboard and remembered in `data/runtime.json`
+(`.env` only supplies the starting values). The routing lives in
+`tos_bot/brokers/venues.py`:
 
-IBKR gives you real exchange data and a real paper account through the same
-API. There is **no token and no 60-day expiry** — the API is a socket into a
-running **IB Gateway** (or TWS); IBKR force-restarts that once a day, and
-**[IBC](https://github.com/IbcAlpha/IBC)** makes the re-login hands-off. The
-adapter watches the socket and **auto-reconnects**, so an IBC restart is
-invisible; if the Gateway is genuinely down the header shows it.
+| Paper / Live | Paper platform | Connection the app holds | Orders go to |
+|---|---|---|---|
+| **Live** | (any) | your live broker | your **real** IBKR or Schwab account |
+| Paper | **IBKR paper account** | IB Gateway, paper port | your IBKR paper account |
+| Paper | **thinkorswim / Schwab** | Schwab (data only) | the built-in simulator |
+| Paper | **Built-in simulator** | the live broker's feed, read-only | the built-in simulator |
 
-```bash
-pip install ib_async
-python scripts/ibkr_setup.py --guide     # the full walkthrough
-python scripts/ibkr_setup.py             # probe ports, connect read-only, report
+- **thinkorswim's paperMoney has no API**, so "thinkorswim / Schwab" paper
+  trading simulates fills on Schwab's real-time quotes. Those positions won't
+  appear in the thinkorswim app.
+- If the chosen platform isn't reachable (Gateway not running, not signed in),
+  paper falls back to the simulator and the header pill turns red with the fix.
+  **Live** is never faked: if the live broker isn't reachable, the switch is
+  refused and tells you why.
+- Every trade is stamped with its venue (`paper`, `ibkr-paper`, `ibkr-live`,
+  `schwab`). The exit manager only manages trades on the active venue, a manual
+  **Close** is refused for a position held elsewhere, and a platform or
+  Paper/Live switch is refused while positions are open on the current venue —
+  so an exit can never be sent to an account that doesn't hold the shares.
+  Positions parked on another platform show an **on IBKR paper**-style badge.
+
+---
+
+## Connecting a broker
+
+Open **Connections** (header button, or click the connection pill). Everything
+below can also be done by editing `.env` by hand — see `.env.example`.
+
+### Interactive Brokers
+
+IBKR's API is a socket into a running **IB Gateway** (or TWS). There is **no
+token and no expiry** — the Gateway login *is* the authentication. IBKR
+restarts the Gateway once a day; **[IBC](https://github.com/IbcAlpha/IBC)**
+re-enters your login automatically, and the app reconnects on its own.
+
+1. In **Client Portal → Settings**, enable your **paper account** (username
+   `DU…`) and tick *Share real-time market data subscriptions with paper
+   account*.
+2. Optional: **Settings → Market Data Subscriptions** (e.g. *US Securities
+   Snapshot Bundle*, ~$10/mo). Without it data is 15-minute delayed and labelled
+   `delayed`.
+3. **IB Gateway → Configure → Settings → API → Settings**: enable *ActiveX and
+   Socket Clients*, socket port **4002** (paper) / **4001** (live), Trusted IP
+   `127.0.0.1`, untick *Read-Only API*. Then *Lock and Exit → Auto restart*.
+4. For a hands-off daily login, set `IbLoginId` / `IbPassword` /
+   `TradingMode=paper` in IBC's `config.ini` and start `StartGateway.bat` (add a
+   Windows "at log on" task).
+5. In **Connections → Interactive Brokers**, check the host/ports, **Save**, then
+   **Test paper** / **Test live** — a read-only connection that reports the
+   account and whether data is real-time or delayed. From a terminal:
+   `python scripts/ibkr_setup.py` (`--guide` prints the full walkthrough).
+
+> The app manages exits itself (it doesn't attach a native OCO bracket at IBKR,
+> so two exit managers never fight over one position). That means **no stop is
+> resting at IBKR if the app isn't running** — keep it running while positions
+> are open.
+
+### Charles Schwab / thinkorswim
+
+1. Create an app at <https://developer.schwab.com> (*Trader API — Individual*),
+   set its callback URL to exactly **`https://127.0.0.1:8182`**, and wait for
+   Schwab to approve it (usually a few days).
+2. In **Connections → thinkorswim / Schwab**, paste the **App key** and **App
+   secret** and **Save**.
+3. Click **Sign in with Schwab**. Your browser opens schwab.com — log in and
+   allow access. The browser then warns about a certificate for
+   `127.0.0.1:8182`: that page is served by *this computer* to catch Schwab's
+   redirect, so continue. The token is saved and the app connects.
+4. **Schwab's sign-in lasts 7 days.** A day before it expires the header pill
+   shows `Schwab · 1d` with a **Sign in with Schwab** banner; one click renews it.
+
+From a terminal: `python scripts/authenticate.py` (`--check` prints the token
+status, `--reset` removes the token first).
+
+### Security of keys and sign-in
+
+- The Connections endpoints only answer **this computer**: a loopback client, a
+  `localhost`/`127.0.0.1` Host header, no foreign `Origin`, and the dashboard's
+  own request header. Another website open in your browser, or a device on your
+  network when the server runs with `--host 0.0.0.0`, is refused.
+- Only a fixed list of broker settings can be written. Values are validated (no
+  line breaks, ports in range, the callback URL shape), `.env` is replaced
+  atomically with your comments and other lines preserved, and **secret values
+  are never sent back** — the panel only shows that a key is set and its last
+  four characters.
+- The app never asks for your brokerage password: you log in on schwab.com.
+  The Schwab token lives in `secrets/` and `.env` stays on your machine — both
+  are git-ignored.
+
+### Schwab token upkeep
+
+`tos_bot/auth/token_manager.py` + `AuthWatchdog` (IBKR and the simulator need none):
+
+| what | how |
+|---|---|
+| access token (30 min) | refreshed by `schwab-py`; the watchdog makes a cheap authenticated call on a timer |
+| refresh token (7 days) | age read from a sidecar `*.meta.json` written at each sign-in |
+| reminder | from `refresh_token_ttl_days − rotate_before_days` (day 6): one banner + toast per token, nothing deleted |
+| expiry | on day 7: timestamped backup, the dead token is removed, and you're asked to sign in again |
+| audit | sign-ins, refreshes and expiries go to the `token_audit` table |
+
+```yaml
+auth:
+  refresh_token_ttl_days: 7
+  rotate_before_days: 1
 ```
-
-1. **Client Portal → Settings** → enable your **paper account** (`DU…`). Tick
-   *"Share real-time market data subscriptions with paper account"*.
-2. **Market data** (optional): *Settings → Market Data Subscriptions* → e.g.
-   *US Securities Snapshot Bundle* (~$10/mo). Without it the bot runs on
-   15-minute delayed data and labels the feed `delayed`.
-3. **IB Gateway** → *Configure → Settings → API → Settings*: enable
-   *ActiveX and Socket Clients*, socket port **4002** (paper) / **4001**
-   (live), Trusted IP `127.0.0.1`, untick *Read-Only API*. Then
-   *Configure → Lock and Exit → Auto restart*.
-4. **IBC**: set `IbLoginId` / `IbPassword` / `TradingMode=paper` in its
-   `config.ini`, launch `StartGateway.bat`, and add a Windows "run at logon"
-   task so it survives reboots.
-5. `.env`:
-
-   ```dotenv
-   BROKER=paper
-   LIVE_BROKER=ibkr
-   IBKR_HOST=127.0.0.1
-   IBKR_PAPER_PORT=4002
-   IBKR_LIVE_PORT=4001
-   IBKR_CLIENT_ID=11
-   # IBKR_ACCOUNT_ID=DU1234567   # only if the login has several accounts
-   # IBKR_MARKET_DATA=auto       # auto | live | delayed | delayed-frozen
-   # IBKR_READONLY=0             # 1 = data only, never send orders
-   ```
-
-The Paper/Live toggle now switches ports for you. The header's session pill
-shows `connected` / `reconnecting` / `Gateway not reachable` instead of a
-token status.
-
-### Option B — Schwab
-
-#### 1. Schwab developer app
-
-1. Create an app at <https://developer.schwab.com> (the *Trader API* product).
-2. Add **`https://127.0.0.1:8182`** as an allowed callback URL.
-3. Put the key/secret in `.env`:
-
-   ```dotenv
-   BROKER=schwab
-   SCHWAB_API_KEY=...
-   SCHWAB_APP_SECRET=...
-   SCHWAB_CALLBACK_URL=https://127.0.0.1:8182
-   SCHWAB_ACCOUNT_ID=12345678          # plain account number; the hash is resolved at runtime
-   ```
-4. `pip install schwab-py`
-5. Mint the token once (opens a browser):
-
-   ```bash
-   python scripts/authenticate.py
-   ```
 
 ### MySQL (optional — SQLite is the default)
 
@@ -217,60 +215,23 @@ DB_ALLOW_SQLITE_FALLBACK=0            # set 0 in production so a DB outage is lo
 python scripts/init_db.py            # creates all tables + indexes
 ```
 
-`tos_bot/persistence/schema.sql` has the raw DDL if you prefer to apply it by hand.
-
-### Run
-
-```bash
-python run.py --host 127.0.0.1 --port 8787
-```
-
 ---
 
-## The 60-day token rotation (Schwab / TDA only)
+## Sector filter
 
-> **Interactive Brokers has no token and no 60-day clock** — its "auth" is the
-> IB Gateway login, which IBKR restarts daily. IBC handles the re-login; the
-> adapter auto-reconnects the socket. None of this section applies to
-> `LIVE_BROKER=ibkr`.
+**Sectors** (above the plays table) picks which of the 11 GICS sectors to scan
+and trade; "all" means no filter. The choice is remembered in
+`data/runtime.json` (default: `scanner.sectors` in `config.yaml`).
 
-The brief: *"delete and get the authentication token every 60 days
-automatically with little to no manual handling."* (Schwab's real refresh
-token is ~7 days, so the watchdog rotates well inside that.)
-
-`tos_bot/auth/token_manager.py` + `AuthWatchdog`:
-
-| what | how |
-|---|---|
-| access token (minutes-long) | refreshed automatically by the SDK; the watchdog pings on a timer and logs `REFRESH` |
-| refresh token age | read from the token file / a sidecar `*.meta.json` written at each full auth |
-| rotation | when age ≥ `refresh_token_ttl_days − rotate_before_days`: timestamped **backup → delete** the token file → new grant |
-| new grant | `auth.auto_reauth: notify` → dashboard banner + `POST /api/auth/reauth` (one click); or `headless` → `scripts/reauth_headless.py` (Playwright + OS keyring, **opt-in**) |
-| audit | every event goes to the `token_audit` MySQL table |
-
-Set the TTL to your broker's real value in `config/config.yaml`:
-
-```yaml
-auth:
-  refresh_token_ttl_days: 60     # Schwab's real refresh token is ~7 days; TDA was 90
-  rotate_before_days: 5
-  auto_reauth: notify            # or: headless
-```
-
-> **Security:** this project never asks for or stores your brokerage password.
-> Plain-text credential entry is out of scope by design. The headless path is
-> a script **you** own that reads **your** OS keyring; many brokers also force
-> 2FA, in which case keep `auto_reauth: notify`.
-
-**Unattended check on Windows** (Task Scheduler, every 6 h):
-
-```bat
-schtasks /Create /TN "AutoTradeBot token" /SC HOURLY /MO 6 ^
-  /TR "\"%CD%\.venv\Scripts\python.exe\" \"%CD%\scripts\authenticate.py\" --check" /F
-```
-
-(`--check` prints status and exits; the live dashboard's watchdog does the real
-work while it is running.)
+- **Scan:** each cycle drops symbols outside the selection before any price data
+  is fetched. Sectors come from a bundled map, then a disk cache, then a
+  one-off `yfinance` lookup (at most 20 new tickers per cycle, so a filter never
+  stalls a scan); a ticker whose sector isn't known yet is skipped until it is.
+- **Execute:** a play outside the selection can't be executed, by you or by
+  Autopilot — the order card says why. Changing the selection clears
+  non-matching plays from the board and starts a rescan.
+- yfinance spellings are normalised (`Consumer Cyclical` → *Consumer
+  Discretionary*, `Financial Services` → *Financials*, …).
 
 ---
 
@@ -278,7 +239,7 @@ work while it is running.)
 
 `tos_bot/risk/pdt_guard.py` runs on every **Assess** before you can confirm.
 **In paper mode nothing below is enforced** — the day-trade tally is still
-shown, with a "(paper)" note, so you can see where live would stop you.
+shown so you can see where live would stop you.
 
 - **Equity floor** — if account equity `< min_start_equity` ($2,000), *no new
   entries*, full stop.
@@ -288,7 +249,6 @@ shown, with a "(paper)" note, so you can see where live would stop you.
   closed same-session round-trips (plus still-open intraday trades opened today)
   from the `trades` table and **blocks the 4th**, warning from the 2nd–3rd.
 - Every **intraday** play is treated as a *potential* day trade (conservative).
-  Mark a setup `SWING` (hold overnight) and it no longer counts.
 - **Cash account** (`account.cash_account: true`) — PDT does not apply, but the
   guard warns about T+1 settlement / good-faith violations.
 
@@ -304,25 +264,22 @@ Thresholds live in `config/config.yaml → account`.
 * **Session-aware execution.** You can only send an order when a session can
   accept it:
   * **Regular hours** → the order type from `execution.default_order_type`
-    (`LIMIT` / `MARKET` / `STOP_LIMIT`), with a native broker OCO bracket.
+    (`LIMIT` / `MARKET` / `STOP_LIMIT`).
   * **Pre-market / after-hours** → **limit only**, and only for setups flagged
     extended-hours-eligible (all swing/valuation setups, plus `gap_and_go`).
-    No native stop is possible, so the auto exit manager holds it instead.
   * **Closed** (overnight / weekend / holiday) → execution is blocked; the
-    dashboard shows the exact reason and when the market next opens.
-* Every play's order card shows the **concrete order** — "LIMIT (regular
-  hours)", "pre-market limit", "after-hours limit", "MARKET", "STOP_LIMIT" —
-  with the limit price, stop trigger, TIF and protection mode.
-* The header pill shows the live status ("Pre-market — closes into regular at
-  09:30 ET", "Closed — Thanksgiving Day", "Regular hours (half day)"), and
-  `GET /api/market` returns the full breakdown incl. the next holiday.
+    dashboard shows the reason and when the market next opens.
+* Every play's order card shows the **concrete order** — type, limit price, stop
+  trigger, TIF and protection mode — and which venue it **routes to**.
+* The header pill shows the live session status, and `GET /api/market` returns
+  the full breakdown incl. the next holiday.
 
 ---
 
 ## Automatic exit strategy
 
-`tos_bot/execution/exit_manager.py` runs every few seconds on every open
-trade — **entries need your click, exits never do**:
+`tos_bot/execution/exit_manager.py` runs every few seconds on every open trade
+held on the active platform — **entries need your click, exits never do**:
 
 | rule | default | config key |
 |---|---|---|
@@ -333,47 +290,32 @@ trade — **entries need your click, exits never do**:
 | **flatten day trades** before the (holiday-aware) close | 10 min before | `flatten_intraday_before_close_min` |
 | force-close **stale swings** | 10 days | `max_swing_hold_days` |
 
-> The break-even waits for +1.3 R, so a trade that runs and then wobbles isn't
-> killed at entry, and it tightens to *+0.3 R locked* rather than a pure
-> scratch; trailing starts later (+2 R).
-
-The stop only ever ratchets in your favour and never through the last price.
-R is always measured against the **original** stop (`trades.initial_stop_price`),
-not a trailed one. Each open position has an **Auto exit** toggle in the
-blotter (`POST /api/trades/{id}/managed`) if you want to hand-manage one.
-Tune everything in `config/config.yaml → exit_manager` (`enabled: false`
-turns it off entirely).
+The stop only ever ratchets in your favour and never through the last price. R
+is measured against the **original** stop (`trades.initial_stop_price`). Each
+open position has an **Auto exit** toggle in the blotter if you want to
+hand-manage it. Tune everything in `config/config.yaml → exit_manager`.
 
 ### Expected time-to-exit (overwatch)
 
-Every strategy declares how long its trade *should* take — minutes for
-intraday setups, trading days for swing/valuation ones (`Strategy.expected_hold`,
-overridable per strategy with `params.hold_typical` / `hold_max`). At fill,
-that's turned into `expected_exit_at` and `overwatch_at` on the trade (via the
-trading-day calendar, capped at the close for day trades).
-
-The blotter shows an **Age / Expected** bar per position — green while on
-track, amber once past the typical hold (**aging**), red once past the review
-threshold (**⏰ overdue**) — and you get a one-time toast when a trade goes
-overdue, noting its current R so you can tell "let it run" from "get out". This
-is **purely informational**: it never moves the stop or closes anything.
+Every strategy declares how long its trade *should* take — minutes for intraday
+setups, trading days for swing/valuation ones. The blotter shows an **Age /
+Expected** bar per position (green → amber **aging** → red **⏰ overdue**) and
+you get a one-time toast when a trade goes overdue. This is **purely
+informational**: it never moves the stop or closes anything.
 
 ---
 
 ## Autopilot — hands-off entry
 
-`tos_bot/execution/autopilot.py`. The exit side is *already* automatic (above);
-Autopilot is the switch that also lets the bot take the **entry** with no click.
-After each scan it walks the fresh plays and, for any that clear the gate, calls
-the exact same approve/execute path as the **Execute ✓ Yes** button.
-
-Toggle and tune it from the header (**Autopilot: off / day / day+swing**, plus a
-⚙ settings pop-up). Defaults live in `config/config.yaml → autopilot`:
+`tos_bot/execution/autopilot.py`. After each scan it walks the fresh plays and,
+for any that clear the gate, calls the same approve/execute path as the
+**Execute ✓ Yes** button. Toggle and tune it from the header (**Autopilot: off /
+day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot`:
 
 | gate | default | key |
 |---|---|---|
 | master switch | off | `enabled` (UI toggle) |
-| **route real orders** | **off** | `allow_live` — *config-file only*; with it off, the UI toggle arms Autopilot for **paper only** even in Live mode, and says so |
+| **route real orders** | **off** | `allow_live` — *config-file only*; with it off, Autopilot is armed for **paper only** even in Live mode, and says so |
 | which trade types it may take | `["INTRADAY"]` | `trade_types` (Day / Swing checkboxes) |
 | minimum strategy confidence | 0.62 | `min_confidence` |
 | minimum reward : risk | 2.0 | `min_reward_risk` (Aziz Rule 5) |
@@ -383,57 +325,57 @@ Toggle and tune it from the header (**Autopilot: off / day / day+swing**, plus a
 | concurrent auto trades from **one** strategy | 2 | `max_per_strategy` |
 | new auto entries **per scan cycle** | 1 | `max_new_per_cycle` |
 | **cool off** a ticker after it stops out today | on | `cooldown_after_loss` |
-| sit out a sector / require a catalyst / dry-run | off | `block_sectors`, `require_catalyst`, `dry_run` |
+| require a catalyst / dry-run | off | `require_catalyst`, `dry_run` |
 
-It still passes through every existing check — session validity, position
-sizing, the PDT guard, the $2,000 live floor. Fundamental (valuation) plays are
-never auto-traded. Every decision is on the event bus
-(`autopilot.entered` / `.skipped` / `.blocked`) and eligible plays get a
-**🤖** marker in the table. `GET`/`POST /api/autopilot`.
+Sectors are set with the **Sectors** button and apply to Autopilot too. It
+still passes through every other check — session validity, position sizing, the
+PDT guard, the $2,000 live floor. Fundamental (valuation) plays are never
+auto-traded. Eligible plays get a **🤖** marker.
 
 > `max_per_strategy`, `max_new_per_cycle` and `cooldown_after_loss` guard against
 > a pile-on: every auto trade from the *same* strategy, a burst of positions in
-> one mid-day chop, or a ticker entered long *then* short minutes apart. They stop the pile-on.
+> one mid-day chop, or a ticker entered long *then* short minutes apart.
 
-**Faster loop while day-trading.** When Autopilot is armed with `INTRADAY` in
-`trade_types` *and* the regular session is open, the engine drops from the
-normal `scanner.interval_seconds` (300) to `scanner.autopilot_interval_seconds`
-(45) — self-throttled so a new scan never starts before the previous cycle
-finished (+3 s) and never below `scanner.min_interval_seconds` (20). The account
-also re-syncs every ~10 s instead of ~30 s in this mode. The header button shows
-the live cadence (`Autopilot: day ⚡45s`). Outside those conditions everything
-returns to the normal cadence.
+**Faster loop while day-trading.** When Autopilot is armed with `INTRADAY` *and*
+the regular session is open, scans run every `scanner.autopilot_interval_seconds`
+(45) instead of `scanner.interval_seconds` (300), self-throttled so a cycle never
+overlaps the last and never below `scanner.min_interval_seconds` (20). The
+header button shows the cadence (`Autopilot: day ⚡45s`).
 
 ---
 
 ## Dashboard controls
 
-* **↻ Refresh** — re-pull account, positions and fills right now
-  (`POST /api/account/refresh`).
-* **Autopilot: off / day / …** + **⚙** — turn hands-off entry on/off and pick
-  trade types, confidence floor, and caps (see the Autopilot section above).
-* **Reconcile** (paper only) — rebuild the paper broker's positions from the
-  open trades in the database, e.g. after a mis-click
-  (`POST /api/paper/reconcile`).
-* A play you've executed shows a **✓ executed** badge and can't be fired
-  again — re-opening it shows the linked trade, not the button (the engine
-  also refuses a second submit server-side).
+* **Paper / Live** — which side you're trading; the platforms behind each are
+  chosen in Connections. Going Live asks for confirmation.
+* **Connection pill** (next to the data pill) — what orders go to and whether
+  it's healthy: `Simulator`, `IBKR paper ●`, `Schwab live · 1d`, `IBKR live ✕`.
+  Click it to open **Connections**. A banner appears when something needs you
+  (Gateway down, Schwab sign-in expiring).
+* **Connections** — paper platform, live broker, broker settings and keys,
+  **Test paper / Test live** for IBKR, **Sign in with Schwab**, **Reconnect**.
+* **Sectors** — which sectors to scan and trade.
+* **◐** — light / dark theme (remembered per browser).
+* **↻ Refresh** — re-pull account, positions and fills now.
+* **Autopilot** + **⚙** — hands-off entry and its caps.
+* **Reset paper** / **Reconcile** (simulator only) — reset the balance, or
+  rebuild simulator positions from the open trades in the database.
+* A play you've executed shows **✓ executed** and can't be fired again.
 
 ---
 
 ## Strategy catalogue
 
-Toggle each one and tune its params/weight in `config/config.yaml → strategies`.
-Hover any play in the UI for its thesis; the **Strategies** button lists them all.
+Toggle each one and tune its params/weight in `config/config.yaml → strategies`
+(params there override the defaults in code). Hover any play in the UI for its
+thesis; the **Strategies** button lists them all.
 
 **How the explanation is framed (Douglas).** Every play's hover text reads:
 the *edge* (what tends to happen at this setup) → what's true *right now* →
 **the plan** (entry, stop with the $-per-share you risk "to find out", target,
 reward:risk, and an *estimated ~P%* — a probability over many trades, not a call
-on this one) → the **invalidation** price → a short reminder that wins and
-losses land randomly around an edge, so decide the loss is acceptable *before*
-you click and then leave the stop alone. `Play.probability` and
-`Play.invalidation` are persisted with every play.
+on this one) → the **invalidation** price → a reminder that wins and losses land
+randomly around an edge, so decide the loss is acceptable *before* you click.
 
 ### Technical (`tos_bot/strategies/technical.py`)
 
@@ -444,8 +386,7 @@ discounted ~25 % at midday, a reversal is not.
 **Every play's stop is floored.** A protective stop closer than ~0.6 % of price
 (or ~0.9 intraday ATRs) is noise, not a level — `_mk_play` widens it to that
 floor and *then* re-checks reward:risk, so a stop can't be tightened to fake a
-good ratio (Aziz p.66). A stop only 0.2 % wide gets hit by normal noise and
-fills well past it; such plays now either carry an honest stop or don't exist.
+good ratio (Aziz p.66).
 
 | key | timeframe | idea |
 |---|---|---|
@@ -453,9 +394,9 @@ fills well past it; such plays now either carry an honest stop or don't exist.
 | `bull_bear_flag` | intraday | near-vertical pole + tight sideways flag; enter on the flag break, target ≈ one more pole-length |
 | `opening_range_breakout` | intraday | break of the first N-min range **only when that range < the daily ATR**, VWAP-side stop, target = next level |
 | `vwap_reclaim` | intraday | a **5-min close** back across session VWAP after ≥ 3 bars on the other side; target = next level |
-| `red_to_green` | intraday | gapped stock grinding back to the **prior-day close** on rising volume; target = that close, stop = nearest technical level |
-| `intraday_reversal` | intraday | 5+ candles one way **+** 5-min RSI extreme **+** at a daily level **+** an indecision / opposite candle (Aziz's top/bottom reversal) |
-| `sr_bounce` | intraday | price into a strong **horizontal** S/R level (≥ 0.58 strength) **on ≥ 1.3× volume**, confirming candle, not against the daily trend; stop a full buffer *beyond* the level (a 5-min close-through), and only if the next level still pays ≥ 2:1 |
+| `red_to_green` | intraday | gapped stock grinding back to the **prior-day close** on rising volume; target = that close |
+| `intraday_reversal` | intraday | 5+ candles one way **+** 5-min RSI extreme **+** at a daily level **+** an indecision / opposite candle |
+| `sr_bounce` | intraday | price into a strong **horizontal** S/R level (≥ 0.58 strength) **on ≥ 1.3× volume**, confirming candle, not against the daily trend; stop a full buffer *beyond* the level, and only if the next level pays ≥ 2:1 |
 | `ema_pullback_trend` | intraday | first pullback to the 20-EMA inside a 9/20/50 stacked trend |
 | `gap_and_go` | intraday | ≥ 2 % gap holding the right side of the opening VWAP on ≥ 2× volume |
 | `rsi2_mean_reversion` | swing | Connors RSI(2) < 10 above the 200-SMA (long) / > 90 below it (short) |
@@ -465,8 +406,8 @@ fills well past it; such plays now either carry an honest stop or don't exist.
 | `week52_breakout` | swing | push to a new 52-week high/low on volume expansion |
 
 Shared chart-reading primitives live in `tos_bot/analysis/` — `levels.py`
-(horizontal S/R clustering: swing pivots, prior-day close, round numbers,
-pre-market H/L) and `candles.py` (doji / hammer / shooting-star / engulfing).
+(horizontal S/R clustering) and `candles.py` (doji / hammer / shooting-star /
+engulfing).
 
 ### Valuation — from *Pignataro, Financial Modeling and Valuation* (2nd ed.)
 
@@ -475,16 +416,12 @@ pre-market H/L) and `candles.py` (doji / hammer / shooting-star / engulfing).
 | key | book chapter | idea |
 |---|---|---|
 | `relative_value_comps` | Ch. 8 & 10 | EV/EBITDA, P/E, EV/Sales vs the **peer median**. Consistently cheaper ⇒ long; richer ⇒ short. Target = re-rate to the peer multiple. |
-| `dcf_fair_value_gap` | Ch. 9 | project UFCF — **NOPAT method** `EBIT·(1−t) + D&A + deferred tax + non-cash + ΔNWC − CapEx` (the book's Amazon model; falls back to the net-income form, then reported FCF) — discount at **WACC** (CAPM `rf + β·MRP`, debt weight includes leases), terminal value **both** ways: exit multiple **and** Gordon perpetuity `UFCF·(1+g)/(WACC−g)`. Blended per-share vs price beyond a margin of safety; a `sensitivity` grid (g ±1 %, exit ±20 %) rides along. When the two terminal values disagree by > 2.5× — the growth-stock case the book calls out — the verdict is **`ambiguous`** and this strategy sits out. |
-| `valuation_football_field` | Ch. 12 | overlay 52-week range + comps range + both DCF ranges into one low/high band. Price below the band ⇒ long to the band edge / weighted fair value; above ⇒ short. |
+| `dcf_fair_value_gap` | Ch. 9 | project UFCF (**NOPAT method**), discount at **WACC**, terminal value **both** ways (exit multiple and Gordon perpetuity). Blended per-share vs price beyond a margin of safety, with a sensitivity grid. When the two terminal values disagree by > 2.5× the verdict is **`ambiguous`** and this strategy sits out. |
+| `valuation_football_field` | Ch. 12 | overlay 52-week range + comps range + both DCF ranges into one band. Price below the band ⇒ long; above ⇒ short. |
 
 The seven projection methods (Ch. 1) are in `tos_bot/valuation/projections.py`.
-
-> The book is a valuation text, not a technical-trading book — so the technical
-> setups above are standard market-structure practice, and the *fundamental
-> overlay* is what comes from Pignataro. Fundamental data is from `yfinance`
-> (free, occasionally patchy); every field is optional and the engine degrades
-> gracefully. Drop in a paid provider behind `FundamentalsProvider` later.
+Fundamental data is from `yfinance` (free, occasionally patchy); every field is
+optional and the engine degrades gracefully.
 
 ---
 
@@ -492,34 +429,28 @@ The seven projection methods (Ch. 1) are in `tos_bot/valuation/projections.py`.
 
 `tos_bot/scanner/scanner.py`:
 
-1. loads the full symbol list from the Nasdaq Trader directory (cached daily;
-   bundled Nasdaq-100 fallback offline);
+1. loads the symbol list (cached daily; bundled Nasdaq-100 fallback offline);
 2. each cycle takes a **rotating slice** of `scanner.max_symbols_scanned`
-   symbols, so the whole universe is covered over several cycles without
-   hammering the data provider;
+   symbols, then drops anything outside the **sector filter**;
 3. cheap **pre-filter** (price band, 20-day $-volume, ATR %, spread);
 4. survivors get intraday bars + the technical strategies;
 5. the leaders additionally get fundamentals + peers + the valuation strategies;
 6. every play is position-sized, ranked by a blended score, and the top
    `shortlist_size` names become the focus list.
 
-Tune cadence and size in `config/config.yaml → scanner`, or override without
-editing it: `SCANNER_UNIVERSE`, `SCANNER_MAX_SYMBOLS`, `SCANNER_INTERVAL_SECONDS`.
-The cadence is `interval_seconds` normally and `autopilot_interval_seconds` when
-Autopilot is day-trading an open session (see the Autopilot section).
+Override without editing the config: `SCANNER_UNIVERSE`, `SCANNER_MAX_SYMBOLS`,
+`SCANNER_INTERVAL_SECONDS`.
 
 ---
 
-## Adding a broker later
+## Adding a broker
 
-Implement `tos_bot/brokers/base.py::BrokerAdapter` and register it in
-`tos_bot/brokers/__init__.py::get_broker`. Live adapters shipped:
-**`schwab_adapter.py`** (`schwab-py` + OAuth) and **`ibkr_adapter.py`**
-(`ib_async` → IB Gateway/TWS, own asyncio-loop thread, auto-reconnect, native
-brackets, live+paper by port). Still a stub:
-
-- **`crypto_adapter.py`** → `ccxt` (Coinbase / Kraken / …). 24/7 market, no PDT,
-  no token; `AssetClass.CRYPTO` bypasses `PdtGuard`.
+Implement `tos_bot/brokers/base.py::BrokerAdapter`, register it in
+`tos_bot/brokers/__init__.py::get_broker`, and add it to the tables in
+`tos_bot/brokers/venues.py` (plus any `.env` fields to `tos_bot/secrets_store.py`
+so Connections can edit them). Shipped: `paper_adapter.py` (simulator),
+`ibkr_adapter.py` (`ib_async`, own asyncio-loop thread, auto-reconnect,
+paper + live by port) and `schwab_adapter.py` (`schwab-py`).
 
 ---
 
@@ -530,26 +461,26 @@ run.py                     boot engine + dashboard
 scripts/
   init_db.py               create the MySQL schema
   ibkr_setup.py            IBKR connectivity doctor + setup guide  (--guide, --live)
-  authenticate.py          one-time / re-auth Schwab OAuth  (--check, --force-rotate)
-  reauth_headless.py       unattended re-auth (Playwright + keyring, opt-in)
+  authenticate.py          Schwab sign-in from the terminal  (--check, --reset)
   run_scan_once.py         one scan cycle from the CLI
 tos_bot/
   config.py                .env + config.yaml loader
-  engine.py                the conductor (scan / sync / snapshot loops)
+  secrets_store.py         the Connections panel's validated, allow-listed .env writer
+  engine.py                the conductor (routing, scan / sync / snapshot loops)
   core/                    enums + framework-free dataclasses + event bus
   indicators/ta.py         vectorised TA (no TA-Lib) incl. divergence / run-length
   analysis/                horizontal S/R clustering + candlestick reads (Aziz / Murphy)
-  data/                    universe loader, market data (broker→yfinance→synthetic), fundamentals
+  data/                    universe, market data (broker→yfinance→synthetic), fundamentals, sectors
   valuation/               EV, multiples, DCF, football field, projections   (Pignataro)
   strategies/              base (Douglas-framed explanations) + registry + technical.py + fundamental.py
-  scanner/                 pre-filter + cycle orchestration
+  scanner/                 pre-filter, sector filter + cycle orchestration
   risk/                    position sizing + PDT guard
-  execution/               order_builder + executor + exit_manager + autopilot (hands-off entry)
-  util/clock.py            sessions + NYSE holiday / half-day calendar to 2028
-  auth/token_manager.py    Schwab access-token refresh + 60-day rotation + audit
-  brokers/                 base + paper (sim) + ibkr + schwab + tda + crypto stub
+  execution/               order_builder + executor + exit_manager + autopilot
+  util/                    clock (sessions + NYSE calendar to 2028), net, logging
+  auth/                    schwab_login (one-click OAuth) + token_manager (7-day upkeep)
+  brokers/                 base, venues (routing), paper (simulator), ibkr, schwab
   persistence/             SQLAlchemy models, repository, schema.sql
-  server/app.py            FastAPI REST + WebSocket
+  server/                  app.py (FastAPI REST + WebSocket) + security.py (same-machine guard)
   web/                     the dashboard (index.html / styles.css / app.js)
 tests/                     pytest  (fast by default; `-m slow` for the e2e)
 ```
@@ -557,22 +488,24 @@ tests/                     pytest  (fast by default; `-m slow` for the e2e)
 ## Tests
 
 ```bash
-pytest              # 98 fast unit tests
+pytest              # 148 fast unit tests
 pytest -m slow      # boots the engine, runs scan → approve → close on paper
 ```
 
-Coverage includes the analysis primitives (`test_analysis.py`), the Autopilot
-gate — trade-type filter, confidence/RR floors, position & per-day caps, the
-paper-only-in-live hard gate, dry-run (`test_autopilot.py`), the new Aziz
-setups on purpose-built frames (`test_strategies.py`), and the IBKR adapter's
-translation layer against a fake `ib_async.IB` (`test_ibkr_adapter.py`). The
-real Gateway path needs a running IB Gateway and isn't in CI.
+Coverage includes the analysis primitives, the strategies on purpose-built
+frames, the Autopilot gate, the exit manager, the IBKR adapter against a fake
+`ib_async.IB`, venue routing and the open-position switch guard
+(`test_venues.py`, `test_venue_safety.py`, `test_engine_routing.py`), the `.env`
+writer (`test_secrets_store.py`), the same-machine guard (`test_security.py`),
+Schwab sign-in with a faked browser flow (`test_schwab_login.py`), token upkeep
+(`test_token_manager.py`) and the sector filter (`test_sectors.py`). Tests use a
+throwaway `.env`, database and runtime file, never yours. The real IB Gateway and
+Schwab login paths need your accounts and aren't exercised in tests.
 
 ## Roadmap
 
+- a native stop resting at the broker as a crash-safety backup, kept in sync with the exit manager
 - streaming IBKR ticks (`reqMktData` subscriptions) instead of snapshot polls
 - per-strategy backtester + walk-forward on the persisted play log
 - options plays (IBKR + the Schwab option-chain endpoint)
-- ATR-based trailing stop option in the exit manager (currently R-based)
 - equity-curve chart in the dashboard
-- crypto adapter (`ccxt`) fleshed out

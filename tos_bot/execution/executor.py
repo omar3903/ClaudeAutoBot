@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from ..brokers.base import BrokerAdapter, BrokerError
+from ..brokers.venues import venue_label
 from ..core.enums import PlayStatus, Side
 from ..core.eventbus import BUS
 from ..core.models import Account, OrderRequest, Play
@@ -33,19 +34,22 @@ class _Pending:
 
 
 class Executor:
-    def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS) -> None:
+    def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS,
+                 venue: Optional[str] = None) -> None:
         self.broker = broker
+        self.venue = venue or broker.name      # stamped on trades - see brokers/venues.py
         self.repo = repo
         self.cfg = cfg
         self.bus = bus
         self._pending: Dict[str, _Pending] = {}
         self._open_by_symbol: Dict[str, str] = {}   # symbol -> trade_id
 
-    def rebind(self, broker: BrokerAdapter) -> None:
-        """Point at a different broker (paper <-> live switch). In-flight
-        order tracking is broker-specific, so it is dropped; open trades in
-        the database are untouched."""
+    def rebind(self, broker: BrokerAdapter, venue: Optional[str] = None) -> None:
+        """Point at a different broker (paper <-> live / platform switch).
+        In-flight order tracking is broker-specific, so it is dropped; open
+        trades in the database are untouched."""
         self.broker = broker
+        self.venue = venue or broker.name
         self._pending.clear()
         self._open_by_symbol.clear()
 
@@ -103,6 +107,11 @@ class Executor:
         t = self.repo.get_trade(trade_id)
         if not t or t["status"] == "CLOSED":
             return {"ok": False, "reason": "trade not open"}
+        held_on = t.get("broker") or "paper"
+        if held_on != self.venue:
+            # never send an exit to an account that doesn't hold the position
+            return {"ok": False, "reason": f"This position is on {venue_label(held_on)} - "
+                                           f"switch back to that platform to close it."}
         req = build_exit_order(t["symbol"], t["side"], abs(float(t["quantity"])),
                                limit_price=limit_price, cfg=self.cfg, tag=f"exit:{trade_id}")
         try:
@@ -189,7 +198,7 @@ class Executor:
     # ------------------------------------------------------------------ #
     def _open_trade(self, play: Play, price: float, qty: float, order_id: str,
                     order_type: str = "LIMIT", order_session: str = "REGULAR") -> str:
-        tid = self.repo.open_trade(play, float(price), float(qty), self.broker.name, order_id,
+        tid = self.repo.open_trade(play, float(price), float(qty), self.venue, order_id,
                                    order_type=order_type, order_session=order_session)
         self._open_by_symbol[play.symbol] = tid
         play.status = PlayStatus.FILLED

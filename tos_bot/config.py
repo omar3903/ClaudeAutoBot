@@ -2,8 +2,10 @@
 
 Two layers:
 
-* ``.env``            -> secrets and machine-specific values (:class:`Secrets`)
-* ``config/config.yaml`` -> tunable behaviour (:class:`AppConfig`, plain dict-ish)
+* ``.env``               -> secrets and machine-specific values (:class:`Secrets`).
+                            The dashboard's Connections panel edits the broker
+                            settings in it (see :mod:`tos_bot.secrets_store`).
+* ``config/config.yaml`` -> tunable behaviour (:class:`AppConfig`)
 
 ``get_settings()`` returns a cached :class:`Settings` bundle with both.
 Everything else in the codebase imports from here, never from ``os.environ``.
@@ -14,7 +16,7 @@ from __future__ import annotations
 import functools
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import yaml
 from dotenv import load_dotenv
@@ -23,8 +25,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
+#: the machine-local secrets file (overridable so tests never read yours)
+ENV_PATH = Path(os.getenv("ATB_ENV_PATH") or (PROJECT_ROOT / ".env"))
 
-load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(ENV_PATH)
 
 
 # --------------------------------------------------------------------------- #
@@ -32,39 +36,36 @@ load_dotenv(PROJECT_ROOT / ".env")
 # --------------------------------------------------------------------------- #
 class Secrets(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=str(PROJECT_ROOT / ".env"),
+        env_file=str(ENV_PATH),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
     )
 
-    broker: str = "paper"            # "paper" | "schwab" | "ibkr" | "tda" | "crypto"
-    live_broker: str = "schwab"      # which live broker the paper<->live toggle targets
+    # Where orders go. All three are also switchable from the dashboard and
+    # remembered in data/runtime.json - see tos_bot/brokers/venues.py.
+    broker: str = "paper"              # paper | ibkr | schwab  (a broker here = start in LIVE mode)
+    live_broker: str = "schwab"        # what the Live side trades on: ibkr | schwab
+    paper_platform: str = "simulator"  # what the Paper side trades on: simulator | ibkr | schwab
 
-    # Schwab
+    # Charles Schwab / thinkorswim (schwab-py; sign in from the dashboard)
     schwab_api_key: str = ""
     schwab_app_secret: str = ""
     schwab_callback_url: str = "https://127.0.0.1:8182"
     schwab_account_id: str = ""
 
-    # Interactive Brokers (via ib_async -> IB Gateway / TWS; no OAuth token).
-    # The Paper/Live toggle picks the port: paper 4002, live 4001 (Gateway).
+    # Interactive Brokers (ib_async -> IB Gateway / TWS; no token)
     ibkr_host: str = "127.0.0.1"
     ibkr_paper_port: int = 4002       # IB Gateway paper  (TWS paper = 7497)
     ibkr_live_port: int = 4001        # IB Gateway live   (TWS live  = 7496)
-    ibkr_port: int = 0               # non-zero = force this port for BOTH modes
+    ibkr_port: int = 0               # non-zero = force this port for BOTH accounts
     ibkr_client_id: int = 11         # any int unique to this app on the Gateway
     ibkr_account_id: str = ""        # DUxxxxxxx (paper) / Uxxxxxxx (live); blank = first
     ibkr_market_data: str = "auto"   # auto | live | delayed | delayed-frozen
     ibkr_readonly: bool = False      # true = connect for data only, never send orders
 
-    # Legacy TDA (reference only)
-    tda_api_key: str = ""
-    tda_redirect_uri: str = "https://localhost:8182"
-
-    # Token storage
+    # Schwab token storage
     token_dir: str = "./secrets"
-    token_encryption_key: str = ""
 
     # Database
     database_url: str = ""
@@ -75,22 +76,12 @@ class Secrets(BaseSettings):
     db_password: str = ""
     db_allow_sqlite_fallback: bool = True
 
-    # Fundamentals
-    fmp_api_key: str = ""
-    alphavantage_api_key: str = ""
-
     # Web
     web_host: str = "127.0.0.1"
     web_port: int = 8787
     open_browser_on_start: bool = True
 
     # ---- derived helpers -------------------------------------------------- #
-    @property
-    def effective_live_broker(self) -> str:
-        """The live venue the paper<->live toggle targets. ``BROKER`` in .env
-        may name it directly; otherwise fall back to ``LIVE_BROKER``."""
-        return self.broker if self.broker != "paper" else self.live_broker
-
     @property
     def token_dir_path(self) -> Path:
         p = Path(self.token_dir)
@@ -101,12 +92,8 @@ class Secrets(BaseSettings):
 
     @property
     def token_path(self) -> Path:
-        # tokens always belong to the live broker, never to "paper"
-        return self.token_path_for(self.effective_live_broker)
-
-    @property
-    def token_key_path(self) -> Path:
-        return self.token_path.parent / "token_key.bin"
+        """The Schwab token file - the only broker here that uses a token."""
+        return self.token_path_for("schwab")
 
     def resolved_database_url(self) -> str:
         if self.database_url:
@@ -130,7 +117,7 @@ class _Model(BaseModel):
 
 class AccountCfg(_Model):
     min_start_equity: float = 2000.0          # LIVE only - paper ignores this
-    paper_start_cash: float = 100000.0        # opening balance for the paper account
+    paper_start_cash: float = 100000.0        # opening balance for the built-in simulator
     pdt_equity_threshold: float = 25000.0
     max_day_trades_under_threshold: int = 3
     day_trade_warn_at: int = 2
@@ -156,6 +143,9 @@ class ScannerCfg(_Model):
     min_interval_seconds: int = 20        # absolute floor, never scan faster than this
     universe: str = "nasdaq100"
     universe_file: str = "config/watchlist.txt"
+    # only scan and trade these sectors ([] = all). The dashboard's Sectors
+    # button overrides this and remembers the choice in data/runtime.json.
+    sectors: list = Field(default_factory=list)
     shortlist_size: int = 8
     max_symbols_scanned: int = 110
     fundamentals_leaders: int = 8
@@ -173,11 +163,11 @@ class ValuationCfg(_Model):
 
 
 class AuthCfg(_Model):
-    refresh_token_ttl_days: int = 60
-    rotate_before_days: int = 5
+    """Schwab OAuth upkeep. Schwab's refresh token lasts 7 days."""
+    refresh_token_ttl_days: int = 7
+    rotate_before_days: int = 1           # start reminding you this long before it expires
     access_refresh_margin_seconds: int = 120
     check_interval_seconds: int = 1800
-    auto_reauth: str = "notify"
     backup_old_tokens: bool = True
 
 
@@ -219,7 +209,6 @@ class AutopilotCfg(_Model):
     max_per_strategy: int = 2            # concurrent open auto trades from ONE strategy key
     max_new_per_cycle: int = 1          # new auto entries per scan cycle (no bursts)
     cooldown_after_loss: bool = True    # don't re-enter a name that stopped out earlier today
-    block_sectors: list = Field(default_factory=list)  # e.g. ["Energy"] to sit out a sector
     require_catalyst: bool = False        # only auto-take plays tagged "catalyst"/"gap"
     dry_run: bool = False                 # log what it WOULD do, place nothing
 

@@ -40,6 +40,8 @@ scanner:
   # cycle finishes in a minute and does not get rate-limited.
   universe: "nasdaq100"
   universe_file: "config/watchlist.txt"
+  sectors: []                          # only scan + trade these, e.g. ["Technology", "Energy"]; [] = all.
+                                       # The dashboard's Sectors button overrides this.
   shortlist_size: 8                    # how many names to focus on each cycle
   max_symbols_scanned: 110            # cap per cycle (>= universe size => full sweep)
   fundamentals_leaders: 8            # run the valuation strategies on this many top names
@@ -64,7 +66,7 @@ strategies:
     bull_bear_flag:         { enabled: true,  weight: 0.9, params: { pole_atr_mult: 1.6, flag_bars: 3 } }
     red_to_green:           { enabled: true,  weight: 1.0, params: { max_dist_pct: 1.5, rvol_min: 1.3 } }
     intraday_reversal:      { enabled: true,  weight: 0.9, params: { min_run: 5, rsi_hot: 80, rsi_cold: 20 } }
-    sr_bounce:              { enabled: true,  weight: 0.9, params: { touch_pct: 0.25, min_strength: 0.45 } }
+    sr_bounce:              { enabled: true,  weight: 0.9, params: { touch_pct: 0.20, min_strength: 0.58, min_rvol: 1.3 } }
     opening_range_breakout: { enabled: true,  weight: 1.0, params: { or_minutes: 5, rvol_min: 1.3, max_or_vs_atr: 1.0 } }
     vwap_reclaim:           { enabled: true,  weight: 1.0, params: { min_bars_below: 3 } }
     ema_pullback_trend:     { enabled: true,  weight: 1.0, params: { fast: 9, slow: 20, trend: 50 } }
@@ -96,14 +98,13 @@ valuation:
   # verdict is "ambiguous" and dcf_fair_value_gap sits out (the book's growth-stock case).
 
 auth:
-  # "delete and get the authentication token every 60 days"
-  refresh_token_ttl_days: 60           # Schwab real value is 7; TDA was 90. Set to your broker's.
-  rotate_before_days: 5                # start a full re-auth this many days before TTL
-  access_refresh_margin_seconds: 120   # refresh the short-lived access token this early
+  # Schwab / thinkorswim sign-in upkeep (IBKR and the simulator need no token).
+  # Schwab's refresh token lasts 7 days - sign in again from Connections.
+  refresh_token_ttl_days: 7
+  rotate_before_days: 1                # remind you this many days before it expires
+  access_refresh_margin_seconds: 120   # refresh the 30-min access token this early
   check_interval_seconds: 1800         # how often the token watchdog runs
-  auto_reauth: "notify"               # notify = one-click prompt in UI + desktop toast
-                                       # headless = run scripts/reauth_headless.py (needs Playwright + keyring opt-in)
-  backup_old_tokens: true             # timestamped copy before each rotation
+  backup_old_tokens: true             # timestamped copy before an expired token is removed
 
 execution:
   default_order_type: "LIMIT"          # LIMIT | MARKET | STOP_LIMIT  (regular hours)
@@ -151,7 +152,6 @@ autopilot:
   max_per_strategy: 2               # at most this many concurrent auto trades from ONE strategy key
   max_new_per_cycle: 1             # at most this many NEW auto entries per scan cycle (no bursts)
   cooldown_after_loss: true        # skip a ticker for the rest of the session after it stops out
-  block_sectors: []                  # e.g. ["Energy"] to sit that sector out
   require_catalyst: false            # true = only auto-take plays tagged gap / catalyst
   dry_run: false                     # true = log every entry it WOULD take but place nothing
 

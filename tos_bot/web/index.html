@@ -3,7 +3,18 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
   <title>AutoTradeBot</title>
+  <script>
+    // pick the theme before first paint: your saved choice, else the OS setting
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("atb-theme"); } catch (e) { }
+      if (t !== "light" && t !== "dark")
+        t = window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      document.documentElement.dataset.theme = t;
+    })();
+  </script>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -11,7 +22,7 @@
 
   <header class="topbar">
     <div class="brand">AutoTradeBot</div>
-    <div class="mode-switch" id="mode-switch" title="Paper = simulated fills on real data. Live = real orders.">
+    <div class="mode-switch" id="mode-switch">
       <button class="seg" data-mode="paper">Paper</button>
       <button class="seg" data-mode="live">Live</button>
     </div>
@@ -22,6 +33,7 @@
     <div class="statuses">
       <span class="pill" id="pill-market">market</span>
       <span class="pill" id="pill-data" title="Where quotes &amp; candles come from">data</span>
+      <span class="pill clickable" id="pill-conn" role="button" tabindex="0">connection</span>
       <span class="pill hidden" id="pill-armed"
         title="LIVE only: the engine will route orders you approve. It disarms if account equity falls below the configured floor ($2,000).">armed</span>
     </div>
@@ -33,11 +45,12 @@
       <div><label>Realized today</label><b id="a-pnl-today">&ndash;</b></div>
     </div>
     <div class="actions">
-      <span class="pill" id="pill-token" title="OAuth token status">token</span>
       <button id="btn-refresh" class="ghost" title="Re-pull account, positions and fills now">↻ Refresh</button>
-      <button id="btn-reconcile" class="ghost hidden" title="Rebuild paper positions from the trade log">Reconcile</button>
-      <button id="btn-reset-paper" class="ghost" title="Reset the paper account balance">Reset paper</button>
+      <button id="btn-reconcile" class="ghost hidden" title="Rebuild simulator positions from the trade log">Reconcile</button>
+      <button id="btn-reset-paper" class="ghost hidden" title="Reset the simulator balance">Reset paper</button>
+      <button id="btn-connections" class="ghost" title="Brokers, keys and sign-in">Connections</button>
       <button id="btn-strategies" class="ghost">Strategies</button>
+      <button id="btn-theme" class="ghost icon" title="Switch light / dark">&#9680;</button>
       <button id="btn-scan">Scan now</button>
     </div>
   </header>
@@ -52,7 +65,7 @@
           <label><input type="checkbox" id="f-intraday" checked /> Intraday</label>
           <label><input type="checkbox" id="f-swing" checked /> Swing</label>
           <label><input type="checkbox" id="f-hide-done" /> Hide executed</label>
-          <select id="f-sector" class="mini-select"><option value="">All sectors</option></select>
+          <button id="btn-sectors" class="ghost mini">Sectors: all</button>
           <span class="muted" id="scan-meta"></span>
         </div>
       </div>
@@ -109,8 +122,8 @@
   </div>
 
   <div id="drawer" class="drawer hidden">
-    <div class="drawer-inner">
-      <div class="drawer-head"><h3>Strategy playbook</h3><button id="drawer-close" class="ghost">Close</button></div>
+    <div class="drawer-inner" id="drawer-inner">
+      <div class="drawer-head"><h3 id="drawer-title"></h3><button id="drawer-close" class="ghost">Close</button></div>
       <div id="drawer-body"></div>
     </div>
   </div>

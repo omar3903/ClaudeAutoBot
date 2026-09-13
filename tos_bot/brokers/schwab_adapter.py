@@ -1,19 +1,15 @@
-"""Live adapter for the Charles Schwab Trader API via ``schwab-py``.
+"""Charles Schwab / thinkorswim adapter via ``schwab-py``.
 
-``schwab-py`` is the maintained successor to ``tda-api`` (same author,
-near-identical surface) after Schwab retired the TD Ameritrade Developer
-platform. Install with ``pip install schwab-py`` and run
-``python scripts/authenticate.py`` once to mint the token.
-
-Only the methods in :class:`BrokerAdapter` are implemented here; everything
-else stays broker-neutral upstream.
+Sign in from the dashboard (Connections -> Sign in with Schwab) or with
+``python scripts/authenticate.py``; that writes the token this adapter loads.
+Schwab has no paper-trading API, so this is used for live orders and for
+real-time data (the "thinkorswim" paper platform simulates fills on it).
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
-import os
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -52,32 +48,20 @@ class SchwabBroker(BrokerAdapter):
     # -- connection -------------------------------------------------- #
     def connect(self) -> None:
         try:
-            from schwab.auth import client_from_token_file, easy_client
+            from schwab.auth import client_from_token_file
         except ImportError as e:  # pragma: no cover
-            raise AuthError(
-                "schwab-py is not installed. `pip install schwab-py` then "
-                "`python scripts/authenticate.py`."
-            ) from e
+            raise AuthError("schwab-py is not installed - pip install schwab-py") from e
 
-        api_key = self._s.schwab_api_key
-        secret = self._s.schwab_app_secret
-        cb = self._s.schwab_callback_url
-        token_path = str(self._s.token_path)
-        if not (api_key and secret):
-            raise AuthError("SCHWAB_API_KEY / SCHWAB_APP_SECRET missing in .env")
-
-        if os.path.exists(token_path):
-            self._client = client_from_token_file(token_path, api_key, secret)
-        else:
-            # easy_client will open a browser for the one-time consent
-            self._client = easy_client(api_key, secret, cb, token_path)
-
+        s = self._s
+        if not (s.schwab_api_key and s.schwab_app_secret):
+            raise AuthError("Schwab app key / secret not set - add them under Connections")
+        if not s.token_path.exists():
+            # never start an interactive login here - it would block the engine
+            raise AuthError("not signed in to Schwab - use Connections -> Sign in with Schwab")
+        self._client = client_from_token_file(str(s.token_path), s.schwab_api_key,
+                                              s.schwab_app_secret)
         self._resolve_account_hash()
         self._connected = True
-        if self.token_manager:
-            self.token_manager.note_full_auth(source="startup") if not os.path.exists(
-                self.token_manager.meta_path
-            ) else None
         log.info("Schwab connected (account …%s)", (self._s.schwab_account_id or "?")[-4:])
 
     @property
