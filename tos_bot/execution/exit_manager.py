@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Dict, FrozenSet, List, Optional
 
 from ..core.eventbus import BUS
 from ..util import clock
@@ -38,6 +39,12 @@ class ExitManager:
         self._closing: set = set()          # trade ids we've already sent a close for
         self._overdue_seen: set = set()     # trade ids we've already flagged as overdue
         self._not_held: set = set()         # trade ids whose position the broker doesn't show
+        self._prices: Dict[str, Optional[float]] = {}   # this pass's quotes
+
+    @property
+    def closing(self) -> FrozenSet[str]:
+        """Trades whose automatic close has been sent."""
+        return frozenset(self._closing)
 
     # ------------------------------------------------------------------ #
     def run_once(self) -> List[Dict[str, Any]]:
@@ -71,16 +78,13 @@ class ExitManager:
         syms = sorted(symbols)
         if len(syms) < 2:
             return {s: self._fetch_price(s) for s in syms}
-        from concurrent.futures import ThreadPoolExecutor
-
         with ThreadPoolExecutor(max_workers=min(8, len(syms))) as ex:
             return dict(zip(syms, ex.map(self._fetch_price, syms)))
 
     # ------------------------------------------------------------------ #
     def _quote_price(self, symbol: str) -> Optional[float]:
-        prices = getattr(self, "_prices", {})
-        if symbol in prices:
-            return prices[symbol]
+        if symbol in self._prices:
+            return self._prices[symbol]
         return self._fetch_price(symbol)
 
     def _fetch_price(self, symbol: str) -> Optional[float]:

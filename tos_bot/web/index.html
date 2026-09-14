@@ -19,7 +19,7 @@
 </head>
 <body>
   <div id="quit-banner" class="banner quit hidden" role="status"></div>
-  <div id="reauth-banner" class="banner hidden"></div>
+  <div id="conn-banner" class="banner hidden"></div>
 
   <header class="topbar">
     <div class="brand">AutoTradeBot</div>
@@ -28,31 +28,33 @@
       <button class="seg" data-mode="live">Live</button>
     </div>
     <div class="autopilot-ctl lockable" id="autopilot-ctl">
-      <button id="ap-toggle" class="ap-btn" title="Hands-off ENTRY. Exits are always automatic. The bot picks entries that clear the gate and sends them for you.">Autopilot: off</button>
+      <button id="ap-toggle" class="ap-btn" title="Hands-off ENTRY. Exits are always automatic.">Autopilot: off</button>
       <button id="ap-cfg" class="ghost mini" title="Autopilot settings">&#9881;</button>
     </div>
     <div class="statuses">
       <span class="pill" id="pill-market">market</span>
-      <span class="pill" id="pill-data" title="Where quotes &amp; candles come from">data</span>
+      <span class="pill" id="pill-data">data</span>
       <span class="pill clickable" id="pill-conn" role="button" tabindex="0">connection</span>
       <span class="pill hidden" id="pill-armed"
-        title="LIVE only: the engine will route orders you approve. It disarms if account equity falls below the configured floor ($2,000).">armed</span>
+        title="LIVE only: the engine will route orders you approve. It disarms if account equity falls below the configured floor.">armed</span>
     </div>
     <div class="acct">
       <div><label>Equity</label><b id="a-equity">&ndash;</b></div>
       <div><label>Cash</label><b id="a-cash">&ndash;</b></div>
       <div><label>Buying power</label><b id="a-bp">&ndash;</b></div>
+      <div><label data-term="capital">Trading capital</label><button id="btn-capital" class="capital-btn lockable">&ndash;</button></div>
       <div><label>Day trades (5d)</label><b id="a-dt">&ndash;</b></div>
       <div><label>Realized today</label><b id="a-pnl-today">&ndash;</b></div>
     </div>
     <div class="actions">
-      <button id="btn-refresh" class="ghost" title="Re-pull account, positions and fills now">↻ Refresh</button>
+      <button id="btn-refresh" class="ghost" title="Re-pull account, positions and fills now">&#8635; Refresh</button>
       <button id="btn-reset-paper" class="ghost lockable hidden" title="Reset the simulator balance">Reset paper</button>
-      <button id="btn-connections" class="ghost" title="Brokers, keys and sign-in">Connections</button>
+      <button id="btn-connections" class="ghost" title="IB Gateway and where orders go">Connections</button>
       <button id="btn-strategies" class="ghost" title="Switch setups on or off and set their weight">Strategies</button>
+      <button id="btn-settings" class="ghost" title="When the scans run and how big the hot list and buffers are">Settings</button>
       <button id="btn-theme" class="ghost icon" title="Switch light / dark">&#9680;</button>
       <button id="btn-quit" class="ghost danger-ghost" title="Quit the app - open positions are handled first">Quit</button>
-      <button id="btn-scan" class="lockable">Scan now</button>
+      <button id="btn-scan" class="lockable" title="Rescan the hot list and the next buffer names now">Scan now</button>
     </div>
   </header>
 
@@ -67,7 +69,7 @@
           <label class="lockable" data-term="swing"><input type="checkbox" id="f-swing" checked /> Swing</label>
           <label data-term="hide_done"><input type="checkbox" id="f-hide-done" /> Hide executed</label>
           <button id="btn-sectors" class="ghost mini lockable">Sectors: all</button>
-          <span class="muted" id="scan-meta"></span>
+          <span class="muted scan-meta" id="scan-meta"></span>
         </div>
       </div>
       <div class="table-wrap">
@@ -84,7 +86,7 @@
           </thead>
           <tbody id="plays-body"></tbody>
         </table>
-        <div id="plays-empty" class="empty">No plays yet &mdash; the scanner runs every few minutes. Hit <b>Scan now</b>.</div>
+        <div id="plays-empty" class="empty">No plays yet.</div>
       </div>
     </section>
 
@@ -103,12 +105,14 @@
         <button class="tab active" data-tab="open">Open positions</button>
         <button class="tab" data-tab="history">Trade history</button>
         <button class="tab" data-tab="stats">P/L summary</button>
+        <button class="tab" data-tab="watchlist">Watchlist</button>
       </div>
       <button id="btn-exit-all" class="danger mini hidden" title="Exit every open position at the market">Exit all</button>
     </div>
     <div class="tab-body" id="tab-open"></div>
     <div class="tab-body hidden" id="tab-history"></div>
     <div class="tab-body hidden" id="tab-stats"></div>
+    <div class="tab-body hidden" id="tab-watchlist"></div>
   </section>
 
   <div id="tooltip" class="tooltip hidden" role="tooltip"></div>
@@ -132,6 +136,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script type="module" src="/static/js/main.js"></script>
 </body>
 </html>

@@ -33,14 +33,6 @@ def capm_cost_of_equity(risk_free: float, beta: float, market_risk_premium: floa
     return risk_free + beta * market_risk_premium
 
 
-def unlever_beta(levered_beta: float, tax_rate: float, debt_to_equity: float) -> float:
-    return levered_beta / (1.0 + (1.0 - tax_rate) * debt_to_equity)
-
-
-def relever_beta(unlevered_beta: float, tax_rate: float, debt_to_equity: float) -> float:
-    return unlevered_beta * (1.0 + (1.0 - tax_rate) * debt_to_equity)
-
-
 def wacc(
     equity_value: float, debt_value: float,
     cost_of_equity: float, cost_of_debt: float, tax_rate: float,
@@ -61,7 +53,6 @@ class DcfInputs:
     market_risk_premium: float = 0.055
     tax_rate: float = 0.21
     projection_years: int = 5
-    projection_method: str = "last_year"     # one of SEVEN_METHODS
     ufcf_growth: Optional[float] = None      # override; else inferred from revenue CAGR
     perpetuity_growth: float = 0.025
     exit_multiple: Optional[float] = None    # else current EV/EBITDA (book's default)

@@ -11,15 +11,7 @@ from sqlalchemy import func, or_, select
 from ..core.models import Account, Play
 from ..util import clock
 from .db import session_scope
-from .models_orm import (
-    AccountSnapshot,
-    Fill,
-    OrderAudit,
-    PlayLog,
-    ScanRun,
-    TokenAudit,
-    Trade,
-)
+from .models_orm import AccountSnapshot, Fill, OrderAudit, PlayLog, ScanRun, Trade
 
 log = logging.getLogger(__name__)
 
@@ -142,11 +134,11 @@ class Repository:
     def record_scan(self, result, keep_rejected: bool = True, top_n: int = 60) -> None:
         with session_scope() as s:
             s.merge(ScanRun(
-                id=result.run_id, started_at=_naive(result.started_at),
+                id=result.run_id, kind=result.kind, started_at=_naive(result.started_at),
                 finished_at=_naive(result.finished_at),
                 universe_size=result.universe_size, scanned=result.scanned,
-                prefiltered=result.prefiltered, n_plays=len(result.plays),
-                shortlist={"symbols": result.shortlist}, n_errors=len(result.errors),
+                liquid=result.liquid, n_plays=len(result.plays),
+                hot={"symbols": result.hot}, n_errors=len(result.errors),
                 elapsed_s=result.elapsed_s,
             ))
             plays = result.plays if keep_rejected else result.plays[:top_n]
@@ -164,11 +156,6 @@ class Repository:
                 row.status = status
                 row.decided_at = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
                 row.decided_by = decided_by
-
-    def get_play(self, play_id: str) -> Optional[Dict[str, Any]]:
-        with session_scope() as s:
-            row = s.get(PlayLog, play_id)
-            return play_to_dict(row) if row else None
 
     # -------------------------------------------------------------- #
     #  Trades                                                       #
@@ -246,13 +233,6 @@ class Repository:
             t = s.get(Trade, trade_id)
             if t and not t.overdue_notified:
                 t.overdue_notified = True
-
-    def add_fill(self, trade_id: str, side: str, leg: str, qty: float, price: float,
-                 commission: float = 0.0, broker_order_id: str = "") -> None:
-        now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-        with session_scope() as s:
-            s.add(Fill(trade_id=trade_id, broker_order_id=broker_order_id, ts=now,
-                       side=side, leg=leg, quantity=qty, price=price, commission=commission))
 
     def close_trade(
         self, trade_id: str, exit_price: float, exit_reason: str = "manual",
@@ -399,20 +379,6 @@ class Repository:
             "worst": round(min(pls), 2) if pls else 0.0,
         }
 
-    def equity_curve(self, limit: int = 500) -> List[Dict[str, Any]]:
-        with session_scope() as s:
-            rows = s.execute(
-                select(Trade).where(Trade.status == "CLOSED", Trade.exit_time.is_not(None))
-                .order_by(Trade.exit_time.asc()).limit(limit)
-            ).scalars().all()
-        cum = 0.0
-        out = []
-        for t in rows:
-            cum += float(t.realized_pl or 0.0)
-            out.append({"ts": t.exit_time.isoformat(), "symbol": t.symbol,
-                        "pl": round(float(t.realized_pl or 0.0), 2), "cumulative": round(cum, 2)})
-        return out
-
     # -------------------------------------------------------------- #
     #  Snapshots + audits                                           #
     # -------------------------------------------------------------- #
@@ -434,20 +400,6 @@ class Repository:
             s.add(OrderAudit(action=action, request=request, response=response, ok=ok,
                              broker=broker, play_id=play_id or None, trade_id=trade_id or None,
                              message=message[:400]))
-
-    def record_token_event(self, broker: str, event: str, age_days: Optional[float] = None,
-                           expires_at: Optional[dt.datetime] = None, detail: str = "") -> None:
-        with session_scope() as s:
-            s.add(TokenAudit(broker=broker, event=event, refresh_token_age_days=age_days,
-                             refresh_token_expires_at=_naive(expires_at), detail=detail[:400]))
-
-    def token_history(self, limit: int = 50) -> List[Dict[str, Any]]:
-        with session_scope() as s:
-            rows = s.execute(select(TokenAudit).order_by(TokenAudit.ts.desc()).limit(limit)).scalars().all()
-            return [{"ts": r.ts.isoformat(), "broker": r.broker, "event": r.event,
-                     "age_days": r.refresh_token_age_days,
-                     "expires_at": r.refresh_token_expires_at.isoformat() if r.refresh_token_expires_at else None,
-                     "detail": r.detail} for r in rows]
 
 
 # --------------------------------------------------------------------------- #

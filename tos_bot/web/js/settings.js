@@ -1,0 +1,94 @@
+/* Settings: when the scans run and how big the lists are, plus the scan status
+   and buttons to scan now. */
+import { $, $$, api, count, escapeHtml, fmtClock, plural, post } from "./util.js";
+import { S, emit, on } from "./state.js";
+import { busy, drawerOpen, openDrawer, toastResult, unbusy } from "./ui.js";
+import { currentRun, kindLabel, nextFullScanText, progressHTML, requestScan } from "./scan.js";
+
+async function openSettings() {
+  openDrawer("settings", "Settings", `<p class="muted">Loading…</p>`);
+  let scan;
+  try { scan = await api("/api/settings"); } catch {
+    $("#drawer-body").innerHTML = `<p class="reasons">Couldn't load the settings.</p>`;
+    return;
+  }
+  if (drawerOpen("settings")) render(scan);
+}
+
+function numberField(key, label, help, [lo, hi], value) {
+  return `<label for="set-${key}">${label}</label>
+    <div><input type="number" id="set-${key}" data-key="${key}" min="${lo}" max="${hi}" step="1" value="${value}">
+      <div class="help">${help} (${lo}–${hi})</div></div>`;
+}
+
+function render(scan) {
+  const s = scan.settings, limits = scan.limits, [earliest, latest] = scan.full_scan_window;
+  $("#drawer-body").innerHTML = `
+    <section class="conn">
+      <h4>Scanning</h4>
+      <p class="muted">Once a day before the open every US stock is ranked by how in play it is. The hottest become the day's
+        <b data-term="hot">hot list</b>; the next best in each sector wait in a <b data-term="buffer">buffer</b>. During the
+        session the hot list and a couple of buffer names per sector are rescanned on a cycle, so few IBKR requests are used.</p>
+      <form class="field-grid" id="form-settings" onsubmit="return false">
+        <label for="set-premarket_time">Full scan at (ET)</label>
+        <div><input type="time" id="set-premarket_time" data-key="premarket_time" min="${earliest}" max="${latest}" step="300" value="${escapeHtml(s.premarket_time)}">
+          <div class="help">Pre-market, ${earliest}–${latest} ET, so it's finished at least half an hour before the open.</div></div>
+        ${numberField("cycle_minutes", "Rescan every (min)", "How often the hot list and buffers are rescanned in the session", limits.cycle_minutes, s.cycle_minutes)}
+        ${numberField("hot_list_size", "Hot list size", "Stocks rescanned every cycle", limits.hot_list_size, s.hot_list_size)}
+        ${numberField("sector_queue_size", "Buffer per sector", "Candidates lined up in each sector", limits.sector_queue_size, s.sector_queue_size)}
+      </form>
+      <div class="row-gap"><button class="mini lockable" id="settings-save">Save</button></div>
+    </section>
+
+    <section class="conn">
+      <h4>Scan status</h4>
+      <div id="settings-status">${statusHTML(scan)}</div>
+      <div class="row-gap">
+        <button class="mini lockable" id="settings-full">Run full scan now</button>
+        <button class="ghost mini lockable" id="settings-cycle">Rescan hot list now</button>
+      </div>
+      <p class="muted small">A full scan re-ranks every stock and rebuilds today's hot list and buffers. Candles already downloaded
+        are reused, so running it again later in the day is quick.</p>
+    </section>`;
+  $("#settings-save").onclick = e => save(e.currentTarget);
+  $("#settings-full").onclick = e => requestScan("full", e.currentTarget);
+  $("#settings-cycle").onclick = e => requestScan("cycle", e.currentTarget);
+}
+
+function summary(label, sum) {
+  if (!sum) return `<span>${label}</span><span class="muted">not since the app started</span>`;
+  const size = sum.kind === "full"
+    ? `${count(sum.universe_size)} listed · ${count(sum.liquid)} liquid · hot list ${sum.hot.length}`
+    : `${count(sum.scanned)} scanned`;
+  return `<span>${label}</span><span>${fmtClock(sum.finished_at)} · ${size} · ${plural(sum.n_plays, "play")} · ${sum.elapsed_s}s</span>`;
+}
+
+function statusHTML(scan) {
+  const run = currentRun();
+  return `<div class="kv">
+    <span>Now</span><span>${run ? progressHTML(run) : "idle"}</span>
+    ${summary("Last full scan", scan.last_full)}
+    ${summary(`Last ${scan.last_cycle ? kindLabel(scan.last_cycle.kind).toLowerCase() : "cycle"}`, scan.last_cycle)}
+    <span>Watchlist for</span><span>${escapeHtml(scan.watchlist_session || "none yet")}</span>
+    <span>Next full scan</span><span>${nextFullScanText(scan)}</span>
+  </div>`;
+}
+
+async function save(btn) {
+  const body = {};
+  $$("#form-settings [data-key]").forEach(i => {
+    body[i.dataset.key] = i.type === "time" ? i.value : parseInt(i.value, 10);
+  });
+  busy(btn, "Saving…");
+  const r = await post("/api/settings", body);
+  unbusy(btn);
+  toastResult(r.ok && !r.note ? { ...r, note: "Saved." } : r);
+  if (r.ok) { S.state.scan = r.scan; emit("scan"); render(r.scan); }
+}
+
+export function initSettings() {
+  $("#btn-settings").onclick = openSettings;
+  on("scan", () => {
+    if (drawerOpen("settings") && $("#settings-status")) $("#settings-status").innerHTML = statusHTML(S.state.scan || {});
+  });
+}

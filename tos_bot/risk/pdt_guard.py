@@ -18,12 +18,10 @@ day-trading rules. So this guard:
 
 from __future__ import annotations
 
-import datetime as dt
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 from ..core.models import Account, Play
-from ..util import clock
 
 
 @dataclass

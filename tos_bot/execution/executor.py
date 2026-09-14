@@ -8,12 +8,12 @@ here decides *whether* to trade - only *how*.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from ..brokers.base import BrokerAdapter, BrokerError
 from ..brokers.venues import venue_label
-from ..core.enums import PlayStatus, Side
+from ..core.enums import PlayStatus, Side, StrategyKind, Timeframe
 from ..core.eventbus import BUS
 from ..core.models import Account, OrderRequest, Play
 from ..util import clock
@@ -190,7 +190,6 @@ class Executor:
         # 3) detect broker-side bracket exits (child order filled against an open trade)
         try:
             for o in self.broker.list_orders(status="FILLED"):
-                tag = (o.raw or {}).get("client_tag") or ""
                 self._maybe_close_from_bracket(o)
         except Exception:  # noqa: BLE001
             pass
@@ -262,8 +261,6 @@ def _req_dict(r: OrderRequest) -> dict:
 
 
 def _min_play(t: dict) -> dict:
-    from ..core.enums import Side, StrategyKind, Timeframe
-
     return dict(symbol=t["symbol"], side=Side(t["side"]), strategy=t["strategy"],
                 kind=StrategyKind(t["kind"]), timeframe=Timeframe(t["timeframe"]),
                 entry=float(t["entry_price"] or 0), stop=float(t["stop_price"] or 0),

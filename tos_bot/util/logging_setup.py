@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import sys
-from pathlib import Path
 
 from ..config import PROJECT_ROOT
 
@@ -44,7 +43,7 @@ def setup_logging(level: str = "INFO") -> None:
     root.addHandler(fileh)
 
     # third-party noise
-    for noisy in ("httpx", "urllib3", "yfinance", "peewee", "asyncio"):
+    for noisy in ("httpx", "urllib3", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     _CONFIGURED = True

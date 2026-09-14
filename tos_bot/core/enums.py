@@ -15,16 +15,12 @@ class Side(str, Enum):
     def entry_action(self) -> str:
         return "BUY" if self is Side.LONG else "SELL_SHORT"
 
-    @property
-    def exit_action(self) -> str:
-        return "SELL" if self is Side.LONG else "BUY_TO_COVER"
 
 
 class AssetClass(str, Enum):
     EQUITY = "EQUITY"
     ETF = "ETF"
     OPTION = "OPTION"
-    CRYPTO = "CRYPTO"
     FUTURE = "FUTURE"
 
 
@@ -33,7 +29,6 @@ class OrderType(str, Enum):
     LIMIT = "LIMIT"
     STOP = "STOP"
     STOP_LIMIT = "STOP_LIMIT"
-    TRAILING_STOP = "TRAILING_STOP"
 
 
 class TimeInForce(str, Enum):
@@ -56,15 +51,9 @@ class PlayStatus(str, Enum):
     ERROR = "ERROR"
 
 
-class TradeStatus(str, Enum):
-    OPEN = "OPEN"
-    CLOSED = "CLOSED"
-
-
 class StrategyKind(str, Enum):
     TECHNICAL = "TECHNICAL"
     FUNDAMENTAL = "FUNDAMENTAL"
-    HYBRID = "HYBRID"
 
 
 class Timeframe(str, Enum):

@@ -12,11 +12,10 @@ import asyncio
 import datetime as dt
 from types import SimpleNamespace
 
-import pandas as pd
 import pytest
 
 from tos_bot.brokers import ibkr_adapter as mod
-from tos_bot.brokers.base import AuthError, NotSupported, OrderRejected
+from tos_bot.brokers.base import AuthError, OrderRejected
 from tos_bot.core.enums import OrderType, Side, TimeInForce
 from tos_bot.core.models import OrderRequest
 
@@ -29,6 +28,7 @@ class FakeIB:
         self._connected = False
         self.market_data_type = None
         self.placed = []
+        self.history_requests = []
 
     # connection
     def isConnected(self):
@@ -46,17 +46,18 @@ class FakeIB:
     def managedAccounts(self):
         return ["DU111111"]
 
-    # account
-    async def reqAccountSummaryAsync(self):
-        return []
+    # account - what reqAccountUpdates streams (tag, currency, value); a USD account by default
+    account_values = [
+        ("AccountCode", "", "DU111111"),
+        ("NetLiquidation", "USD", "101234.50"),
+        ("TotalCashValue", "USD", "40000"),
+        ("BuyingPower", "USD", "200000"),
+        ("NetLiquidationByCurrency", "BASE", "101234.50"),
+    ]
 
-    def accountSummary(self, acct=""):
-        AV = SimpleNamespace
-        return [
-            AV(tag="NetLiquidation", value="101234.50", currency="USD", account="DU111111"),
-            AV(tag="TotalCashValue", value="40000", currency="USD", account="DU111111"),
-            AV(tag="BuyingPower", value="200000", currency="USD", account="DU111111"),
-        ]
+    def accountValues(self, acct=""):
+        return [SimpleNamespace(tag=t, currency=c, value=v, account="DU111111")
+                for t, c, v in self.account_values]
 
     def portfolio(self, acct=""):
         return [SimpleNamespace(contract=SimpleNamespace(symbol="MSFT"),
@@ -73,7 +74,16 @@ class FakeIB:
         return [SimpleNamespace(bid=100.0, ask=100.1, last=float("nan"),
                                 close=99.9, volume=1234.0, marketPrice=100.0)]
 
+    async def reqContractDetailsAsync(self, contract):
+        if contract.symbol == "NOPE":
+            return []
+        if contract.symbol == "SLOW":
+            raise asyncio.TimeoutError()
+        return [SimpleNamespace(contract=SimpleNamespace(conId=265598, primaryExchange="NASDAQ"),
+                                stockType="COMMON", industry="Technology", category="Computers")]
+
     async def reqHistoricalDataAsync(self, c, **kw):
+        self.history_requests.append((c, kw))
         base = dt.datetime(2026, 9, 3, 13, 30, tzinfo=dt.timezone.utc)
         out = []
         for i in range(20):
@@ -161,7 +171,7 @@ def test_bars_to_df_shape_and_tz():
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
     assert str(df.index.tz) == "America/New_York"
     assert df.index.is_monotonic_increasing
-    assert df["volume"].iloc[0] == 3 * 100.0          # lots -> shares
+    assert df["volume"].iloc[0] == 3.0                # IBKR reports stock volume in shares
 
 
 def test_port_is_open_false_on_dead_port():
@@ -195,11 +205,29 @@ def test_quote_falls_back_to_close_when_last_is_nan(broker):
     assert q.bid == 100.0 and q.ask == 100.1
 
 
-def test_price_history_interval_map_and_reject(broker):
-    df = broker.get_price_history("AAPL", "5m", 2)
-    assert len(df) == 20 and list(df.columns)[0] == "open"
-    with pytest.raises(NotSupported):
-        broker.get_price_history("AAPL", "3m", 2)
+def test_history_for_many_symbols_at_once(broker):
+    frames = broker.history_many({"AAPL": ("5 mins", "2 D"), "MSFT": ("1 day", "1 Y")}, con_ids={"MSFT": 272093})
+    assert set(frames) == {"AAPL", "MSFT"} and len(frames["AAPL"]) == 20
+    assert list(frames["MSFT"].columns) == ["open", "high", "low", "close", "volume"]
+    asked = {getattr(c, "symbol", "") or c.conId: kw for c, kw in broker._session.ib.history_requests}
+    assert asked["AAPL"]["barSizeSetting"] == "5 mins" and asked["AAPL"]["durationStr"] == "2 D"
+    assert asked[272093]["durationStr"] == "1 Y"                  # a known contract id skips the lookup
+
+
+def test_a_failed_history_request_is_left_out(broker):
+    async def pacing_violation(c, **kw):
+        raise RuntimeError("pacing violation")
+
+    broker._session.ib.reqHistoricalDataAsync = pacing_violation
+    assert broker.history_many({"AAPL": ("1 day", "5 D")}) == {}
+
+
+def test_contract_details_tell_stocks_from_unknown_symbols(broker):
+    details = broker.contract_details_many(["AAPL", "NOPE", "SLOW"])
+    assert details["AAPL"] == {"con_id": 265598, "exchange": "NASDAQ", "stock_type": "COMMON",
+                               "industry": "Technology", "category": "Computers"}
+    assert details["NOPE"] is None                                # IBKR has no such stock
+    assert "SLOW" not in details                                  # a failed lookup is asked again later
 
 
 @pytest.mark.parametrize("side,is_entry,expect", [
@@ -259,6 +287,60 @@ def test_info_errors_are_ignored(broker):
 
 def test_session_status_shape(broker):
     st = broker.session_status()
-    assert st["broker"] == "ibkr" and st["connected"] is True
+    assert st["connected"] is True and st["reconnecting"] is False
     assert st["port"] == 4002 and st["mode"] == "paper"
     assert st["market_data"] == "live"
+
+
+# --------------------------------------------------------------------------- #
+#  accounts in another currency (an IBKR Canada paper account is in CAD)
+# --------------------------------------------------------------------------- #
+def _cad_account(ib, rate_tag=None):
+    ib.account_values = [
+        ("NetLiquidation", "CAD", "1000000.00"),
+        ("TotalCashValue", "CAD", "1000000.00"),
+        ("BuyingPower", "CAD", "3333333.33"),
+        ("NetLiquidationByCurrency", "BASE", "1000000.00"),
+    ] + ([("ExchangeRate", "USD", rate_tag)] if rate_tag else [])
+
+
+def test_an_account_in_another_currency_is_sized_in_usd(broker):
+    _cad_account(broker._session.ib)
+    broker._fx_fn = lambda cur: 0.72 if cur == "CAD" else None
+    acc = broker.get_account()
+    assert acc.base_currency == "CAD" and acc.usd_per_base == pytest.approx(0.72)
+    assert acc.equity == pytest.approx(720_000.0) and acc.buying_power == pytest.approx(2_400_000.0)
+    assert acc.raw["base"]["equity"] == pytest.approx(1_000_000.0) and not acc.raw["fx_missing"]
+
+
+def test_ibkrs_own_exchange_rate_is_used_when_it_sends_one(broker):
+    _cad_account(broker._session.ib, rate_tag="1.25")            # 1 USD = 1.25 CAD
+    broker._fx_fn = lambda cur: pytest.fail("no lookup needed")
+    assert broker.get_account().equity == pytest.approx(800_000.0)
+
+
+def test_without_an_exchange_rate_nothing_can_be_sized(broker):
+    _cad_account(broker._session.ib)
+    broker._fx_fn = lambda cur: None
+    acc = broker.get_account()
+    assert acc.equity == 0.0 and acc.usd_per_base == 0.0 and acc.raw["fx_missing"]
+    assert acc.raw["base"]["cash"] == pytest.approx(1_000_000.0)
+
+
+# --------------------------------------------------------------------------- #
+#  no market-data subscription
+# --------------------------------------------------------------------------- #
+def test_a_quote_with_no_price_raises_so_the_next_feed_answers(broker):
+    async def empty(c):
+        return [SimpleNamespace(bid=-1.0, ask=-1.0, last=float("nan"), close=float("nan"),
+                                volume=float("nan"), marketPrice=float("nan"))]
+
+    broker._session.ib.reqTickersAsync = empty
+    with pytest.raises(RuntimeError):
+        broker.get_quote("AAPL")
+
+
+def test_not_subscribed_switches_to_delayed_data(broker):
+    broker._on_error(5, 354, "Requested market data is not subscribed. Delayed market data is available.", None)
+    assert broker._data_is_delayed and broker.quotes_from_bars
+    assert broker._session.ib.market_data_type == 3

@@ -1,11 +1,8 @@
-"""Sector names and the scan-time sector filter."""
+"""Sector names and the sector filter."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
-from tos_bot.data.sectors import SECTORS, canonical_sector, clean_sector_list, sector_allowed
-from tos_bot.scanner.scanner import Scanner
+from tos_bot.data.sectors import SECTORS, canonical_sector, clean_sector_list, sector_allowed, sector_from_ibkr
 
 
 def test_canonical_names():
@@ -30,22 +27,11 @@ def test_sector_allowed():
     assert not sector_allowed("", ["Technology"])        # unknown is excluded while filtering
 
 
-class _Lookup:
-    def __init__(self, known, online):
-        self.known, self.online, self.fetched = known, online, []
-
-    def peek(self, sym):
-        return self.known.get(sym)
-
-    def get(self, sym):
-        self.fetched.append(sym)
-        return self.online.get(sym, "")
-
-
-def test_scanner_filters_the_slice_within_a_lookup_budget():
-    look = _Lookup({"AAPL": "Technology", "XOM": "Energy"},
-                   {"NEW1": "Technology", "NEW2": "Technology"})
-    scanner = SimpleNamespace(_sectors=look, SECTOR_LOOKUPS_PER_CYCLE=1)
-    kept = Scanner._in_sectors(scanner, ["AAPL", "XOM", "NEW1", "NEW2"], ["Technology"])
-    assert kept == ["AAPL", "NEW1"]                      # NEW2 is resolved on a later cycle
-    assert look.fetched == ["NEW1"]
+def test_ibkr_industries_map_onto_the_sectors():
+    for industry in ("Technology", "Communications", "Consumer, Cyclical", "Consumer, Non-cyclical",
+                     "Financial", "Industrial", "Energy", "Utilities", "Basic Materials"):
+        assert sector_from_ibkr(industry, "") in SECTORS
+    # a few categories override their industry
+    assert sector_from_ibkr("Consumer, Non-cyclical", "Biotechnology") == "Healthcare"
+    assert sector_from_ibkr("Financial", "REITS") == "Real Estate"
+    assert sector_from_ibkr("Funds", "Equity Fund") == ""
