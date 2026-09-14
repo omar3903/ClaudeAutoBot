@@ -58,6 +58,12 @@ def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0) ->
         qty = math.floor(bp / entry)
         caps.append("buying power")
 
+    # what's left of a trading-capital limit (see TradingEngine.sizing_account)
+    room = (getattr(account, "raw", None) or {}).get("capital_room")
+    if room is not None and qty * entry > room:
+        qty = math.floor(max(0.0, float(room)) / entry)
+        caps.append("trading capital")
+
     # round lot
     lot = max(1, int(getattr(cfg, "round_lot", 1)))
     qty = (qty // lot) * lot

@@ -8,11 +8,12 @@ here decides *whether* to trade - only *how*.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from ..brokers.base import BrokerAdapter, BrokerError
-from ..core.enums import PlayStatus, Side
+from ..brokers.venues import venue_label
+from ..core.enums import PlayStatus, Side, StrategyKind, Timeframe
 from ..core.eventbus import BUS
 from ..core.models import Account, OrderRequest, Play
 from ..util import clock
@@ -33,21 +34,42 @@ class _Pending:
 
 
 class Executor:
-    def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS) -> None:
+    def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS,
+                 venue: Optional[str] = None) -> None:
         self.broker = broker
+        self.venue = venue or broker.name      # stamped on trades - see brokers/venues.py
         self.repo = repo
         self.cfg = cfg
         self.bus = bus
         self._pending: Dict[str, _Pending] = {}
         self._open_by_symbol: Dict[str, str] = {}   # symbol -> trade_id
 
-    def rebind(self, broker: BrokerAdapter) -> None:
-        """Point at a different broker (paper <-> live switch). In-flight
-        order tracking is broker-specific, so it is dropped; open trades in
-        the database are untouched."""
+    def rebind(self, broker: BrokerAdapter, venue: Optional[str] = None) -> None:
+        """Point at a different broker (paper <-> live / platform switch).
+        In-flight order tracking is broker-specific, so it is dropped; open
+        trades in the database are untouched."""
         self.broker = broker
+        self.venue = venue or broker.name
         self._pending.clear()
         self._open_by_symbol.clear()
+
+    def cancel_pending_entries(self) -> int:
+        """Cancel entry orders still working at the broker (used when quitting)."""
+        n = 0
+        for oid, p in list(self._pending.items()):
+            if p.kind != "entry":
+                continue
+            try:
+                self.broker.cancel_order(oid)
+            except Exception:  # noqa: BLE001
+                log.debug("cancel %s failed", oid, exc_info=True)
+            self._pending.pop(oid, None)
+            n += 1
+        return n
+
+    def pending_exit_trade_ids(self) -> set:
+        """Trades whose close order is still working at the broker."""
+        return {p.trade_id for p in list(self._pending.values()) if p.kind == "exit" and p.trade_id}
 
     # ------------------------------------------------------------------ #
     def execute_play(self, play: Play, account: Account,
@@ -103,7 +125,21 @@ class Executor:
         t = self.repo.get_trade(trade_id)
         if not t or t["status"] == "CLOSED":
             return {"ok": False, "reason": "trade not open"}
-        req = build_exit_order(t["symbol"], t["side"], abs(float(t["quantity"])),
+        held_on = t.get("broker") or "paper"
+        if held_on != self.venue:
+            # never send an exit to an account that doesn't hold the position
+            return {"ok": False, "reason": f"This position is on {venue_label(held_on)} - "
+                                           f"switch back to that platform to close it."}
+        qty = abs(float(t["quantity"]))
+        held = self._held_quantity(t["symbol"])
+        if held is not None:
+            if abs(held) < 1e-9 or (held > 0) != (t["side"] == "LONG"):
+                # closed or removed outside the app - an exit now would open the other side
+                return {"ok": False, "not_held": True,
+                        "reason": f"{venue_label(held_on)} doesn't show a {t['side'].lower()} {t['symbol']} "
+                                  f"position (closed or removed outside the app?) - no exit sent."}
+            qty = min(qty, abs(held))           # never sell more than is there
+        req = build_exit_order(t["symbol"], t["side"], qty,
                                limit_price=limit_price, cfg=self.cfg, tag=f"exit:{trade_id}")
         try:
             res = self.broker.place_order(req)
@@ -120,8 +156,17 @@ class Executor:
             return {"ok": True, "status": "FILLED", "trade": out}
 
         self._pending[res.order_id] = _Pending(res.order_id, Play(**_min_play(t)), "exit",
-                                               trade_id=trade_id, qty=abs(float(t["quantity"])))
+                                               trade_id=trade_id, qty=qty)
         return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id}
+
+    def _held_quantity(self, symbol: str) -> Optional[float]:
+        """Signed quantity the broker reports for ``symbol`` (0.0 if none), or
+        None when it can't say - then the exit goes ahead, as a missed stop is worse."""
+        try:
+            pos = self.broker.get_account().position(symbol)
+        except Exception:  # noqa: BLE001
+            return None
+        return float(pos.quantity) if pos is not None else 0.0
 
     # ------------------------------------------------------------------ #
     def sync_open_orders(self) -> None:
@@ -145,7 +190,6 @@ class Executor:
         # 3) detect broker-side bracket exits (child order filled against an open trade)
         try:
             for o in self.broker.list_orders(status="FILLED"):
-                tag = (o.raw or {}).get("client_tag") or ""
                 self._maybe_close_from_bracket(o)
         except Exception:  # noqa: BLE001
             pass
@@ -189,7 +233,7 @@ class Executor:
     # ------------------------------------------------------------------ #
     def _open_trade(self, play: Play, price: float, qty: float, order_id: str,
                     order_type: str = "LIMIT", order_session: str = "REGULAR") -> str:
-        tid = self.repo.open_trade(play, float(price), float(qty), self.broker.name, order_id,
+        tid = self.repo.open_trade(play, float(price), float(qty), self.venue, order_id,
                                    order_type=order_type, order_session=order_session)
         self._open_by_symbol[play.symbol] = tid
         play.status = PlayStatus.FILLED
@@ -217,8 +261,6 @@ def _req_dict(r: OrderRequest) -> dict:
 
 
 def _min_play(t: dict) -> dict:
-    from ..core.enums import Side, StrategyKind, Timeframe
-
     return dict(symbol=t["symbol"], side=Side(t["side"]), strategy=t["strategy"],
                 kind=StrategyKind(t["kind"]), timeframe=Timeframe(t["timeframe"]),
                 entry=float(t["entry_price"] or 0), stop=float(t["stop_price"] or 0),

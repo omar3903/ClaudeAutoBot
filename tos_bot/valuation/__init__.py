@@ -9,7 +9,7 @@
 """
 
 from .dcf import DcfInputs, DcfResult, capm_cost_of_equity, dcf_fair_value, wacc
-from .enterprise_value import enterprise_value, equity_value_from_ev, implied_share_price
+from .enterprise_value import enterprise_value
 from .football_field import MethodRange, football_field, band_verdict
 from .multiples import (
     Multiples,
@@ -18,13 +18,13 @@ from .multiples import (
     peer_median_multiples,
     relative_value_signal,
 )
-from .projections import SEVEN_METHODS, project_series
+from .projections import project_series
 
 __all__ = [
     "DcfInputs", "DcfResult", "capm_cost_of_equity", "dcf_fair_value", "wacc",
-    "enterprise_value", "equity_value_from_ev", "implied_share_price",
+    "enterprise_value",
     "MethodRange", "football_field", "band_verdict",
     "Multiples", "compute_multiples", "implied_price_from_multiple",
     "peer_median_multiples", "relative_value_signal",
-    "SEVEN_METHODS", "project_series",
+    "project_series",
 ]

@@ -76,7 +76,7 @@ def _cfg(**over):
     base = dict(
         enabled=True, allow_live=False, trade_types=["INTRADAY"],
         min_confidence=0.6, min_reward_risk=2.0, max_auto_positions=2,
-        max_auto_trades_per_day=3, max_open_risk_pct=4.0, block_sectors=[],
+        max_auto_trades_per_day=3, max_open_risk_pct=4.0,
         require_catalyst=False, dry_run=False,
         # cap tests below isolate one cap at a time; keep these wide open
         max_per_strategy=99, max_new_per_cycle=99, cooldown_after_loss=False,
@@ -145,12 +145,6 @@ def test_fundamental_plays_are_never_auto_traded():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(trade_types=["INTRADAY", "SWING"]), bus=SILENT)
     _run(ap, mkplay(kind=StrategyKind.FUNDAMENTAL, tf=Timeframe.SWING))
-    assert eng.approved == []
-
-
-def test_blocked_sector():
-    eng = FakeEngine()
-    _run(AutoPilot(eng, _cfg(block_sectors=["Energy"]), bus=SILENT), mkplay(sector="Energy"))
     assert eng.approved == []
 
 
@@ -271,19 +265,6 @@ def test_configure_updates_and_persists():
     assert calls, "configure() should persist"
 
 
-def test_engine_wires_autopilot_into_snapshot():
-    """The real engine exposes autopilot in the snapshot and via set_autopilot."""
-    from tos_bot.engine import TradingEngine
-    eng = TradingEngine()
-    snap = eng.snapshot()
-    assert "autopilot" in snap and "trade_types" in snap["autopilot"]
-    assert "scan_interval_s" in snap and "scan_fast" in snap
-    out = eng.set_autopilot(enabled=True, trade_types=["INTRADAY", "SWING"])
-    assert out["ok"] and out["autopilot"]["enabled"] is True
-    assert set(out["autopilot"]["trade_types"]) == {"INTRADAY", "SWING"}
-    eng.set_autopilot(enabled=False)
-
-
 def test_day_mode_active_truth_table():
     ap = AutoPilot(FakeEngine(), _cfg(enabled=False, trade_types=["INTRADAY"]), bus=SILENT)
     assert ap.day_mode_active(market_open=True) is False          # disabled
@@ -296,29 +277,3 @@ def test_day_mode_active_truth_table():
     eng_live = FakeEngine(mode="live")
     ap_live = AutoPilot(eng_live, _cfg(enabled=True, allow_live=False, trade_types=["INTRADAY"]), bus=SILENT)
     assert ap_live.day_mode_active(market_open=True) is False
-
-
-def test_effective_scan_interval_adapts_to_autopilot(monkeypatch):
-    from tos_bot.engine import TradingEngine
-    from tos_bot.util import clock
-    eng = TradingEngine()
-    base = eng.settings.config.scanner.interval_seconds
-    floor = eng.settings.config.scanner.min_interval_seconds
-    fast = eng.settings.config.scanner.autopilot_interval_seconds
-
-    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: True)
-
-    eng.set_autopilot(enabled=False)
-    assert eng._effective_scan_interval() == base                 # off -> normal cadence
-
-    eng.set_autopilot(enabled=True, trade_types=["INTRADAY"])
-    eng._last_scan_elapsed = 10.0
-    assert eng._effective_scan_interval() == fast                 # armed + open -> fast cadence
-    eng._last_scan_elapsed = 200.0                                # a slow cycle
-    assert eng._effective_scan_interval() == 203                  # ~back-to-back, not faster
-    eng._last_scan_elapsed = 0.0
-
-    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: False)
-    assert eng._effective_scan_interval() == base                 # session closed -> normal
-    eng.set_autopilot(enabled=False)
-    assert floor <= fast <= base

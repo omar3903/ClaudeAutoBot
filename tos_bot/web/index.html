@@ -3,42 +3,58 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
   <title>AutoTradeBot</title>
+  <script>
+    // pick the theme before first paint: your saved choice, else the OS setting
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("atb-theme"); } catch (e) { }
+      if (t !== "light" && t !== "dark")
+        t = window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      document.documentElement.dataset.theme = t;
+    })();
+  </script>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <div id="reauth-banner" class="banner hidden"></div>
+  <div id="quit-banner" class="banner quit hidden" role="status"></div>
+  <div id="conn-banner" class="banner hidden"></div>
 
   <header class="topbar">
     <div class="brand">AutoTradeBot</div>
-    <div class="mode-switch" id="mode-switch" title="Paper = simulated fills on real data. Live = real orders.">
+    <div class="mode-switch lockable" id="mode-switch">
       <button class="seg" data-mode="paper">Paper</button>
       <button class="seg" data-mode="live">Live</button>
     </div>
-    <div class="autopilot-ctl" id="autopilot-ctl">
-      <button id="ap-toggle" class="ap-btn" title="Hands-off ENTRY. Exits are always automatic. The bot picks entries that clear the gate and sends them for you.">Autopilot: off</button>
+    <div class="autopilot-ctl lockable" id="autopilot-ctl">
+      <button id="ap-toggle" class="ap-btn" title="Hands-off ENTRY. Exits are always automatic.">Autopilot: off</button>
       <button id="ap-cfg" class="ghost mini" title="Autopilot settings">&#9881;</button>
     </div>
     <div class="statuses">
       <span class="pill" id="pill-market">market</span>
-      <span class="pill" id="pill-data" title="Where quotes &amp; candles come from">data</span>
+      <span class="pill" id="pill-data">data</span>
+      <span class="pill clickable" id="pill-conn" role="button" tabindex="0">connection</span>
       <span class="pill hidden" id="pill-armed"
-        title="LIVE only: the engine will route orders you approve. It disarms if account equity falls below the configured floor ($2,000).">armed</span>
+        title="LIVE only: the engine will route orders you approve. It disarms if account equity falls below the configured floor.">armed</span>
     </div>
     <div class="acct">
       <div><label>Equity</label><b id="a-equity">&ndash;</b></div>
       <div><label>Cash</label><b id="a-cash">&ndash;</b></div>
       <div><label>Buying power</label><b id="a-bp">&ndash;</b></div>
+      <div><label data-term="capital">Trading capital</label><button id="btn-capital" class="capital-btn lockable">&ndash;</button></div>
       <div><label>Day trades (5d)</label><b id="a-dt">&ndash;</b></div>
       <div><label>Realized today</label><b id="a-pnl-today">&ndash;</b></div>
     </div>
     <div class="actions">
-      <span class="pill" id="pill-token" title="OAuth token status">token</span>
-      <button id="btn-refresh" class="ghost" title="Re-pull account, positions and fills now">↻ Refresh</button>
-      <button id="btn-reconcile" class="ghost hidden" title="Rebuild paper positions from the trade log">Reconcile</button>
-      <button id="btn-reset-paper" class="ghost" title="Reset the paper account balance">Reset paper</button>
-      <button id="btn-strategies" class="ghost">Strategies</button>
-      <button id="btn-scan">Scan now</button>
+      <button id="btn-refresh" class="ghost" title="Re-pull account, positions and fills now">&#8635; Refresh</button>
+      <button id="btn-reset-paper" class="ghost lockable hidden" title="Reset the simulator balance">Reset paper</button>
+      <button id="btn-connections" class="ghost" title="IB Gateway and where orders go">Connections</button>
+      <button id="btn-strategies" class="ghost" title="Switch setups on or off and set their weight">Strategies</button>
+      <button id="btn-settings" class="ghost" title="When the scans run and how big the hot list and buffers are">Settings</button>
+      <button id="btn-theme" class="ghost icon" title="Switch light / dark">&#9680;</button>
+      <button id="btn-quit" class="ghost danger-ghost" title="Quit the app - open positions are handled first">Quit</button>
+      <button id="btn-scan" class="lockable" title="Rescan the hot list and the next buffer names now">Scan now</button>
     </div>
   </header>
 
@@ -46,36 +62,38 @@
     <section class="plays">
       <div class="section-head">
         <h2>Plays <span class="muted" id="plays-count"></span></h2>
-        <div class="filters">
-          <label><input type="checkbox" id="f-long" checked /> Long</label>
-          <label><input type="checkbox" id="f-short" checked /> Short</label>
-          <label><input type="checkbox" id="f-intraday" checked /> Intraday</label>
-          <label><input type="checkbox" id="f-swing" checked /> Swing</label>
-          <label><input type="checkbox" id="f-hide-done" /> Hide executed</label>
-          <select id="f-sector" class="mini-select"><option value="">All sectors</option></select>
-          <span class="muted" id="scan-meta"></span>
+        <div class="filters" title="These filters also decide what the bot scans for and trades">
+          <label class="lockable" data-term="long"><input type="checkbox" id="f-long" checked /> Long</label>
+          <label class="lockable" data-term="short"><input type="checkbox" id="f-short" checked /> Short</label>
+          <label class="lockable" data-term="intraday"><input type="checkbox" id="f-intraday" checked /> Intraday</label>
+          <label class="lockable" data-term="swing"><input type="checkbox" id="f-swing" checked /> Swing</label>
+          <label data-term="hide_done"><input type="checkbox" id="f-hide-done" /> Hide executed</label>
+          <button id="btn-sectors" class="ghost mini lockable">Sectors: all</button>
+          <span class="muted scan-meta" id="scan-meta"></span>
         </div>
       </div>
       <div class="table-wrap">
         <table id="plays-table">
           <thead>
             <tr>
-              <th>Symbol</th><th>Side</th><th>Strategy</th><th>TF</th>
-              <th class="num">Entry</th><th class="num">Stop</th><th class="num">Target</th>
-              <th class="num">R:R</th><th class="num">Qty</th><th class="num">$ Risk</th>
-              <th class="num">Score</th><th></th>
+              <th data-term="symbol">Symbol</th><th data-term="side">Side</th>
+              <th data-term="strategy_col">Strategy</th><th data-term="tf">TF</th>
+              <th class="num" data-term="entry">Entry</th><th class="num" data-term="stop">Stop</th>
+              <th class="num" data-term="target">Target</th><th class="num" data-term="rr">R:R</th>
+              <th class="num" data-term="qty">Qty</th><th class="num" data-term="risk">$ Risk</th>
+              <th class="num" data-term="score">Score</th><th></th>
             </tr>
           </thead>
           <tbody id="plays-body"></tbody>
         </table>
-        <div id="plays-empty" class="empty">No plays yet &mdash; the scanner runs every few minutes. Hit <b>Scan now</b>.</div>
+        <div id="plays-empty" class="empty">No plays yet.</div>
       </div>
     </section>
 
     <aside class="detail" id="detail">
       <div class="detail-empty" id="detail-empty">
         <p>Select a play to see the full explanation, the numbers behind it, and the order you would send.</p>
-        <p class="muted">Nothing is ever sent without your click.</p>
+        <p class="muted">Nothing is ever sent without your click. Hover any badge or column name for what it means.</p>
       </div>
       <div id="detail-body" class="hidden"></div>
     </aside>
@@ -87,14 +105,17 @@
         <button class="tab active" data-tab="open">Open positions</button>
         <button class="tab" data-tab="history">Trade history</button>
         <button class="tab" data-tab="stats">P/L summary</button>
+        <button class="tab" data-tab="watchlist">Watchlist</button>
       </div>
+      <button id="btn-exit-all" class="danger mini hidden" title="Exit every open position at the market">Exit all</button>
     </div>
     <div class="tab-body" id="tab-open"></div>
     <div class="tab-body hidden" id="tab-history"></div>
     <div class="tab-body hidden" id="tab-stats"></div>
+    <div class="tab-body hidden" id="tab-watchlist"></div>
   </section>
 
-  <div id="tooltip" class="tooltip hidden"></div>
+  <div id="tooltip" class="tooltip hidden" role="tooltip"></div>
   <div id="toasts"></div>
 
   <div id="modal" class="modal hidden">
@@ -109,12 +130,12 @@
   </div>
 
   <div id="drawer" class="drawer hidden">
-    <div class="drawer-inner">
-      <div class="drawer-head"><h3>Strategy playbook</h3><button id="drawer-close" class="ghost">Close</button></div>
+    <div class="drawer-inner" id="drawer-inner">
+      <div class="drawer-head"><h3 id="drawer-title"></h3><button id="drawer-close" class="ghost">Close</button></div>
       <div id="drawer-body"></div>
     </div>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script type="module" src="/static/js/main.js"></script>
 </body>
 </html>

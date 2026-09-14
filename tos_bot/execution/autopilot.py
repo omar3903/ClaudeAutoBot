@@ -213,7 +213,9 @@ class AutoPilot:
             return []
         self._blocked_note = ""
 
-        acct = getattr(self.engine, "_account", None)
+        # the account as sizing sees it - a trading-capital limit shrinks it
+        sizing = getattr(self.engine, "sizing_account", None)
+        acct = sizing() if callable(sizing) else getattr(self.engine, "_account", None)
         equity = float(getattr(acct, "equity", 0.0) or 0.0)
         actions: List[Dict[str, Any]] = []
         taken = 0                              # new entries opened this cycle
@@ -320,9 +322,6 @@ class AutoPilot:
             return f"reward:risk {p.reward_risk:.1f} < {self.min_reward_risk:.1f}"
         if p.kind.value == "FUNDAMENTAL":
             return "valuation plays are not day/swing entries - not auto-traded"
-        blocked = {s.lower() for s in (self.cfg.block_sectors or [])}
-        if p.sector and p.sector.lower() in blocked:
-            return f"sector '{p.sector}' is on the autopilot block list"
         if self.cfg.require_catalyst and not any(t in ("catalyst", "gap") for t in (p.tags or [])):
             return "no catalyst tag (autopilot.require_catalyst is on)"
         try:

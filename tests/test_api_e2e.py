@@ -1,61 +1,86 @@
-"""End-to-end: dashboard API drives a full scan -> approve -> close on paper."""
+"""End to end: the dashboard API on a synthetic IB Gateway - the full scan and a
+cycle, the watchlist and settings, then assess -> approve -> close on the simulator."""
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
+
+import fakes
 
 pytestmark = pytest.mark.slow
 
 
 @pytest.fixture
-def client(monkeypatch):
-    monkeypatch.setenv("SCANNER_UNIVERSE", "nasdaq100")
-    monkeypatch.setenv("SCANNER_MAX_SYMBOLS", "24")
-    monkeypatch.setenv("SCANNER_INTERVAL_SECONDS", "9999")
-    from tos_bot.config import reload_settings
-    reload_settings()
+def client(monkeypatch, tmp_path):
+    # the flow needs a tradable session: pin the clock to mid regular hours so
+    # this doesn't fail every night and weekend (and nothing auto-flattens)
+    from tos_bot.util import clock
+    monkeypatch.setattr(clock, "current_session", lambda ts=None: clock.Session.REGULAR)
+    monkeypatch.setattr(clock, "is_market_open", lambda ts=None: True)
+    monkeypatch.setattr(clock, "minutes_to_close", lambda ts=None: 240.0)
+
     from fastapi.testclient import TestClient
+    from tos_bot.engine import TradingEngine
+    from tos_bot.scanner.scanner import BENCHMARK
     from tos_bot.server.app import create_app
-    with TestClient(create_app()) as c:
+
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text(json.dumps({"paper_platform": "simulator"}), encoding="utf-8")
+    gateway = fakes.FakeGateway(fakes.SYMBOLS + [BENCHMARK])
+
+    def engine(settings):
+        return TradingEngine(settings, data_dir=tmp_path / "data", runtime_path=runtime,
+                             broker_factory=fakes.broker_factory(gateway), port_check=lambda host, port: True,
+                             listings=fakes.FakeListings(fakes.SYMBOLS), fundamentals=fakes.NoFundamentals())
+
+    with TestClient(create_app(engine)) as c:
         yield c
 
 
-def test_scan_assess_approve_close(client):
-    st = client.get("/api/state").json()
-    assert st["broker"] == "paper" and st["connected"] and st["armed"]
+def _wait_for(check, seconds=90):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        value = check()
+        if value:
+            return value
+        time.sleep(0.5)
+    return None
 
-    client.post("/api/scan/now")
-    plays = []
-    for _ in range(45):
-        time.sleep(1)
-        plays = client.get("/api/plays").json()["plays"]
-        if plays:
+
+def test_scan_watchlist_approve_close(client):
+    state = client.get("/api/state").json()
+    assert state["connected"] and state["armed"] and state["data"]["connected"]
+    assert state["venue"]["trading_on"] == "paper"
+    assert client.post("/api/scan", json={"kind": "cycle"}).json()["ok"]
+
+    assert _wait_for(lambda: client.get("/api/settings").json()["last_cycle"]), "no cycle ran after the full scan"
+    watchlist = client.get("/api/watchlist").json()["watchlist"]
+    assert watchlist["hot"] and watchlist["sectors"]
+
+    trade_id = None
+    for play in client.get("/api/plays").json()["plays"]:
+        assessed = client.post(f"/api/plays/{play['id']}/assess").json()
+        if not assessed.get("can_execute"):
+            continue
+        approved = client.post(f"/api/plays/{play['id']}/approve").json()
+        if approved.get("status") == "FILLED":
+            trade_id = approved["trade_id"]
             break
-    assert plays, "scanner produced no plays"
+    assert trade_id, "no play could be executed"
 
-    # find an executable one
-    chosen = None
-    for p in plays:
-        a = client.post(f"/api/plays/{p['id']}/assess").json()
-        assert a["ok"]
-        if a["can_execute"]:
-            chosen = p
-            break
-    assert chosen, "no executable play"
+    assert trade_id in [t["id"] for t in client.get("/api/trades?status=OPEN").json()["trades"]]
+    assert client.post(f"/api/trades/{trade_id}/close").json()["ok"]
+    assert client.get("/api/pnl").json()["n_closed"] >= 1
+    closed = [t for t in client.get("/api/trades?limit=50").json()["trades"] if t["status"] == "CLOSED"]
+    assert closed and closed[0]["realized_pl"] is not None
 
-    r = client.post(f"/api/plays/{chosen['id']}/approve").json()
-    assert r["ok"] and r["status"] == "FILLED"
 
-    open_trades = client.get("/api/trades?status=OPEN").json()["trades"]
-    assert open_trades
-    tid = open_trades[0]["id"]
-
-    cr = client.post(f"/api/trades/{tid}/close").json()
-    assert cr["ok"]
-    pnl = client.get("/api/pnl").json()
-    assert pnl["n_closed"] >= 1
-
-    hist = [t for t in client.get("/api/trades?limit=50").json()["trades"] if t["status"] == "CLOSED"]
-    assert hist and hist[0]["realized_pl"] is not None
+def test_settings_round_trip_and_the_dashboard_loads(client):
+    r = client.post("/api/settings", json={"cycle_minutes": 20, "hot_list_size": 30}).json()
+    assert r["ok"] and r["scan"]["settings"]["cycle_minutes"] == 20
+    assert client.post("/api/settings", json={"premarket_time": "10:00"}).status_code == 400
+    assert client.get("/").status_code == 200
+    assert "javascript" in client.get("/static/js/main.js").headers["content-type"]

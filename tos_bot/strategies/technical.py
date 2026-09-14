@@ -11,7 +11,6 @@ from __future__ import annotations
 import math
 from typing import List
 
-import numpy as np
 import pandas as pd
 
 from ..analysis import read_row
@@ -66,9 +65,9 @@ class OpeningRangeBreakout(Strategy):
 
         orr = ta.opening_range(ctx.intraday, or_m)
         or_high, or_low = safe_last(orr["or_high"]), safe_last(orr["or_low"])
-        vwap = safe_last(ta.session_vwap(ctx.intraday))
-        atr = safe_last(ta.atr(ctx.intraday, 14))
-        d_atr = safe_last(ta.atr(ctx.daily, 14))
+        vwap = ctx.vwap
+        atr = ctx.intraday_atr
+        d_atr = ctx.daily_atr
         rvol = ctx.rvol()
         price = ctx.price
         if _nan(or_high, or_low, vwap, atr) or or_high <= or_low:
@@ -160,9 +159,9 @@ class VwapReclaim(Strategy):
         today = ctx.today_intraday()
         if today is None or len(today) < 8:
             return []
-        vwap_s = ta.session_vwap(ctx.intraday).reindex(today.index)
+        vwap_s = ctx.vwap_series.reindex(today.index)
         close = today["close"]
-        atr = safe_last(ta.atr(ctx.intraday, 14))
+        atr = ctx.intraday_atr
         if _nan(atr) or atr <= 0:
             return []
         above = (close > vwap_s)
@@ -248,7 +247,7 @@ class EmaPullbackTrend(Strategy):
         f = ta.ema(c, self.params["fast"])
         s = ta.ema(c, self.params["slow"])
         t = ta.ema(c, self.params["trend"])
-        atr = safe_last(ta.atr(ctx.intraday, 14))
+        atr = ctx.intraday_atr
         if any(math.isnan(safe_last(x)) for x in (f, s, t)) or math.isnan(atr) or atr <= 0:
             return []
         price = ctx.price
@@ -331,7 +330,7 @@ class Rsi2MeanReversion(Strategy):
         c = d["close"]
         sma = ta.sma(c, self.params["trend_sma"])
         rsi = ta.rsi(c, self.params["rsi_len"])
-        atr = safe_last(ta.atr(d, 14))
+        atr = ctx.daily_atr
         sma5 = ta.sma(c, 5)
         price = ctx.price
         if math.isnan(safe_last(sma)) or math.isnan(atr) or atr <= 0:
@@ -397,7 +396,7 @@ class BollingerFade(Strategy):
         d = ctx.daily
         bb = ta.bollinger(d["close"], self.params["length"], self.params["mult"])
         adx = safe_last(ta.adx(d, 14)["adx"])
-        atr = safe_last(ta.atr(d, 14))
+        atr = ctx.daily_atr
         price = ctx.price
         mid, lower, upper = safe_last(bb["mid"]), safe_last(bb["lower"]), safe_last(bb["upper"])
         pctb = safe_last(bb["pct_b"])
@@ -463,7 +462,7 @@ class AtrChannelBreakout(Strategy):
         adxdf = ta.adx(d, 14)
         adx = safe_last(adxdf["adx"])
         adx_prev = float(adxdf["adx"].iloc[-3]) if len(adxdf) > 3 else adx
-        atr = safe_last(ta.atr(d, 14))
+        atr = ctx.daily_atr
         price = ctx.price
         upper, lower, mid = safe_last(kc["upper"]), safe_last(kc["lower"]), safe_last(kc["mid"])
         if any(math.isnan(x) for x in (upper, lower, mid, adx, atr)) or atr <= 0:
@@ -527,9 +526,9 @@ class GapAndGo(Strategy):
         prior_close = float(ctx.daily["close"].iloc[-2]) if len(ctx.daily) >= 2 else float(ctx.daily["close"].iloc[-1])
         day_open = float(today["open"].iloc[0])
         gap_pct = (day_open / prior_close - 1.0) * 100.0
-        rvol = ta.rel_volume_intraday(ctx.intraday)
-        vwap = safe_last(ta.session_vwap(ctx.intraday))
-        atr = safe_last(ta.atr(ctx.intraday, 14))
+        rvol = ctx.rvol()
+        vwap = ctx.vwap
+        atr = ctx.intraday_atr
         price = ctx.price
         if math.isnan(vwap) or math.isnan(atr) or atr <= 0 or rvol < self.params["rvol_min"]:
             return []
@@ -592,7 +591,7 @@ class Week52Breakout(Strategy):
         hi_52 = float(d["high"].max())
         lo_52 = float(d["low"].min())
         price = ctx.price
-        atr = safe_last(ta.atr(ctx.daily, 14))
+        atr = ctx.daily_atr
         vol = float(d["volume"].iloc[-1])
         vol_avg = float(d["volume"].tail(20).mean())
         if math.isnan(atr) or atr <= 0 or vol_avg <= 0:
@@ -663,7 +662,7 @@ class AbcdPattern(Strategy):
         seg = today.tail(w)
         if len(seg) < 6:
             return []
-        atr = safe_last(ta.atr(ctx.intraday, 14))
+        atr = ctx.intraday_atr
         rvol = ctx.rvol()
         if _nan(atr) or atr <= 0:
             return []
@@ -690,7 +689,7 @@ class AbcdPattern(Strategy):
             return []
 
         entry = max(price, C)
-        stop = C - max(0.25 * atr, 0.02 * C * 0.0 + 0.03)
+        stop = C - max(0.25 * atr, 0.03)
         move = B - A
         targets = [B, B + move]             # D = retest of B, then measured move
         conf = min(0.80, 0.44 + 0.12 * (rvol - 1) + 0.10 * ((C - A) / move if move else 0))
@@ -738,7 +737,7 @@ class MomentumFlag(Strategy):
         fb = int(self.params["flag_bars"])
         if today is None or len(today) < fb + 5:
             return []
-        atr = safe_last(ta.atr(ctx.intraday, 14))
+        atr = ctx.intraday_atr
         rvol = ctx.rvol()
         if _nan(atr) or atr <= 0:
             return []
@@ -819,8 +818,8 @@ class RedToGreen(Strategy):
         prev_close = ctx.prev_close()
         day_open = float(today["open"].iloc[0])
         price = ctx.price
-        atr = safe_last(ta.atr(ctx.intraday, 14))
-        vwap = safe_last(ta.session_vwap(ctx.intraday))
+        atr = ctx.intraday_atr
+        vwap = ctx.vwap
         rvol = ctx.rvol()
         if _nan(atr, vwap, prev_close) or atr <= 0 or prev_close <= 0:
             return []
@@ -904,8 +903,8 @@ class IntradayReversal(Strategy):
         rsi = ta.rsi(close, 14)
         run = ta.consecutive_run(close)
         r = safe_last(rsi)
-        atr = safe_last(ta.atr(ctx.intraday, 14))
-        vwap = safe_last(ta.session_vwap(ctx.intraday))
+        atr = ctx.intraday_atr
+        vwap = ctx.vwap
         if _nan(r, atr, vwap) or atr <= 0:
             return []
         if abs(run) < int(self.params["min_run"]):
@@ -1003,7 +1002,7 @@ class SupportResistanceBounce(Strategy):
         today = ctx.today_intraday()
         if today is None or len(today) < 6:
             return []
-        atr = safe_last(ta.atr(ctx.intraday, 14))
+        atr = ctx.intraday_atr
         if _nan(atr) or atr <= 0:
             return []
         price = ctx.price
@@ -1101,7 +1100,7 @@ class DivergenceReversal(Strategy):
         d = ctx.daily
         c = d["close"]
         rsi = ta.rsi(c, 14)
-        atr = safe_last(ta.atr(d, 14))
+        atr = ctx.daily_atr
         if _nan(atr) or atr <= 0:
             return []
         rsi_div = ta.rsi_divergence(c, rsi, lb)
@@ -1117,7 +1116,7 @@ class DivergenceReversal(Strategy):
             if lvl is None:
                 return []
             entry = price
-            stop = min(float(d["low"].tail(10).min()), lvl.price) - self.params["stop_atr"] * atr * 0.0 - 0.02
+            stop = min(float(d["low"].tail(10).min()), lvl.price) - 0.02
             stop = min(stop, entry - self.params["stop_atr"] * atr)
             up = sr.nearest_above(price)
             targets = [up.price if up else entry + 2.0 * atr, entry + 3.5 * atr]

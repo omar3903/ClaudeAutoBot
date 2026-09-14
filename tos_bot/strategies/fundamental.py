@@ -11,11 +11,10 @@ from __future__ import annotations
 
 import math
 import statistics
-from typing import List, Optional
+from typing import List
 
 from ..core.enums import Side, StrategyKind, Timeframe
 from ..core.models import Play
-from ..indicators import ta
 from ..valuation import (
     DcfInputs,
     MethodRange,
@@ -27,14 +26,8 @@ from ..valuation import (
     peer_median_multiples,
     relative_value_signal,
 )
-from .base import Strategy, StrategyContext, safe_last
+from .base import Strategy, StrategyContext
 from .registry import register
-
-
-def _daily_atr(ctx: StrategyContext) -> float:
-    if not ctx.enough_daily(20):
-        return math.nan
-    return safe_last(ta.atr(ctx.daily, 14))
 
 
 def _clamp_target(price: float, target: float, side: Side, max_move: float = 0.20) -> float:
@@ -70,7 +63,7 @@ class RelativeValueComps(Strategy):
         fin = ctx.fundamentals
         if fin is None or not fin.has_min_data() or not ctx.peers:
             return []
-        atr = _daily_atr(ctx)
+        atr = ctx.daily_atr
         if math.isnan(atr) or atr <= 0:
             return []
 
@@ -152,7 +145,7 @@ class DcfFairValueGap(Strategy):
         fin = ctx.fundamentals
         if fin is None or not fin.has_min_data():
             return []
-        atr = _daily_atr(ctx)
+        atr = ctx.daily_atr
         if math.isnan(atr) or atr <= 0:
             return []
 
@@ -225,7 +218,7 @@ class ValuationFootballField(Strategy):
         fin = ctx.fundamentals
         if fin is None or not fin.has_min_data() or not ctx.enough_daily(200):
             return []
-        atr = _daily_atr(ctx)
+        atr = ctx.daily_atr
         if math.isnan(atr) or atr <= 0:
             return []
         price = ctx.price
