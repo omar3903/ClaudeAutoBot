@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Dict, FrozenSet, List, Optional
 
 from ..core.eventbus import BUS
 from ..util import clock
@@ -27,38 +28,66 @@ log = logging.getLogger(__name__)
 
 
 class ExitManager:
-    def __init__(self, repo, executor, quote_fn: Callable[[str], Any], cfg, bus=BUS) -> None:
+    def __init__(self, repo, executor, quote_fn: Callable[[str], Any], cfg, bus=BUS,
+                 venue: Optional[str] = None) -> None:
         self.repo = repo
+        self.venue = venue                  # only manage trades held on this venue
         self.executor = executor
         self.quote_fn = quote_fn
         self.cfg = cfg
         self.bus = bus
         self._closing: set = set()          # trade ids we've already sent a close for
         self._overdue_seen: set = set()     # trade ids we've already flagged as overdue
+        self._not_held: set = set()         # trade ids whose position the broker doesn't show
+        self._prices: Dict[str, Optional[float]] = {}   # this pass's quotes
+
+    @property
+    def closing(self) -> FrozenSet[str]:
+        """Trades whose automatic close has been sent."""
+        return frozenset(self._closing)
 
     # ------------------------------------------------------------------ #
     def run_once(self) -> List[Dict[str, Any]]:
         if not bool(getattr(self.cfg, "enabled", True)):
             return []
-        acted: List[Dict[str, Any]] = []
         try:
             open_trades = self.repo.open_trades()
         except Exception:  # noqa: BLE001
             log.exception("exit manager: could not list open trades")
             return []
-        for t in open_trades:
-            if t["id"] in self._closing:
-                continue
-            try:
-                r = self._manage(t)
-                if r:
-                    acted.append(r)
-            except Exception:  # noqa: BLE001
-                log.exception("exit manager failed for %s", t.get("id"))
+        # only trades held on this venue - an exit can't be sent anywhere else
+        mine = [t for t in open_trades if t["id"] not in self._closing
+                and not (self.venue and (t.get("broker") or self.venue) != self.venue)]
+        self._prices = self._fetch_prices({t["symbol"] for t in mine})
+        acted: List[Dict[str, Any]] = []
+        try:
+            for t in mine:
+                try:
+                    r = self._manage(t)
+                    if r:
+                        acted.append(r)
+                except Exception:  # noqa: BLE001
+                    log.exception("exit manager failed for %s", t.get("id"))
+        finally:
+            self._prices = {}
         return acted
+
+    def _fetch_prices(self, symbols) -> Dict[str, Optional[float]]:
+        """One quote per symbol, fetched concurrently - with several positions a
+        sequential pass would delay the last one's stop check by seconds."""
+        syms = sorted(symbols)
+        if len(syms) < 2:
+            return {s: self._fetch_price(s) for s in syms}
+        with ThreadPoolExecutor(max_workers=min(8, len(syms))) as ex:
+            return dict(zip(syms, ex.map(self._fetch_price, syms)))
 
     # ------------------------------------------------------------------ #
     def _quote_price(self, symbol: str) -> Optional[float]:
+        if symbol in self._prices:
+            return self._prices[symbol]
+        return self._fetch_price(symbol)
+
+    def _fetch_price(self, symbol: str) -> Optional[float]:
         try:
             q = self.quote_fn(symbol)
         except Exception as e:  # noqa: BLE001
@@ -75,8 +104,13 @@ class ExitManager:
             log.info("AUTO-EXIT %s: %s  P/L %.2f", tid, reason, trade.get("realized_pl") or 0.0)
             self.bus.publish("exit.triggered", trade_id=tid, reason=reason, trade=trade)
             return {"trade_id": tid, "reason": reason, "trade": trade}
-        # close didn't take (order working / market shut) - allow a retry next tick
+        # close didn't take (order working / market shut / nothing held) - allow a retry next tick
         self._closing.discard(tid)
+        if out and out.get("not_held") and tid not in self._not_held:
+            # say it once; the engine's broker check removes the record once confirmed
+            self._not_held.add(tid)
+            log.warning("AUTO-EXIT %s skipped: %s", tid, out.get("reason"))
+            self.bus.publish("exit.not_held", trade_id=tid, reason=out.get("reason"))
         return None
 
     # ------------------------------------------------------------------ #

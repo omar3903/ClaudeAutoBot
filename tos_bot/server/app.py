@@ -1,33 +1,58 @@
-"""FastAPI app: REST + a WebSocket that streams engine events to the dashboard."""
+"""FastAPI app: REST + a WebSocket that streams engine events to the dashboard.
+
+Endpoints that touch secrets, exit every position or quit the app are
+same-machine only (see :mod:`tos_bot.server.security`). Handlers that call into
+the engine are plain ``def``, so FastAPI runs them in its thread pool and a
+slow broker call never stalls the event loop that feeds the WebSocket.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import logging
+import mimetypes
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from ..config import get_settings
+from ..config import Settings, get_settings
 from ..core.eventbus import BUS
+from ..data.sectors import SECTORS
 from ..engine import TradingEngine
+from ..scanner.filters import SIDES, TIMEFRAMES
+from .security import require_local
 
 log = logging.getLogger(__name__)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+LOCAL_ONLY = [Depends(require_local)]
+# Windows can map .js to text/plain, and browsers refuse to run modules served that way
+mimetypes.add_type("text/javascript", ".js")
 
 
-def create_app() -> FastAPI:
+def _result(res: Dict[str, Any]) -> JSONResponse:
+    return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+
+
+def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngine) -> FastAPI:
     settings = get_settings()
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         BUS.bind_loop(asyncio.get_running_loop())
-        engine = TradingEngine(settings)
+        engine = engine_factory(settings)
+
+        def shutdown() -> None:
+            if app.state.shutdown is not None:
+                app.state.shutdown()
+            else:
+                log.warning("quit finished - stop the server process to exit")
+
+        engine.on_shutdown = shutdown
         app.state.engine = engine
         # start() spawns its own daemon threads and returns quickly
         await asyncio.get_running_loop().run_in_executor(None, engine.start)
@@ -37,147 +62,176 @@ def create_app() -> FastAPI:
         finally:
             engine.stop()
 
-    app = FastAPI(title="AutoTradeBot", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="AutoTradeBot", version="0.4.0", lifespan=lifespan)
+    app.state.shutdown = None           # run.py wires this to the uvicorn server
 
-    def eng(app_: FastAPI) -> TradingEngine:
-        return app_.state.engine
+    def eng() -> TradingEngine:
+        return app.state.engine
 
-    # ---- state / plays -------------------------------------------- #
+    # ---- state and plays ------------------------------------------------ #
     @app.get("/api/state")
-    async def state():
-        return eng(app).snapshot()
+    def state():
+        return eng().snapshot()
 
     @app.get("/api/plays")
-    async def plays():
-        return {"plays": eng(app).current_plays()}
-
-    @app.get("/api/plays/{play_id}")
-    async def play_detail(play_id: str):
-        p = eng(app).get_play(play_id)
-        if not p:
-            raise HTTPException(404, "play not found")
-        return p
+    def plays():
+        return {"plays": eng().current_plays()}
 
     @app.post("/api/plays/{play_id}/assess")
-    async def assess(play_id: str):
-        return eng(app).assess_play(play_id)
+    def assess(play_id: str):
+        return eng().assess_play(play_id)
 
     @app.post("/api/plays/{play_id}/approve")
-    async def approve(play_id: str):
-        res = eng(app).approve_play(play_id)
-        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+    def approve(play_id: str):
+        return _result(eng().approve_play(play_id))
 
     @app.post("/api/plays/{play_id}/reject")
-    async def reject(play_id: str):
-        return eng(app).reject_play(play_id)
+    def reject(play_id: str):
+        return eng().reject_play(play_id)
 
-    # ---- trades / pnl ------------------------------------------ #
+    # ---- trades and P/L ------------------------------------------------- #
     @app.get("/api/trades")
-    async def trades(status: Optional[str] = None, limit: int = 100):
-        repo = eng(app).repo
-        if status == "OPEN":
-            return {"trades": repo.open_trades()}
-        return {"trades": repo.recent_trades(limit)}
+    def trades(status: Optional[str] = None, limit: int = 100):
+        repo = eng().repo
+        return {"trades": repo.open_trades() if status == "OPEN" else repo.recent_trades(limit)}
 
-    @app.get("/api/trades/{trade_id}")
-    async def trade(trade_id: str):
-        t = eng(app).repo.get_trade(trade_id)
-        if not t:
-            raise HTTPException(404, "trade not found")
-        return t
+    @app.post("/api/trades/close-all", dependencies=LOCAL_ONLY)
+    def close_all():
+        return _result(eng().close_all_positions())
+
+    @app.get("/api/trades/{trade_id}/record")
+    def trade_record(trade_id: str):
+        rec = eng().trade_record(trade_id)
+        if not rec:
+            raise HTTPException(404, "trade record not found (it may have been removed)")
+        return rec
 
     @app.post("/api/trades/{trade_id}/close")
-    async def close_trade(trade_id: str):
-        res = eng(app).close_position(trade_id, reason="manual")
-        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+    def close_trade(trade_id: str):
+        return _result(eng().close_position(trade_id, reason="manual"))
 
     @app.post("/api/trades/{trade_id}/managed")
-    async def set_managed(trade_id: str, body: dict):
-        return eng(app).set_trade_managed(trade_id, bool((body or {}).get("on", True)))
+    def set_managed(trade_id: str, body: dict):
+        return _result(eng().set_trade_managed(trade_id, bool((body or {}).get("on", True))))
 
     @app.get("/api/pnl")
-    async def pnl():
-        return eng(app).repo.pnl_summary()
+    def pnl():
+        return eng().repo.pnl_summary()
 
-    # ---- account / market ------------------------------------ #
+    # ---- account and routing -------------------------------------------- #
     @app.post("/api/account/refresh")
-    async def account_refresh():
-        return eng(app).refresh_account_now()
+    def account_refresh():
+        return eng().refresh_account_now()
 
-    @app.get("/api/market")
-    async def market():
-        from ..util import clock as _clock
-        return _clock.market_status()
-
-    @app.post("/api/paper/reconcile")
-    async def paper_reconcile():
-        res = eng(app).reconcile_paper()
-        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
-
-    @app.get("/api/equity-curve")
-    async def equity_curve():
-        return {"points": eng(app).repo.equity_curve()}
-
-    # ---- broker mode (paper <-> live) --------------------- #
-    @app.get("/api/broker")
-    async def broker_state():
-        s = eng(app).snapshot()
-        return {"mode": s["mode"], "broker": s["broker"], "live": s["live"],
-                "data_source": s["data_source"], "data_is_real": s["data_is_real"],
-                "armed": s["armed"], "app_mode": s["app_mode"]}
-
-    @app.post("/api/broker")
-    async def set_broker(body: dict):
-        res = eng(app).set_mode((body or {}).get("mode", ""))
-        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+    @app.post("/api/mode")
+    def set_mode(body: dict):
+        return _result(eng().set_mode((body or {}).get("mode", "")))
 
     @app.post("/api/paper/reset")
-    async def paper_reset(body: dict):
+    def paper_reset(body: dict):
         cash = (body or {}).get("cash")
-        res = eng(app).reset_paper(float(cash) if cash is not None else None)
-        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+        return _result(eng().reset_paper(float(cash) if cash is not None else None))
 
-    # ---- autopilot (hands-off entry) ---------------------- #
-    @app.get("/api/autopilot")
-    async def autopilot_state():
-        return eng(app).snapshot().get("autopilot", {})
+    @app.get("/api/capital")
+    def capital():
+        return {"capital": eng().capital_state()}
 
-    @app.post("/api/autopilot")
-    async def set_autopilot(body: dict):
-        res = eng(app).set_autopilot(**(body or {}))
-        return JSONResponse(res, status_code=200 if res.get("ok") else 400)
+    @app.post("/api/capital")
+    def set_capital(body: dict):
+        return _result(eng().set_capital((body or {}).get("amount")))
 
-    # ---- scan / strategies / auth -------------------------- #
-    @app.post("/api/scan/now")
-    async def scan_now():
-        return eng(app).trigger_scan()
+    # ---- quitting (same machine only) ----------------------------------- #
+    @app.get("/api/quit", dependencies=LOCAL_ONLY)
+    def quit_preview():
+        return eng().quit_preview()
 
-    @app.get("/api/scans")
-    async def scans():
-        return {"last": eng(app).snapshot().get("scan", {})}
+    @app.post("/api/quit", dependencies=LOCAL_ONLY)
+    def quit_app(body: dict):
+        return _result(eng().begin_quit(close_all=bool((body or {}).get("close_all", True))))
+
+    # ---- connections (same machine only) -------------------------------- #
+    @app.get("/api/setup", dependencies=LOCAL_ONLY)
+    def setup():
+        return eng().setup_state()
+
+    @app.post("/api/setup/paper-platform", dependencies=LOCAL_ONLY)
+    def setup_paper_platform(body: dict):
+        return _result(eng().set_paper_platform((body or {}).get("paper_platform")))
+
+    @app.post("/api/setup/secrets", dependencies=LOCAL_ONLY)
+    def setup_secrets(body: dict):
+        return _result(eng().save_secrets((body or {}).get("values") or {}))
+
+    # a probe that finds nothing listening is an answer, not a bad request - 200 + ok flag
+    @app.post("/api/setup/reconnect", dependencies=LOCAL_ONLY)
+    def setup_reconnect():
+        return eng().reconnect()
+
+    @app.post("/api/setup/ibkr/test", dependencies=LOCAL_ONLY)
+    def ibkr_test(body: dict):
+        return eng().probe_ibkr((body or {}).get("account", "paper"))
+
+    # ---- filters, strategies, Autopilot --------------------------------- #
+    @app.get("/api/filters")
+    def get_filters():
+        return {"filters": eng().filters.as_dict(), "all_sectors": list(SECTORS),
+                "sides": list(SIDES), "timeframes": list(TIMEFRAMES)}
+
+    @app.post("/api/filters")
+    def set_filters(body: dict):
+        b = body or {}
+        return _result(eng().set_filters(sides=b.get("sides"), timeframes=b.get("timeframes"),
+                                         sectors=b.get("sectors")))
 
     @app.get("/api/strategies")
-    async def strategies():
-        return {"strategies": eng(app).strategy_catalog()}
+    def strategies():
+        return {"strategies": eng().strategy_state()}
 
-    @app.get("/api/auth")
-    async def auth_status():
-        return eng(app).snapshot().get("token", {})
+    @app.post("/api/strategies/reset")
+    def reset_strategies():
+        return _result(eng().reset_strategies())
 
-    @app.post("/api/auth/reauth")
-    async def reauth():
-        return eng(app).reauthenticate()
+    @app.post("/api/strategies/{key}")
+    def set_strategy(key: str, body: dict):
+        b = body or {}
+        return _result(eng().set_strategy(key, enabled=b.get("enabled"), weight=b.get("weight")))
 
-    # ---- websocket ------------------------------------------- #
+    @app.post("/api/autopilot")
+    def set_autopilot(body: dict):
+        return _result(eng().set_autopilot(**(body or {})))
+
+    # ---- scans, scan settings, watchlist -------------------------------- #
+    @app.post("/api/scan")
+    def scan(body: dict):
+        return _result(eng().request_scan((body or {}).get("kind", "cycle")))
+
+    @app.get("/api/settings")
+    def scan_settings():
+        return eng().scan_status()
+
+    @app.post("/api/settings")
+    def set_scan_settings(body: dict):
+        b = body or {}
+        return _result(eng().set_scan_settings(
+            premarket_time=b.get("premarket_time"), cycle_minutes=b.get("cycle_minutes"),
+            hot_list_size=b.get("hot_list_size"), sector_queue_size=b.get("sector_queue_size")))
+
+    @app.get("/api/watchlist")
+    def watchlist():
+        return eng().watchlist_state()
+
+    # ---- websocket -------------------------------------------------------- #
     @app.websocket("/ws")
     async def ws(sock: WebSocket):
         await sock.accept()
         q: asyncio.Queue = asyncio.Queue(maxsize=1000)
         BUS.add_queue(q)
+        loop = asyncio.get_running_loop()
         try:
-            await sock.send_json({"topic": "hello", "payload": eng(app).snapshot()})
-            await sock.send_json({"topic": "plays.updated",
-                                  "payload": {"plays": eng(app).current_plays()}})
+            snap = await loop.run_in_executor(None, eng().snapshot)
+            await sock.send_json({"topic": "hello", "payload": snap})
+            rows = await loop.run_in_executor(None, eng().current_plays)
+            await sock.send_json({"topic": "plays.updated", "payload": {"plays": rows}})
             while True:
                 evt = await q.get()
                 await sock.send_json(evt.as_dict())
@@ -188,12 +242,12 @@ def create_app() -> FastAPI:
         finally:
             BUS.remove_queue(q)
 
-    # ---- static dashboard --------------------------------- #
+    # ---- the dashboard ------------------------------------------------------ #
     if WEB_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
         @app.get("/")
-        async def index():
+        def index():
             return FileResponse(str(WEB_DIR / "index.html"))
 
     return app

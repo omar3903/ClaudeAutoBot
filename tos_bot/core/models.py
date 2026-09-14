@@ -35,16 +35,6 @@ def _new_id(prefix: str) -> str:
 #  Market data                                                               #
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
-class Bar:
-    ts: datetime
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
-
-
-@dataclass(frozen=True)
 class Quote:
     symbol: str
     bid: float
@@ -66,17 +56,6 @@ class Quote:
         return 0.0
 
 
-@dataclass(frozen=True)
-class Instrument:
-    symbol: str
-    asset_class: AssetClass = AssetClass.EQUITY
-    name: str = ""
-    exchange: str = ""
-    cusip: str = ""
-    tick_size: float = 0.01
-    lot_size: float = 1.0
-
-
 # --------------------------------------------------------------------------- #
 #  Account / positions                                                       #
 # --------------------------------------------------------------------------- #
@@ -91,10 +70,6 @@ class Position:
     @property
     def side(self) -> Side:
         return Side.LONG if self.quantity >= 0 else Side.SHORT
-
-    @property
-    def market_value(self) -> float:
-        return self.quantity * self.market_price
 
     @property
     def unrealized_pl(self) -> float:
@@ -113,6 +88,11 @@ class Account:
     positions: List[Position] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
     ts: datetime = field(default_factory=_utcnow)
+    #: the account's own currency. equity / cash / buying_power above are always
+    #: USD, because US stocks are sized in dollars; usd_per_base converts one unit
+    #: of the account currency to USD (0.0 = no rate known, nothing gets sized)
+    base_currency: str = "USD"
+    usd_per_base: float = 1.0
 
     def position(self, symbol: str) -> Optional[Position]:
         for p in self.positions:
@@ -168,23 +148,8 @@ class OrderResult:
 
 
 # --------------------------------------------------------------------------- #
-#  Scanner + Play                                                            #
+#  Play                                                                      #
 # --------------------------------------------------------------------------- #
-@dataclass
-class ScanCandidate:
-    """A symbol that survived the pre-filter and is worth running strategies on."""
-
-    symbol: str
-    price: float
-    dollar_volume: float
-    atr_pct: float
-    rvol: float                          # today's volume vs. 20-day average, so far
-    gap_pct: float
-    change_pct: float
-    spread_bps: float = 0.0
-    notes: Dict[str, Any] = field(default_factory=dict)
-
-
 @dataclass
 class Play:
     """A single actionable idea shown in the dashboard.
@@ -212,7 +177,7 @@ class Play:
     evidence: Dict[str, Any] = field(default_factory=dict)
     tags: List[str] = field(default_factory=list)
     asset_class: AssetClass = AssetClass.EQUITY
-    sector: str = ""                     # GICS sector of the underlying
+    sector: str = ""                     # one of data/sectors.py SECTORS
     #: may this idea be entered in the pre / post-market session too?
     extended_hours_ok: bool = False
     #: expected time to exit (minutes if intraday, trading days if swing)

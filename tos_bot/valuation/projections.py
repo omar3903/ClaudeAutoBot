@@ -1,7 +1,15 @@
 """The "Seven Methods of Projections" (Pignataro Ch. 1, pp. 49-51).
 
 Used to project a base-year metric (revenue, EBITDA, UFCF, ...) forward for
-the DCF. Each returns a list of length ``years``.
+the DCF. Each returns a list of length ``years``:
+
+    conservative   max of the last 3 years
+    aggressive     min of the last 3 years
+    average        average of the last 3 years
+    last_year      most recent actual
+    repeat_cycle   replay the historical sequence
+    yoy_growth     apply a constant YoY growth rate
+    pct_of_line    as a % of another projected line item
 """
 
 from __future__ import annotations
@@ -9,16 +17,6 @@ from __future__ import annotations
 import math
 import statistics
 from typing import List, Optional
-
-SEVEN_METHODS = [
-    "conservative",   # 1. max of the last 3 years
-    "aggressive",     # 2. min of the last 3 years
-    "average",        # 3. average of the last 3 years
-    "last_year",      # 4. most recent actual
-    "repeat_cycle",   # 5. replay the historical sequence
-    "yoy_growth",     # 6. apply a constant YoY growth rate
-    "pct_of_line",    # 7. as a % of another projected line item
-]
 
 
 def _clean(history: List[float]) -> List[float]:

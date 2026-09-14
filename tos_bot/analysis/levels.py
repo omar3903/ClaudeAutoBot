@@ -11,12 +11,10 @@ A level is an **area**, not a number - Aziz uses roughly 5-10c per side.
 
 from __future__ import annotations
 
-import datetime as dt
 import math
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-import numpy as np
 import pandas as pd
 
 
@@ -50,10 +48,6 @@ class SupportResistance:
         px = self.last_price if px is None else px
         near = [l for l in self.levels if l.contains(px, tol_pct)]
         return max(near, key=lambda l: l.strength) if near else None
-
-    def as_rows(self) -> list:
-        return [{"price": round(l.price, 2), "kind": l.kind,
-                 "strength": round(l.strength, 2), "sources": l.sources} for l in self.levels]
 
 
 def _round_number_levels(low: float, high: float) -> List[float]:

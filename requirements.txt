@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------
-# tos-trader requirements
-# Python 3.9+  (tested on 3.9 and 3.11)
+# AutoTradeBot requirements
+# Python 3.10+  (ib_async needs 3.10)
 # ---------------------------------------------------------------------------
 
 # --- core engine ---
@@ -10,36 +10,20 @@ pydantic>=2.6
 pydantic-settings>=2.2
 PyYAML>=6.0
 python-dotenv>=1.0
-python-dateutil>=2.9
-pytz>=2024.1
-tenacity>=8.2            # retry/backoff for API calls
 
 # --- persistence (SQLite works out of the box; MySQL optional) ---
 SQLAlchemy>=2.0
 PyMySQL>=1.1             # only needed if you point DATABASE_URL at MySQL
-cryptography>=42.0       # Fernet encryption for the OAuth token file
 
 # --- web dashboard ---
 fastapi>=0.110
 uvicorn[standard]>=0.29
-jinja2>=3.1
 websockets>=12.0
 
-# --- market data / fundamentals ---
-yfinance>=0.2.40         # free fundamentals + backup price history
-requests>=2.31
-
-# --- brokerage adapters (NOT needed for paper mode - install when going live) ---
-# schwab-py>=1.4         # LIVE adapter: pip install schwab-py   (pin a version you've tested)
-# tda-api>=1.6           # legacy / reference only - TD Ameritrade API is decommissioned
-# ib_async>=1.0          # Interactive Brokers (later)
-# ccxt>=4.3              # crypto exchanges (later)
-
-# --- optional: unattended token re-authentication ---
-# playwright>=1.44       # headless broker login; run `playwright install chromium`
-# keyring>=25.0          # OS credential store for the automated re-auth path
+# --- market data ---
+ib_async>=1.0.3          # Interactive Brokers, via a running IB Gateway / TWS
+requests>=2.31           # US listings (Nasdaq Trader), SEC EDGAR financials, ECB exchange rates
 
 # --- dev ---
 pytest>=8.0
-pytest-asyncio>=0.23
 httpx>=0.27              # required by starlette's TestClient (tests/test_api_e2e.py)

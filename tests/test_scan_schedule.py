@@ -1,0 +1,134 @@
+"""When the scans run, the day's hot list and sector buffers, and the play board."""
+
+from __future__ import annotations
+
+import datetime as dt
+
+import pytest
+
+from tos_bot.core.enums import Side, StrategyKind, Timeframe
+from tos_bot.core.models import Play
+from tos_bot.engine.board import PlayBoard
+from tos_bot.scanner import schedule
+from tos_bot.scanner.heat import DailyMetrics
+from tos_bot.scanner.schedule import ScanSettings
+from tos_bot.scanner.watchlist import DayWatchlist
+from tos_bot.util import clock
+
+MONDAY = dt.date(2026, 9, 14)
+
+
+def at(day: dt.date, hour: int, minute: int = 0) -> dt.datetime:
+    return dt.datetime(day.year, day.month, day.day, hour, minute, tzinfo=clock.NY)
+
+
+# ---------------------------------------------------------------- the market clock
+def test_the_next_session_change_is_exact():
+    assert clock.next_session_change(at(MONDAY, 3)) == (at(MONDAY, 4), clock.Session.PRE)
+    assert clock.next_session_change(at(MONDAY, 9, 29)) == (at(MONDAY, 9, 30), clock.Session.REGULAR)
+    half_day = dt.date(2026, 11, 27)
+    assert clock.next_session_change(at(half_day, 12)) == (at(half_day, 13), clock.Session.POST)
+    # Friday night -> Tuesday morning, past the weekend and Labor Day
+    assert clock.next_session_change(at(dt.date(2026, 9, 4), 20, 30)) == (at(dt.date(2026, 9, 8), 4), clock.Session.PRE)
+
+
+# ---------------------------------------------------------------- scan settings and schedule
+def test_scan_settings_are_validated():
+    s = ScanSettings()
+    assert s.changed(premarket_time="07:05", cycle_minutes="30").as_dict() == {
+        "premarket_time": "07:05", "cycle_minutes": 30, "hot_list_size": 20, "sector_queue_size": 25}
+    with pytest.raises(ValueError, match="04:00 to 09:00"):
+        s.changed(premarket_time="09:15")
+    with pytest.raises(ValueError, match="look like"):
+        s.changed(premarket_time="soon")
+    with pytest.raises(ValueError, match="between 5 and 60"):
+        s.changed(cycle_minutes=2)
+    assert ScanSettings.load({"cycle_minutes": 999}, s) == s               # a bad saved value falls back
+    assert ScanSettings.load({"hot_list_size": 30, "bogus": 1}, s).hot_list_size == 30
+
+
+def test_which_session_a_watchlist_is_for():
+    assert schedule.watchlist_session(at(MONDAY, 8)) == MONDAY
+    assert schedule.watchlist_session(at(MONDAY, 16, 30)) == dt.date(2026, 9, 15)
+    assert schedule.watchlist_session(at(dt.date(2026, 9, 12), 11)) == MONDAY          # Saturday
+    assert schedule.watchlist_session(at(dt.date(2026, 9, 7), 10)) == dt.date(2026, 9, 8)   # Labor Day
+    assert schedule.last_completed_session(at(MONDAY, 8)) == dt.date(2026, 9, 11)
+    assert schedule.last_completed_session(at(MONDAY, 16, 5)) == MONDAY
+
+
+def test_the_full_scan_runs_once_a_day_before_the_open():
+    s, friday = ScanSettings(premarket_time="08:30"), dt.date(2026, 9, 11)
+    assert schedule.full_scan_due(at(MONDAY, 2), s, None, have_any=False)        # nothing at all: build one now
+    assert not schedule.full_scan_due(at(MONDAY, 7), s, friday, have_any=True)   # not time yet
+    assert schedule.full_scan_due(at(MONDAY, 8, 31), s, friday, have_any=True)
+    assert schedule.full_scan_due(at(MONDAY, 11), s, friday, have_any=True)      # started late: catch up
+    assert not schedule.full_scan_due(at(MONDAY, 11), s, MONDAY, have_any=True)  # already built today
+    assert not schedule.full_scan_due(at(MONDAY, 20), s, MONDAY, have_any=True)  # tomorrow's waits for its time
+    assert schedule.next_full_scan_at(at(MONDAY, 7), s, friday) == at(MONDAY, 8, 30)
+    assert schedule.next_full_scan_at(at(MONDAY, 11), s, MONDAY) == at(dt.date(2026, 9, 15), 8, 30)
+
+
+# ---------------------------------------------------------------- the day's watchlist
+def _metric(symbol: str, heat: float) -> DailyMetrics:
+    return DailyMetrics(symbol, 50.0, 1e8, 3.0, 2.0, 1.5, 0.8, heat)
+
+
+def _sector(symbol: str) -> str:
+    return {"T": "Technology", "E": "Energy"}.get(symbol[0], "")
+
+
+@pytest.fixture
+def watchlist():
+    ranked = ([_metric(f"T{i}", 1 - i / 100) for i in range(10)] + [_metric("U1", 0.8)]
+              + [_metric(f"E{i}", 0.5 - i / 100) for i in range(5)])
+    return DayWatchlist.build(MONDAY, dt.date(2026, 9, 11), ranked, _sector, hot_size=6, queue_size=3,
+                              universe=100, liquid=16)
+
+
+def test_the_hot_list_takes_no_more_than_a_third_from_one_sector(watchlist):
+    assert watchlist.hot_symbols() == ["T0", "T1", "E0", "E1"]                  # U1 has no sector: skipped
+    assert {s: [c.symbol for c in q] for s, q in watchlist.queues.items()} == {
+        "Technology": ["T2", "T3", "T4"], "Energy": ["E2", "E3", "E4"]}
+
+
+def test_a_cycle_adopts_keeps_or_drops_each_buffer_name(watchlist):
+    picks = watchlist.next_picks(per_sector=1)
+    decisions = watchlist.apply_cycle({"T0": 0.2, "T1": 0.5, "E0": 0.6, "E1": 0.7, "T2": 0.9, "E2": 0.1},
+                                      picks, kept_per_sector=1)
+    assert {d.symbol: (d.action, d.replaced) for d in decisions} == {"T2": ("adopted", "T0"), "E2": ("kept", "")}
+    assert watchlist.hot_symbols() == ["T2", "T1", "E0", "E1"]
+    assert watchlist.kept_symbols() == ["E2"] and watchlist.searched == {"Technology": 1, "Energy": 1}
+    assert [c.symbol for c in watchlist.queues["Technology"]] == ["T3", "T4"]
+
+    picks = watchlist.next_picks(per_sector=1)                                   # T3 and E3
+    decisions = watchlist.apply_cycle({"T1": 0.5, "E0": 0.6, "E1": 0.7, "T2": 0.9, "E2": 0.3, "E3": 0.2},
+                                      picks, kept_per_sector=1)
+    assert {d.symbol: d.action for d in decisions} == {"T3": "dropped", "E2": "kept", "E3": "dropped"}
+
+
+def test_a_watchlist_survives_a_restart_and_old_ones_are_pruned(watchlist, tmp_path):
+    watchlist.apply_cycle({"T2": 0.9}, watchlist.next_picks(1), kept_per_sector=1)
+    watchlist.save(tmp_path)
+    assert DayWatchlist.load_latest(tmp_path).state() == watchlist.state()
+    for day in range(1, 8):
+        DayWatchlist.build(dt.date(2026, 8, day), dt.date(2026, 8, day), [], _sector, 5, 10, 0, 0).save(tmp_path)
+    assert len(list(tmp_path.glob("watchlist_*.json"))) == 5
+
+
+# ---------------------------------------------------------------- the play board
+def _play(symbol: str, minutes_left: float = 45) -> Play:
+    return Play(symbol=symbol, side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=10.0, stop=9.5, targets=[11.0],
+                expires_at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes_left))
+
+
+def test_a_cycle_replaces_only_the_plays_for_the_symbols_it_scanned():
+    board = PlayBoard()
+    swing, old_hot, stale = _play("SWG"), _play("HOT"), _play("OLD", minutes_left=-1)
+    board.replace([swing, old_hot, stale])
+    new_hot = _play("HOT")
+    board.replace([new_hot], scanned=["HOT", "BUF"])
+    assert set(board.plays) == {swing.id, new_hot.id}                          # the expired one went too
+    assert board.keep_only(lambda p: p.symbol != "SWG") == 1
+    board.replace([], scanned=None)                                             # a full scan covers everything
+    assert len(board) == 0
