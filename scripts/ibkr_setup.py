@@ -1,15 +1,15 @@
 #!/usr/bin/env python
-"""IBKR connectivity doctor + setup guide.
+"""IB Gateway connectivity doctor + setup guide.
 
-    python scripts/ibkr_setup.py            # probe both ports, connect, report
+    python scripts/ibkr_setup.py            # probe both ports, connect read-only, report
     python scripts/ibkr_setup.py --live     # prefer the live port
     python scripts/ibkr_setup.py --symbol MSFT
     python scripts/ibkr_setup.py --guide    # just print the setup walkthrough
 
-It never sends an order. It connects read-only, prints your managed accounts,
-net liquidation value, and a sample quote (telling you whether the feed is
-real-time or 15-minute delayed), then reminds you how to make the daily
-Gateway login hands-off with IBC.
+It never sends an order. It connects read-only under its own client id, prints
+the account, a sample quote and a few candles (saying whether the data is
+real-time or delayed), then reminds you how to make the daily Gateway login
+hands-off with IBC.
 """
 
 from __future__ import annotations
@@ -22,14 +22,17 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from tos_bot.config import get_settings  # noqa: E402
 
+#: the app uses IBKR_CLIENT_ID, and +50 for the dashboard's Test buttons
+DOCTOR_CLIENT_OFFSET = 60
+
 GUIDE = r"""
 ============================================================================
  Interactive Brokers - one-time setup
 ============================================================================
 
-IBKR has NO API token and NO 60-day expiry. The API is a socket into a
-running IB Gateway (or TWS). Auth = the Gateway login, which IBKR restarts
-once a day. IBC makes that hands-off.
+IBKR has NO API token and NO expiry. The API is a socket into a running
+IB Gateway (or TWS). The login is the Gateway's, which IBKR restarts once a
+day. IBC makes that hands-off.
 
 1. PAPER ACCOUNT
    Client Portal -> Settings -> Account Settings -> "Paper Trading Account".
@@ -37,17 +40,19 @@ once a day. IBC makes that hands-off.
    "Share real-time market data subscriptions with paper account" so the
    paper feed matches live.
 
-2. MARKET DATA (for real-time quotes; skip for 15-min delayed)
+2. MARKET DATA (for real-time quotes; skip for delayed)
    Client Portal -> Settings -> Market Data Subscriptions. For US stocks the
    cheap option is "US Securities Snapshot and Futures Value Bundle"
    (~USD 10/mo, waived if commissions >= USD 30/mo). Without a subscription
-   the bot still works on delayed data and labels the feed "delayed".
+   the bot still works: it scans on IBKR's candles, prices stops and targets
+   off the latest one-minute candle, and labels the feed "delayed".
 
 3. IB GATEWAY  (lighter than TWS - install this)
    https://www.interactivebrokers.com/en/trading/ibgateway-stable.php
    Launch it, log in with your PAPER user first.
    Configure -> Settings -> API -> Settings:
-     [x] Enable ActiveX and Socket Clients
+     [x] Enable ActiveX and Socket Clients   (older versions only - newer
+                                              ones have the API on already)
      [ ] Read-Only API           (untick so the bot can place orders;
                                   leave ticked + set IBKR_READONLY=1 for
                                   data-only)
@@ -70,9 +75,8 @@ once a day. IBC makes that hands-off.
    - Start it with  C:\IBC\StartGateway.bat  (add a Windows Task Scheduler
      entry "At log on" to make it survive reboots).
 
-5. .env   (in this project)
-       BROKER=paper
-       LIVE_BROKER=ibkr
+5. .env   (in this project - or use Connections in the dashboard)
+       PAPER_PLATFORM=ibkr             # or simulator
        IBKR_HOST=127.0.0.1
        IBKR_PAPER_PORT=4002
        IBKR_LIVE_PORT=4001
@@ -98,61 +102,60 @@ def main() -> None:
         print(GUIDE)
         return
 
+    from tos_bot.brokers.ibkr_adapter import IbkrBroker
+    from tos_bot.util.net import port_is_open
+
     s = get_settings().secrets
-    from tos_bot.brokers.ibkr_adapter import IbkrBroker, port_is_open
-
     host = s.ibkr_host or "127.0.0.1"
-    paper_port = s.ibkr_port or s.ibkr_paper_port
-    live_port = s.ibkr_port or s.ibkr_live_port
-
+    ports = {account: s.ibkr_port_for(account) for account in ("paper", "live")}
     print(f"probing {host} ...")
-    p_up = port_is_open(host, paper_port)
-    l_up = port_is_open(host, live_port)
-    print(f"  paper port {paper_port}: {'OPEN' if p_up else 'closed'}")
-    print(f"  live  port {live_port}: {'OPEN' if l_up else 'closed'}")
-
-    if not (p_up or l_up):
+    up = {account: port_is_open(host, port) for account, port in ports.items()}
+    for account, port in ports.items():
+        print(f"  {account:<5} port {port}: {'OPEN' if up[account] else 'closed'}")
+    if not any(up.values()):
         print("\nNo Gateway/TWS is listening. Run  python scripts/ibkr_setup.py --guide\n")
         sys.exit(1)
 
-    mode = "live" if (args.live and l_up) else ("paper" if p_up else "live")
-    port = live_port if mode == "live" else paper_port
-    print(f"\nconnecting {mode} (port {port}), read-only ...")
-    b = IbkrBroker(port=port, mode=mode, readonly=True)
+    mode = "live" if (args.live and up["live"]) or not up["paper"] else "paper"
+    print(f"\nconnecting to the {mode} account (port {ports[mode]}), read-only ...")
+    broker = IbkrBroker(port=ports[mode], mode=mode, readonly=True,
+                        client_id=int(s.ibkr_client_id) + DOCTOR_CLIENT_OFFSET)
     try:
-        b.connect()
+        broker.connect()
     except Exception as e:  # noqa: BLE001
         print(f"  connect failed: {e}")
         sys.exit(1)
 
-    st = b.session_status()
-    print(f"  connected: account(s) via login, using {st['market_data']} market data")
+    status = broker.session_status()
+    print(f"  connected, using {status['market_data']} market data")
     try:
-        acc = b.get_account()
+        acc = broker.get_account()
         print(f"  account   : {acc.account_id}")
-        print(f"  equity    : {acc.equity:,.2f}")
-        print(f"  cash      : {acc.cash:,.2f}")
+        print(f"  equity    : {acc.equity:,.2f} USD" + (f"  ({acc.base_currency} account)" if acc.base_currency != "USD" else ""))
         print(f"  positions : {len(acc.positions)}")
     except Exception as e:  # noqa: BLE001
-        print(f"  get_account failed: {e}")
+        print(f"  account failed: {e}")
 
     try:
-        q = b.get_quote(args.symbol)
+        q = broker.get_quote(args.symbol)
         print(f"  {args.symbol:<6}    : last {q.last}  bid {q.bid}  ask {q.ask}  "
-              f"({'DELAYED ~15m' if st['market_data'] == 'delayed' else 'real-time'})")
+              f"({'delayed' if status['market_data'] == 'delayed' else 'real-time'})")
     except Exception as e:  # noqa: BLE001
-        print(f"  get_quote failed: {e}")
+        print(f"  quote failed: {e}")
 
     try:
-        h = b.get_price_history(args.symbol, "5m", 2)
-        print(f"  history   : {len(h)} x 5-min bars, latest close {h['close'].iloc[-1]:.2f} "
-              f"@ {h.index[-1]}")
+        candles = broker.history_many({args.symbol: ("5 mins", "2 D")}).get(args.symbol)
+        if candles is None:
+            print("  candles   : none returned")
+        else:
+            print(f"  candles   : {len(candles)} x 5-min bars, latest close "
+                  f"{candles['close'].iloc[-1]:.2f} @ {candles.index[-1]}")
     except Exception as e:  # noqa: BLE001
-        print(f"  get_price_history failed: {e}")
+        print(f"  candles failed: {e}")
 
-    b.close()
-    print("\nOK. Set  LIVE_BROKER=ibkr  in .env and start the app.")
-    if st["market_data"] == "delayed":
+    broker.close()
+    print("\nOK. Start the app with  python run.py")
+    if status["market_data"] == "delayed":
         print("Tip: subscribe to US market data (step 2 in --guide) for real-time quotes.")
 
 

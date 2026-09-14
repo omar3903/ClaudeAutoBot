@@ -42,6 +42,7 @@ CREATE INDEX ix_order_audit_trade_id ON order_audit (trade_id);
 
 CREATE TABLE IF NOT EXISTS scan_runs (
 	id VARCHAR(32) NOT NULL, 
+	kind VARCHAR(8) NOT NULL, 
 	started_at DATETIME NOT NULL, 
 	finished_at DATETIME, 
 	universe_size INTEGER NOT NULL, 
@@ -54,18 +55,6 @@ CREATE TABLE IF NOT EXISTS scan_runs (
 	PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE INDEX ix_scan_runs_started_at ON scan_runs (started_at);
-
-CREATE TABLE IF NOT EXISTS token_audit (
-	id INTEGER NOT NULL AUTO_INCREMENT, 
-	ts DATETIME NOT NULL, 
-	broker VARCHAR(16) NOT NULL, 
-	event VARCHAR(32) NOT NULL, 
-	refresh_token_age_days FLOAT, 
-	refresh_token_expires_at DATETIME, 
-	detail VARCHAR(400) NOT NULL, 
-	PRIMARY KEY (id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-CREATE INDEX ix_token_audit_ts ON token_audit (ts);
 
 CREATE TABLE IF NOT EXISTS play_logs (
 	id VARCHAR(32) NOT NULL, 

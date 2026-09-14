@@ -1,10 +1,10 @@
 """Read and update the machine-local ``.env`` from the dashboard.
 
-Only a fixed allow-list of broker settings can be written. Values are validated
-(no line breaks, so nothing can smuggle extra lines into the file), the file is
-replaced atomically with comments and unrelated lines preserved, and secret
-values are never sent back to the browser - only whether they're set and their
-last four characters.
+Only a fixed allow-list of IB Gateway settings can be written. Values are
+validated (no line breaks, so nothing can smuggle extra lines into the file),
+the file is replaced atomically with comments and unrelated lines preserved,
+and secret values are never sent back to the browser - only whether they're
+set and their last four characters.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
-from urllib.parse import urlparse
 
 from dotenv import dotenv_values
 
@@ -25,9 +24,8 @@ from .config import ENV_PATH, Secrets
 class EnvField:
     key: str
     label: str
-    group: str                      # "schwab" | "ibkr"
     secret: bool = False
-    kind: str = "text"              # text | int | bool | choice | url
+    kind: str = "text"              # text | int | bool | choice
     choices: Tuple[str, ...] = ()
     help: str = ""
     min: int = 0
@@ -35,28 +33,17 @@ class EnvField:
 
 
 FIELDS: Tuple[EnvField, ...] = (
-    EnvField("SCHWAB_API_KEY", "App key", "schwab", secret=True,
-             help="developer.schwab.com → Dashboard → your app → App Key"),
-    EnvField("SCHWAB_APP_SECRET", "App secret", "schwab", secret=True,
-             help="shown next to the App Key once Schwab approves the app"),
-    EnvField("SCHWAB_CALLBACK_URL", "Callback URL", "schwab", kind="url",
-             help="must match your Schwab app exactly, e.g. https://127.0.0.1:8182"),
-    EnvField("SCHWAB_ACCOUNT_ID", "Account number", "schwab", secret=True,
-             help="optional - only if you have more than one Schwab account"),
-    EnvField("IBKR_HOST", "Gateway host", "ibkr",
-             help="127.0.0.1 unless IB Gateway runs on another computer"),
-    EnvField("IBKR_PAPER_PORT", "Paper port", "ibkr", kind="int", min=1, max=65535,
-             help="IB Gateway 4002 · TWS 7497"),
-    EnvField("IBKR_LIVE_PORT", "Live port", "ibkr", kind="int", min=1, max=65535,
-             help="IB Gateway 4001 · TWS 7496"),
-    EnvField("IBKR_CLIENT_ID", "Client ID", "ibkr", kind="int", min=0, max=999999,
+    EnvField("IBKR_HOST", "Gateway host", help="127.0.0.1 unless IB Gateway runs on another computer"),
+    EnvField("IBKR_PAPER_PORT", "Paper port", kind="int", min=1, max=65535, help="IB Gateway 4002 · TWS 7497"),
+    EnvField("IBKR_LIVE_PORT", "Live port", kind="int", min=1, max=65535, help="IB Gateway 4001 · TWS 7496"),
+    EnvField("IBKR_CLIENT_ID", "Client ID", kind="int", min=0, max=999999,
              help="any number not used by another app on the same Gateway"),
-    EnvField("IBKR_ACCOUNT_ID", "Account ID", "ibkr", secret=True,
+    EnvField("IBKR_ACCOUNT_ID", "Account ID", secret=True,
              help="optional - DU… (paper) / U… (live) if the login has several accounts"),
-    EnvField("IBKR_MARKET_DATA", "Market data", "ibkr", kind="choice",
+    EnvField("IBKR_MARKET_DATA", "Market data", kind="choice",
              choices=("auto", "live", "delayed", "delayed-frozen"),
-             help="auto = real-time if you're subscribed, otherwise 15-min delayed"),
-    EnvField("IBKR_READONLY", "Read-only (data only, never send orders)", "ibkr", kind="bool"),
+             help="auto = real-time if you're subscribed, otherwise delayed"),
+    EnvField("IBKR_READONLY", "Read-only (data only, never send orders)", kind="bool"),
 )
 _BY_KEY = {f.key: f for f in FIELDS}
 
@@ -81,12 +68,12 @@ def describe(path: Path = ENV_PATH) -> List[Dict[str, Any]]:
         value = env.get(f.key, "")
         default = defaults.get(f.key.lower())
         row: Dict[str, Any] = {
-            "key": f.key, "label": f.label, "group": f.group, "secret": f.secret,
-            "kind": f.kind, "choices": list(f.choices), "help": f.help, "set": bool(value),
+            "key": f.key, "label": f.label, "secret": f.secret, "kind": f.kind,
+            "choices": list(f.choices), "help": f.help, "set": bool(value),
             "default": "" if default is None or default.default in (None, "") else str(default.default),
         }
         if f.secret:
-            row["hint"] = ("…" + value[-4:]) if len(value) >= 8 else ""
+            row["hint"] = mask(value) if len(value) >= 8 else ""
         else:
             row["value"] = value
         out.append(row)
@@ -108,9 +95,7 @@ def validate(updates: Mapping[str, Any]) -> Dict[str, str]:
             raise ValueError(f"{f.label}: line breaks aren't allowed")
         if len(v) > _MAX_LEN:
             raise ValueError(f"{f.label}: too long")
-        if v:
-            v = _check(f, v)
-        clean[key] = v
+        clean[key] = _check(f, v) if v else v
     return clean
 
 
@@ -130,19 +115,7 @@ def _check(f: EnvField, v: str) -> str:
         return "1" if low in ("1", "true", "yes", "on") else "0"
     if f.kind == "choice" and v not in f.choices:
         raise ValueError(f"{f.label}: must be one of {', '.join(f.choices)}")
-    if f.kind == "url":
-        u = urlparse(v)
-        if u.scheme != "https" or u.hostname != "127.0.0.1" or not _has_port(u):
-            raise ValueError(f"{f.label}: must look like https://127.0.0.1:8182 "
-                             "(the sign-in helper only accepts 127.0.0.1 with a port)")
     return v
-
-
-def _has_port(u) -> bool:
-    try:
-        return u.port is not None
-    except ValueError:
-        return False
 
 
 def write(updates: Mapping[str, Any], path: Path = ENV_PATH) -> List[str]:

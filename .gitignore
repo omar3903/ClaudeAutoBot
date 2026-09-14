@@ -11,6 +11,9 @@ token_key.bin
 data/cache/
 data/paper_state.json
 data/runtime.json
+data/bars/
+data/symbols.json
+data/watchlists/
 logs/
 *.sqlite
 *.sqlite3

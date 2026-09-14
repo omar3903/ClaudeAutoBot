@@ -51,3 +51,26 @@ def test_opening_range_shape(frame):
     orr = ta.opening_range(frame, 15)
     assert set(["or_high", "or_low"]).issubset(orr.columns)
     assert (orr["or_high"] >= orr["or_low"]).dropna().all()
+
+
+def _session(day, bars, volume):
+    idx = pd.date_range(pd.Timestamp(f"{day} 09:30", tz="America/New_York"), periods=bars, freq="5min")
+    return pd.DataFrame({"open": 10.0, "high": 10.1, "low": 9.9, "close": 10.0,
+                         "volume": np.full(bars, volume)}, index=idx)
+
+
+def test_relative_volume_compares_the_same_time_of_day():
+    # two full sessions at 1,000 a bar, then the first 50 minutes of today at 2,000 a bar
+    frame = pd.concat([_session("2026-02-02", 78, 1000.0), _session("2026-02-03", 78, 1000.0),
+                       _session("2026-02-04", 10, 2000.0)])
+    assert ta.rel_volume_intraday(frame) == pytest.approx(2.0)
+    assert ta.rel_volume_intraday(_session("2026-02-04", 10, 2000.0)) == 1.0      # no history: neutral
+
+
+def test_beta_measures_how_much_a_stock_moves_with_the_market():
+    idx = pd.bdate_range("2025-01-01", periods=250, tz="America/New_York")
+    market_returns = np.random.default_rng(3).normal(0, 0.01, len(idx))
+    market = pd.Series(100 * np.cumprod(1 + market_returns), index=idx)
+    stock = pd.Series(50 * np.cumprod(1 + 2 * market_returns), index=idx)
+    assert ta.beta(stock, market) == pytest.approx(2.0)
+    assert np.isnan(ta.beta(stock.tail(30), market.tail(30)))                   # too short to say

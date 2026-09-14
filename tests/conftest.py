@@ -1,3 +1,6 @@
+"""Every test run gets its own database, .env, data folder and runtime file, so
+nothing a test does can touch yours."""
+
 from __future__ import annotations
 
 import os
@@ -5,24 +8,13 @@ import tempfile
 
 import pytest
 
-# isolate every test run's DB before tos_bot.persistence is imported anywhere
-_TMPDB = os.path.join(tempfile.gettempdir(), "tos_trader_pytest.sqlite")
-if os.path.exists(_TMPDB):
-    os.remove(_TMPDB)
-os.environ["DATABASE_URL"] = f"sqlite:///{_TMPDB}"
-os.environ["BROKER"] = "paper"
-# never read (or let a test write) the real .env
-_TMP_ENV = os.path.join(tempfile.gettempdir(), "tos_trader_pytest.env")
-if os.path.exists(_TMP_ENV):
-    os.remove(_TMP_ENV)
-os.environ["ATB_ENV_PATH"] = _TMP_ENV
+_RUN_DIR = tempfile.mkdtemp(prefix="atb-tests-")
+os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(_RUN_DIR, "tests.sqlite").replace("\\", "/")
+os.environ["ATB_ENV_PATH"] = os.path.join(_RUN_DIR, "tests.env")
+os.environ["ATB_DATA_DIR"] = os.path.join(_RUN_DIR, "data")
+os.environ["TOS_RUNTIME_PATH"] = os.path.join(_RUN_DIR, "runtime.json")
 os.environ["OPEN_BROWSER_ON_START"] = "0"
-os.environ["PAPER_PERSIST"] = "0"          # tests never touch data/paper_state.json
-# tests never rewrite the user's data/runtime.json (mode + autopilot knobs)
-_TMP_RUNTIME = os.path.join(tempfile.gettempdir(), "tos_trader_pytest_runtime.json")
-if os.path.exists(_TMP_RUNTIME):
-    os.remove(_TMP_RUNTIME)
-os.environ["TOS_RUNTIME_PATH"] = _TMP_RUNTIME
+os.environ["PAPER_PERSIST"] = "0"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -34,29 +26,22 @@ def _db():
 
 
 @pytest.fixture
-def md():
-    from tos_bot.data.market_data import MarketDataService, SyntheticProvider
-    return MarketDataService(providers=[SyntheticProvider(seed=99)], cache=False,
-                             min_interval_between_calls=0.0)
-
-
-@pytest.fixture
-def paper(md):
-    from tos_bot.brokers.paper_adapter import PaperBroker
-    b = PaperBroker(starting_cash=5000.0, data_service=md, persist=False)
-    b.connect()
-    return b
-
-
-@pytest.fixture
 def repo():
     from tos_bot.persistence.repository import Repository
     return Repository()
 
 
 @pytest.fixture
-def synth_frames(md):
-    intr = md.get_price_history("TESTX", "5m", 10)
-    daily = md.get_price_history("TESTX", "1d", 400)
-    q = md.get_quote("TESTX")
-    return intr, daily, q
+def paper():
+    from fakes import fixed_quote
+    from tos_bot.brokers.paper_adapter import PaperBroker
+    broker = PaperBroker(quote=fixed_quote(), starting_cash=5000.0)
+    broker.connect()
+    return broker
+
+
+@pytest.fixture
+def synth_frames():
+    import fakes
+    intraday = fakes.intraday_bars("TESTX")
+    return intraday, fakes.daily_bars("TESTX"), fakes.quote_from_price("TESTX", float(intraday["close"].iloc[-1]))

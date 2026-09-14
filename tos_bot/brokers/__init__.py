@@ -1,11 +1,7 @@
-"""Broker adapters. ``get_broker(name, **kwargs)`` is the only entry point the
-rest of the app uses; every adapter implements :class:`BrokerAdapter`.
+"""Broker adapters: the built-in simulator and Interactive Brokers.
 
-* ``paper``  - the built-in simulator, no credentials, always available
-* ``ibkr``   - Interactive Brokers via ``ib_async`` -> IB Gateway / TWS (paper + live)
-* ``schwab`` - Charles Schwab / thinkorswim via ``schwab-py`` (live + real-time data)
-
-Which one trades is decided by :mod:`tos_bot.brokers.venues`.
+``get_broker(name, **kwargs)`` is the one entry point; which one trades is
+decided by :mod:`tos_bot.brokers.venues`.
 """
 
 from __future__ import annotations
@@ -16,7 +12,6 @@ from .base import BrokerAdapter, BrokerError, OrderRejected
 
 
 def get_broker(name: str, **kwargs: Any) -> BrokerAdapter:
-    name = (name or "paper").lower()
     if name == "paper":
         from .paper_adapter import PaperBroker
 
@@ -25,11 +20,7 @@ def get_broker(name: str, **kwargs: Any) -> BrokerAdapter:
         from .ibkr_adapter import IbkrBroker
 
         return IbkrBroker(**kwargs)
-    if name == "schwab":
-        from .schwab_adapter import SchwabBroker
-
-        return SchwabBroker(**kwargs)
-    raise BrokerError(f"unknown broker '{name}' (use paper, ibkr or schwab)")
+    raise BrokerError(f"unknown broker '{name}' (use paper or ibkr)")
 
 
 __all__ = ["BrokerAdapter", "BrokerError", "OrderRejected", "get_broker"]

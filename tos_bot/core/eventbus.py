@@ -1,9 +1,8 @@
-"""A tiny synchronous + async pub/sub bus.
+"""A tiny pub/sub bus from the engine's threads to the dashboard.
 
-The engine publishes domain events (`scan.completed`, `play.proposed`,
-`order.filled`, `auth.reauth_required`, ...). The web layer subscribes an
-``asyncio.Queue`` per websocket client; other modules can register plain
-callables. Nothing here depends on FastAPI.
+The engine publishes domain events (``scan.completed``, ``order.filled``,
+``quit.done``, ...). The web layer registers an ``asyncio.Queue`` per
+WebSocket client. Nothing here depends on FastAPI.
 """
 
 from __future__ import annotations
@@ -11,10 +10,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Set
+from typing import Any, Dict, Set
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +29,6 @@ class Event:
 
 class EventBus:
     def __init__(self) -> None:
-        self._sync_subs: Dict[str, List[Callable[[Event], None]]] = defaultdict(list)
         self._queues: Set[asyncio.Queue] = set()
         self._lock = threading.RLock()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -41,17 +38,6 @@ class EventBus:
         """Called once from the web server so background threads can push
         events into asyncio queues safely."""
         self._loop = loop
-
-    def subscribe(self, topic: str, fn: Callable[[Event], None]) -> Callable[[], None]:
-        with self._lock:
-            self._sync_subs[topic].append(fn)
-
-        def _unsub() -> None:
-            with self._lock:
-                if fn in self._sync_subs[topic]:
-                    self._sync_subs[topic].remove(fn)
-
-        return _unsub
 
     def add_queue(self, q: "asyncio.Queue[Event]") -> None:
         with self._lock:
@@ -65,15 +51,7 @@ class EventBus:
     def publish(self, topic: str, **payload: Any) -> None:
         evt = Event(topic=topic, payload=payload)
         with self._lock:
-            sync = list(self._sync_subs.get(topic, ())) + list(self._sync_subs.get("*", ()))
             queues = list(self._queues)
-
-        for fn in sync:
-            try:
-                fn(evt)
-            except Exception:  # noqa: BLE001 - a bad subscriber must not kill the engine
-                log.exception("event subscriber for %s failed", topic)
-
         for q in queues:
             self._offer(q, evt)
 

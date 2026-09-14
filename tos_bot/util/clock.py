@@ -15,7 +15,7 @@ from __future__ import annotations
 import datetime as dt
 from enum import Enum
 from functools import lru_cache
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 try:
     from zoneinfo import ZoneInfo  # py3.9+
@@ -140,28 +140,24 @@ def is_market_open(ts: Optional[dt.datetime] = None) -> bool:
     return current_session(ts) is Session.REGULAR
 
 
-def is_any_session_open(ts: Optional[dt.datetime] = None) -> bool:
-    return current_session(ts).is_open
-
-
-def next_session_change(ts: Optional[dt.datetime] = None):
-    """(datetime, Session) of the next boundary - when the market next changes
-    state. Looks up to ~10 days ahead to clear long weekends / holidays."""
+def next_session_change(ts: Optional[dt.datetime] = None) -> Tuple[Optional[dt.datetime], Session]:
+    """(datetime, Session) of the next boundary - when the market next changes state."""
     ts = _as_ny(ts)
     cur = current_session(ts)
-    probe = ts
-    for _ in range(10 * 24 * 4):          # 15-min steps, ~10 days
-        probe = probe + dt.timedelta(minutes=15)
-        s = current_session(probe)
-        if s != cur:
-            # snap to the exact minute of the change
-            lo = probe - dt.timedelta(minutes=15)
-            for _ in range(15):
-                lo += dt.timedelta(minutes=1)
-                if current_session(lo) == s:
-                    return lo, s
-            return probe, s
+    d = ts.date()
+    for _ in range(15):                   # clears any run of weekends + holidays
+        if is_trading_day(d):
+            for at, session in _boundaries(d):
+                if at > ts and session is not cur:
+                    return at, session
+        d += dt.timedelta(days=1)
     return None, cur
+
+
+def _boundaries(d: dt.date) -> List[Tuple[dt.datetime, Session]]:
+    return [(dt.datetime.combine(d, t, tzinfo=NY), session) for t, session in (
+        (PRE_OPEN, Session.PRE), (OPEN, Session.REGULAR),
+        (regular_close_time(d), Session.POST), (post_close_time(d), Session.CLOSED))]
 
 
 def market_status(ts: Optional[dt.datetime] = None) -> dict:

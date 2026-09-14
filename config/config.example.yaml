@@ -1,17 +1,17 @@
 # ===========================================================================
 # AutoTradeBot configuration.  Copy to  config/config.yaml  and tune.
-# Anything secret (keys, passwords) belongs in .env, not here.
+# Anything secret belongs in .env, not here. What you change on the dashboard
+# (filters, strategies, scan settings, Autopilot) is remembered in
+# data/runtime.json and wins over these defaults.
 # ===========================================================================
 
 app:
-  timezone: "America/New_York"          # market clock everything is aligned to
-  mode: "suggest"                       # suggest = never auto-trades; propose = same, kept for clarity
   log_level: "INFO"
 
 account:
   # Day-trading guard rails. See tos_bot/risk/pdt_guard.py
   min_start_equity: 2000.0              # LIVE only: refuse to arm below this. Ignored in paper mode.
-  paper_start_cash: 100000.0           # opening balance of the paper account (tracked from here on)
+  paper_start_cash: 100000.0           # opening balance of the built-in simulator
   pdt_equity_threshold: 25000.0        # FINRA pattern-day-trader equity line
   max_day_trades_under_threshold: 3    # rolling 5 business days when equity < pdt_equity_threshold
   day_trade_warn_at: 2                 # surface a warning once this many are used
@@ -20,41 +20,32 @@ account:
 risk:
   max_risk_per_trade_pct: 1.0          # % of equity risked between entry and stop
   max_open_risk_pct: 4.0               # sum of open-trade risk not allowed to exceed this
-  max_positions: 5
   max_position_pct_of_equity: 35.0     # notional cap per name
-  default_stop_atr_mult: 1.5           # stop = entry -/+ ATR * this, if strategy gives none
   min_reward_risk: 1.5                 # discard plays whose target/stop R:R is below this
   round_lot: 1                         # share rounding
 
 scanner:
-  interval_seconds: 300                # normal rescan cadence ("every few minutes")
-  # When Autopilot is armed for day trades AND the regular session is open the
-  # scanner switches to this faster cadence, self-throttled so a new cycle never
-  # starts before the previous one has finished (+ a 3s gap) and never faster
-  # than min_interval_seconds. On the free yfinance feed keep this >= ~40.
-  autopilot_interval_seconds: 45
-  min_interval_seconds: 20             # absolute floor - never rescan faster than this
-  # nasdaq | nasdaq100 | sp500 | file
-  # "nasdaq" (the full ~4500 names) is only practical with an entitled real-time
-  # feed (Schwab). On the free yfinance feed use nasdaq100 / sp500 / file so a
-  # cycle finishes in a minute and does not get rate-limited.
-  universe: "nasdaq100"
-  universe_file: "config/watchlist.txt"
+  # Once a day before the open every US stock and ADR is ranked from its daily
+  # candles. The hottest become the day's hot list; the next best in each sector
+  # wait in a buffer. During the session the hot list and a few buffer names per
+  # sector are rescanned on a cycle. The dashboard's Settings override the first
+  # four values.
+  premarket_time: "08:30"              # ET, 04:00-09:00 - the daily full scan
+  cycle_minutes: 15                    # 5-60 - rescan the hot list and buffer names
+  hot_list_size: 20                    # 5-50 - no more than a third from one sector
+  sector_queue_size: 25                # 10-50 - buffer candidates lined up per sector
+  buffer_picks_per_sector: 2           # new buffer names looked at per sector each cycle
+  kept_per_sector: 2                   # promising buffer names kept waiting for a hot-list slot
+  fast_cycle_seconds: 60               # hot list only, while Autopilot day-trades an open session
+  fundamentals_leaders: 8              # valuation setups (SEC EDGAR financials) on this many top names
+  max_universe: 0                      # 0 = every listing; a smaller number caps it (for testing)
   sectors: []                          # only scan + trade these, e.g. ["Technology", "Energy"]; [] = all.
                                        # The dashboard's Sectors button overrides this.
-  shortlist_size: 8                    # how many names to focus on each cycle
-  max_symbols_scanned: 110            # cap per cycle (>= universe size => full sweep)
-  fundamentals_leaders: 8            # run the valuation strategies on this many top names
-  prefilter:
+  prefilter:                           # liquid enough to trade, judged from the daily candles
     min_price: 3.0
     max_price: 600.0
-    min_dollar_volume: 5_000_000       # 20-day avg $ volume
+    min_dollar_volume: 5_000_000       # 20-session average $ volume
     min_atr_pct: 1.0                   # daily ATR as % of price (need range to trade)
-    max_spread_bps: 25                 # skip wide markets
-  bars:
-    intraday_interval: "5m"
-    intraday_lookback_days: 10
-    daily_lookback_days: 400           # enough for 52-week + 200-day metrics
 
 strategies:
   # Toggle individual setups and set per-strategy weight in the blended score.
@@ -83,75 +74,53 @@ strategies:
     valuation_football_field: { enabled: true, weight: 1.0, params: {} }
 
 valuation:
-  # Inputs to the DCF / WACC engine (Pignataro Ch. 9). Overridable per run.
+  # Inputs to the DCF / WACC engine (Pignataro Ch. 9). Financials come from the
+  # companies' SEC filings; companies that don't file US-GAAP 10-Ks sit out.
   # Update rf from treasury.gov (use the 10-30y rate) and the MRP from
   # Damodaran's page (pages.stern.nyu.edu/~adamodar/) - both cited in the book.
   risk_free_rate: 0.042                 # 10-30Y US Treasury
   market_risk_premium: 0.055            # implied US equity risk premium (Damodaran)
   tax_rate: 0.21
-  midyear_convention: true             # book's Amazon example uses end-of-year; this is the banking default
-  terminal_method: "both"              # multiple | perpetuity | both  (report the pair)
-  projection_method: "last_year"       # one of the seven: conservative|aggressive|average|last_year|repeat_cycle|yoy_growth|pct_of_line
+  midyear_convention: true             # the book's Amazon example uses end-of-year; this is the banking default
+  perpetuity_growth: 0.025
+  projection_years: 5
   # UFCF is the NOPAT method (EBIT*(1-t) + D&A + def.tax + non-cash + dNWC - CapEx),
-  # matching the book's Amazon model; falls back to the net-income form then reported FCF.
-  # When the exit-multiple and perpetuity terminal values disagree by > 2.5x the DCF
-  # verdict is "ambiguous" and dcf_fair_value_gap sits out (the book's growth-stock case).
-
-auth:
-  # Schwab / thinkorswim sign-in upkeep (IBKR and the simulator need no token).
-  # Schwab's refresh token lasts 7 days - sign in again from Connections.
-  refresh_token_ttl_days: 7
-  rotate_before_days: 1                # remind you this many days before it expires
-  access_refresh_margin_seconds: 120   # refresh the 30-min access token this early
-  check_interval_seconds: 1800         # how often the token watchdog runs
-  backup_old_tokens: true             # timestamped copy before an expired token is removed
+  # matching the book's Amazon model. When the exit-multiple and perpetuity terminal
+  # values disagree by > 2.5x the DCF verdict is "ambiguous" and dcf_fair_value_gap
+  # sits out (the book's growth-stock case).
 
 execution:
   default_order_type: "LIMIT"          # LIMIT | MARKET | STOP_LIMIT  (regular hours)
   limit_offset_bps: 5                  # cross the spread by this when marketable-limit
   time_in_force: "DAY"
   bracket_orders: true                # attach stop + target as an OCO child (regular hours)
-  confirm_required: true              # UI must click Yes; engine never sends an ENTRY without it
-  allow_extended_hours: true          # permit pre/post-market entries (limit-only) at all
 
 exit_manager:
   # Automatic exit strategy - runs every few seconds, no manual input.
-  # By default entries need your click; exits never do. (autopilot, below, can
-  # take the entry too.)
   enabled: true
   breakeven_at_r: 1.3                 # tighten the stop once the trade is +this R (0 = off)
-  breakeven_lock_r: 0.3             # ...to LOCK +this R of profit, not a pure scratch
-                                     #   (a +1.3R trade that pulls back should still book something)
-  breakeven_buffer_bps: 5            # plus this nudge past the lock point
-  trail_start_r: 2.0                 # begin trailing once past this R (0 = no trailing)
-  trail_lock_ratio: 0.5             # keep the stop at this fraction of the open R
+  breakeven_lock_r: 0.3               # ...to LOCK +this R of profit, not a pure scratch
+  breakeven_buffer_bps: 5             # plus this nudge past the lock point
+  trail_start_r: 2.0                  # begin trailing once past this R (0 = no trailing)
+  trail_lock_ratio: 0.5               # keep the stop at this fraction of the open R
   flatten_intraday_before_close_min: 10   # force-close day trades this many min before the bell
-  max_swing_hold_days: 10           # force-close swing trades held longer than this (0 = off)
+  max_swing_hold_days: 10             # force-close swing trades held longer than this (0 = off)
 
 autopilot:
-  # Hands-off ENTRY. The exit side is already automatic (exit_manager above);
-  # this switch also lets the bot take the entry with no click. Off by default.
-  # Everything here is tunable live from the dashboard toggle.
-  #
-  #   Douglas: "act on your edge without hesitation" - but "predefine the risk".
-  #   Aziz Rule 5: never take worse than 2:1. Rule 10: no emotion. This is that,
-  #   mechanised, inside hard caps.
+  # Hands-off ENTRY. Exits are already automatic (exit_manager above); this
+  # switch also lets the bot take the entry with no click. Off by default, and
+  # tunable live from the dashboard.
   enabled: false                     # master switch
-  allow_live: false                  # HARD gate - autopilot NEVER routes a real order unless true.
-                                     #   With this false, flipping the UI toggle on in Live mode
-                                     #   arms it for PAPER only and says so.
+  allow_live: false                  # HARD gate - Autopilot NEVER routes a real order unless true
   trade_types: ["INTRADAY"]          # what it may auto-take: INTRADAY and/or SWING
-                                     #   e.g. ["INTRADAY", "SWING"] for both
   min_confidence: 0.62               # skip plays the strategy itself isn't confident in
   min_reward_risk: 2.0               # never auto-take a play worse than this (Aziz Rule 5)
   max_auto_positions: 2              # most concurrent open autopilot trades
   max_auto_trades_per_day: 3         # per session; matches the sub-$25k PDT day-trade cap
-  max_open_risk_pct: 4.0             # sum of open autopilot $-risk must stay under this % of equity
-  # anti-concentration / anti-chop - no pile-on in one strategy, no burst of
-  # entries, no ticker flipped long<->short minutes apart:
-  max_per_strategy: 2               # at most this many concurrent auto trades from ONE strategy key
-  max_new_per_cycle: 1             # at most this many NEW auto entries per scan cycle (no bursts)
-  cooldown_after_loss: true        # skip a ticker for the rest of the session after it stops out
+  max_open_risk_pct: 4.0             # open autopilot $-risk must stay under this % of equity
+  max_per_strategy: 2                # at most this many concurrent auto trades from ONE strategy
+  max_new_per_cycle: 1               # at most this many NEW auto entries per scan (no bursts)
+  cooldown_after_loss: true          # skip a ticker for the rest of the session after it stops out
   require_catalyst: false            # true = only auto-take plays tagged gap / catalyst
   dry_run: false                     # true = log every entry it WOULD take but place nothing
 
@@ -159,8 +128,3 @@ database:
   echo_sql: false
   pool_size: 5
   record_rejected_plays: true         # keep every suggestion, not just executed ones
-
-web:
-  title: "AutoTradeBot"
-  theme: "dark"
-  refresh_ms: 2000

@@ -2,13 +2,12 @@
 
 Tables
 ------
-scan_runs          one row per scanner cycle
+scan_runs          one row per scan (full scan, cycle or fast cycle)
 play_logs          EVERY proposed play (accepted or not) - the audit of ideas
 trades             an executed position's full lifecycle + realised P/L
 fills              individual executions attached to a trade
 account_snapshots  periodic equity / cash / buying-power / day-trade count
 order_audit        raw order request + broker response
-token_audit        every token refresh / rotation / re-auth event
 """
 
 from __future__ import annotations
@@ -34,13 +33,15 @@ class ScanRun(Base):
     __tablename__ = "scan_runs"
 
     id: Mapped[str] = mapped_column(sa.String(32), primary_key=True)
+    kind: Mapped[str] = mapped_column(sa.String(8), default="cycle")        # full / cycle / fast
     started_at: Mapped[dt.datetime] = mapped_column(sa.DateTime, default=_utcnow, index=True)
     finished_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
     universe_size: Mapped[int] = mapped_column(sa.Integer, default=0)
     scanned: Mapped[int] = mapped_column(sa.Integer, default=0)
-    prefiltered: Mapped[int] = mapped_column(sa.Integer, default=0)
+    # the column names predate the hot list; existing databases keep them
+    liquid: Mapped[int] = mapped_column("prefiltered", sa.Integer, default=0)
     n_plays: Mapped[int] = mapped_column(sa.Integer, default=0)
-    shortlist: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
+    hot: Mapped[Optional[dict]] = mapped_column("shortlist", sa.JSON, nullable=True)
     n_errors: Mapped[int] = mapped_column(sa.Integer, default=0)
     elapsed_s: Mapped[float] = mapped_column(sa.Float, default=0.0)
 
@@ -180,15 +181,3 @@ class OrderAudit(Base):
     response: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     ok: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     message: Mapped[str] = mapped_column(sa.String(400), default="")
-
-
-class TokenAudit(Base):
-    __tablename__ = "token_audit"
-
-    id: Mapped[int] = mapped_column(sa.Integer, primary_key=True, autoincrement=True)
-    ts: Mapped[dt.datetime] = mapped_column(sa.DateTime, default=_utcnow, index=True)
-    broker: Mapped[str] = mapped_column(sa.String(16), default="schwab")
-    event: Mapped[str] = mapped_column(sa.String(32))   # REFRESH / ROTATE / REAUTH_REQUIRED / REAUTH_OK / ERROR
-    refresh_token_age_days: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
-    refresh_token_expires_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
-    detail: Mapped[str] = mapped_column(sa.String(400), default="")

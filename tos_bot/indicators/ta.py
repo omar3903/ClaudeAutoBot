@@ -1,22 +1,21 @@
 """Vectorised technical indicators.
 
-Every function takes pandas Series / DataFrame and returns the same, so the
-strategies stay one-liners. OHLCV frames are expected to have lowercase
-columns ``open, high, low, close, volume`` and a tz-aware DatetimeIndex.
-No TA-Lib dependency - all pure pandas/numpy so it installs anywhere.
+Every function takes pandas Series / DataFrames and returns the same. OHLCV
+frames have lowercase ``open, high, low, close, volume`` columns and a
+tz-aware DatetimeIndex. Pure pandas / numpy - no TA-Lib.
 """
 
 from __future__ import annotations
 
-from typing import Tuple
+import math
 
 import numpy as np
 import pandas as pd
 
+_NY = "America/New_York"
 
-# --------------------------------------------------------------------------- #
-#  Moving averages / oscillators                                             #
-# --------------------------------------------------------------------------- #
+
+# ---- averages and oscillators -------------------------------------------- #
 def sma(s: pd.Series, length: int) -> pd.Series:
     return s.rolling(length, min_periods=length).mean()
 
@@ -28,263 +27,140 @@ def ema(s: pd.Series, length: int) -> pd.Series:
 def rsi(close: pd.Series, length: int = 14) -> pd.Series:
     """Wilder's RSI."""
     delta = close.diff()
-    up = delta.clip(lower=0.0)
-    down = -delta.clip(upper=0.0)
-    roll_up = up.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
-    roll_down = down.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
-    rs = roll_up / roll_down.replace(0.0, np.nan)
-    out = 100.0 - (100.0 / (1.0 + rs))
-    return out.fillna(100.0).where(roll_down != 0, 100.0)
+    up = delta.clip(lower=0.0).ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+    down = (-delta.clip(upper=0.0)).ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+    out = 100.0 - 100.0 / (1.0 + up / down.replace(0.0, np.nan))
+    return out.fillna(100.0).where(down != 0, 100.0)
 
 
-def macd(
-    close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
-) -> pd.DataFrame:
-    macd_line = ema(close, fast) - ema(close, slow)
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return pd.DataFrame({"macd": macd_line, "signal": signal_line, "hist": hist})
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+    line = ema(close, fast) - ema(close, slow)
+    signal_line = line.ewm(span=signal, adjust=False).mean()
+    return pd.DataFrame({"macd": line, "signal": signal_line, "hist": line - signal_line})
 
 
-def zscore(s: pd.Series, length: int = 20) -> pd.Series:
-    mean = s.rolling(length, min_periods=length).mean()
-    std = s.rolling(length, min_periods=length).std(ddof=0)
-    return (s - mean) / std.replace(0.0, np.nan)
-
-
-def linreg_slope(s: pd.Series, length: int = 20) -> pd.Series:
-    """Slope of an OLS line through the last `length` points, per bar,
-    normalised by price so it reads like a % move per bar."""
-    idx = np.arange(length)
-    denom = (idx - idx.mean()) ** 2
-    denom_sum = denom.sum()
-
-    def _slope(window: np.ndarray) -> float:
-        y = window
-        x = idx - idx.mean()
-        return float((x * (y - y.mean())).sum() / denom_sum)
-
-    raw = s.rolling(length, min_periods=length).apply(_slope, raw=True)
-    return raw / s.replace(0.0, np.nan)
-
-
-# --------------------------------------------------------------------------- #
-#  Range / volatility                                                        #
-# --------------------------------------------------------------------------- #
+# ---- range and volatility -------------------------------------------------- #
 def true_range(df: pd.DataFrame) -> pd.Series:
     prev_close = df["close"].shift(1)
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - prev_close).abs(),
-            (df["low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr
+    return pd.concat([df["high"] - df["low"], (df["high"] - prev_close).abs(),
+                      (df["low"] - prev_close).abs()], axis=1).max(axis=1)
 
 
 def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    tr = true_range(df)
-    return tr.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+    return true_range(df).ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
 
 
-def atr_pct(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    return atr(df, length) / df["close"] * 100.0
-
-
-def bollinger(
-    close: pd.Series, length: int = 20, mult: float = 2.0
-) -> pd.DataFrame:
+def bollinger(close: pd.Series, length: int = 20, mult: float = 2.0) -> pd.DataFrame:
     mid = sma(close, length)
     std = close.rolling(length, min_periods=length).std(ddof=0)
-    upper = mid + mult * std
-    lower = mid - mult * std
-    width = (upper - lower) / mid.replace(0.0, np.nan)
-    pct_b = (close - lower) / (upper - lower).replace(0.0, np.nan)
-    return pd.DataFrame(
-        {"mid": mid, "upper": upper, "lower": lower, "bandwidth": width, "pct_b": pct_b}
-    )
+    upper, lower = mid + mult * std, mid - mult * std
+    return pd.DataFrame({"mid": mid, "upper": upper, "lower": lower,
+                         "pct_b": (close - lower) / (upper - lower).replace(0.0, np.nan)})
 
 
-def keltner(
-    df: pd.DataFrame, length: int = 20, mult: float = 1.5, atr_len: int = 20
-) -> pd.DataFrame:
+def keltner(df: pd.DataFrame, length: int = 20, mult: float = 1.5, atr_len: int = 20) -> pd.DataFrame:
     mid = ema(df["close"], length)
-    rng = atr(df, atr_len)
-    return pd.DataFrame(
-        {"mid": mid, "upper": mid + mult * rng, "lower": mid - mult * rng}
-    )
-
-
-def donchian(df: pd.DataFrame, length: int = 20) -> pd.DataFrame:
-    upper = df["high"].rolling(length, min_periods=length).max()
-    lower = df["low"].rolling(length, min_periods=length).min()
-    return pd.DataFrame({"upper": upper, "lower": lower, "mid": (upper + lower) / 2.0})
+    band = atr(df, atr_len)
+    return pd.DataFrame({"mid": mid, "upper": mid + mult * band, "lower": mid - mult * band})
 
 
 def adx(df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
-    up = df["high"].diff()
-    down = -df["low"].diff()
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    tr = true_range(df)
-    atr_ = tr.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
-    plus_di = 100.0 * pd.Series(plus_dm, index=df.index).ewm(
-        alpha=1.0 / length, adjust=False, min_periods=length
-    ).mean() / atr_.replace(0.0, np.nan)
-    minus_di = 100.0 * pd.Series(minus_dm, index=df.index).ewm(
-        alpha=1.0 / length, adjust=False, min_periods=length
-    ).mean() / atr_.replace(0.0, np.nan)
+    up, down = df["high"].diff(), -df["low"].diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
+
+    def smooth(s: pd.Series) -> pd.Series:
+        return s.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+
+    tr = smooth(true_range(df)).replace(0.0, np.nan)
+    plus_di, minus_di = 100.0 * smooth(plus_dm) / tr, 100.0 * smooth(minus_dm) / tr
     dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
-    adx_ = dx.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
-    return pd.DataFrame({"adx": adx_, "plus_di": plus_di, "minus_di": minus_di})
+    return pd.DataFrame({"adx": smooth(dx), "plus_di": plus_di, "minus_di": minus_di})
 
 
-# --------------------------------------------------------------------------- #
-#  Rolling highs / lows                                                      #
-# --------------------------------------------------------------------------- #
-def rolling_high(s: pd.Series, length: int) -> pd.Series:
-    return s.rolling(length, min_periods=1).max()
+def beta(asset_close: pd.Series, market_close: pd.Series, sessions: int = 252) -> float:
+    """Sensitivity of the asset's daily returns to the market's."""
+    returns = pd.concat([asset_close.pct_change(), market_close.pct_change()], axis=1,
+                        join="inner").dropna().tail(sessions)
+    if len(returns) < 60:
+        return math.nan
+    variance = returns.iloc[:, 1].var()
+    return float(returns.cov().iloc[0, 1] / variance) if variance else math.nan
 
 
-def rolling_low(s: pd.Series, length: int) -> pd.Series:
-    return s.rolling(length, min_periods=1).min()
-
-
-def pct_from_rolling_high(close: pd.Series, length: int) -> pd.Series:
-    hi = rolling_high(close, length)
-    return (close / hi - 1.0) * 100.0
-
-
-def pct_from_rolling_low(close: pd.Series, length: int) -> pd.Series:
-    lo = rolling_low(close, length)
-    return (close / lo - 1.0) * 100.0
-
-
-# --------------------------------------------------------------------------- #
-#  Intraday-specific                                                         #
-# --------------------------------------------------------------------------- #
-def _session_key(index: pd.DatetimeIndex) -> pd.Series:
-    return pd.Series(index.tz_convert("America/New_York").date, index=index)
-
-
+# ---- intraday -------------------------------------------------------------- #
 def session_vwap(df: pd.DataFrame) -> pd.Series:
-    """Volume-weighted average price, reset at each session boundary."""
-    tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    grp = _session_key(df.index)
-    pv = (tp * df["volume"]).groupby(grp).cumsum()
-    vol = df["volume"].groupby(grp).cumsum().replace(0.0, np.nan)
-    out = pv / vol
-    out.index = df.index
-    return out
-
-
-def anchored_vwap(df: pd.DataFrame, anchor_ts) -> pd.Series:
-    tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    mask = df.index >= pd.Timestamp(anchor_ts)
-    pv = (tp * df["volume"]).where(mask, 0.0).cumsum()
-    vol = df["volume"].where(mask, 0.0).cumsum().replace(0.0, np.nan)
-    return pv / vol
+    """Volume-weighted average price, reset at each session."""
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    day = df.index.tz_convert(_NY).date
+    pv = (typical * df["volume"]).groupby(day).cumsum()
+    volume = df["volume"].groupby(day).cumsum().replace(0.0, np.nan)
+    return pv / volume
 
 
 def opening_range(df: pd.DataFrame, minutes: int = 15) -> pd.DataFrame:
-    """First-`minutes` high/low for each session. Returns a frame reindexed to
-    `df` so you can compare `close` against `or_high` / `or_low` per bar."""
-    ny = df.index.tz_convert("America/New_York")
+    """Each session's first-``minutes`` high and low, aligned to every bar."""
+    ny = df.index.tz_convert(_NY)
     since_open = (ny.hour - 9) * 60 + (ny.minute - 30)
-    in_or = (since_open >= 0) & (since_open < minutes)
-    grp = pd.Series(ny.date, index=df.index)
-    or_high = df["high"].where(in_or).groupby(grp).transform("max")
-    or_low = df["low"].where(in_or).groupby(grp).transform("min")
-    return pd.DataFrame(
-        {"or_high": or_high.ffill(), "or_low": or_low.ffill(), "minutes": minutes},
-        index=df.index,
-    )
+    in_range = (since_open >= 0) & (since_open < minutes)
+    day = ny.date
+    return pd.DataFrame({
+        "or_high": df["high"].where(in_range).groupby(day).transform("max").ffill(),
+        "or_low": df["low"].where(in_range).groupby(day).transform("min").ffill(),
+    }, index=df.index)
 
 
 def rel_volume_intraday(intraday: pd.DataFrame, lookback_days: int = 20) -> float:
-    """Rough RVOL: today's cumulative volume so far vs. the average
-    cumulative volume by this time of day over the last `lookback_days`
-    sessions. > 1 means unusually active."""
-    ny = intraday.index.tz_convert("America/New_York")
-    grp = pd.Series(ny.date, index=intraday.index)
-    sessions = list(dict.fromkeys(grp.tolist()))
-    if len(sessions) < 2:
+    """Today's volume so far against the average volume by the same time of
+    day over recent sessions. Above 1 means unusually active."""
+    ny = intraday.index.tz_convert(_NY)
+    day = np.asarray(ny.date)
+    minute = np.asarray(ny.hour * 60 + ny.minute)
+    volume = intraday["volume"].to_numpy(dtype=float)
+    today = day == day[-1]
+    earlier = ~today & (minute <= minute[today].max())
+    by_session = pd.Series(volume[earlier]).groupby(day[earlier]).sum()
+    by_session = by_session[by_session > 0].tail(lookback_days)
+    if by_session.empty:
         return 1.0
-    today = sessions[-1]
-    minute_of_day = (ny.hour * 60 + ny.minute).to_numpy()
-    cur_mask = (grp == today).to_numpy()
-    if not cur_mask.any():
-        return 1.0
-    cur_minute_cutoff = minute_of_day[cur_mask].max()
-    cur_vol = intraday.loc[cur_mask, "volume"].sum()
-
-    prior = sessions[-(lookback_days + 1):-1]
-    ratios = []
-    for d in prior:
-        m = (grp == d).to_numpy() & (minute_of_day <= cur_minute_cutoff)
-        v = intraday.loc[m, "volume"].sum()
-        if v > 0:
-            ratios.append(v)
-    if not ratios:
-        return 1.0
-    avg = float(np.mean(ratios))
-    return float(cur_vol / avg) if avg else 1.0
+    return float(volume[today].sum() / by_session.mean())
 
 
-# --------------------------------------------------------------------------- #
-#  Momentum structure / divergence  (Murphy: oscillator divergence is one of
-#  the most reliable reversal warnings)                                       #
-# --------------------------------------------------------------------------- #
+# ---- momentum structure and divergence (Murphy) ------------------------------ #
 def consecutive_run(close: pd.Series) -> int:
-    """Signed count of the current run of higher/lower closes (e.g. +5 = five
-    up closes in a row, -3 = three down). Aziz's reversal setups key off '5+
-    consecutive candles one direction'."""
-    d = close.diff().to_numpy()
+    """Signed length of the current run of higher (+) or lower (-) closes.
+    Aziz's reversal setups key off five or more candles one way."""
     n = 0
-    for x in d[::-1]:
+    for x in close.diff().to_numpy()[::-1]:
         if x > 0 and n >= 0:
             n += 1
         elif x < 0 and n <= 0:
             n -= 1
         else:
             break
-    return int(n)
+    return n
 
 
 def _last_two_extremes(series: pd.Series, lookback: int, want_high: bool):
-    s = series.tail(lookback)
-    if len(s) < 6:
+    arr = series.tail(lookback).to_numpy()
+    if len(arr) < 6:
         return None
-    arr = s.to_numpy()
-    idx = []
-    for i in range(2, len(arr) - 2):
-        w = arr[i - 2:i + 3]
-        if want_high and arr[i] == w.max():
-            idx.append(i)
-        if not want_high and arr[i] == w.min():
-            idx.append(i)
-    if len(idx) < 2:
-        return None
-    a, b = idx[-2], idx[-1]
-    return (float(arr[a]), float(arr[b]))
+    pick = np.max if want_high else np.min
+    idx = [i for i in range(2, len(arr) - 2) if arr[i] == pick(arr[i - 2:i + 3])]
+    return (float(arr[idx[-2]]), float(arr[idx[-1]])) if len(idx) >= 2 else None
 
 
 def rsi_divergence(close: pd.Series, rsi_series: pd.Series, lookback: int = 40) -> str:
-    """'bullish' = price made a lower low but RSI made a higher low (down-move
-    losing steam); 'bearish' = price higher high, RSI lower high; else ''."""
-    p_low = _last_two_extremes(close, lookback, want_high=False)
-    r_low = _last_two_extremes(rsi_series, lookback, want_high=False)
+    """'bullish' = price made a lower low but the oscillator a higher low;
+    'bearish' = price a higher high, the oscillator a lower high; else ''."""
+    p_low, r_low = _last_two_extremes(close, lookback, False), _last_two_extremes(rsi_series, lookback, False)
     if p_low and r_low and p_low[1] < p_low[0] and r_low[1] > r_low[0]:
         return "bullish"
-    p_hi = _last_two_extremes(close, lookback, want_high=True)
-    r_hi = _last_two_extremes(rsi_series, lookback, want_high=True)
+    p_hi, r_hi = _last_two_extremes(close, lookback, True), _last_two_extremes(rsi_series, lookback, True)
     if p_hi and r_hi and p_hi[1] > p_hi[0] and r_hi[1] < r_hi[0]:
         return "bearish"
     return ""
 
 
 def macd_divergence(close: pd.Series, lookback: int = 40) -> str:
-    hist = macd(close)["hist"]
-    return rsi_divergence(close, hist, lookback)
+    return rsi_divergence(close, macd(close)["hist"], lookback)

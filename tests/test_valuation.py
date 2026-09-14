@@ -26,7 +26,7 @@ from tos_bot.valuation import (
 def _fin(**kw) -> Financials:
     base = dict(
         symbol="X", price=50.0, shares_out=100e6, market_cap=5e9, beta=1.1,
-        sector="Technology", total_debt=1e9, cash_and_st_investments=0.4e9,
+        total_debt=1e9, cash_and_st_investments=0.4e9,
         revenue=[3e9, 3.4e9, 3.9e9, 4.4e9], ebitda=[0.7e9, 0.8e9, 0.95e9, 1.1e9],
         ebit=[0.5e9, 0.58e9, 0.7e9, 0.82e9], net_income=[0.34e9, 0.4e9, 0.5e9, 0.6e9],
         dep_amort=[0.2e9] * 4, interest_expense=[-0.05e9] * 4,

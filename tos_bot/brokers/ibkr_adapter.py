@@ -1,112 +1,107 @@
-"""Interactive Brokers adapter — live **and** paper, via ``ib_async``.
+"""Interactive Brokers - paper and live accounts, orders and market data, via ``ib_async``.
 
-`ib_async` (the maintained fork of `ib_insync`) talks to a running
-**IB Gateway** or **Trader Workstation** on ``127.0.0.1``:
+``ib_async`` talks to a running IB Gateway (or Trader Workstation):
 
-    | app         | paper port | live port |
-    |-------------|-----------|-----------|
-    | IB Gateway  | 4002      | 4001      |
-    | TWS         | 7497      | 7496      |
+    app          paper port   live port
+    IB Gateway   4002         4001
+    TWS          7497         7496
 
-There is **no OAuth token and no 60-day expiry** — the "auth" is the Gateway
-login, which IBKR force-restarts once a day (and fully once a week). Make that
-hands-off with **IBC** (https://github.com/IbcAlpha/IBC), which relaunches
-Gateway and re-enters your stored login. This adapter watches the socket and
-**auto-reconnects** with backoff whenever the session drops, so an IBC restart
-is invisible; if the Gateway is genuinely down it reports that loudly instead.
+There's no token and no expiry: the Gateway login is the authentication, and
+IBKR restarts the Gateway once a day (IBC can log it back in unattended). The
+adapter reconnects with backoff whenever the socket drops.
 
-All `ib_async` work happens on one dedicated asyncio-loop thread
-(:class:`_IBSession`); the public methods are plain blocking calls, so the rest
-of the engine stays synchronous and unaware of asyncio.
+All ``ib_async`` work runs on one asyncio loop in its own thread
+(:class:`_IBSession`); the public methods block, so the rest of the app stays
+synchronous.
 """
 
 from __future__ import annotations
 
 import asyncio
-import datetime as dt
 import logging
 import math
 import threading
 import time
-from concurrent.futures import Future as _CFuture
-from typing import Any, Callable, Dict, List, Optional
+from concurrent.futures import Future
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 
 from ..config import get_settings
-from ..core.enums import AssetClass, OrderType, Side, TimeInForce
+from ..core.enums import OrderType, Side, TimeInForce
 from ..core.models import Account, Fill, OrderRequest, OrderResult, Position, Quote
-from ..util.net import port_is_open  # noqa: F401  (re-exported; tests patch it here)
-from .base import AuthError, BrokerAdapter, NotSupported, OrderRejected
+from ..util.net import port_is_open
+from .base import AuthError, BrokerAdapter, OrderRejected
 
 log = logging.getLogger(__name__)
 
-# our interval label -> IBKR barSizeSetting
-_BAR_SIZE = {
-    "1m": "1 min", "5m": "5 mins", "10m": "10 mins", "15m": "15 mins",
-    "30m": "30 mins", "1h": "1 hour", "1d": "1 day", "1wk": "1 week",
-}
-# IBKR market-data-type codes
-_MDT = {"live": 1, "frozen": 2, "delayed": 3, "delayed-frozen": 4}
-# error codes that mean "no real-time entitlement, delivering delayed instead"
-_DELAYED_ERRS = {10167, 10168, 10197, 10089}
-# error codes that are just connection chatter, not failures
+_MARKET_DATA_TYPES = {"live": 1, "frozen": 2, "delayed": 3, "delayed-frozen": 4}
+# error codes meaning "no real-time subscription" (354 / 10168: not subscribed)
+_DELAYED_ERRS = {10167, 10168, 10197, 10089, 354}
+# connection chatter, not failures
 _INFO_ERRS = {2104, 2106, 2107, 2108, 2158, 2100, 2150, 202}
 
 
-# --------------------------------------------------------------------------- #
-#  one asyncio loop, on its own thread, owning the IB() client                #
-# --------------------------------------------------------------------------- #
+class _QuietDataErrors(logging.Filter):
+    """ib_async logs every "not subscribed" reply as an ERROR. _on_error handles
+    those and explains them once, so keep them out of the console."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(msg.startswith(f"Error {code},") for code in _DELAYED_ERRS)
+
+
+logging.getLogger("ib_async.wrapper").addFilter(_QuietDataErrors())
+
+
 class _IBSession:
+    """One asyncio loop on its own thread, owning the ``ib_async.IB`` client."""
+
     def __init__(self) -> None:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
-        self._up = threading.Event()
-        self.ib = None  # ib_async.IB
+        self._ready = threading.Event()
+        self.ib = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._thread = threading.Thread(target=self._run, name="ibkr-loop", daemon=True)
         self._thread.start()
-        if not self._up.wait(timeout=10):
+        if not self._ready.wait(timeout=10):
             raise AuthError("IBKR event loop failed to start")
 
     def _run(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         try:
-            from ib_async import IB, util
-            try:
-                util.logToConsole(logging.WARNING)
-            except Exception:  # noqa: BLE001
-                pass
+            from ib_async import IB
+
             self.ib = IB()
         except Exception:  # noqa: BLE001
             log.exception("could not create ib_async.IB()")
         finally:
-            self._up.set()
+            self._ready.set()
         self._loop.run_forever()
 
     def run_coro(self, factory: Callable[[Any], Any], timeout: float = 30.0):
-        """`factory(ib)` returns an awaitable; block for its result."""
+        """``factory(ib)`` returns an awaitable; block for its result."""
         if self._loop is None:
             raise AuthError("IBKR loop not started")
-        fut = asyncio.run_coroutine_threadsafe(factory(self.ib), self._loop)
-        return fut.result(timeout=timeout)
+        return asyncio.run_coroutine_threadsafe(factory(self.ib), self._loop).result(timeout=timeout)
 
     def call(self, fn: Callable[[Any], Any], timeout: float = 15.0):
-        """`fn(ib)` is a plain (non-async) call executed on the loop thread."""
-        cf: _CFuture = _CFuture()
+        """``fn(ib)`` is a plain call run on the loop thread."""
+        done: Future = Future()
 
-        def _cb() -> None:
+        def _run() -> None:
             try:
-                cf.set_result(fn(self.ib))
+                done.set_result(fn(self.ib))
             except Exception as e:  # noqa: BLE001
-                cf.set_exception(e)
+                done.set_exception(e)
 
-        self._loop.call_soon_threadsafe(_cb)
-        return cf.result(timeout=timeout)
+        self._loop.call_soon_threadsafe(_run)
+        return done.result(timeout=timeout)
 
     def stop(self) -> None:
         try:
@@ -118,23 +113,20 @@ class _IBSession:
             self._loop.call_soon_threadsafe(self._loop.stop)
 
 
-# --------------------------------------------------------------------------- #
 class IbkrBroker(BrokerAdapter):
     name = "ibkr"
-    asset_classes = (AssetClass.EQUITY, AssetClass.ETF, AssetClass.OPTION, AssetClass.FUTURE)
-    supports_shorting = True
-    supports_fractional = True
-    # The tuned automatic exit strategy (ExitManager: stop/target/break-even/
-    # R-trail/EOD-flatten) owns exits and sends real close orders. We do NOT
-    # also attach a native OCA bracket at IBKR - two managers on one position
-    # fight, and a resting child can outlive the position. Trade-off: if this
-    # process dies there is no stop resting at IBKR. Keep the bot up (IBC keeps
-    # the Gateway up) and the ExitManager polls every ~4s.
+    # The ExitManager owns exits and sends real close orders. No native bracket
+    # is attached at IBKR - two exit managers on one position fight, and a
+    # resting child can outlive the position. The cost: no stop rests at IBKR
+    # while the app isn't running.
     supports_bracket_native = False
+
+    #: IBKR paces historical requests; about six at a time runs ~10 symbols a second
+    HISTORY_CONCURRENCY = 6
+    DETAILS_CONCURRENCY = 16
 
     def __init__(
         self,
-        token_manager: Any = None,
         *,
         host: Optional[str] = None,
         port: Optional[int] = None,
@@ -144,38 +136,31 @@ class IbkrBroker(BrokerAdapter):
         readonly: Optional[bool] = None,
         mode: str = "live",
         session_factory: Optional[Callable[[], _IBSession]] = None,
+        fx_fn: Optional[Callable[[str], Optional[float]]] = None,
     ) -> None:
         s = get_settings().secrets
-        self.mode = mode                              # "paper" | "live" (which IBKR account)
+        self.mode = mode                                  # which IBKR login: paper | live
         self.host = host or s.ibkr_host or "127.0.0.1"
-        if port:
-            self.port = int(port)
-        elif s.ibkr_port:
-            self.port = int(s.ibkr_port)
-        else:
-            self.port = int(s.ibkr_live_port if mode == "live" else s.ibkr_paper_port)
+        self.port = int(port or s.ibkr_port_for(mode))
         self.client_id = int(client_id if client_id is not None else s.ibkr_client_id)
         self.account_id = (account_id if account_id is not None else s.ibkr_account_id) or ""
         self.readonly = bool(s.ibkr_readonly if readonly is None else readonly)
         self._md_pref = (market_data or s.ibkr_market_data or "auto").lower()
-
-        # IBKR paper is a *real* brokerage paper account, not our simulator, so
-        # paper=False: fills, PDT reporting and buying power all come from IBKR.
-        self.paper = False
-        self.token_manager = token_manager           # unused - IBKR has no token
+        self._data_type = _MARKET_DATA_TYPES.get(self._md_pref, 1)
+        self._data_is_delayed = self._data_type in (3, 4)
+        self._fx_fn = fx_fn
+        self._fx_warned = False
 
         self._session_factory = session_factory or _IBSession
         self._session: Optional[_IBSession] = None
         self._connected = False
         self._want_connected = False
         self._reconnecting = False
-        self._data_type = _MDT.get(self._md_pref, 1) if self._md_pref != "auto" else 1
-        self._data_is_delayed = self._data_type in (3, 4)
-        self._contracts: Dict[str, Any] = {}         # symbol -> qualified Contract
-        self._last_error: str = ""
+        self._contracts: Dict[str, Any] = {}              # symbol -> qualified Contract
+        self._last_error = ""
         self._lock = threading.RLock()
 
-    # -- connection ------------------------------------------------------ #
+    # ---- connection --------------------------------------------------- #
     @property
     def _ib(self):
         return self._session.ib if self._session else None
@@ -184,68 +169,68 @@ class IbkrBroker(BrokerAdapter):
         try:
             import ib_async  # noqa: F401
         except ImportError as e:  # pragma: no cover
-            raise AuthError(
-                "ib_async is not installed. `pip install ib_async` (needs Python 3.10+), "
-                "then start IB Gateway / TWS. See scripts/ibkr_setup.py."
-            ) from e
-
+            raise AuthError("ib_async is not installed - `pip install ib_async` (Python 3.10+).") from e
         if not port_is_open(self.host, self.port):
             raise AuthError(
-                f"nothing is listening on {self.host}:{self.port} - start "
-                f"IB {'Gateway' if self.port in (4001, 4002) else 'TWS'} "
-                f"({'live' if self.mode == 'live' else 'paper'} port {self.port}) "
-                f"with the API enabled, or run IBC. Guide: python scripts/ibkr_setup.py"
-            )
-
+                f"nothing is listening on {self.host}:{self.port} - start IB "
+                f"{'Gateway' if self.port in (4001, 4002) else 'TWS'} ({self.mode} port {self.port}) "
+                "with the API enabled. Guide: python scripts/ibkr_setup.py --guide")
         self._want_connected = True
         if self._session is None:
             self._session = self._session_factory()
             self._session.start()
-        self._do_connect(initial=True)
+        self._do_connect(first=True)
 
-    def _do_connect(self, initial: bool = False) -> None:
-        async def _c(ib):
-            await ib.connectAsync(
-                self.host, self.port, clientId=self.client_id,
-                timeout=8, readonly=self.readonly,
-            )
-        self._session.run_coro(_c, timeout=15)
-
-        ib = self._ib
-        if initial:
-            # wire the connection-health + entitlement listeners once
+    def _do_connect(self, first: bool = False) -> None:
+        async def _connect(ib):
+            await ib.connectAsync(self.host, self.port, clientId=self.client_id, timeout=8,
+                                  readonly=self.readonly)
+        self._session.run_coro(_connect, timeout=15)
+        if first:
             try:
-                ib.disconnectedEvent += self._on_disconnect
-                ib.errorEvent += self._on_error
+                self._ib.disconnectedEvent += self._on_disconnect
+                self._ib.errorEvent += self._on_error
             except Exception:  # noqa: BLE001
                 pass
-
-        # market-data mode
         try:
             self._session.call(lambda ib: ib.reqMarketDataType(self._data_type), timeout=5)
         except Exception:  # noqa: BLE001
             pass
-        # let the initial account / portfolio snapshot arrive
-        try:
-            self._session.run_coro(lambda ib: ib.reqAccountSummaryAsync(), timeout=10)
-        except Exception:  # noqa: BLE001
-            pass
+        # connectAsync has already synced account values and positions; give the
+        # first portfolio updates a moment to land
         try:
             self._session.run_coro(lambda ib: _sleep(1.0), timeout=5)
         except Exception:  # noqa: BLE001
             pass
-
         self._connected = True
-        accts = []
+        if not self.account_id:
+            try:
+                accounts = list(self._session.call(lambda ib: ib.managedAccounts(), timeout=5) or [])
+                self.account_id = accounts[0] if accounts else ""
+            except Exception:  # noqa: BLE001
+                pass
+        self._check_data_entitlement()
+        log.info("IBKR connected  %s:%s  account=%s  data=%s", self.host, self.port,
+                 self.account_id or "?", "delayed" if self._data_is_delayed else "live")
+
+    def _check_data_entitlement(self) -> None:
+        """One quick live quote at connect. Without a real-time subscription IBKR
+        refuses at once, which switches to delayed data (see _on_error), so the
+        dashboard's data label is right from the start."""
+        if self._md_pref != "auto" or self._data_is_delayed:
+            return
         try:
-            accts = list(self._session.call(lambda ib: ib.managedAccounts(), timeout=5) or [])
+            probe = self._contract("SPY")             # IBKR only refuses a qualified contract
+            self._session.run_coro(lambda ib: ib.reqTickersAsync(probe), timeout=4)
+            self._session.run_coro(lambda ib: _sleep(0.3), timeout=2)    # let the refusal land
         except Exception:  # noqa: BLE001
             pass
-        if not self.account_id and accts:
-            self.account_id = accts[0]
-        log.info("IBKR connected  %s:%s  account=%s  data=%s",
-                 self.host, self.port, self.account_id or "?",
-                 "delayed" if self._data_is_delayed else "live")
+
+    @property
+    def quotes_from_bars(self) -> bool:
+        """Without real-time data a quote is a slow delayed snapshot, so prices
+        are read off the latest candles instead."""
+        return self._data_is_delayed
 
     @property
     def is_connected(self) -> bool:
@@ -260,7 +245,6 @@ class IbkrBroker(BrokerAdapter):
             self._session.stop()
         self._connected = False
 
-    # -- auto-reconnect (covers the daily IBC-driven Gateway restart) ---- #
     def _on_disconnect(self) -> None:
         self._connected = False
         if self._want_connected:
@@ -275,214 +259,227 @@ class IbkrBroker(BrokerAdapter):
         threading.Thread(target=self._reconnect_loop, name="ibkr-reconnect", daemon=True).start()
 
     def _reconnect_loop(self) -> None:
-        delay, cap = 5, 120
+        delay = 5
         try:
             while self._want_connected and not self.is_connected:
                 if port_is_open(self.host, self.port, timeout=2):
                     try:
-                        self._do_connect(initial=False)
+                        self._do_connect()
                         log.info("IBKR reconnected")
                         return
                     except Exception as e:  # noqa: BLE001
                         self._last_error = f"reconnect: {e}"
                 time.sleep(delay)
-                delay = min(cap, delay * 2)
+                delay = min(120, delay * 2)
         finally:
             self._reconnecting = False
 
-    def refresh_if_needed(self, margin_s: int = 120) -> bool:
-        """Called by the engine's watchdog. For IBKR this just nudges a
-        reconnect when the socket has dropped; there is no token to refresh."""
+    def refresh_if_needed(self) -> bool:
+        """Nudge a reconnect when the socket has dropped (the daily Gateway restart)."""
         if not self.is_connected and self._want_connected:
             self._start_reconnect()
         return self.is_connected
 
     def session_status(self) -> Dict[str, Any]:
         return {
-            "broker": "ibkr",
             "connected": self.is_connected,
             "reconnecting": self._reconnecting,
             "host": self.host, "port": self.port, "mode": self.mode,
             "account": self.account_id or None,
             "market_data": "delayed" if self._data_is_delayed else "live",
             "readonly": self.readonly,
-            "message": (
-                "connected" if self.is_connected
-                else "reconnecting - Gateway restarting?" if self._reconnecting
-                else f"IB Gateway not reachable on {self.host}:{self.port}"
-            ),
+            "message": ("connected" if self.is_connected
+                        else "reconnecting - Gateway restarting?" if self._reconnecting
+                        else f"IB Gateway not reachable on {self.host}:{self.port}"),
             "last_error": self._last_error,
         }
 
-    # -- entitlement / error listener ---------------------------------- #
     def _on_error(self, reqId, errorCode, errorString, contract=None) -> None:  # noqa: ANN001
         if errorCode in _INFO_ERRS:
             return
         if errorCode in _DELAYED_ERRS:
             if not self._data_is_delayed:
-                log.warning("IBKR: no real-time market-data entitlement - using delayed feed")
+                log.warning("IBKR: no real-time market-data subscription - using delayed data")
             self._data_is_delayed = True
             self._data_type = 3
             try:
-                self._session.call(lambda ib: ib.reqMarketDataType(3), timeout=5)
+                # this runs on the IB loop thread, so call directly: session.call()
+                # would wait on this same thread and time out
+                self._ib.reqMarketDataType(3)
             except Exception:  # noqa: BLE001
                 pass
             return
         if errorCode in (1100, 1300, 2110):
             self._connected = False
         self._last_error = f"{errorCode}: {errorString}"
-        if errorCode not in (162, 200, 354):     # hist-data / contract noise
+        if errorCode not in (162, 200):        # historical-data / unknown-contract noise
             log.debug("IBKR error %s: %s", errorCode, errorString)
 
-    # -- contracts ---------------------------------------------------- #
+    # ---- contracts ------------------------------------------------------ #
     def _contract(self, symbol: str):
-        c = self._contracts.get(symbol)
-        if c is not None:
-            return c
+        contract = self._contracts.get(symbol)
+        if contract is not None:
+            return contract
         from ib_async import Stock
 
-        stk = Stock(symbol.upper(), "SMART", "USD")
+        stock = Stock(symbol, "SMART", "USD")
         try:
-            qs = self._session.run_coro(lambda ib: ib.qualifyContractsAsync(stk), timeout=10)
-            c = qs[0] if qs else stk
+            qualified = self._session.run_coro(lambda ib: ib.qualifyContractsAsync(stock), timeout=10)
+            contract = qualified[0] if qualified else stock
         except Exception:  # noqa: BLE001
-            c = stk
-        self._contracts[symbol] = c
-        return c
+            contract = stock
+        self._contracts[symbol] = contract
+        return contract
 
-    # -- account ---------------------------------------------------- #
+    @staticmethod
+    def _contract_for_history(symbol: str, con_id: Optional[int]):
+        from ib_async import Contract, Stock
+
+        return Contract(conId=con_id, exchange="SMART") if con_id else Stock(symbol, "SMART", "USD")
+
+    # ---- account ---------------------------------------------------------- #
     def get_account(self) -> Account:
+        """Balances converted to USD - US stocks are priced in dollars - whatever
+        the account's own currency (an IBKR Canada account is in CAD). The
+        account-currency figures are in ``raw["base"]``; with no exchange rate
+        the USD figures are 0, so nothing is sized off a guess."""
         if not self.is_connected:
             raise AuthError("IBKR not connected")
-        ib = self._ib
         acct = self.account_id or ""
-
-        summ = {}
+        # accountValues() is the stream ib_async subscribes to at connect. Not
+        # accountSummary(): called on the loop thread it tries to run the loop.
         try:
-            for av in self._session.call(lambda ib: ib.accountSummary(acct or ""), timeout=8) or []:
-                summ[av.tag] = av.value
+            values = list(self._session.call(lambda ib: ib.accountValues(acct), timeout=8) or [])
         except Exception:  # noqa: BLE001
-            pass
-        if not summ:
-            try:
-                for av in self._session.call(lambda ib: ib.accountValues(acct or ""), timeout=8) or []:
-                    if av.currency in ("", "USD", "BASE"):
-                        summ[av.tag] = av.value
-            except Exception:  # noqa: BLE001
-                pass
+            values = []
+        base = next((v.currency for v in values
+                     if v.tag == "NetLiquidation" and v.currency not in ("", "BASE")), "USD")
+        summary: Dict[str, str] = {}
+        base_per_usd = 0.0
+        for v in values:
+            if v.currency == base:
+                summary[v.tag] = v.value
+            elif v.tag == "ExchangeRate" and v.currency == "USD":
+                base_per_usd = _num(v.value)             # 1 USD = this many units of base
 
-        def _f(*tags: str) -> float:
-            for t in tags:
-                v = summ.get(t)
-                if v not in (None, ""):
-                    try:
-                        return float(v)
-                    except ValueError:
-                        pass
-            return 0.0
+        def first(*tags: str) -> float:
+            return next((x for x in (_num(summary.get(t)) for t in tags) if x), 0.0)
 
-        positions: List[Position] = []
+        in_base = {"equity": first("NetLiquidation", "EquityWithLoanValue"),
+                   "cash": first("TotalCashValue", "CashBalance", "AvailableFunds"),
+                   "buying_power": first("BuyingPower", "AvailableFunds", "ExcessLiquidity")}
+        if base == "USD":
+            usd_per_base: Optional[float] = 1.0
+        elif base_per_usd > 0:
+            usd_per_base = 1.0 / base_per_usd
+        else:
+            usd_per_base = (self._fx_fn or _default_fx)(base)
+        k = float(usd_per_base or 0.0)
+        if not k and not self._fx_warned:
+            self._fx_warned = True
+            log.warning("IBKR account is in %s and no USD exchange rate was found - "
+                        "no trade can be sized until there is one", base)
+
         try:
-            port = self._session.call(lambda ib: ib.portfolio(acct or ""), timeout=8) or []
+            portfolio = self._session.call(lambda ib: ib.portfolio(acct), timeout=8) or []
         except Exception:  # noqa: BLE001
-            port = []
-        for it in port:
-            q = float(getattr(it, "position", 0.0) or 0.0)
-            if abs(q) < 1e-9:
-                continue
-            positions.append(Position(
-                symbol=getattr(it.contract, "symbol", "?"), quantity=q,
-                avg_price=float(getattr(it, "averageCost", 0.0) or 0.0),
-                market_price=float(getattr(it, "marketPrice", 0.0) or 0.0),
-            ))
-        if not positions:
-            try:
-                for p in self._session.call(lambda ib: ib.positions(acct or ""), timeout=8) or []:
-                    q = float(p.position or 0.0)
-                    if abs(q) < 1e-9:
-                        continue
-                    positions.append(Position(symbol=p.contract.symbol, quantity=q,
-                                              avg_price=float(p.avgCost or 0.0),
-                                              market_price=float(p.avgCost or 0.0)))
-            except Exception:  # noqa: BLE001
-                pass
-
-        equity = _f("NetLiquidation", "NetLiquidationByCurrency", "EquityWithLoanValue")
+            portfolio = []
+        positions = [Position(symbol=getattr(it.contract, "symbol", "?"), quantity=float(it.position),
+                              avg_price=float(it.averageCost or 0.0), market_price=float(it.marketPrice or 0.0))
+                     for it in portfolio if abs(float(getattr(it, "position", 0.0) or 0.0)) > 1e-9]
         return Account(
             account_id=str(acct or "ibkr"),
-            equity=equity,
-            cash=_f("TotalCashValue", "CashBalance", "AvailableFunds"),
-            buying_power=_f("BuyingPower", "AvailableFunds", "ExcessLiquidity"),
-            day_trade_buying_power=_f("DayTradesRemaining") and 0.0 or 0.0,
-            is_cash_account=False,
+            equity=round(in_base["equity"] * k, 2),
+            cash=round(in_base["cash"] * k, 2),
+            buying_power=round(in_base["buying_power"] * k, 2),
             positions=positions,
-            raw={"summary": summ, "delayed_data": self._data_is_delayed},
+            base_currency=base,
+            usd_per_base=k,
+            raw={"base": in_base, "fx_missing": not k, "delayed_data": self._data_is_delayed},
         )
 
-    # -- market data --------------------------------------------- #
+    # ---- market data ------------------------------------------------------ #
     def get_quote(self, symbol: str) -> Quote:
         if not self.is_connected:
             raise AuthError("IBKR not connected")
-        c = self._contract(symbol)
+        contract = self._contract(symbol)
 
-        async def _q(ib):
-            tks = await ib.reqTickersAsync(c)
-            return tks[0] if tks else None
+        async def _ticker(ib):
+            tickers = await ib.reqTickersAsync(contract)
+            return tickers[0] if tickers else None
 
-        tk = self._session.run_coro(_q, timeout=12)
+        tk = self._session.run_coro(_ticker, timeout=12)
         if tk is None:
             raise RuntimeError(f"IBKR returned no ticker for {symbol}")
+        last = _price(tk.last) or _price(tk.close) or _price(getattr(tk, "marketPrice", None))
+        bid, ask = _price(tk.bid), _price(tk.ask)
+        if not (last or bid or ask):
+            raise RuntimeError(f"IBKR has no price for {symbol} "
+                               f"({'delayed' if self._data_is_delayed else 'real-time'} data)")
+        spread = max(0.01, (last or bid or ask) * 0.0005)
+        bid = bid or round(last - spread, 2)
+        ask = ask or round(last + spread, 2)
+        return Quote(symbol=symbol, bid=bid, ask=ask, last=last or (bid + ask) / 2, volume=_price(tk.volume))
 
-        def _n(x):
-            try:
-                x = float(x)
-                return x if not math.isnan(x) else 0.0
-            except (TypeError, ValueError):
-                return 0.0
-
-        last = _n(tk.last) or _n(tk.close) or _n(getattr(tk, "marketPrice", None))
-        bid, ask = _n(tk.bid), _n(tk.ask)
-        if not bid and last:
-            bid = round(last - max(0.01, last * 0.0005), 2)
-        if not ask and last:
-            ask = round(last + max(0.01, last * 0.0005), 2)
-        return Quote(symbol=symbol, bid=bid, ask=ask, last=last or bid or ask,
-                     volume=_n(tk.volume) * (100 if _n(tk.volume) and _n(tk.volume) < 1e5 else 1))
-
-    def get_price_history(
-        self, symbol: str, interval: str = "5m", lookback_days: int = 10,
-        start: Optional[dt.datetime] = None, end: Optional[dt.datetime] = None,
-        extended_hours: bool = False,
-    ) -> pd.DataFrame:
+    def history_many(self, requests: Mapping[str, Tuple[str, str]],
+                     con_ids: Optional[Mapping[str, int]] = None,
+                     timeout: float = 30.0) -> Dict[str, pd.DataFrame]:
+        """Candles for many symbols at once. ``requests`` maps a symbol to
+        (bar size, duration), e.g. ("1 day", "1 Y") or ("5 mins", "5 D").
+        Symbols IBKR has nothing for are left out of the result."""
         if not self.is_connected:
             raise AuthError("IBKR not connected")
-        bar = _BAR_SIZE.get(interval)
-        if bar is None:
-            raise NotSupported(f"interval {interval} not supported by IBKR adapter")
-        c = self._contract(symbol)
-        intraday = interval not in ("1d", "1wk")
-        if intraday:
-            days = min(max(int(lookback_days), 1), 30)
-            duration = f"{days} D"
-        elif int(lookback_days) > 365:
-            duration = f"{math.ceil(lookback_days / 365)} Y"
-        else:
-            duration = f"{max(int(lookback_days), 1)} D"
-        end_dt = end or dt.datetime.now(dt.timezone.utc)
+        if not requests:
+            return {}
+        con_ids = con_ids or {}
 
-        async def _h(ib):
-            return await ib.reqHistoricalDataAsync(
-                c, endDateTime=end_dt, durationStr=duration, barSizeSetting=bar,
-                whatToShow="TRADES", useRTH=not extended_hours, formatDate=2,
-                keepUpToDate=False,
-            )
+        async def one(ib, gate: asyncio.Semaphore, symbol: str, bar: str, duration: str):
+            async with gate:
+                try:
+                    bars = await ib.reqHistoricalDataAsync(
+                        self._contract_for_history(symbol, con_ids.get(symbol)), endDateTime="",
+                        durationStr=duration, barSizeSetting=bar, whatToShow="TRADES", useRTH=True,
+                        formatDate=2, keepUpToDate=False, timeout=timeout)
+                except Exception:  # noqa: BLE001
+                    return symbol, None
+                return symbol, _bars_to_df(bars) if bars else None
 
-        bars = self._session.run_coro(_h, timeout=40)
-        if not bars:
-            raise RuntimeError(f"IBKR returned no candles for {symbol}")
-        return _bars_to_df(bars)
+        async def run(ib):
+            gate = asyncio.Semaphore(self.HISTORY_CONCURRENCY)
+            return await asyncio.gather(*(one(ib, gate, s, bar, dur) for s, (bar, dur) in requests.items()))
 
-    # -- orders ------------------------------------------------ #
+        budget = timeout * (len(requests) / self.HISTORY_CONCURRENCY + 1) + 30
+        return {s: f for s, f in self._session.run_coro(run, timeout=budget) if f is not None and len(f)}
+
+    def contract_details_many(self, symbols: Sequence[str], timeout: float = 20.0) -> Dict[str, Optional[dict]]:
+        """Contract id, primary exchange, stock type and IBKR's industry / category
+        for each symbol. A symbol IBKR has no stock for maps to None; one whose
+        lookup failed is left out, so it's asked about again later."""
+        if not self.is_connected:
+            raise AuthError("IBKR not connected")
+        from ib_async import Stock
+
+        async def one(ib, gate: asyncio.Semaphore, symbol: str):
+            async with gate:
+                try:
+                    found = await asyncio.wait_for(ib.reqContractDetailsAsync(Stock(symbol, "SMART", "USD")), timeout)
+                except Exception:  # noqa: BLE001
+                    return symbol, None, False
+            if not found:
+                return symbol, None, True
+            d = found[0]
+            return symbol, {"con_id": int(d.contract.conId), "exchange": d.contract.primaryExchange or "",
+                            "stock_type": d.stockType or "", "industry": d.industry or "",
+                            "category": d.category or ""}, True
+
+        async def run(ib):
+            gate = asyncio.Semaphore(self.DETAILS_CONCURRENCY)
+            return await asyncio.gather(*(one(ib, gate, s) for s in symbols))
+
+        budget = timeout * (len(symbols) / self.DETAILS_CONCURRENCY + 1) + 30
+        return {s: d for s, d, answered in self._session.run_coro(run, timeout=budget) if answered}
+
+    # ---- orders ------------------------------------------------------------ #
     def _guard_orders(self) -> None:
         if self.readonly:
             raise OrderRejected("IBKR adapter is in read-only mode (IBKR_READONLY=1)")
@@ -493,77 +490,57 @@ class IbkrBroker(BrokerAdapter):
         self._guard_orders()
         from ib_async import LimitOrder, MarketOrder
 
-        c = self._contract(req.symbol)
-        action = "BUY" if ((req.side is Side.LONG) == bool(req.is_entry)) else "SELL"
+        contract = self._contract(req.symbol)
+        action = "BUY" if (req.side is Side.LONG) == bool(req.is_entry) else "SELL"
         qty = abs(float(req.quantity))
-        if req.order_type is OrderType.MARKET or not req.limit_price:
-            order = MarketOrder(action, qty)
-        else:
-            order = LimitOrder(action, qty, float(req.limit_price))
+        order = (MarketOrder(action, qty) if req.order_type is OrderType.MARKET or not req.limit_price
+                 else LimitOrder(action, qty, float(req.limit_price)))
         order.tif = _tif(req.tif)
         order.outsideRth = req.session in ("EXTENDED", "SEAMLESS")
         if self.account_id:
             order.account = self.account_id
-
-        trade = self._session.call(lambda ib: ib.placeOrder(c, order), timeout=10)
+        trade = self._session.call(lambda ib: ib.placeOrder(contract, order), timeout=10)
         oid = str(getattr(trade.order, "orderId", "") or getattr(trade.order, "permId", ""))
-        st = getattr(trade.orderStatus, "status", "") or "Submitted"
-        return OrderResult(order_id=oid, status=_norm_status(st), symbol=req.symbol,
+        status = getattr(trade.orderStatus, "status", "") or "Submitted"
+        return OrderResult(order_id=oid, status=_norm_status(status), symbol=req.symbol,
                            submitted_qty=req.quantity, raw={"tif": order.tif})
 
-    # place_bracket is intentionally NOT overridden - the base method just
-    # places the entry (supports_bracket_native = False). The ExitManager
-    # holds and manages the stop/target and sends the real close order.
+    def _find_trade(self, order_id: str):
+        def _find(ib):
+            return next((t for t in ib.trades() if str(getattr(t.order, "orderId", "")) == str(order_id)), None)
+        return self._session.call(_find, timeout=8)
 
     def cancel_order(self, order_id: str) -> None:
         self._guard_orders()
-
-        def _cx(ib):
-            for t in ib.trades():
-                if str(getattr(t.order, "orderId", "")) == str(order_id):
-                    ib.cancelOrder(t.order)
-                    return True
-            return False
-
-        if not self._session.call(_cx, timeout=8):
+        trade = self._find_trade(order_id)
+        if trade is None:
             raise OrderRejected(f"IBKR: no live order {order_id} to cancel")
+        self._session.call(lambda ib: ib.cancelOrder(trade.order), timeout=8)
 
     def get_order(self, order_id: str) -> OrderResult:
         if not self.is_connected:
             raise AuthError("IBKR not connected")
-
-        def _find(ib):
-            for t in ib.trades():
-                if str(getattr(t.order, "orderId", "")) == str(order_id):
-                    return t
-            return None
-
-        t = self._session.call(_find, timeout=8)
+        t = self._find_trade(order_id)
         if t is None:
             return OrderResult(order_id=str(order_id), status="UNKNOWN", symbol="?", submitted_qty=0.0)
         os_ = t.orderStatus
-        fills = [
-            Fill(order_id=str(order_id), symbol=t.contract.symbol,
-                 side=Side.LONG if t.order.action == "BUY" else Side.SHORT,
-                 quantity=float(f.execution.shares), price=float(f.execution.price))
-            for f in (t.fills or [])
-        ]
-        return OrderResult(
-            order_id=str(order_id), status=_norm_status(os_.status),
-            symbol=t.contract.symbol, submitted_qty=float(t.order.totalQuantity or 0.0),
-            filled_qty=float(os_.filled or 0.0), avg_fill_price=float(os_.avgFillPrice or 0.0),
-            fills=fills, raw={},
-        )
+        fills = [Fill(order_id=str(order_id), symbol=t.contract.symbol,
+                      side=Side.LONG if t.order.action == "BUY" else Side.SHORT,
+                      quantity=float(f.execution.shares), price=float(f.execution.price))
+                 for f in (t.fills or [])]
+        return OrderResult(order_id=str(order_id), status=_norm_status(os_.status), symbol=t.contract.symbol,
+                           submitted_qty=float(t.order.totalQuantity or 0.0), filled_qty=float(os_.filled or 0.0),
+                           avg_fill_price=float(os_.avgFillPrice or 0.0), fills=fills)
 
     def list_orders(self, status: Optional[str] = None) -> List[OrderResult]:
         if not self.is_connected:
             return []
-        trades = self._session.call(lambda ib: list(ib.openTrades() if status in (None, "OPEN", "WORKING")
-                                                    else ib.trades()), timeout=8) or []
+        open_only = status in (None, "OPEN", "WORKING")
+        trades = self._session.call(lambda ib: list(ib.openTrades() if open_only else ib.trades()), timeout=8) or []
         out = []
         for t in trades:
             s = _norm_status(getattr(t.orderStatus, "status", ""))
-            if status and status.upper() not in (s.upper(), "OPEN", "WORKING"):
+            if status and status.upper() not in (s, "OPEN", "WORKING"):
                 continue
             out.append(OrderResult(order_id=str(getattr(t.order, "orderId", "")), status=s,
                                    symbol=t.contract.symbol,
@@ -572,11 +549,28 @@ class IbkrBroker(BrokerAdapter):
         return out
 
 
-# --------------------------------------------------------------------------- #
-#  helpers                                                                    #
-# --------------------------------------------------------------------------- #
-async def _sleep(sec: float) -> None:
-    await asyncio.sleep(sec)
+async def _sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+def _num(v: Any) -> float:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return x if math.isfinite(x) else 0.0
+
+
+def _price(v: Any) -> float:
+    """IBKR marks a missing price as NaN or -1."""
+    x = _num(v)
+    return x if x > 0 else 0.0
+
+
+def _default_fx(currency: str) -> Optional[float]:
+    from ..data.fx import usd_per
+
+    return usd_per(currency)
 
 
 def _tif(tif: TimeInForce) -> str:
@@ -594,20 +588,13 @@ def _norm_status(s: str) -> str:
 
 
 def _bars_to_df(bars) -> pd.DataFrame:
-    rows = []
-    for b in bars:
-        d = getattr(b, "date", None)
-        rows.append({
-            "date": d, "open": float(b.open), "high": float(b.high),
-            "low": float(b.low), "close": float(b.close),
-            "volume": float(getattr(b, "volume", 0.0) or 0.0),
-        })
-    df = pd.DataFrame(rows)
-    ts = pd.to_datetime(df["date"], utc=True, errors="coerce")
-    if ts.isna().all():                       # daily bars come back as date objects
-        ts = pd.to_datetime(df["date"].astype(str), errors="coerce").dt.tz_localize("America/New_York")
-    df = df.drop(columns=["date"])
-    df.index = ts.dt.tz_convert("America/New_York")
-    # IBKR TRADES volume is in lots (x100) for US stocks
-    df["volume"] = df["volume"] * 100.0
+    """ib_async bars -> an OHLCV frame on a New York DatetimeIndex. IBKR reports
+    US stock volume in shares."""
+    df = pd.DataFrame([{"date": b.date, "open": float(b.open), "high": float(b.high), "low": float(b.low),
+                        "close": float(b.close), "volume": float(getattr(b, "volume", 0.0) or 0.0)}
+                       for b in bars])
+    stamps = pd.to_datetime(df["date"], utc=True, errors="coerce")
+    if stamps.isna().all():                 # daily bars arrive as dates
+        stamps = pd.to_datetime(df["date"].astype(str), errors="coerce").dt.tz_localize("America/New_York")
+    df.index = pd.DatetimeIndex(stamps).tz_convert("America/New_York")
     return df[["open", "high", "low", "close", "volume"]].dropna().sort_index()

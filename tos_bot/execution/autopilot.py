@@ -213,7 +213,9 @@ class AutoPilot:
             return []
         self._blocked_note = ""
 
-        acct = getattr(self.engine, "_account", None)
+        # the account as sizing sees it - a trading-capital limit shrinks it
+        sizing = getattr(self.engine, "sizing_account", None)
+        acct = sizing() if callable(sizing) else getattr(self.engine, "_account", None)
         equity = float(getattr(acct, "equity", 0.0) or 0.0)
         actions: List[Dict[str, Any]] = []
         taken = 0                              # new entries opened this cycle

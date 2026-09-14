@@ -1,10 +1,9 @@
 """FastAPI app: REST + a WebSocket that streams engine events to the dashboard.
 
-Endpoints that touch secrets, start a broker sign-in, exit every position or
-quit the app are same-machine only (see :mod:`tos_bot.server.security`).
-Handlers that call into the engine are plain ``def``, so FastAPI runs them in
-its thread pool and a slow broker call never stalls the event loop that feeds
-the WebSocket.
+Endpoints that touch secrets, exit every position or quit the app are
+same-machine only (see :mod:`tos_bot.server.security`). Handlers that call into
+the engine are plain ``def``, so FastAPI runs them in its thread pool and a
+slow broker call never stalls the event loop that feeds the WebSocket.
 """
 
 from __future__ import annotations
@@ -12,14 +11,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import mimetypes
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from ..config import get_settings
+from ..config import Settings, get_settings
 from ..core.eventbus import BUS
 from ..data.sectors import SECTORS
 from ..engine import TradingEngine
@@ -30,24 +30,25 @@ log = logging.getLogger(__name__)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 LOCAL_ONLY = [Depends(require_local)]
+# Windows can map .js to text/plain, and browsers refuse to run modules served that way
+mimetypes.add_type("text/javascript", ".js")
 
 
 def _result(res: Dict[str, Any]) -> JSONResponse:
     return JSONResponse(res, status_code=200 if res.get("ok") else 400)
 
 
-def create_app() -> FastAPI:
+def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngine) -> FastAPI:
     settings = get_settings()
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         BUS.bind_loop(asyncio.get_running_loop())
-        engine = TradingEngine(settings)
+        engine = engine_factory(settings)
 
         def shutdown() -> None:
-            hook = getattr(app.state, "shutdown", None)
-            if hook is not None:
-                hook()
+            if app.state.shutdown is not None:
+                app.state.shutdown()
             else:
                 log.warning("quit finished - stop the server process to exit")
 
@@ -61,13 +62,13 @@ def create_app() -> FastAPI:
         finally:
             engine.stop()
 
-    app = FastAPI(title="AutoTradeBot", version="0.3.0", lifespan=lifespan)
+    app = FastAPI(title="AutoTradeBot", version="0.4.0", lifespan=lifespan)
     app.state.shutdown = None           # run.py wires this to the uvicorn server
 
     def eng() -> TradingEngine:
         return app.state.engine
 
-    # ---- state / plays -------------------------------------------- #
+    # ---- state and plays ------------------------------------------------ #
     @app.get("/api/state")
     def state():
         return eng().snapshot()
@@ -75,13 +76,6 @@ def create_app() -> FastAPI:
     @app.get("/api/plays")
     def plays():
         return {"plays": eng().current_plays()}
-
-    @app.get("/api/plays/{play_id}")
-    def play_detail(play_id: str):
-        p = eng().get_play(play_id)
-        if not p:
-            raise HTTPException(404, "play not found")
-        return p
 
     @app.post("/api/plays/{play_id}/assess")
     def assess(play_id: str):
@@ -95,7 +89,7 @@ def create_app() -> FastAPI:
     def reject(play_id: str):
         return eng().reject_play(play_id)
 
-    # ---- trades / pnl ------------------------------------------ #
+    # ---- trades and P/L ------------------------------------------------- #
     @app.get("/api/trades")
     def trades(status: Optional[str] = None, limit: int = 100):
         repo = eng().repo
@@ -104,13 +98,6 @@ def create_app() -> FastAPI:
     @app.post("/api/trades/close-all", dependencies=LOCAL_ONLY)
     def close_all():
         return _result(eng().close_all_positions())
-
-    @app.get("/api/trades/{trade_id}")
-    def trade(trade_id: str):
-        t = eng().repo.get_trade(trade_id)
-        if not t:
-            raise HTTPException(404, "trade not found")
-        return t
 
     @app.get("/api/trades/{trade_id}/record")
     def trade_record(trade_id: str):
@@ -131,28 +118,12 @@ def create_app() -> FastAPI:
     def pnl():
         return eng().repo.pnl_summary()
 
-    @app.get("/api/equity-curve")
-    def equity_curve():
-        return {"points": eng().repo.equity_curve()}
-
-    # ---- account / market ------------------------------------ #
+    # ---- account and routing -------------------------------------------- #
     @app.post("/api/account/refresh")
     def account_refresh():
         return eng().refresh_account_now()
 
-    @app.get("/api/market")
-    def market():
-        from ..util import clock
-        return clock.market_status()
-
-    # ---- routing: paper <-> live ----------------------------- #
-    @app.get("/api/broker")
-    def broker_state():
-        s = eng().snapshot()
-        return {k: s[k] for k in ("mode", "broker", "venue", "connection", "data_source",
-                                  "data_is_real", "armed", "app_mode")}
-
-    @app.post("/api/broker")
+    @app.post("/api/mode")
     def set_mode(body: dict):
         return _result(eng().set_mode((body or {}).get("mode", "")))
 
@@ -161,7 +132,15 @@ def create_app() -> FastAPI:
         cash = (body or {}).get("cash")
         return _result(eng().reset_paper(float(cash) if cash is not None else None))
 
-    # ---- quitting (same machine only) ------------------------ #
+    @app.get("/api/capital")
+    def capital():
+        return {"capital": eng().capital_state()}
+
+    @app.post("/api/capital")
+    def set_capital(body: dict):
+        return _result(eng().set_capital((body or {}).get("amount")))
+
+    # ---- quitting (same machine only) ----------------------------------- #
     @app.get("/api/quit", dependencies=LOCAL_ONLY)
     def quit_preview():
         return eng().quit_preview()
@@ -170,16 +149,14 @@ def create_app() -> FastAPI:
     def quit_app(body: dict):
         return _result(eng().begin_quit(close_all=bool((body or {}).get("close_all", True))))
 
-    # ---- connections (same machine only) ---------------------- #
+    # ---- connections (same machine only) -------------------------------- #
     @app.get("/api/setup", dependencies=LOCAL_ONLY)
     def setup():
         return eng().setup_state()
 
-    @app.post("/api/setup/brokers", dependencies=LOCAL_ONLY)
-    def setup_brokers(body: dict):
-        b = body or {}
-        return _result(eng().set_broker_setup(paper_platform=b.get("paper_platform"),
-                                              live_broker=b.get("live_broker")))
+    @app.post("/api/setup/paper-platform", dependencies=LOCAL_ONLY)
+    def setup_paper_platform(body: dict):
+        return _result(eng().set_paper_platform((body or {}).get("paper_platform")))
 
     @app.post("/api/setup/secrets", dependencies=LOCAL_ONLY)
     def setup_secrets(body: dict):
@@ -194,15 +171,7 @@ def create_app() -> FastAPI:
     def ibkr_test(body: dict):
         return eng().probe_ibkr((body or {}).get("account", "paper"))
 
-    @app.post("/api/setup/schwab/login", dependencies=LOCAL_ONLY)
-    def schwab_login():
-        return _result(eng().schwab_login.start())
-
-    @app.get("/api/auth")
-    def auth_status():
-        return eng().token_manager.status().as_dict()
-
-    # ---- filters + strategies --------------------------------- #
+    # ---- filters, strategies, Autopilot --------------------------------- #
     @app.get("/api/filters")
     def get_filters():
         return {"filters": eng().filters.as_dict(), "all_sectors": list(SECTORS),
@@ -227,25 +196,31 @@ def create_app() -> FastAPI:
         b = body or {}
         return _result(eng().set_strategy(key, enabled=b.get("enabled"), weight=b.get("weight")))
 
-    # ---- autopilot (hands-off entry) ---------------------- #
-    @app.get("/api/autopilot")
-    def autopilot_state():
-        return eng().autopilot.status()
-
     @app.post("/api/autopilot")
     def set_autopilot(body: dict):
         return _result(eng().set_autopilot(**(body or {})))
 
-    # ---- scan --------------------------------------------- #
-    @app.post("/api/scan/now")
-    def scan_now():
-        return _result(eng().trigger_scan())
+    # ---- scans, scan settings, watchlist -------------------------------- #
+    @app.post("/api/scan")
+    def scan(body: dict):
+        return _result(eng().request_scan((body or {}).get("kind", "cycle")))
 
-    @app.get("/api/scans")
-    def scans():
-        return {"last": eng().snapshot().get("scan", {})}
+    @app.get("/api/settings")
+    def scan_settings():
+        return eng().scan_status()
 
-    # ---- websocket ------------------------------------------- #
+    @app.post("/api/settings")
+    def set_scan_settings(body: dict):
+        b = body or {}
+        return _result(eng().set_scan_settings(
+            premarket_time=b.get("premarket_time"), cycle_minutes=b.get("cycle_minutes"),
+            hot_list_size=b.get("hot_list_size"), sector_queue_size=b.get("sector_queue_size")))
+
+    @app.get("/api/watchlist")
+    def watchlist():
+        return eng().watchlist_state()
+
+    # ---- websocket -------------------------------------------------------- #
     @app.websocket("/ws")
     async def ws(sock: WebSocket):
         await sock.accept()
@@ -255,8 +230,8 @@ def create_app() -> FastAPI:
         try:
             snap = await loop.run_in_executor(None, eng().snapshot)
             await sock.send_json({"topic": "hello", "payload": snap})
-            await sock.send_json({"topic": "plays.updated",
-                                  "payload": {"plays": eng().current_plays()}})
+            rows = await loop.run_in_executor(None, eng().current_plays)
+            await sock.send_json({"topic": "plays.updated", "payload": {"plays": rows}})
             while True:
                 evt = await q.get()
                 await sock.send_json(evt.as_dict())
@@ -267,7 +242,7 @@ def create_app() -> FastAPI:
         finally:
             BUS.remove_queue(q)
 
-    # ---- static dashboard --------------------------------- #
+    # ---- the dashboard ------------------------------------------------------ #
     if WEB_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
