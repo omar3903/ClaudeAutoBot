@@ -59,7 +59,11 @@ day. IBC makes that hands-off.
      Socket port:  4002  (paper)   /  4001  (live)
      Trusted IPs:  127.0.0.1
    Configure -> Settings -> Lock and Exit -> "Auto restart" (NOT auto
-   logoff) so it re-launches itself after the daily restart.
+   logoff) at 09:00 PM New York time. After-hours trading has ended
+   (8:00 PM), IBKR's nightly maintenance (about 11:45 PM - 12:45 AM ET)
+   hasn't started, and pre-market (4:00 AM) and the bot's pre-market scan
+   are hours away. The bot reconnects by itself; IBKR still asks for a
+   full login about once a week.
 
 4. IBC  (auto-login + auto-restart)   https://github.com/IbcAlpha/IBC
    - Download the Windows release, install to  C:\IBC

@@ -69,8 +69,11 @@ IBKR_STEPS = (
     "Gateway → Configure → Settings → API → Settings: set the socket port (4002 paper / 4001 live), "
     "keep 127.0.0.1 in Trusted IPs and untick Read-Only API. (Older versions also have an Enable "
     "ActiveX and Socket Clients box to tick; newer ones have the API on already.)",
-    "Configure → Lock and Exit → Auto restart, so it survives IBKR's daily restart. For a hands-off "
-    "daily login, run it through IBC (github.com/IbcAlpha/IBC).",
+    "Configure → Settings → Lock and Exit → Auto restart (not Auto logoff), set to 9:00 PM New York time. "
+    "After-hours trading has ended at 8:00 PM, IBKR's nightly maintenance (about 11:45 PM–12:45 AM ET) "
+    "hasn't started, and pre-market (4:00 AM) and the pre-market scan are hours away. The app reconnects "
+    "by itself; IBKR still asks for a full login about once a week. For hands-off logins, run it through "
+    "IBC (github.com/IbcAlpha/IBC).",
     "Click Test paper (or Test live). There's no token to store - IBKR's login is the running Gateway, "
     "and the app connects by itself as soon as the Gateway answers.",
 )

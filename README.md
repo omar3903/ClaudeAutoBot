@@ -200,7 +200,11 @@ re-enters your login automatically, and the app reconnects on its own.
    (paper) / **4001** (live), *Allow connections from localhost only* with
    Trusted IP `127.0.0.1`, and untick *Read-Only API*. (Older versions also have
    an *Enable ActiveX and Socket Clients* box to tick; newer ones have the API
-   on already.) Then *Lock and Exit → Auto restart*.
+   on already.) Then *Lock and Exit → Auto restart* (not *Auto logoff*) at
+   **9:00 PM New York time**: after-hours trading has ended at 8:00 PM, IBKR's
+   nightly maintenance (about 11:45 PM–12:45 AM ET) hasn't started, and
+   pre-market (4:00 AM) and the pre-market scan are hours away. The app
+   reconnects on its own; IBKR still asks for a full login about once a week.
 4. For a hands-off daily login, set `IbLoginId` / `IbPassword` /
    `TradingMode=paper` in IBC's `config.ini` and start `StartGateway.bat` (add a
    Windows "at log on" task).
