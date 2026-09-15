@@ -61,7 +61,12 @@ def test_scan_watchlist_approve_close(client):
     assert watchlist["hot"] and watchlist["sectors"]
 
     trade_id = None
-    for play in client.get("/api/plays").json()["plays"]:
+    plays = client.get("/api/plays").json()["plays"]
+    if plays:
+        chart = client.get(f"/api/plays/{plays[0]['id']}/chart").json()
+        assert chart["ok"] and chart["candles"] and {r["key"] for r in chart["routes"]} >= {"stop"}
+    assert client.get("/api/plays/missing/chart").json()["ok"] is False
+    for play in plays:
         assessed = client.post(f"/api/plays/{play['id']}/assess").json()
         if not assessed.get("can_execute"):
             continue
@@ -81,11 +86,22 @@ def test_scan_watchlist_approve_close(client):
 
 
 def test_settings_round_trip_and_the_dashboard_loads(client):
-    r = client.post("/api/settings", json={"cycle_minutes": 20, "hot_list_size": 30}).json()
-    assert r["ok"] and r["scan"]["settings"]["cycle_minutes"] == 20
+    r = client.post("/api/settings", json={"cycle_minutes": 4, "hot_list_size": 30}).json()
+    assert r["ok"] and r["scan"]["settings"]["cycle_minutes"] == 4
     assert client.post("/api/settings", json={"premarket_time": "10:00"}).status_code == 400
     assert client.get("/").status_code == 200
     main = client.get("/static/js/main.js")
     assert "javascript" in main.headers["content-type"]
     assert main.headers["cache-control"] == "no-cache"             # an update never mixes with cached modules
     assert client.get("/").headers["cache-control"] == "no-cache"
+    journal = client.get("/api/journal").json()
+    assert journal["review_at"] and isinstance(journal["days"], list)
+    assert client.get("/api/journal/2020-01-02").status_code == 404
+    assert client.get("/api/journal/someday").status_code == 400
+    replay = client.get("/api/replay").json()
+    assert replay["defaults"]["sessions"] == 60 and "evidence" in replay and "learned_skips" in replay
+    assert client.get("/api/replay/history").json()["runs"] == []
+    pairs = client.get("/api/pairs").json()
+    assert pairs["enabled"] and isinstance(pairs["watch"], list) and isinstance(pairs["trades"], list)
+    assert client.post("/api/pairs/enter", json={"pair": "NOPE/PAIR"}).status_code == 400
+    assert client.get("/api/pairs/chart", params={"pair": "NOPE/PAIR"}).json()["ok"] is False

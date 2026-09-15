@@ -20,6 +20,7 @@ from ..core.enums import AssetClass, Side, StrategyKind, Timeframe
 from ..core.models import Play, Quote
 from ..data.fundamentals import Financials
 from ..indicators import ta
+from ..quant import readings
 from ..util import clock
 
 
@@ -38,12 +39,29 @@ class StrategyContext:
     activity: Dict[str, Any] = field(default_factory=dict)
     #: what insiders and the news say about the stock (signals/book.py SymbolSignals), when known
     signals: Any = None
+    #: the market's regime (engine/market_regime.py): {"p_turbulent": ..., "regime": ...}, when known
+    market: Dict[str, Any] = field(default_factory=dict)
     _memo: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     def _cached(self, key: str, compute: Callable[[], Any]) -> Any:
         if key not in self._memo:
             self._memo[key] = compute()
         return self._memo[key]
+
+    # ---- the quantitative readings (see quant/readings.py) ------------------ #
+    def price_character(self, intraday: bool) -> Optional[Dict[str, Any]]:
+        """Trending, mean reverting or a random walk: read on the last sessions' 5-minute
+        closes for a day trade, on the daily closes for a swing trade."""
+        def compute():
+            frame, bars = (self.intraday, readings.INTRADAY_BARS) if intraday else (self.daily, readings.DAILY_BARS)
+            if frame is None or len(frame) < readings.MIN_BARS:
+                return None
+            return readings.price_character(frame["close"].to_numpy()[-bars:])
+        return self._cached("character_5m" if intraday else "character_1d", compute)
+
+    def vol_forecast(self) -> Optional[Dict[str, Any]]:
+        """Tomorrow's volatility from the completed daily candles (GARCH, or RiskMetrics)."""
+        return self._cached("vol_forecast", lambda: readings.vol_forecast(self.symbol, self.daily, self.now.date()))
 
     # ---- price and time --------------------------------------------------- #
     @property
@@ -152,6 +170,9 @@ class Strategy:
     thesis: str = ""
     default_params: Dict[str, Any] = {}
 
+    #: switched on when config.yaml doesn't list the setup (newer setups the file predates)
+    enabled_by_default: bool = False
+
     #: may this setup be entered pre- or post-market too? (limit orders only there)
     extended_hours_ok: bool = False
 
@@ -183,6 +204,8 @@ class Strategy:
     MIN_STOP_PCT = {"INTRADAY": 0.006, "SWING": 0.015}
     MIN_STOP_ATR = 0.9
     MIN_STOP_DAILY_ATR = {"INTRADAY": 0.25, "SWING": 1.0}
+    #: the stop floor in forecast daily standard deviations, while volatility is rising
+    VOL_STOP_SIGMAS = {"INTRADAY": 0.35, "SWING": 1.4}
     MAX_TARGET_PCT = {"INTRADAY": 0.15, "SWING": 0.45}
     MIN_TARGET_PCT = 0.002
     RR_BOUNDS = (0.4, 8.0)
@@ -222,6 +245,11 @@ class Strategy:
             floor = max(floor, self.MIN_STOP_ATR * ctx.intraday_atr)
         if self.kind is StrategyKind.TECHNICAL and ctx.daily_atr > 0:
             floor = max(floor, self.MIN_STOP_DAILY_ATR.get(self.timeframe.value, 0.25) * ctx.daily_atr)
+        # volatility clusters (Tsay ch. 3): when tomorrow's forecast volatility is above the last
+        # months', the usual daily range understates the noise a stop has to sit outside of
+        vol = ctx.vol_forecast() if self.kind is StrategyKind.TECHNICAL else None
+        if vol and vol.get("vol") and float(vol.get("ratio") or 0.0) > 1.0:
+            floor = max(floor, self.VOL_STOP_SIGMAS.get(self.timeframe.value, 0.35) * float(vol["vol"]) * entry)
         if floor > max_stop:
             return None                           # too volatile for this setup's stop
         if abs(entry - stop) < floor:

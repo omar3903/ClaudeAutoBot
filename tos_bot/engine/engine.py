@@ -23,6 +23,7 @@ record is deleted only when a connected broker confirms the position is gone
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import threading
 import time
@@ -58,9 +59,18 @@ from ..risk.position_sizing import size_play
 from ..research.history import IntradayHistory, replay_symbols
 from ..research.replay import ReplaySettings
 from ..research.runner import ReplayRunner
+from ..research.journal import ROLLING_SESSIONS, Journal, build_review, first_sightings, live_records, review_day
+from ..research.weights import evidence_multiplier
+from ..quant.sizing import MIN_TRADES as KELLY_MIN_TRADES, half_kelly_risk_pct
+from ..signals.earnings import EarningsCalendar
+from ..pairs.desk import PairDesk, decision_window
+from ..pairs.finder import FinderSettings
+from ..pairs.model import KEY as PAIRS_KEY, PairRules
 from ..signals.book import BoostSettings, SignalBook
 from ..signals.service import SignalService
 from ..signals.store import SignalStore
+from .chart import chart_payload
+from .market_regime import BENCHMARK, MarketRegime
 from ..scanner.noise import LABELS as NOISE_LABELS, NoiseSettings
 from ..scanner import schedule
 from ..scanner.filters import TradeFilters
@@ -156,6 +166,26 @@ class TradingEngine:
         self.position_check = PositionCheck()
         self.replay = ReplayRunner(data_dir / "research" / "replay.json",
                                    IntradayHistory(data_dir / "research" / "intraday"))
+        #: calm or turbulent, from SPY's daily returns (Hamilton's Markov switching model)
+        self.regime = MarketRegime(data_dir / "research" / "benchmark_spy.pkl")
+        #: when companies reported earnings (SEC 8-K item 2.02), for the replay
+        self.earnings = EarningsCalendar(data_dir / "signals" / "earnings", lambda url: self.signals.sec.json(url),
+                                         self.signals.company_ciks)
+        #: the daily review (research/journal.py)
+        self.journal = Journal(data_dir / "journal", self.repo)
+        self._journal_checked: Optional[dt.date] = None
+        self._live_stats: Dict[str, Dict[str, Any]] = {}
+        self._live_stats_at = float("-inf")
+        self._risk_pct: Dict[str, Optional[float]] = {}
+        self._risk_pct_for: Optional[tuple] = None
+        self._started_at = time.monotonic()
+        #: pairs trading (pairs/): the watch list, and both legs of every pair trade
+        self.pairs = PairDesk(self.repo, cfg.pairs, data_dir / "pairs" / "watch.json")
+        self._pairs_live_until = float("-inf")
+        self._pair_etfs_on: Optional[dt.date] = None
+        self._pairs_dry_noted: set = set()
+        self._pairs_next_refresh = float("-inf")
+        self._pairs_published = ""
         self.executor: Optional[Executor] = None
         self.exit_manager: Optional[ExitManager] = None
         self.pdt: Optional[PdtGuard] = None
@@ -179,6 +209,8 @@ class TradingEngine:
         self._last_scans: Dict[str, Dict[str, Any]] = {}
         self._last_cycle_at = float("-inf")
         self._last_fast_at = float("-inf")
+        self._last_plays_at = float("-inf")
+        self._noted: Dict[tuple, float] = {}          # Autopilot notes already shown, and when
         self._scan_retry_at = 0.0
 
         # the orders working at the broker, for the dashboard (see active_orders)
@@ -211,7 +243,8 @@ class TradingEngine:
             log.warning("resuming an unfinished quit - closing the remaining positions first")
         self._threads = [threading.Thread(target=loop, name=name, daemon=True) for name, loop in (
             ("scan-loop", self._scan_loop), ("sync-loop", self._sync_loop), ("snapshot-loop", self._snapshot_loop),
-            ("orders-loop", self._orders_loop), ("signals-loop", self._signals_loop))]
+            ("orders-loop", self._orders_loop), ("signals-loop", self._signals_loop),
+            ("journal-loop", self._journal_loop), ("pairs-loop", self._pairs_loop))]
         for t in self._threads:
             t.start()
         BUS.publish("engine.started", state=self.snapshot())
@@ -378,7 +411,7 @@ class TradingEngine:
     # ------------------------------------------------------------------ #
     #  Strategy replay                                                   #
     # ------------------------------------------------------------------ #
-    def start_replay(self, sessions: int = 20, swing_sessions: int = 120) -> Dict[str, Any]:
+    def start_replay(self, sessions: Optional[int] = None, swing_sessions: Optional[int] = None) -> Dict[str, Any]:
         """Replay the strategies over recent candles in the background (see research/)."""
         if not self.md.attached:
             return {"ok": False, "reason": "IB Gateway isn't connected, so there are no candles to replay."}
@@ -386,19 +419,424 @@ class TradingEngine:
         if not symbols["swing"]:
             return {"ok": False, "reason": "Run the full scan first - the replay uses the stocks on its watchlist."}
         cfg = self.settings.config
+        sessions = cfg.replay.sessions if sessions is None else sessions
+        swing_sessions = cfg.replay.swing_sessions if swing_sessions is None else swing_sessions
         return self.replay.start(
             strategies=self.scanner.strategies, source=self.md.source, daily_frame=self.md.daily_frame,
             intraday_symbols=symbols["intraday"], swing_symbols=symbols["swing"],
-            sessions=max(5, min(60, int(sessions))), swing_sessions=max(20, min(250, int(swing_sessions))),
-            settings=ReplaySettings.from_exit_rules(cfg.exit_manager), noise=NoiseSettings.from_config(cfg.noise),
-            con_ids=self.scanner.con_ids(symbols["intraday"]))
+            sessions=max(5, min(120, int(sessions))), swing_sessions=max(20, min(250, int(swing_sessions))),
+            settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay),
+            noise=NoiseSettings.from_config(cfg.noise), con_ids=self.scanner.con_ids(symbols["intraday"]),
+            market=self._regime_history, earnings=self.earnings.times if cfg.signals.enabled else None,
+            pairs=self._pair_replay_inputs() if cfg.pairs.enabled else None,
+            held_out_fraction=float(cfg.replay.held_out_fraction))
+
+    def _regime_history(self, first_day: dt.date) -> Dict[dt.date, float]:
+        self._refresh_regime()
+        return self.regime.history(first_day)
 
     def replay_state(self) -> Dict[str, Any]:
-        return self.replay.state(self.autopilot.skip_noise, self.autopilot.min_confirmations)
+        cfg = self.settings.config.replay
+        state = self.replay.state(self.autopilot.skipped_noise(), self.autopilot.min_confirmations)
+        return {**state, "evidence": self.evidence_state(), "look_ahead_regime": self.regime.look_ahead,
+                "defaults": {"sessions": cfg.sessions, "swing_sessions": cfg.swing_sessions,
+                             "held_out_fraction": cfg.held_out_fraction}}
+
+    def replay_history(self, limit: int = 30) -> List[Dict[str, Any]]:
+        return self.replay.runs(limit)
 
     def strategy_record(self, key: str) -> Optional[Dict[str, Any]]:
         """A strategy's replayed record over the trades Autopilot would have taken."""
-        return self.replay.records(self.autopilot.skip_noise, self.autopilot.min_confirmations).get(key)
+        return self.replay.records(self.autopilot.skipped_noise(), self.autopilot.min_confirmations).get(key)
+
+    def learned_skips(self) -> List[str]:
+        """Noise checks the replay has shown are worth skipping (see replay.learned_skips)."""
+        return self.replay.learned_skips()
+
+    # ------------------------------------------------------------------ #
+    #  What the evidence says: the market, the weights, the risk         #
+    # ------------------------------------------------------------------ #
+    #: how long the closed real trades are kept before they're read again
+    LIVE_STATS_S = 300.0
+    #: how far back real trades count toward the weights and the half-Kelly risk
+    LIVE_SESSIONS = 60
+
+    def _refresh_regime(self) -> None:
+        try:
+            source = self.md.source if self.md.attached else None
+            self.regime.refresh(source, self.scanner.con_ids([BENCHMARK]) if source is not None else None)
+        except Exception:  # noqa: BLE001
+            log.debug("market regime refresh failed", exc_info=True)
+
+    def live_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Each strategy's closed real trades over the last sessions, in R."""
+        mono = time.monotonic()
+        if mono - self._live_stats_at >= self.LIVE_STATS_S:
+            today = clock.session_date()
+            try:
+                first = min(clock.last_n_sessions(today, self.LIVE_SESSIONS))
+                closed = self.repo.closed_trades_between(first, today)
+                closed += [{"strategy": PAIRS_KEY, "r_multiple": r["r_multiple"]}
+                           for r in self.repo.pair_trades_closed_between(first, today)]
+                self._live_stats = live_records(closed)
+            except Exception:  # noqa: BLE001
+                log.debug("could not read the closed trades", exc_info=True)
+            self._live_stats_at = mono
+        return self._live_stats
+
+    def evidence_state(self) -> Dict[str, Dict[str, Any]]:
+        """Each active strategy's evidence multiplier and what it rests on (research/weights.py)."""
+        records = self.replay.records(self.autopilot.skipped_noise(), self.autopilot.min_confirmations)
+        live = self.live_stats()
+        return {s.key: evidence_multiplier(records.get(s.key), live.get(s.key)).as_dict() for s in self.scanner.strategies}
+
+    def evidence_weights(self) -> Dict[str, float]:
+        return {key: row["multiplier"] for key, row in self.evidence_state().items()}
+
+    def strategy_risk_pct(self, key: str) -> Optional[float]:
+        """Half-Kelly risk per trade from the strategy's record (quant/sizing.py): its real trades
+        once there are enough - paper trading is the true out-of-sample test - otherwise the
+        replayed trades Autopilot would have taken. A record with no edge still leaves a quarter
+        of the usual risk for a trade taken by hand; Autopilot doesn't take those at all."""
+        stats, ap = self.live_stats(), self.autopilot
+        skipped = ap.skipped_noise()
+        records_for = (self.replay.ran_at, tuple(skipped), ap.min_confirmations, self._live_stats_at)
+        if records_for != self._risk_pct_for:                  # sized once per strategy until a record changes
+            self._risk_pct, self._risk_pct_for = {}, records_for
+        if key not in self._risk_pct:
+            cap = float(self.settings.config.risk.max_risk_per_trade_pct)
+            live = stats.get(key, {}).get("r", [])
+            rs = live if len(live) >= KELLY_MIN_TRADES else self.replay.r_multiples(key, skipped, ap.min_confirmations)
+            pct = half_kelly_risk_pct(rs, cap)
+            self._risk_pct[key] = None if pct is None else max(pct, 0.25 * cap)
+        return self._risk_pct[key]
+
+    def _entry_context(self, p: Play, operator: str) -> Dict[str, Any]:
+        """What a play was taken on, kept in its evidence for the journal."""
+        return {"at": clock.now_ny().isoformat(), "by": operator, "noise": list(p.noise),
+                "confirmations": p.confirmations, "score": round(p.score, 4), "confidence": round(p.confidence, 3),
+                "probability": round(p.probability, 3), "reward_risk": round(p.reward_risk, 2),
+                "market_regime": self.regime.context(), "skipped_noise": self.autopilot.skipped_noise(),
+                "unproven": self.autopilot.proof_missing(p.strategy), "replay_record": self.strategy_record(p.strategy),
+                "evidence_weight": self.evidence_weights().get(p.strategy, 1.0),
+                "risk_pct": self.strategy_risk_pct(p.strategy)}
+
+    # ------------------------------------------------------------------ #
+    #  The journal                                                       #
+    # ------------------------------------------------------------------ #
+    JOURNAL_POLL_S = 60.0
+    #: how long after starting the review waits for IB Gateway, to follow the plays not taken
+    JOURNAL_GATEWAY_WAIT_S = 600.0
+
+    def _journal_loop(self) -> None:
+        self._stop.wait(20.0)
+        while not self._stop.is_set():
+            try:
+                self._review_if_due()
+            except Exception:  # noqa: BLE001
+                log.exception("the daily review failed")
+            self._stop.wait(self.JOURNAL_POLL_S)
+
+    def _review_if_due(self) -> None:
+        cfg = self.settings.config.journal
+        if not cfg.enabled:
+            return
+        day = review_day(clock.now_ny(), cfg.review_at)
+        if self._journal_checked == day:
+            return
+        if self.journal.has(day):
+            self._journal_checked = day
+            return
+        if not self.md.attached and time.monotonic() - self._started_at < self.JOURNAL_GATEWAY_WAIT_S:
+            return
+        self.review_session(day)
+        self._journal_checked = day
+
+    def review_session(self, day: Optional[dt.date] = None) -> Dict[str, Any]:
+        """Build one session's review (again, if it exists) and keep it."""
+        cfg = self.settings.config
+        day = day or review_day(clock.now_ny(), cfg.journal.review_at)
+        trades = [t for t in self.repo.closed_trades_between(day, day) if not t.get("pair_id")]
+        plays = self.repo.plays_on(day)
+        pair_trades = self.repo.pair_trades_closed_between(day, day)
+        if not trades and not plays and not pair_trades:
+            return {"ok": False, "reason": f"Nothing was offered or traded on {day.isoformat()}."}
+        first = min(clock.last_n_sessions(day, ROLLING_SESSIONS))
+        ap = self.autopilot
+        skipped = ap.skipped_noise()
+        review = build_review(
+            day, trades=trades, plays=plays, rolling=self.repo.closed_trades_between(first, day),
+            replay_records=self.replay.records(skipped, ap.min_confirmations), evidence=self.evidence_state(),
+            regime=self.regime.reading(), bars=self._session_bars(day, plays),
+            settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay), skip_noise=skipped,
+            min_confirmations=ap.min_confirmations, passes=self._passes_checks,
+            styles={k: c.style for k, c in REGISTRY.items()}, titles={k: c.title for k, c in REGISTRY.items()},
+            breakeven_at_r=float(cfg.exit_manager.breakeven_at_r))
+        if pair_trades:
+            review["pairs"] = [{k: r.get(k) for k in ("id", "pair", "side", "opened_at", "closed_at", "entry_z",
+                                                   "exit_z_at", "exit_reason", "realized_pl", "r_multiple", "by")}
+                              for r in pair_trades]
+            total = sum(float(r.get("r_multiple") or 0.0) for r in pair_trades)
+            review["lessons"].append(f"{len(pair_trades)} pair trade{'s' if len(pair_trades) != 1 else ''} "
+                                     f"closed: {total:+.2f}R in all.")
+        self.journal.save(review)
+        self._live_stats_at = float("-inf")
+        BUS.publish("journal.updated", session=review["session"], mistakes=len(review["mistakes"]),
+                    lessons=len(review["lessons"]))
+        shadows = review["shadows"]
+        return {"ok": True, "review": review,
+                "note": (f"Reviewed {review['session']}: {review['day'].get('trades', 0)} closed trades, "
+                         f"{len(review['mistakes'])} things to learn from, {shadows.get('filled', 0)} plays not taken "
+                         "followed to their outcome.")}
+
+    def _session_bars(self, day: dt.date, plays: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The session's 5-minute candles for the plays not taken (kept with the replay's candles)."""
+        symbols = list(dict.fromkeys(p["symbol"] for p in first_sightings(plays)))
+        if not symbols:
+            return {}
+        if not self.md.attached:
+            return None
+        try:
+            return self.replay.history.load(self.md.source, symbols, 1, self.scanner.con_ids(symbols),
+                                            today=clock.next_trading_day(day))
+        except Exception:  # noqa: BLE001
+            log.warning("could not download the session's candles for the review", exc_info=True)
+            return None
+
+    def _passes_checks(self, row: Mapping[str, Any]) -> bool:
+        """Whether a recorded play clears Autopilot's own checks on it (not the account's caps)."""
+        ap = self.autopilot
+        return (row.get("timeframe") in ap.trade_types and float(row.get("confidence") or 0) >= ap.min_confidence
+                and float(row.get("reward_risk") or 0) >= ap.min_reward_risk
+                and not set(ap.skipped_noise()).intersection(row.get("noise") or [])
+                and (row.get("timeframe") != "INTRADAY" or int(row.get("confirmations") or 1) >= ap.min_confirmations))
+
+    # ------------------------------------------------------------------ #
+    #  Pairs trading (pairs/)                                            #
+    # ------------------------------------------------------------------ #
+    PAIRS_POLL_S = 30.0
+    #: the watch list's live prices are read for this long after the Pairs tab asks
+    PAIRS_LIVE_S = 120.0
+    #: while the stored candles lag the last session, the pairs are looked for again this often
+    PAIRS_REFRESH_RETRY_S = 300.0
+
+    def _pairs_loop(self) -> None:
+        self._stop.wait(15.0)
+        while not self._stop.is_set():
+            try:
+                self._pairs_pass()
+            except Exception:  # noqa: BLE001
+                log.exception("pairs pass failed")
+            self._stop.wait(self.PAIRS_POLL_S)
+
+    def _pairs_pass(self) -> None:
+        cfg = self.settings.config.pairs
+        if not cfg.enabled or self.executor is None:
+            return
+        self._refresh_pairs()
+        self.pairs.sync(self.executor)
+        now = clock.now_ny()
+        window = decision_window(now, cfg)
+        watch = (window or time.monotonic() < self._pairs_live_until
+                 or clock.minutes_to_close(now) <= float(cfg.window_minutes[0]) + 10)
+        prices = self._pair_prices(watch)
+        self.pairs.manage(self.executor, prices, self.md.daily_frame, in_window=window, now=now)
+        if window and not self.quit_state:
+            self._autopilot_pairs(prices)
+        view = self.pairs_state(prices=prices)
+        signature = json.dumps(view, sort_keys=True, default=str)
+        if signature != self._pairs_published:                 # only when something on the Pairs tab changed
+            self._pairs_published = signature
+            BUS.publish("pairs.updated", **view)
+
+    def _pair_groups(self) -> Dict[str, str]:
+        """The stocks pairs are looked for among - the watchlist's, grouped by IBKR industry -
+        plus the ETF pairs in config.yaml."""
+        groups: Dict[str, str] = {}
+        for symbol in replay_symbols(self.scanner.watchlist)["swing"]:
+            info = self.scanner.symbols.get(symbol)
+            group = (info.industry or info.sector) if info is not None else ""
+            if group:
+                groups[symbol] = group
+        for pair in self.settings.config.pairs.etf_pairs or []:
+            if len(pair) == 2:
+                for symbol in pair:
+                    groups.setdefault(str(symbol).upper(), "ETF " + "/".join(str(s).upper() for s in pair))
+        return groups
+
+    def _refresh_pairs(self) -> None:
+        if self.scanner.watchlist is None:
+            return
+        through = schedule.last_completed_session(clock.now_ny())
+        if self.pairs.refreshed_for == through.isoformat() or time.monotonic() < self._pairs_next_refresh:
+            return                                     # already fitted on the latest session, or tried a moment ago
+        self._pairs_next_refresh = time.monotonic() + self.PAIRS_REFRESH_RETRY_S
+        groups = self._pair_groups()
+        etfs = [s for s, g in groups.items() if g.startswith("ETF ")]
+        if etfs and self.md.attached and self._pair_etfs_on != through:
+            try:
+                self.md.update_daily(etfs, through)
+            except Exception:  # noqa: BLE001
+                log.debug("could not bring the ETF pairs' candles up to date", exc_info=True)
+            self._pair_etfs_on = through
+        frames = {s: f for s in groups if (f := self.md.daily_frame(s)) is not None}
+        if frames:
+            self.pairs.refresh(frames, groups)
+
+    def _pair_replay_inputs(self) -> Optional[Dict[str, Any]]:
+        groups = self._pair_groups()
+        if not groups:
+            return None
+        cfg = self.settings.config
+        return {"groups": groups, "finder": FinderSettings.from_config(cfg.pairs),
+                "rules": PairRules.from_config(cfg.pairs, cost_bps=cfg.replay.slippage_bps + cfg.replay.commission_bps)}
+
+    def _quotes(self, symbols: List[str]) -> Dict[str, float]:
+        """The latest price of each symbol that has one."""
+        if not symbols or not self.md.attached:
+            return {}
+
+        def one(symbol: str):
+            try:
+                q = self.md.quote(symbol)
+                px = getattr(q, "last", 0.0) or getattr(q, "mid", 0.0)
+                return symbol, float(px) if px else None
+            except Exception:  # noqa: BLE001
+                return symbol, None
+
+        with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as pool:
+            return {s: px for s, px in pool.map(one, symbols) if px}
+
+    def _pair_prices(self, watch: bool) -> Dict[str, float]:
+        """Live prices for the legs of the pair trades on, and for the watched pairs when asked -
+        in the regular session only; outside it the desk works from the closes."""
+        if clock.current_session() is not clock.Session.REGULAR:
+            return {}
+        symbols = {t["symbol"] for t in self._open_trades() if t.get("pair_id")}
+        if watch:
+            symbols |= {s for m in self.pairs.models for s in (m.first, m.second)}
+        return self._quotes(sorted(symbols))
+
+    def pairs_state(self, prices: Optional[Mapping[str, float]] = None, live: bool = False) -> Dict[str, Any]:
+        cfg = self.settings.config.pairs
+        if live:
+            self._pairs_live_until = time.monotonic() + self.PAIRS_LIVE_S
+            if prices is None:
+                prices = self._pair_prices(watch=True)
+        prices = prices or {}
+        now = clock.now_ny()
+        ap = self.autopilot
+        return {
+            "enabled": bool(cfg.enabled), "refreshed_for": self.pairs.refreshed_for,
+            "window": {"open": decision_window(now, cfg), "minutes": list(cfg.window_minutes),
+                       "regular": clock.current_session(now) is clock.Session.REGULAR},
+            "watch": self.pairs.watch(self.md.daily_frame, prices),
+            "trades": self.pairs.trade_rows(prices, self.md.daily_frame),
+            "recent": self.pairs.trade_rows({}, self.md.daily_frame, statuses=["CLOSED", "FAILED"], limit=20),
+            "record": self.strategy_record(PAIRS_KEY),
+            "autopilot": {"on": bool(ap.enabled and "PAIRS" in ap.trade_types), "proof": ap.proof_missing(PAIRS_KEY)},
+            "limits": {"max_open_pairs": cfg.max_open_pairs, "max_new_per_day": cfg.max_new_per_day,
+                       "emergency_loss_r": cfg.emergency_loss_r},
+        }
+
+    def enter_pair(self, pair_id: str, operator: str = "operator") -> Dict[str, Any]:
+        """Put a watched pair on: both legs at the market, sized off the distance to its stop."""
+        cfg = self.settings.config
+        with self._switch_lock:
+            locked = self._locked()
+            if locked:
+                return {"ok": False, "reason": locked}
+            if not cfg.pairs.enabled:
+                return {"ok": False, "reason": "Pairs trading is off (pairs.enabled in config.yaml)."}
+            if self.executor is None:
+                return {"ok": False, "reason": "No broker to send the orders to."}
+            self._refresh_account()
+            acc = self._account
+            if acc is None:
+                return {"ok": False, "reason": "no account data"}
+            if self.mode == "live":
+                if not self._armed:
+                    return {"ok": False, "reason": f"engine not armed - live equity below "
+                                                   f"${cfg.account.min_start_equity:,.0f} floor"}
+                if cfg.account.cash_account:
+                    return {"ok": False, "reason": "A pair shorts one of its stocks, which needs a margin account."}
+                if acc.equity < cfg.account.pdt_equity_threshold:
+                    return {"ok": False, "reason": (
+                        f"Live pairs need ${cfg.account.pdt_equity_threshold:,.0f} in a margin account: both legs can "
+                        "close the same day, and under that the pattern-day-trader rule would block them.")}
+            if not acc.usd_per_base:
+                return {"ok": False, "reason": f"no {acc.base_currency}->USD exchange rate yet, so the pair can't be sized"}
+            model = self.pairs.model(pair_id)
+            if model is None:
+                return {"ok": False, "reason": f"{pair_id} isn't on the pairs watch list."}
+            sizing = self.sizing_account() or acc
+            holding = ({t["symbol"] for t in self._open_trades()} | {w["symbol"] for w in self.working_entries()}
+                       | {p.symbol for p in acc.positions if abs(p.quantity) > 1e-9})
+            cap = float(cfg.risk.max_risk_per_trade_pct)
+            kelly = self.strategy_risk_pct(PAIRS_KEY)
+            pct = min(cap, kelly) if kelly is not None else cap
+            buying_power = float(sizing.buying_power or sizing.equity)
+            room = (getattr(sizing, "raw", None) or {}).get("capital_room")
+            if room is not None:
+                buying_power = min(buying_power, max(0.0, float(room)))
+            out = _attempt(self.pairs.enter,
+                pair_id, executor=self.executor, account=acc, prices=self._quotes([model.first, model.second]),
+                closes=self.md.daily_frame, risk_dollars=sizing.equity * pct / 100.0,
+                max_leg_value=sizing.equity * float(cfg.risk.max_position_pct_of_equity) / 100.0,
+                buying_power=buying_power, holding=holding, venue=self._venue, by=operator)
+        self._refresh_account()
+        BUS.publish("pairs.updated", **self.pairs_state(prices=self._pair_prices(watch=True)))
+        return out
+
+    def close_pair(self, pair_trade_id: str, reason: str = "manual") -> Dict[str, Any]:
+        """Exit both legs of a pair at the market - allowed while quitting too."""
+        if self.executor is None:
+            return {"ok": False, "reason": "No broker to send the orders to."}
+        out = self.pairs.close(pair_trade_id, self.executor, reason=reason)
+        self._refresh_account()
+        BUS.publish("account.snapshot", state=self.snapshot())
+        return out
+
+    def pair_chart(self, pair_id: str) -> Dict[str, Any]:
+        model = self.pairs.model(pair_id)
+        prices = self._pair_prices(watch=False)
+        if model is not None and clock.current_session() is clock.Session.REGULAR:
+            prices = {**prices, **self._quotes([model.first, model.second])}
+        return self.pairs.chart(pair_id, self.md.daily_frame, prices)
+
+    def _autopilot_pairs(self, prices: Mapping[str, float]) -> None:
+        """Autopilot's pairs: only with PAIRS among its trade types, only once the replay has proven
+        the pair rules, a few a day, inside its exposure cap."""
+        ap, cfg = self.autopilot, self.settings.config.pairs
+        status = ap.status()
+        if not (status["enabled"] and status["effective"] and "PAIRS" in ap.trade_types):
+            return
+        if ap.require_proven and ap.proof_missing(PAIRS_KEY):
+            return
+        if self.repo.pair_trades_opened_on(clock.session_date()) >= int(cfg.max_new_per_day):
+            return
+        acc = self.sizing_account()
+        if acc is None or (acc.equity and self.gross_exposure() > acc.equity * ap.max_gross_exposure_pct / 100.0):
+            return
+        rows = [r for r in self.pairs.watch(self.md.daily_frame, prices) if r["signal"] and r["live"]]
+        for row in sorted(rows, key=lambda r: abs(r["z"] or 0.0) - r["entry_z"], reverse=True):
+            if ap.dry_run:
+                noted = (clock.session_date().isoformat(), row["id"])
+                if noted not in self._pairs_dry_noted:
+                    self._pairs_dry_noted.add(noted)
+                    log.info("autopilot DRY-RUN would enter pair %s (%s)", row["id"], row["side"])
+                return
+            out = self.enter_pair(row["id"], operator="autopilot")
+            if out.get("ok"):
+                log.warning("autopilot ENTERED pair %s: %s", row["id"], out.get("note"))
+                return
+
+    def journal_state(self, limit: int = 60) -> Dict[str, Any]:
+        cfg = self.settings.config.journal
+        return {"enabled": cfg.enabled, "review_at": cfg.review_at, "days": self.journal.days(limit)}
+
+    def journal_review(self, day: dt.date) -> Optional[Dict[str, Any]]:
+        return self.journal.get(day)
 
     def _switch_blocked(self, target_venue: str) -> Optional[str]:
         """Refuse to move orders to another venue while positions are open on the
@@ -635,6 +1073,9 @@ class TradingEngine:
             return "cycle"
         if self._autopilot_day_active() and mono - self._last_fast_at >= self.settings.config.scanner.fast_cycle_seconds:
             return "fast"
+        refresh = self.settings.config.scanner.plays_refresh_seconds
+        if refresh and mono - self._last_plays_at >= refresh and self._board_symbols():
+            return "plays"
         return None
 
     def _queue_scan(self, kind: str) -> None:
@@ -644,49 +1085,77 @@ class TradingEngine:
         self._scan_wake.set()
 
     def _run_scan(self, kind: str) -> None:
-        self._scan_running = {"kind": kind, "started_at": clock.now_ny().isoformat()}
-        BUS.publish("scan.started", kind=kind)
+        quick = kind == "plays"                         # the quick re-check of the plays on the board
+        if not quick:
+            self._scan_running = {"kind": kind, "started_at": clock.now_ny().isoformat()}
+            BUS.publish("scan.started", kind=kind)
         try:
-            self._refresh_account()
+            if not quick:
+                self._refresh_account()
             self.scanner.account = self.sizing_account()
-            result = (self.scanner.run_full(self.scan_settings) if kind == "full"
-                      else self.scanner.run_cycle(fast=kind == "fast"))
+            if not quick:
+                self._refresh_regime()
+            self.scanner.market = self.regime.context()
+            self.scanner.evidence_weights = self.evidence_weights()
+            if kind == "full":
+                result = self.scanner.run_full(self.scan_settings)
+            elif quick:
+                result = self.scanner.run_plays(self._board_symbols())
+            else:
+                result = self.scanner.run_cycle(fast=kind == "fast")
         except NoDataSource as e:
-            self._scan_failed(kind, str(e))
+            if quick:
+                self._last_plays_at = time.monotonic()
+            else:
+                self._scan_failed(kind, str(e))
             return
         except Exception as e:  # noqa: BLE001
-            log.exception("%s scan failed", kind)
-            self._scan_failed(kind, f"The {kind} scan failed: {e}")
+            if quick:
+                log.debug("quick re-check of the plays failed", exc_info=True)
+                self._last_plays_at = time.monotonic()
+            else:
+                log.exception("%s scan failed", kind)
+                self._scan_failed(kind, f"The {kind} scan failed: {e}")
             return
         finally:
-            self._scan_running = None
+            if not quick:
+                self._scan_running = None
 
         mono = time.monotonic()
-        self._scan_retry_at = 0.0
-        if kind == "full":
-            self._last_cycle_at = float("-inf")         # in the session, a cycle follows straight away
+        if quick:
+            self._last_plays_at = mono
         else:
-            self._last_fast_at = mono
-            if kind == "cycle":
-                self._last_cycle_at = mono
+            self._scan_retry_at = 0.0
+            if kind == "full":
+                self._last_cycle_at = float("-inf")     # in the session, a cycle follows straight away
+            else:
+                self._last_fast_at = mono
+                if kind == "cycle":
+                    self._last_cycle_at = mono
         sizing = self.sizing_account()
         if sizing is not None:
             exposure = self.exposure_by_symbol()
             for p in result.plays:
-                size_play(p, sizing, self.settings.config.risk, symbol_notional=exposure.get(p.symbol, 0.0))
-        self.board.replace(result.plays, None if kind == "full" else result.symbols)
+                size_play(p, sizing, self.settings.config.risk, symbol_notional=exposure.get(p.symbol, 0.0),
+                          risk_pct=self.strategy_risk_pct(p.strategy))
+        # the cycles don't re-check valuation setups, so those stay; a quick re-check isn't a confirmation
+        changes = self.board.replace(result.plays, None if kind == "full" else result.symbols,
+                                     keep=lambda p: p.kind.value == "FUNDAMENTAL", confirm=not quick)
         self._last_scans[kind] = result.summary()
-        try:
-            self.repo.record_scan(result, keep_rejected=self.settings.config.database.record_rejected_plays)
-        except Exception:  # noqa: BLE001
-            log.exception("could not save the scan")
+        if not quick:
+            try:
+                self.repo.record_scan(result, keep_rejected=self.settings.config.database.record_rejected_plays)
+            except Exception:  # noqa: BLE001
+                log.exception("could not save the scan")
         self._publish_plays()
-        BUS.publish("watchlist.updated", **self.watchlist_state())
+        if not quick:
+            BUS.publish("watchlist.updated", **self.watchlist_state())
         if not self.quit_state:
             try:
                 self.autopilot.consider(self.board.plays)
             except Exception:  # noqa: BLE001
                 log.exception("autopilot pass failed")
+        self._note_changes(changes)
 
     def _scan_failed(self, kind: str, reason: str) -> None:
         self._scan_retry_at = time.monotonic() + self.SCAN_RETRY_S
@@ -756,6 +1225,56 @@ class TradingEngine:
 
     def _publish_plays(self) -> None:
         BUS.publish("plays.updated", plays=[self._decorate(p) for p in self.board.ranked()[:self.BOARD_ROWS]])
+
+    #: stocks the quick re-check looks at, best plays first
+    PLAYS_REFRESH_MAX = 25
+    #: a setup that flickers in and out isn't announced again for this long
+    NOTE_QUIET_S = 600.0
+
+    def _board_symbols(self) -> List[str]:
+        """The stocks whose plays are still on offer, best first."""
+        offered = (p.symbol for p in self.board.ranked() if p.status is PlayStatus.PROPOSED)
+        return list(dict.fromkeys(offered))[:self.PLAYS_REFRESH_MAX]
+
+    def _note_changes(self, changes: List[Any]) -> None:
+        """While Autopilot is on, tell the dashboard why plays joined or left the board, and
+        what Autopilot makes of a new one."""
+        if not changes or not self.autopilot.enabled:
+            return
+        mono, notes = time.monotonic(), []
+        for i, c in enumerate(changes):
+            p = c.play
+            key = (c.kind, p.symbol, p.strategy, p.side.value, p.timeframe.value)
+            if mono - self._noted.get(key, float("-inf")) < self.NOTE_QUIET_S:
+                continue
+            self._noted[key] = mono
+            note = {"id": f"note_{time.time_ns()}_{i}", "at": clock.now_ny().isoformat(), "kind": c.kind,
+                    "play_id": p.id, "symbol": p.symbol, "side": p.side.value, "strategy": p.strategy,
+                    "timeframe": p.timeframe.value, "why": c.why}
+            if c.kind == "added":
+                try:
+                    note["autopilot"] = self.autopilot.verdict(p)
+                except Exception:  # noqa: BLE001
+                    log.debug("autopilot verdict failed", exc_info=True)
+            notes.append(note)
+        self._noted = {k: t for k, t in self._noted.items() if mono - t < self.NOTE_QUIET_S}
+        if notes:
+            BUS.publish("plays.changes", notes=notes)
+
+    def play_chart(self, play_id: str) -> Dict[str, Any]:
+        """Candles and the ways out of a play on the board (see engine/chart.py)."""
+        p = self.board.get(play_id)
+        if p is None:
+            return {"ok": False, "reason": "That play is no longer on the board."}
+        frame, intraday = None, p.timeframe is Timeframe.INTRADAY
+        if intraday and self.md.attached:
+            try:
+                frame = self.md.intraday([p.symbol], self.scanner.con_ids([p.symbol])).get(p.symbol)
+            except Exception:  # noqa: BLE001
+                log.debug("chart candles for %s failed", p.symbol, exc_info=True)
+        if frame is None or not len(frame):
+            frame, intraday = self.md.daily_frame(p.symbol), False
+        return chart_payload(p, frame, intraday, self.settings.config.exit_manager)
 
     # ------------------------------------------------------------------ #
     #  Account, arming, broker vs database                              #
@@ -840,7 +1359,8 @@ class TradingEngine:
         cfg = self.settings.config
         # sized against the trading capital; the PDT rule and the floor see the real account
         sizing = size_play(p, self.sizing_account() or acc, cfg.risk,
-                           symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0))
+                           symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0),
+                           risk_pct=self.strategy_risk_pct(p.strategy))
         decision = self.pdt.assess(acc, p)
         session = clock.current_session()
         plan = plan_order(p, session, cfg.execution)
@@ -907,6 +1427,7 @@ class TradingEngine:
                 return {"ok": False, "reason": "; ".join(pre["reasons"]) or "not executable"}
 
             p.status = PlayStatus.ACCEPTED
+            p.evidence["at_entry"] = self._entry_context(p, operator)
             self.repo.record_play(p)
             self.repo.set_play_status(p.id, p.status.value, operator)
             try:
@@ -1063,7 +1584,9 @@ class TradingEngine:
             return {"ok": True, "filters": new.as_dict(), "note": "No change.", "rescanning": False}
         self.filters = self.scanner.filters = new
         self._save_runtime()
-        removed = self.board.keep_only(new.allows)
+        dropped = self.board.drop(new.allows, "the Long/Short, timeframe or sector filters no longer allow it")
+        removed = len(dropped)
+        self._note_changes(dropped)
         self._publish_plays()
         BUS.publish("filters.updated", filters=new.as_dict())
         # narrowing just trims the board; widening needs a scan to find the new plays
@@ -1123,7 +1646,7 @@ class TradingEngine:
         self.scanner.set_strategies(build_strategies(self.settings, overrides))
         self._save_runtime()
         active = {s.key for s in self.scanner.strategies}
-        self.board.keep_only(lambda p: p.strategy in active)
+        self._note_changes(self.board.drop(lambda p: p.strategy in active, "its strategy was switched off"))
         self._publish_plays()
         BUS.publish("strategies.updated", strategies=self.strategy_state())
         if rescan:
@@ -1186,7 +1709,8 @@ class TradingEngine:
             exposure = self.exposure_by_symbol()
             for p in self.board.plays.values():
                 if p.status not in _ACTED_ON:
-                    size_play(p, sizing, self.settings.config.risk, symbol_notional=exposure.get(p.symbol, 0.0))
+                    size_play(p, sizing, self.settings.config.risk, symbol_notional=exposure.get(p.symbol, 0.0),
+                              risk_pct=self.strategy_risk_pct(p.strategy))
         self._publish_plays()
 
     # ------------------------------------------------------------------ #
@@ -1321,6 +1845,7 @@ class TradingEngine:
             "armed": self._armed,
             "market_open": clock.is_market_open(),
             "market": clock.market_status(),
+            "regime": self.regime.reading(),
             "exit_manager": views.exit_rules(cfg.exit_manager),
             "autopilot": self.autopilot.status(),
             "data": views.data_feed(self.md),
@@ -1347,3 +1872,12 @@ def _order_signature(orders: List[Dict[str, Any]]) -> tuple:
     """What has to change for the dashboard to be told about the working orders."""
     keys = ("order_id", "status", "filled", "remaining", "limit_price", "stop_price", "purpose", "trade_id")
     return tuple(sorted((tuple(o.get(k) for k in keys) for o in orders), key=lambda row: str(row[0])))
+
+
+def _attempt(action: Callable[..., Dict[str, Any]], *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Run an operator action; an unexpected error comes back as a reason instead of escaping."""
+    try:
+        return action(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        log.exception("%s failed", getattr(action, "__name__", "action"))
+        return {"ok": False, "reason": f"It didn't go through: {e}"}

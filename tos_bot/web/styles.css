@@ -310,3 +310,83 @@ tr.clickable-row{cursor:pointer}
 /* ---- active orders ---- */
 .order-mark{margin-left:5px; font-size:11px; cursor:pointer; vertical-align:middle}
 .orders-table .purpose{white-space:nowrap}
+
+/* ---- play chart ---- */
+.row-tools{white-space:nowrap}
+.chart-btn{background:transparent; border:1px solid var(--line); color:var(--fg); padding:0 6px; border-radius:6px; font-size:12px; margin-right:6px; line-height:18px}
+.chart-card{max-width:940px; width:94vw}
+.chart-head{display:flex; justify-content:space-between; align-items:center; gap:8px}
+.chart-wrap{margin:8px 0; background:var(--bg); border:1px solid var(--line); border-radius:var(--radius); overflow-x:auto}
+.play-chart{width:100%; height:auto; display:block; min-width:640px}
+.play-chart .wick{stroke-width:1}
+.play-chart .up{stroke:var(--long); fill:var(--long)}
+.play-chart .down{stroke:var(--short); fill:var(--short)}
+.play-chart .ahead{fill:var(--bg3); opacity:.6}
+.play-chart .lvl{stroke-width:1; stroke-dasharray:4 3}
+.play-chart .lv-entry{stroke:var(--accent); fill:var(--accent)}
+.play-chart .lv-stop{stroke:var(--short); fill:var(--short)}
+.play-chart .lv-target{stroke:var(--long); fill:var(--long)}
+.rt-target{stroke:var(--long); fill:var(--long)}
+.rt-stop{stroke:var(--short); fill:var(--short)}
+.rt-lock{stroke:var(--warn); fill:var(--warn)}
+.rt-trail{stroke:var(--accent2); fill:var(--accent2)}
+.rt-time{stroke:var(--muted); fill:var(--muted)}
+.play-chart .route{fill:none; stroke-width:2; stroke-dasharray:6 4}
+.play-chart .route-head{stroke:none}
+.play-chart .lbl, .play-chart .tick{font-size:11px; stroke:none}
+.play-chart .tick{fill:var(--muted)}
+.routes{list-style:none; padding:0; margin:6px 0; font-size:12.5px}
+.routes li{margin:6px 0; color:var(--fg); stroke:none}
+.routes li i{display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px; vertical-align:middle; background:var(--muted)}
+.routes li.rt-target i{background:var(--long)}
+.routes li.rt-stop i{background:var(--short)}
+.routes li.rt-lock i{background:var(--warn)}
+.routes li.rt-trail i{background:var(--accent2)}
+.routes .route-r{font-weight:600}
+
+/* ---- autopilot notes ---- */
+.ap-notes{margin-bottom:12px; padding-bottom:10px; border-bottom:1px solid var(--line)}
+.ap-notes-head{display:flex; justify-content:space-between; align-items:center; margin-bottom:6px}
+#ap-notes-list{max-height:40vh; overflow-y:auto}
+.ap-note{position:relative; background:var(--bg3); border:1px solid var(--line); border-left:3px solid var(--warn); border-radius:8px; padding:8px 28px 8px 10px; margin:6px 0; font-size:12.5px}
+.ap-note.added{border-left-color:var(--long)}
+.ap-note.clickable{cursor:pointer}
+.ap-note .note-x{position:absolute; top:4px; right:4px; background:transparent; border:none; color:var(--muted); padding:2px 6px; font-size:12px}
+.ap-note .note-x:hover{color:var(--fg)}
+.ap-note .note-why, .ap-note .note-ap{margin-top:3px}
+
+/* ---- journal ---- */
+.journal{display:grid; grid-template-columns:230px 1fr; gap:14px; padding:10px 12px}
+.journal-days{display:flex; flex-direction:column; gap:6px; max-height:560px; overflow:auto}
+.journal-day{display:flex; flex-direction:column; align-items:flex-start; gap:2px; text-align:left; background:var(--bg3);
+  border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:6px 10px; cursor:pointer; font:inherit}
+.journal-day.active{border-color:var(--accent); background:var(--sel)}
+.journal-review{min-width:0}
+.journal-review h4{margin:14px 0 6px}
+.journal-cards{display:flex; flex-wrap:wrap; gap:8px; margin:6px 0}
+.journal-cards div{background:var(--bg3); border:1px solid var(--line); border-radius:8px; padding:6px 12px; min-width:110px}
+.journal-cards label{display:block; font-size:11px; color:var(--muted)}
+.journal-lessons{margin:6px 0; padding-left:18px}
+.journal-lessons li{margin:4px 0}
+.journal .gain{color:var(--long)}
+.journal .loss{color:var(--short)}
+.journal .ev-table th{text-align:left; font-size:11px; color:var(--muted); padding:3px 6px}
+@media (max-width:800px){ .journal{grid-template-columns:1fr} }
+
+/* ---- pairs ---- */
+.pairs{padding:10px 12px}
+.pairs h4{margin:14px 0 6px}
+.zbar{position:relative; display:inline-block; width:90px; height:8px; background:var(--bg3); border:1px solid var(--line);
+  border-radius:4px; vertical-align:middle}
+.zbar .band{position:absolute; top:0; bottom:0; background:var(--sel)}
+.zbar .mark{position:absolute; top:-3px; width:3px; height:12px; margin-left:-1px; background:var(--muted)}
+.zbar .mark.hot{background:var(--accent)}
+.pair-chart{width:100%; height:auto; font-size:10px}
+.pair-chart text{fill:var(--muted)}
+.pair-chart .pc-z{fill:none; stroke:var(--accent); stroke-width:1.5}
+.pair-chart .pc-mean{stroke:var(--muted); stroke-dasharray:3 3}
+.pair-chart .pc-band{stroke:var(--warn); stroke-dasharray:5 3}
+.pair-chart .pc-stop{stroke:var(--short)}
+.pair-chart .pc-in{fill:var(--long)}
+.pair-chart .pc-out{fill:var(--short)}
+.pair-chart .pc-live{fill:var(--fg)}

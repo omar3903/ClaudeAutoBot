@@ -11,6 +11,7 @@ export const S = {
   recordId: null,     // trade shown in the record drawer
   scanRun: null,      // {kind, stage, done, total} while a scan runs
   orders: { orders: [], ok: false },   // what's working at the broker (/api/orders, orders.updated)
+  notes: [],          // Autopilot notes: why plays joined or left the board (plays.changes)
   stopped: false,     // the app has shut down
 };
 

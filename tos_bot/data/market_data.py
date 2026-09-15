@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 INTRADAY_BAR = "5 mins"
 INTRADAY_DURATION = "5 D"            # today plus four sessions, for relative volume
 _INTRADAY_TTL_S = 60.0
+REFRESH_DURATION = "1800 S"           # the quick re-check fetches the last half hour only
 _QUOTE_TTL_S = 20.0
 _DAILY_CHUNK = 200
 
@@ -135,6 +136,30 @@ class MarketData:
                 for s, frame in got.items():
                     self._intraday[s] = (now, frame)
             out.update(got)
+        return out
+
+    def refresh_intraday(self, symbols: Sequence[str],
+                         con_ids: Optional[Mapping[str, int]] = None) -> Dict[str, pd.DataFrame]:
+        """Brings the cached 5-minute candles of ``symbols`` up to date by fetching only the
+        last half hour and merging it in - light enough to repeat every few seconds. A stock
+        without cached candles gets its full history first."""
+        wanted = list(dict.fromkeys(symbols))
+        with self._lock:
+            cached = {s: self._intraday[s][1] for s in wanted if s in self._intraday}
+        out = self.intraday([s for s in wanted if s not in cached], con_ids) if len(cached) < len(wanted) else {}
+        if cached:
+            now = time.monotonic()
+            recent = self.source.history_many({s: (INTRADAY_BAR, REFRESH_DURATION) for s in cached}, con_ids)
+            with self._lock:
+                for s, frame in recent.items():
+                    if frame is None or not len(frame) or s not in cached:
+                        continue
+                    merged = pd.concat([cached[s], frame])
+                    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+                    self._intraday[s] = (now, merged)
+                    out[s] = merged
+            for s, frame in cached.items():
+                out.setdefault(s, frame)
         return out
 
     def quote(self, symbol: str) -> Quote:

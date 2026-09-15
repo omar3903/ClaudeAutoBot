@@ -35,3 +35,6 @@ dist/
 Thumbs.db
 .idea/
 .vscode/
+
+# everything the running app writes (database, replay results, signals state, trades)
+data/

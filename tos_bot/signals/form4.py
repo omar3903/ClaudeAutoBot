@@ -15,7 +15,7 @@ import datetime as dt
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 BUY, SELL = "P", "S"
 #: best role first - a filing with several reporting owners takes the most senior
@@ -162,8 +162,3 @@ def _date(value: str) -> Optional[dt.date]:
         return dt.date.fromisoformat(value[:10])
     except ValueError:
         return None
-
-
-def trade_row(t: InsiderTrade) -> Dict[str, object]:
-    """A trade as a plain dict, for the database and the dashboard."""
-    return {**t.__dict__, "value": round(t.value, 2), "holding_change": round(t.holding_change, 4)}

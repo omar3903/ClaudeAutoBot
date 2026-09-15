@@ -113,6 +113,10 @@ class Scanner:
         self._noise = NoiseSettings.from_config(settings.config.noise)
         #: insider and news signals (filled by the signals service); None leaves scores alone
         self.signals: Optional[SignalBook] = None
+        #: the market's regime (engine/market_regime.py), handed to every play's context
+        self.market: Dict[str, Any] = {}
+        #: each strategy's evidence multiplier (research/weights.py)
+        self.evidence_weights: Dict[str, float] = {}
 
     def set_strategies(self, strategies: Sequence[Strategy]) -> None:
         """Swap the active setups. A scan already running keeps the set it started with."""
@@ -165,7 +169,8 @@ class Scanner:
                 if daily is not None:
                     result.plays += evaluate(m.symbol, swing, daily, None, run_id=result.run_id,
                                              equity=self._equity, params=self._params, activity=m, noise=self._noise,
-                                             signals=self.signals)
+                                             signals=self.signals, market=self.market,
+                                             evidence_weights=self.evidence_weights)
             result.plays += self._signal_plays(swing, {m.symbol for m in ranked[:self.SWING_LEADERS]},
                                                result.run_id)[0]
         with self._timed(result, "valuation_setups"):
@@ -213,7 +218,8 @@ class Scanner:
                      if (f := self._financials(p, benchmark)) is not None]
             plays += evaluate(m.symbol, strategies, self.md.daily_frame(m.symbol), None, run_id=run_id,
                               equity=self._equity, params=self._params, activity=m, fundamentals=fin, peers=peers,
-                              noise=self._noise, signals=self.signals)
+                              noise=self._noise, signals=self.signals, market=self.market,
+                              evidence_weights=self.evidence_weights)
         return plays
 
     def _financials(self, symbol: str, benchmark: Optional[pd.DataFrame]) -> Optional[Financials]:
@@ -256,7 +262,8 @@ class Scanner:
                 activity = intraday_metrics(symbol, intraday[symbol], daily[symbol])
                 plays = evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
                                  equity=self._equity, params=self._params, activity=activity, noise=self._noise,
-                                 signals=self.signals)
+                                 signals=self.signals, market=self.market,
+                                 evidence_weights=self.evidence_weights)
                 result.plays += plays
                 if activity is not None:
                     heat[symbol] = activity.heat + (_PLAY_BONUS if plays else 0.0)
@@ -288,8 +295,34 @@ class Scanner:
                 continue
             looked_at.append(symbol)
             plays += evaluate(symbol, strategies, daily, None, run_id=run_id, equity=self._equity, params=self._params,
-                              activity=daily_metrics(symbol, daily), noise=self._noise, signals=self.signals)
+                              activity=daily_metrics(symbol, daily), noise=self._noise, signals=self.signals,
+                              market=self.market, evidence_weights=self.evidence_weights)
         return plays, looked_at
+
+    def run_plays(self, symbols: Sequence[str]) -> ScanResult:
+        """The quick re-check: the setups on ``symbols`` - the stocks with plays on the board -
+        against their newest candles. Only the last half hour of candles is fetched, no
+        watchlist decision is made, and a stock whose candles didn't come keeps its plays."""
+        filters, strategies = self.filters, list(self.strategies)
+        result = ScanResult("plays")
+        wanted = list(dict.fromkeys(symbols))
+        intraday = self.md.refresh_intraday(wanted, self.con_ids(wanted)) if wanted else {}
+        daily = self.md.daily(wanted) if wanted else {}
+        result.symbols = [s for s in wanted if s in intraday and s in daily]
+        result.universe_size, result.scanned = len(wanted), len(result.symbols)
+        market_open = clock.is_market_open()
+        active = [s for s in strategies if s.kind is StrategyKind.TECHNICAL and s.timeframe.value in filters.timeframes
+                  and (s.timeframe is Timeframe.SWING or market_open)]
+        with self._timed(result, "setups"):
+            for symbol in result.symbols:
+                activity = intraday_metrics(symbol, intraday[symbol], daily[symbol])
+                result.plays += evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
+                                         equity=self._equity, params=self._params, activity=activity,
+                                         noise=self._noise, signals=self.signals, market=self.market,
+                                         evidence_weights=self.evidence_weights)
+        for p in result.plays:
+            p.scan_run_id = None               # a quick re-check isn't recorded as a scan
+        return self._finish(result, filters, quiet=True)
 
     # ---- shared ------------------------------------------------------------- #
     @property
@@ -299,7 +332,7 @@ class Scanner:
     def con_ids(self, symbols: Iterable[str]) -> Dict[str, int]:
         return {s: info.con_id for s in symbols if (info := self.symbols.get(s)) is not None and info.found}
 
-    def _finish(self, result: ScanResult, filters: TradeFilters) -> ScanResult:
+    def _finish(self, result: ScanResult, filters: TradeFilters, quiet: bool = False) -> ScanResult:
         min_rr = float(self.settings.config.risk.min_reward_risk)
         for p in result.plays:
             p.sector = self.symbols.sector(p.symbol)
@@ -308,8 +341,11 @@ class Scanner:
                               key=lambda p: p.score, reverse=True)
         result.finished_at = clock.now_ny()
         result.elapsed_s = (result.finished_at - result.started_at).total_seconds()
-        log.info("scan %s: %s", result.kind, result.summary())
-        BUS.publish("scan.completed", summary=result.summary())
+        if quiet:
+            log.debug("scan %s: %s", result.kind, result.summary())
+        else:
+            log.info("scan %s: %s", result.kind, result.summary())
+            BUS.publish("scan.completed", summary=result.summary())
         return result
 
     @staticmethod

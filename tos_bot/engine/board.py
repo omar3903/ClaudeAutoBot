@@ -9,12 +9,17 @@ session. When a scan finds it again the play keeps its id and counts another
 confirmation; once it has been acted on or dismissed, the setup isn't offered
 again until the next session. Opposite setups on one stock and timeframe are
 both flagged as a conflict (see scanner/noise.py).
+
+Every change says why: a new setup was found, or a play left because its setup
+no longer shows on the latest candles, it expired, or a filter or strategy switch
+dropped it. The engine turns these into the dashboard's Autopilot notes.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import threading
+from dataclasses import dataclass
 from typing import Callable, Collection, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..core.enums import PlayStatus
@@ -26,6 +31,13 @@ SetupKey = Tuple[str, str, str, str, dt.date]
 
 def setup_key(p: Play) -> SetupKey:
     return (p.symbol, p.strategy, p.side.value, p.timeframe.value, clock.session_date(p.created_at))
+
+
+@dataclass
+class BoardChange:
+    kind: str                     # added | removed
+    play: Play
+    why: str
 
 
 class PlayBoard:
@@ -48,17 +60,24 @@ class PlayBoard:
         return sorted(self._plays.values(), key=lambda p: p.score, reverse=True)
 
     def replace(self, plays: Iterable[Play], scanned: Optional[Collection[str]] = None,
-                now: Optional[dt.datetime] = None) -> None:
-        """``scanned`` = the symbols the scan looked at; None = it looked at everything."""
+                now: Optional[dt.datetime] = None, keep: Optional[Callable[[Play], bool]] = None,
+                confirm: bool = True) -> List[BoardChange]:
+        """``scanned`` = the symbols the scan looked at; None = it looked at everything.
+        ``keep`` spares the plays on those symbols that the scan doesn't re-evaluate
+        (valuation setups, say). ``confirm`` = False when a quick re-check shouldn't count
+        as another scan confirming a setup. Returns what was added and removed, and why."""
         now = now or dt.datetime.now(dt.timezone.utc)
         with self._lock:
             today = clock.session_date(now)
             self._settled = {k for k in self._settled if k[-1] == today}
             self._settled.update(setup_key(p) for p in self._plays.values() if p.status is not PlayStatus.PROPOSED)
-            previous = {setup_key(p): p for p in self._plays.values()}
+            before = dict(self._plays)
+            previous = {setup_key(p): p for p in before.values()}
             kept = {} if scanned is None else {
-                pid: p for pid, p in self._plays.items()
-                if p.symbol not in scanned and (p.expires_at is None or p.expires_at > now)}
+                pid: p for pid, p in before.items()
+                if (p.symbol not in scanned or (keep is not None and keep(p)))
+                and (p.expires_at is None or p.expires_at > now)}
+            changes: List[BoardChange] = []
             for p in plays:
                 key, old = setup_key(p), previous.get(setup_key(p))
                 if key in self._settled:
@@ -66,21 +85,36 @@ class PlayBoard:
                         kept[old.id] = old                # still shown as executed / dismissed
                     continue
                 if old is not None:
-                    p.id, p.created_at, p.confirmations = old.id, old.created_at, old.confirmations + 1
+                    p.id, p.created_at = old.id, old.created_at
+                    p.scan_run_id = p.scan_run_id or old.scan_run_id
+                    p.confirmations = old.confirmations + 1 if confirm else old.confirmations
+                else:
+                    changes.append(BoardChange("added", p, p.rationale or "a new setup was found"))
                 kept[p.id] = p
             _flag_conflicts(kept.values())
+            changes += [BoardChange("removed", p, _why_gone(p, scanned, now))
+                        for pid, p in before.items() if pid not in kept and p.status is PlayStatus.PROPOSED]
             self._plays = kept
+            return changes
 
-    def keep_only(self, wanted: Callable[[Play], bool]) -> int:
-        """Drop the plays that aren't wanted; returns how many went."""
+    def drop(self, wanted: Callable[[Play], bool], why: str) -> List[BoardChange]:
+        """Drop the plays that aren't wanted, saying ``why``."""
         with self._lock:
-            before = len(self._plays)
+            gone = [p for p in self._plays.values() if not wanted(p)]
             self._plays = {pid: p for pid, p in self._plays.items() if wanted(p)}
-            return before - len(self._plays)
+        return [BoardChange("removed", p, why) for p in gone if p.status is PlayStatus.PROPOSED]
 
     def clear(self) -> None:
         with self._lock:
             self._plays = {}
+
+
+def _why_gone(p: Play, scanned: Optional[Collection[str]], now: dt.datetime) -> str:
+    if p.expires_at is not None and p.expires_at <= now:
+        return "it expired - the setup is too old to act on"
+    if scanned is None:
+        return "the full scan didn't find the setup again"
+    return "the setup no longer shows on the latest candles"
 
 
 def _flag_conflicts(plays: Iterable[Play]) -> None:

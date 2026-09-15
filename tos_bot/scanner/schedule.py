@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import asdict, dataclass, replace
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from ..util import clock
 
@@ -26,11 +26,11 @@ LATEST_FULL_SCAN = dt.time(9, 0)          # half an hour before the open
 @dataclass(frozen=True)
 class ScanSettings:
     premarket_time: str = "08:30"
-    cycle_minutes: int = 15
+    cycle_minutes: int = 5
     hot_list_size: int = 20
     sector_queue_size: int = 25
 
-    LIMITS = {"cycle_minutes": (5, 60), "hot_list_size": (5, 50), "sector_queue_size": (10, 50)}
+    LIMITS = {"cycle_minutes": (3, 5), "hot_list_size": (5, 50), "sector_queue_size": (10, 50)}
 
     @property
     def full_scan_time(self) -> dt.time:
@@ -54,10 +54,27 @@ class ScanSettings:
     def as_dict(self) -> dict:
         return asdict(self)
 
+    def clamped(self) -> "ScanSettings":
+        """A copy with its numbers pulled inside LIMITS."""
+        return replace(self, **self._clamp(asdict(self)))
+
+    @classmethod
+    def _clamp(cls, values: Mapping[str, Any]) -> Dict[str, Any]:
+        out = dict(values)
+        for key, (lo, hi) in cls.LIMITS.items():
+            try:
+                if out.get(key) is not None:
+                    out[key] = min(hi, max(lo, int(out[key])))
+            except (TypeError, ValueError):
+                out.pop(key)
+        return out
+
     @classmethod
     def load(cls, saved: Optional[Mapping[str, Any]], defaults: "ScanSettings") -> "ScanSettings":
+        """The saved settings over the defaults; values saved under older limits are pulled into range."""
+        defaults = defaults.clamped()
         try:
-            return defaults.changed(**dict(saved or {}))
+            return defaults.changed(**cls._clamp(dict(saved or {})))
         except (ValueError, TypeError):
             return defaults
 

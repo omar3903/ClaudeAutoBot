@@ -10,6 +10,16 @@ trades it removes did worse than the ones it keeps.
 Trading against the daily trend, VWAP or today's gap, or into heavier opposing
 volume, only counts against momentum setups; reversal setups fade the move on
 purpose. The play board adds "conflict" when setups on one stock disagree.
+
+Three checks come from the books' statistics (see quant/):
+
+- a momentum setup on a price that has been mean reverting - its Hurst exponent or
+  variance ratio says moves get taken back - is "not_trending" (Chan, *Algorithmic
+  Trading* ch. 2 and 6: test for momentum before trading it);
+- a reversal setup on a price that has been trending is "not_mean_reverting";
+- a momentum setup while the market is in its turbulent regime (Hamilton's Markov
+  switching model, ch. 22) is "turbulent_market" - Chan (ch. 8) finds momentum
+  suffers in high volatility while short-term reversal does better.
 """
 
 from __future__ import annotations
@@ -22,6 +32,7 @@ import pandas as pd
 
 from ..core.enums import Side, Timeframe
 from ..core.models import Play
+from ..quant import readings
 from ..strategies.base import StrategyContext
 
 LABELS = {
@@ -31,8 +42,13 @@ LABELS = {
     "volume_against": "heavier volume against it",
     "conflict": "another setup points the other way",
     "low_expected_value": "too little expected value",
+    "not_trending": "the price keeps snapping back - breakouts in it tend to fail",
+    "not_mean_reverting": "the price has been trending - fading it fights the trend",
+    "turbulent_market": "the market is in its turbulent regime",
 }
 CHECKS = tuple(LABELS)
+#: the checks from the books' statistics; Autopilot also skips one once the replay shows it helps
+QUANT_CHECKS = ("not_trending", "not_mean_reverting", "turbulent_market")
 
 
 @dataclass(frozen=True)
@@ -41,19 +57,25 @@ class NoiseSettings:
     volume_ratio: float = 1.5       # opposing volume this many times the supporting volume
     volume_bars: int = 6            # closed 5-minute bars the volume check looks back over
     min_expected_r: float = 0.15    # expected value (in R) below which a play isn't worth the risk
+    trending_hurst: float = readings.TRENDING_HURST
+    reverting_hurst: float = readings.REVERTING_HURST
+    turbulent_probability: float = 0.7
 
     @classmethod
     def from_config(cls, cfg) -> "NoiseSettings":
         return cls(gap_pct=float(cfg.gap_pct), volume_ratio=float(cfg.volume_ratio),
-                   volume_bars=int(cfg.volume_bars), min_expected_r=float(cfg.min_expected_r))
+                   volume_bars=int(cfg.volume_bars), min_expected_r=float(cfg.min_expected_r),
+                   trending_hurst=float(getattr(cfg, "trending_hurst", readings.TRENDING_HURST)),
+                   reverting_hurst=float(getattr(cfg, "reverting_hurst", readings.REVERTING_HURST)),
+                   turbulent_probability=float(getattr(cfg, "turbulent_probability", 0.7)))
 
 
 def context_flags(play: Play, ctx: StrategyContext, style: str, settings: NoiseSettings) -> List[str]:
     """The checks that read the market around a play."""
+    flags = quant_flags(play, ctx, style, settings)
     if style != "momentum":
-        return []
+        return flags
     long = play.side is Side.LONG
-    flags: List[str] = []
     if ctx.daily_trend() == ("down" if long else "up"):
         flags.append("against_trend")
     today = ctx.today_intraday()
@@ -69,6 +91,25 @@ def context_flags(play: Play, ctx: StrategyContext, style: str, settings: NoiseS
         flags.append("against_gap")
     if opposing_volume_ratio(today, long, settings.volume_bars) >= settings.volume_ratio:
         flags.append("volume_against")
+    return flags
+
+
+def quant_flags(play: Play, ctx: StrategyContext, style: str, settings: NoiseSettings) -> List[str]:
+    """The checks from the price's statistics and the market's regime."""
+    if style not in ("momentum", "reversal"):
+        return []
+    flags: List[str] = []
+    reading = ctx.price_character(play.timeframe is Timeframe.INTRADAY)
+    if reading is not None:
+        kind = readings.classify(reading["hurst"], reading["variance_ratio_z"],
+                                 settings.trending_hurst, settings.reverting_hurst)
+        if style == "momentum" and kind == "mean reverting":
+            flags.append("not_trending")
+        elif style == "reversal" and kind == "trending":
+            flags.append("not_mean_reverting")
+    turbulent = (ctx.market or {}).get("p_turbulent")
+    if style == "momentum" and turbulent is not None and turbulent >= settings.turbulent_probability:
+        flags.append("turbulent_market")
     return flags
 
 

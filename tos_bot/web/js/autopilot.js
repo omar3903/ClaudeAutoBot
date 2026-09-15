@@ -3,12 +3,14 @@ import { $, $$, escapeHtml, post } from "./util.js";
 import { S, on } from "./state.js";
 import { openModal, toast } from "./ui.js";
 
+const typeName = t => ({ INTRADAY: "day", SWING: "swing", PAIRS: "pairs" })[t] || String(t).toLowerCase();
+
 export function renderAutopilot() {
   const ap = S.state.autopilot || {}, scan = S.state.scan || {};
   const btn = $("#ap-toggle");
   const enabled = !!ap.enabled, eff = !!ap.effective;
   const fast = !!scan.fast, secs = scan.fast_cycle_seconds, mins = (scan.settings || {}).cycle_minutes;
-  const types = (ap.trade_types || []).map(t => t === "INTRADAY" ? "day" : "swing").join("+");
+  const types = (ap.trade_types || []).map(typeName).join("+");
   btn.textContent = enabled ? `Autopilot: ${types || "on"}${ap.dry_run ? " · dry" : ""}${fast ? ` ⚡${secs}s` : ""}` : "Autopilot: off";
   btn.classList.toggle("on", enabled && eff);
   btn.classList.toggle("armed-paper", enabled && !eff);       // wants to run but paper-gated in live
@@ -41,7 +43,7 @@ function toggle() {
       ? "Autopilot will arm for <b>paper only</b> — it will not route real orders until you set <code>autopilot.allow_live: true</code> in config/config.yaml."
       : "The bot will <b>place entries for you</b> when a play clears the gate. Exits are already automatic. It stays inside the per-day and position caps and the 2:1 minimum."}
       </div>
-      <p class="muted">Trade types: <b>${(ap.trade_types || ["INTRADAY"]).map(t => t === "INTRADAY" ? "day" : "swing").join(", ")}</b> ·
+      <p class="muted">Trade types: <b>${(ap.trade_types || ["INTRADAY"]).map(typeName).join(", ")}</b> ·
       ≤ ${ap.max_auto_positions ?? 2} open · ≤ ${ap.max_auto_trades_per_day ?? 3}/day · ≥ conf ${ap.min_confidence ?? 0.62}.
       Change these with the ⚙ button.</p>`,
     okText: "Turn on", okClass: live && !ap.allow_live ? "danger" : "long",
@@ -59,6 +61,7 @@ function configure() {
       <div class="ap-row">
         <label><input type="checkbox" id="ap-day" ${has("INTRADAY")}> Day trades</label>
         <label><input type="checkbox" id="ap-swing" ${has("SWING")}> Swing trades</label>
+        <label title="Only once the replay has proven the pair rules, at most pairs.max_new_per_day a day"><input type="checkbox" id="ap-pairs" ${has("PAIRS")}> Pairs</label>
       </div>
       <label>Minimum confidence <b id="ap-conf-v">${ap.min_confidence ?? 0.62}</b></label>
       <input type="range" id="ap-conf" min="0.4" max="0.9" step="0.01" value="${ap.min_confidence ?? 0.62}">
@@ -90,6 +93,7 @@ function configure() {
       const types = [];
       if ($("#ap-day").checked) types.push("INTRADAY");
       if ($("#ap-swing").checked) types.push("SWING");
+      if ($("#ap-pairs").checked) types.push("PAIRS");
       const int = sel => parseInt($(sel).value, 10);
       await postAutopilot({
         trade_types: types.length ? types : ["INTRADAY"],

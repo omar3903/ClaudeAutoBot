@@ -210,14 +210,14 @@ def test_autopilot_is_part_of_the_snapshot_and_remembered(engine):
 
 # ---------------------------------------------------------------- scans
 def test_scan_settings_are_checked_saved_and_used(engine, tmp_path, gateway, port):
-    r = engine.set_scan_settings(cycle_minutes=30, premarket_time="07:45")
-    assert r["ok"] and "07:45" in r["note"] and "30 minutes" in r["note"]
+    r = engine.set_scan_settings(cycle_minutes=4, premarket_time="07:45")
+    assert r["ok"] and "07:45" in r["note"] and "4 minutes" in r["note"]
     assert r["scan"]["settings"]["premarket_time"] == "07:45"
-    assert engine.runtime.read()["scan"]["cycle_minutes"] == 30
+    assert engine.runtime.read()["scan"]["cycle_minutes"] == 4
     assert "04:00 to 09:00" in engine.set_scan_settings(premarket_time="09:45")["reason"]
-    assert "between 5 and 60" in engine.set_scan_settings(cycle_minutes=2)["reason"]
-    assert engine.set_scan_settings(cycle_minutes=30)["note"] == "No change."
-    assert _new_engine(tmp_path, gateway, port).scan_settings.cycle_minutes == 30     # after a restart
+    assert "between 3 and 5" in engine.set_scan_settings(cycle_minutes=2)["reason"]
+    assert engine.set_scan_settings(cycle_minutes=4)["note"] == "No change."
+    assert _new_engine(tmp_path, gateway, port).scan_settings.cycle_minutes == 4      # after a restart
 
 
 def test_scan_requests_queue_and_never_downgrade_a_full_scan(engine):
@@ -244,7 +244,13 @@ def test_scans_follow_the_schedule(engine, port, monkeypatch):
     monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: True)
     assert engine._due_scan() == "cycle"
     engine._run_scan("cycle")
+    engine._last_plays_at = time.monotonic()                              # the quick re-check has just run too
     assert engine._due_scan() is None                                     # the next cycle is minutes away
+    engine.board.replace([_play("AAPL")], None)
+    engine._last_plays_at -= engine.settings.config.scanner.plays_refresh_seconds + 1
+    assert engine._due_scan() == "plays"                                  # plays on the board are re-checked
+    engine._run_scan("plays")
+    assert engine._due_scan() is None and engine.scan_status()["running"] is None
 
     engine.set_autopilot(enabled=True, trade_types=["INTRADAY"])
     engine._last_fast_at -= engine.settings.config.scanner.fast_cycle_seconds + 1
@@ -279,7 +285,7 @@ def test_while_quitting_nothing_but_exits_can_change(engine):
     for refused in (engine.set_mode("live"), engine.set_filters(sides=["LONG"]), engine.request_scan(),
                     engine.reset_paper(), engine.set_strategy(key, enabled=False),
                     engine.set_autopilot(enabled=True), engine.set_paper_platform("simulator"),
-                    engine.approve_play("any"), engine.set_scan_settings(cycle_minutes=20),
+                    engine.approve_play("any"), engine.set_scan_settings(cycle_minutes=4),
                     engine.set_capital(1_000)):
         assert not refused["ok"] and refused["reason"].startswith("Quitting")
     assert engine.close_position(tid)["ok"]                                 # exits still go through
@@ -466,3 +472,17 @@ def test_the_dashboard_lists_the_orders_working_at_the_broker(engine, monkeypatc
     assert listed["ok"]
     assert [(o["symbol"], o["purpose"], o["play_id"], o["limit_price"]) for o in listed["orders"]] == [
         ("AAPL", "entry", "play_waiting", 1.0)]
+
+
+def test_the_session_review_keeps_each_trade_with_what_it_was_taken_on(engine):
+    from tos_bot.util import clock
+
+    today = clock.now_ny().date()
+    assert not engine.review_session(today)["ok"]                          # nothing offered or traded yet
+    tid = _open(engine, "AAPL")
+    engine.repo.close_trade(tid, exit_price=103.0, exit_reason="target")
+    out = engine.review_session(today)
+    review = out["review"]
+    assert out["ok"] and review["day"]["trades"] == 1 and abs(review["trades"][0]["r"] - 0.6) < 1e-9
+    assert engine.journal_review(today)["session"] == today.isoformat()
+    assert engine.journal_state()["days"][0]["session"] == today.isoformat()

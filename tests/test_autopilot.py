@@ -382,3 +382,40 @@ def test_autopilot_only_trades_strategies_the_replay_has_proven():
     eng.records["opening_range_breakout"] = {"trades": 40, "expectancy_r": 0.20}
     _run(ap, p)
     assert eng.approved_ids() == [p.id]
+
+
+def test_autopilot_wants_a_strategy_to_have_made_money_in_the_held_out_sessions_too():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(require_proven=True, min_replay_trades=30, min_replay_expectancy_r=0.05), bus=SILENT)
+    p = mkplay()
+    record = {"trades": 40, "expectancy_r": 0.20}
+    for held in ({"trades": 12, "expectancy_r": -0.10}, {"trades": 4, "expectancy_r": 0.50}):
+        eng.records["opening_range_breakout"] = {**record, "out_of_sample": held}
+        _run(ap, p)
+        assert eng.approved == []
+    assert "held-out" in ap.verdict(p)
+    eng.records["opening_range_breakout"] = {**record, "out_of_sample": {"trades": 12, "expectancy_r": 0.10}}
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]
+
+
+def test_autopilot_skips_a_statistical_noise_flag_once_the_replay_shows_it_helps():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(), bus=SILENT)
+    p = mkplay()
+    p.noise = ["not_trending"]
+    eng.learned_skips = lambda: ["not_trending"]
+    _run(ap, p)
+    assert eng.approved == [] and ap.status()["learned_skip_noise"] == ["not_trending"]
+    eng.learned_skips = lambda: []
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]
+
+
+def test_autopilot_can_be_told_to_take_pairs_only():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(), bus=SILENT)
+    ap.configure(trade_types=["PAIRS", "OPTIONS"])
+    assert ap.trade_types == ["PAIRS"]
+    _run(ap, mkplay())
+    assert eng.approved == []                                                   # plays aren't pairs

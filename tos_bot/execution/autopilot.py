@@ -32,6 +32,9 @@ from ..util import clock
 
 log = logging.getLogger(__name__)
 
+#: what Autopilot can be told to take: day trades, swing trades, pairs (pairs/desk.py)
+TRADE_TYPES = ("INTRADAY", "SWING", "PAIRS")
+
 
 class AutoPilot:
     def __init__(self, engine: Any, cfg: Any, *, bus: Any = BUS,
@@ -96,7 +99,7 @@ class AutoPilot:
         self.enabled = bool(d.get("enabled", self.enabled))
         tt = d.get("trade_types")
         if isinstance(tt, list) and tt:
-            self.trade_types = [str(x).upper() for x in tt if str(x).upper() in ("INTRADAY", "SWING")] or self.trade_types
+            self.trade_types = [str(x).upper() for x in tt if str(x).upper() in TRADE_TYPES] or self.trade_types
         for k in ("min_confidence", "min_reward_risk", "max_gross_exposure_pct"):
             if isinstance(d.get(k), (int, float)):
                 setattr(self, k, float(d[k]))
@@ -125,7 +128,7 @@ class AutoPilot:
             self.dry_run = bool(kw["dry_run"])
         tt = kw.get("trade_types")
         if isinstance(tt, list):
-            clean = [str(x).upper() for x in tt if str(x).upper() in ("INTRADAY", "SWING")]
+            clean = [str(x).upper() for x in tt if str(x).upper() in TRADE_TYPES]
             if clean:
                 self.trade_types = clean
         if isinstance(kw.get("min_confidence"), (int, float)):
@@ -201,6 +204,7 @@ class AutoPilot:
             "max_gross_exposure_pct": round(self.max_gross_exposure_pct, 1),
             "min_confirmations": self.min_confirmations,
             "skip_noise": list(self.skip_noise),
+            "learned_skip_noise": self._learned_skips(),
             "noise_labels": NOISE_LABELS,
             "require_proven": self.require_proven,
             "min_replay_trades": self.min_replay_trades,
@@ -363,7 +367,8 @@ class AutoPilot:
             return f"reward:risk {p.reward_risk:.1f} < {self.min_reward_risk:.1f}"
         if p.kind.value == "FUNDAMENTAL":
             return "valuation plays are not day/swing entries - not auto-traded"
-        noisy = [n for n in p.noise if n in self.skip_noise]
+        skipped = self.skipped_noise()
+        noisy = [n for n in p.noise if n in skipped]
         if noisy:
             return "noise: " + ", ".join(NOISE_LABELS.get(n, n) for n in noisy)
         if tf == "INTRADAY" and p.confirmations < self.min_confirmations:
@@ -398,10 +403,23 @@ class AutoPilot:
                 pass
         return None
 
+    def verdict(self, p: Any) -> str:
+        """What Autopilot makes of a play, in words, for the dashboard's notes."""
+        if not self.enabled:
+            return "Autopilot is off"
+        if p.id in self._acted:
+            return "Autopilot has acted on it"
+        sizing = getattr(self.engine, "sizing_account", None)
+        acct = sizing() if callable(sizing) else getattr(self.engine, "_account", None)
+        gate = self._last_reason.get(p.id) or self._pre_gate(p, float(getattr(acct, "equity", 0.0) or 0.0))
+        return f"won't take it: {gate}" if gate else "passes its checks - it can take it on the next pass"
+
     def _unproven(self, strategy: str) -> Optional[str]:
         """Why a strategy's replayed record isn't good enough to auto-trade, if it isn't."""
-        if not self.require_proven:
-            return None
+        return self.proof_missing(strategy) if self.require_proven else None
+
+    def proof_missing(self, strategy: str) -> Optional[str]:
+        """Why a strategy's replayed record doesn't prove it, whether or not Autopilot asks for proof."""
         record = self.engine.strategy_record(strategy) or {}
         trades = int(record.get("trades", 0))
         if trades < self.min_replay_trades:
@@ -409,12 +427,37 @@ class AutoPilot:
                     "trades it needs (Strategies -> Run replay)")
         if record["expectancy_r"] < self.min_replay_expectancy_r:
             return f"{strategy} averaged {record['expectancy_r']:+.2f}R over {trades} replayed trades"
+        held = record.get("out_of_sample")
+        if held is not None:
+            n = int(held.get("trades", 0))
+            if n < self.MIN_HELD_OUT_TRADES:
+                return (f"{strategy} isn't proven yet: {n} of its replayed trades fall in the held-out "
+                        f"sessions and it needs {self.MIN_HELD_OUT_TRADES} there")
+            if held["expectancy_r"] <= 0:
+                return (f"{strategy} averaged {held['expectancy_r']:+.2f}R over the {n} trades in the "
+                        "replay's held-out sessions - its record doesn't hold up out of sample")
         return None
+
+    #: replayed trades a strategy needs in the held-out sessions (Chan: test out of sample)
+    MIN_HELD_OUT_TRADES = 10
+
+    def _learned_skips(self) -> List[str]:
+        """The checks from the books' statistics that the replay shows are worth skipping."""
+        learned = getattr(self.engine, "learned_skips", None)
+        try:
+            return [c for c in learned() if c not in self.skip_noise] if callable(learned) else []
+        except Exception:  # noqa: BLE001
+            return []
+
+    def skipped_noise(self) -> List[str]:
+        """Every noise flag Autopilot won't trade: the ones chosen, and the ones the replay taught it."""
+        return list(self.skip_noise) + self._learned_skips()
 
     # ------------------------------------------------------------------ #
     def decorate_play(self, row: Dict[str, Any]) -> Dict[str, Any]:
         """Tag a play row so the dashboard can show a '🤖 auto' badge."""
         pid = row.get("id")
+        skipped = self.skipped_noise()
         will = (
             self.enabled and self._live_ok()
             and row.get("timeframe") in self.trade_types
@@ -422,7 +465,7 @@ class AutoPilot:
             and float(row.get("reward_risk", 0)) >= self.min_reward_risk
             and row.get("kind") != "FUNDAMENTAL"
             and row.get("status") == "PROPOSED"
-            and not any(n in self.skip_noise for n in row.get("noise", []))
+            and not any(n in skipped for n in row.get("noise", []))
             and (row.get("timeframe") != "INTRADAY" or int(row.get("confirmations", 1)) >= self.min_confirmations)
             and not self._unproven(row.get("strategy", ""))
         )

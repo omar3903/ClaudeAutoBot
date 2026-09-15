@@ -11,7 +11,7 @@ from sqlalchemy import func, or_, select
 from ..core.models import Account, Play
 from ..util import clock
 from .db import session_scope
-from .models_orm import AccountSnapshot, Fill, OrderAudit, PlayLog, ScanRun, Trade
+from .models_orm import AccountSnapshot, DailyReviewLog, Fill, OrderAudit, PairTradeLog, PlayLog, ScanRun, Trade
 
 log = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ def trade_to_dict(t: Trade) -> Dict[str, Any]:
         "r_multiple": _f(t.r_multiple), "mae": _f(t.mae), "mfe": _f(t.mfe),
         "is_day_trade": bool(t.is_day_trade),
         "session_date": t.session_date.isoformat() if t.session_date else None,
-        "notes": t.notes,
+        "notes": t.notes, "pair_id": getattr(t, "pair_id", None),
         **_time_status(t),
     }
 
@@ -123,6 +123,7 @@ def play_to_dict(p: PlayLog) -> Dict[str, Any]:
         "suggested_qty": p.suggested_qty, "dollar_risk": _f(p.dollar_risk),
         "notional": _f(p.notional), "rationale": p.rationale,
         "explanation": p.explanation, "evidence": p.evidence, "tags": p.tags,
+        "noise": list(getattr(p, "noise", None) or []), "confirmations": int(getattr(p, "confirmations", None) or 1),
         "status": p.status,
     }
 
@@ -185,15 +186,18 @@ class Repository:
                 float(getattr(play, "expected_hold_typical", 0.0) or 0.0),
                 float(getattr(play, "expected_hold_max", 0.0) or 0.0),
             )
+            pair_id = getattr(play, "pair_id", None)     # a pair leg: no stop or target of its own
             s.add(Trade(
                 id=tid, play_id=play.id, symbol=play.symbol,
                 sector=getattr(play, "sector", "") or "", side=play.side.value,
                 strategy=play.strategy, kind=play.kind.value, timeframe=play.timeframe.value,
                 broker=broker, status="OPEN", quantity=fill_qty, entry_price=fill_price,
                 entry_time=now, order_type=order_type, order_session=order_session,
-                stop_price=play.stop, target_price=play.primary_target,
-                initial_stop_price=play.stop, initial_target_price=play.primary_target,
-                hwm_price=fill_price, managed_exit=True, fees=commission,
+                stop_price=None if pair_id else play.stop,
+                target_price=None if pair_id else play.primary_target,
+                initial_stop_price=None if pair_id else play.stop,
+                initial_target_price=None if pair_id else play.primary_target,
+                hwm_price=fill_price, managed_exit=not pair_id, pair_id=pair_id, fees=commission,
                 expected_exit_at=exp_exit, overwatch_at=overwatch,
                 session_date=clock.session_date(),
                 is_day_trade=(play.timeframe.value == "INTRADAY"),
@@ -353,6 +357,101 @@ class Repository:
         return int(closed) + int(open_today)
 
     # -------------------------------------------------------------- #
+    #  Pair trades (pairs/desk.py)                                   #
+    # -------------------------------------------------------------- #
+    def create_pair_trade(self, row: Dict[str, Any]) -> None:
+        with session_scope() as s:
+            s.add(PairTradeLog(**_pair_columns(row)))
+
+    def update_pair_trade(self, pair_trade_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
+        with session_scope() as s:
+            row = s.get(PairTradeLog, pair_trade_id)
+            if row is None:
+                return None
+            for name, value in _pair_columns(fields).items():
+                setattr(row, name, value)
+            return pair_to_dict(row)
+
+    def get_pair_trade(self, pair_trade_id: str) -> Optional[Dict[str, Any]]:
+        with session_scope() as s:
+            row = s.get(PairTradeLog, pair_trade_id)
+            return pair_to_dict(row) if row is not None else None
+
+    def pair_trades(self, statuses: Optional[List[str]] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Pair trades, newest first - only those in ``statuses`` when given."""
+        with session_scope() as s:
+            query = select(PairTradeLog).order_by(PairTradeLog.created_at.desc()).limit(limit)
+            if statuses:
+                query = query.where(PairTradeLog.status.in_(list(statuses)))
+            return [pair_to_dict(r) for r in s.execute(query).scalars().all()]
+
+    def trades_for_pair(self, pair_trade_id: str) -> List[Dict[str, Any]]:
+        """Both legs of a pair trade, open or closed."""
+        with session_scope() as s:
+            rows = s.execute(select(Trade).where(Trade.pair_id == pair_trade_id)
+                             .order_by(Trade.entry_time)).scalars().all()
+            return [trade_to_dict(r) for r in rows]
+
+    def pair_trades_closed_between(self, first: dt.date, last: dt.date) -> List[Dict[str, Any]]:
+        start, end = _ny_bounds(first)[0], _ny_bounds(last)[1]
+        with session_scope() as s:
+            rows = s.execute(select(PairTradeLog).where(PairTradeLog.status == "CLOSED",
+                                                        PairTradeLog.closed_at >= start, PairTradeLog.closed_at < end)
+                             .order_by(PairTradeLog.closed_at)).scalars().all()
+            return [pair_to_dict(r) for r in rows]
+
+    def pair_trades_opened_on(self, day: dt.date) -> int:
+        """Pair trades entered during the New York session ``day`` - failed attempts aside."""
+        start, end = _ny_bounds(day)
+        with session_scope() as s:
+            return int(s.execute(select(func.count()).select_from(PairTradeLog)
+                                 .where(PairTradeLog.created_at >= start, PairTradeLog.created_at < end,
+                                        PairTradeLog.status != "FAILED")).scalar() or 0)
+
+    # -------------------------------------------------------------- #
+    #  The journal (research/journal.py)                            #
+    # -------------------------------------------------------------- #
+    def closed_trades_between(self, first: dt.date, last: dt.date) -> List[Dict[str, Any]]:
+        """Trades closed during the New York sessions ``first`` .. ``last``, oldest first, each
+        with the play it came from - its evidence holds what the trade was taken on."""
+        start, end = _ny_bounds(first)[0], _ny_bounds(last)[1]
+        with session_scope() as s:
+            rows = s.execute(select(Trade, PlayLog).outerjoin(PlayLog, Trade.play_id == PlayLog.id)
+                             .where(Trade.status == "CLOSED", Trade.exit_time >= start, Trade.exit_time < end)
+                             .order_by(Trade.exit_time)).all()
+            return [{**trade_to_dict(t), "play": play_to_dict(p) if p is not None else None} for t, p in rows]
+
+    def plays_on(self, day: dt.date, limit: int = 5000) -> List[Dict[str, Any]]:
+        """The plays recorded during the New York session ``day``, oldest first."""
+        start, end = _ny_bounds(day)
+        with session_scope() as s:
+            rows = s.execute(select(PlayLog).where(PlayLog.created_at >= start, PlayLog.created_at < end)
+                             .order_by(PlayLog.created_at).limit(limit)).scalars().all()
+            return [play_to_dict(r) for r in rows]
+
+    def save_review(self, day: dt.date, review: Dict[str, Any]) -> None:
+        stats = review.get("day") or {}
+        with session_scope() as s:
+            s.merge(DailyReviewLog(
+                session_date=day, created_at=dt.datetime.now(dt.timezone.utc).replace(tzinfo=None),
+                trades=int(stats.get("trades") or 0), total_r=float(stats.get("total_r") or 0.0),
+                realized_pl=float(stats.get("realized_pl") or 0.0), mistakes=len(review.get("mistakes") or []),
+                review=review))
+
+    def get_review(self, day: dt.date) -> Optional[Dict[str, Any]]:
+        with session_scope() as s:
+            row = s.get(DailyReviewLog, day)
+            return dict(row.review) if row is not None and row.review else None
+
+    def list_reviews(self, limit: int = 60) -> List[Dict[str, Any]]:
+        with session_scope() as s:
+            rows = s.execute(select(DailyReviewLog).order_by(DailyReviewLog.session_date.desc())
+                             .limit(limit)).scalars().all()
+            return [{"session": r.session_date.isoformat(), "trades": r.trades, "total_r": r.total_r,
+                     "realized_pl": _f(r.realized_pl), "mistakes": r.mistakes,
+                     "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]
+
+    # -------------------------------------------------------------- #
     #  P/L analytics                                                #
     # -------------------------------------------------------------- #
     def pnl_summary(self) -> Dict[str, Any]:
@@ -407,6 +506,44 @@ class Repository:
                              message=message[:400]))
 
 
+_PAIR_COLUMNS = {"first": "first_symbol", "second": "second_symbol"}
+_PAIR_TIMES = ("opened_at", "closed_at", "created_at")
+
+
+def _pair_columns(row: Dict[str, Any]) -> Dict[str, Any]:
+    """A pair trade's fields as table columns - unknown ones dropped, times made naive UTC."""
+    known = set(PairTradeLog.__table__.columns.keys())
+    out = {}
+    for key, value in row.items():
+        name = _PAIR_COLUMNS.get(key, key)
+        if name not in known:
+            continue
+        if name in _PAIR_TIMES and isinstance(value, str):
+            value = dt.datetime.fromisoformat(value)
+        if name in _PAIR_TIMES and isinstance(value, dt.datetime):
+            value = _naive(value)
+        out[name] = value
+    return out
+
+
+def pair_to_dict(r: PairTradeLog) -> Dict[str, Any]:
+    out = {("first" if c == "first_symbol" else "second" if c == "second_symbol" else c): getattr(r, c)
+           for c in PairTradeLog.__table__.columns.keys()}
+    for name in _PAIR_TIMES:
+        out[name] = out[name].isoformat() if out[name] else None
+    for name in ("qty_first", "qty_second", "price_first", "price_second", "entry_first", "entry_second",
+                 "dollar_risk", "realized_pl"):
+        out[name] = _f(out[name])
+    return out
+
+
+def _ny_bounds(day: dt.date):
+    """A New York calendar day as naive-UTC bounds, the way the tables store times."""
+    def utc(d: dt.date) -> dt.datetime:
+        return dt.datetime.combine(d, dt.time(0), tzinfo=clock.NY).astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return utc(day), utc(day + dt.timedelta(days=1))
+
+
 # --------------------------------------------------------------------------- #
 def _play_row(p: Play) -> PlayLog:
     return PlayLog(
@@ -417,7 +554,8 @@ def _play_row(p: Play) -> PlayLog:
         reward_risk=p.reward_risk, confidence=p.confidence, score=p.score,
         suggested_qty=p.suggested_qty, dollar_risk=p.dollar_risk, notional=p.notional,
         rationale=p.rationale[:400], explanation=p.explanation, evidence=p.evidence,
-        tags=p.tags, status=p.status.value if hasattr(p.status, "value") else str(p.status),
+        tags=p.tags, noise=list(p.noise), confirmations=int(p.confirmations),
+        status=p.status.value if hasattr(p.status, "value") else str(p.status),
     )
 
 

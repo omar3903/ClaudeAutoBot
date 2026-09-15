@@ -290,6 +290,10 @@ class SignalService:
                 log.debug("Finnhub news for %s: %s", symbol, e)
         return items
 
+    def company_ciks(self) -> Dict[str, int]:
+        """SEC's ticker -> CIK map, read at most once a day."""
+        return self._company_ciks()
+
     def _company_ciks(self) -> Dict[str, int]:
         today = self._today()
         if self._ciks_on != today:

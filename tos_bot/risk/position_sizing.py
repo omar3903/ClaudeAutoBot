@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 from ..core.models import Account, Play
 
@@ -27,9 +27,10 @@ class SizingResult:
 
 
 def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
-              symbol_notional: float = 0.0) -> SizingResult:
+              symbol_notional: float = 0.0, risk_pct: Optional[float] = None) -> SizingResult:
     """``symbol_notional``: dollars already in this stock - shares held at the
-    broker and entry orders still working."""
+    broker and entry orders still working. ``risk_pct``: the strategy's half-Kelly
+    risk per trade (see quant/sizing.py), which can only lower the configured one."""
     entry = play.entry
     stop = play.stop
     rps = abs(entry - stop)
@@ -39,7 +40,11 @@ def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
         return SizingResult(0, rps, 0.0, 0.0, ["degenerate geometry"])
 
     equity = account.equity
-    risk_budget = equity * cfg.max_risk_per_trade_pct / 100.0
+    pct = float(cfg.max_risk_per_trade_pct)
+    if risk_pct is not None and risk_pct < pct:
+        pct = max(0.0, float(risk_pct))
+        caps.append("half-Kelly from the strategy's record")
+    risk_budget = equity * pct / 100.0
 
     # respect the portfolio-wide open-risk ceiling
     room = equity * cfg.max_open_risk_pct / 100.0 - open_risk_used

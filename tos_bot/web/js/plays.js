@@ -7,6 +7,7 @@ import { stratLabel } from "./strategies.js";
 import { hideExecuted, hideNoisy } from "./filters.js";
 import { loadOpen, openRecord, showTab } from "./blotter.js";
 import { orderMark } from "./orders.js";
+import { openChart } from "./chart.js";
 
 const DONE = new Set(["ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED", "ERROR"]);
 const isDone = p => DONE.has(p.status);
@@ -36,7 +37,7 @@ export function renderPlays() {
   const rows = visiblePlays();
   $("#plays-count").textContent = rows.length ? `(${rows.length})` : "";
   $("#plays-empty").innerHTML = S.plays.length && !rows.length
-    ? `All ${S.plays.length} plays are hidden by the view options above — untick <b>Hide noisy</b> or <b>Hide executed</b> to see them.`
+    ? `All ${S.plays.length} plays are hidden by the view options above — untick <b>Hide noise</b> or <b>Hide executed</b> to see them.`
     : emptyText();
   $("#plays-empty").classList.toggle("hidden", rows.length > 0);
   const body = $("#plays-body");
@@ -69,8 +70,12 @@ function playRow(p) {
     <td class="num">${p.suggested_qty || 0}</td>
     <td class="num">${usd(p.dollar_risk)}</td>
     <td class="num"><span class="score-bar"><i style="width:${Math.min(100, (p.score || 0) * 100)}%"></i></span></td>
-    <td>${last}</td>`;
-  tr.addEventListener("click", e => { if (e.target.closest(".order-mark")) showTab("orders"); else selectPlay(p.id); });
+    <td class="row-tools"><button class="chart-btn" title="Chart, and the ways this trade can end" aria-label="Chart">📈</button>${last}</td>`;
+  tr.addEventListener("click", e => {
+    if (e.target.closest(".chart-btn")) openChart(p);
+    else if (e.target.closest(".order-mark")) showTab("orders");
+    else selectPlay(p.id);
+  });
   tr.addEventListener("mousemove", e => {
     if (e.target.closest("[data-term]")) return;      // the term's own explanation is showing
     showTipAt(e.clientX, e.clientY, ((S.strategies[p.strategy] || {}).title || pretty(p.strategy)).toUpperCase(),
@@ -182,7 +187,17 @@ function evidenceHTML(ev) {
       f.rows.map(r => `<tr><td>${r.method}</td><td class="num">${r.low}</td><td class="num">${r.high}</td></tr>`).join("") +
       `</table><div class="muted">band ${f.band_low}–${f.band_high}, fair value ${f.fair_value}</div>`);
   }
-  const skip = new Set(["signal", "dcf", "football_field", "spark", "verdict", "peer_median", "target_multiples", "peers"]);
+  const qc = ev.price_character, vf = ev.vol_forecast, mr = ev.market_regime;
+  if (qc || vf || (mr && mr.p_turbulent != null) || ev.evidence_weight) {
+    blocks.push(`<h4>Statistics</h4><div class="kv">` +
+      (qc ? `<span>Price character</span><span>${escapeHtml(qc.character)} — Hurst ${num(qc.hurst, 2)}, variance ratio z ${num(qc.variance_ratio_z, 1)}${qc.half_life_bars ? `, half-life ${num(qc.half_life_bars, 0)} bars` : ""}</span>` : "") +
+      (vf ? `<span>Tomorrow's volatility</span><span>${num(vf.vol * 100, 2)}% (${escapeHtml(vf.model)}, ${num(vf.ratio, 2)}× the last 60 days)</span>` : "") +
+      (mr && mr.p_turbulent != null ? `<span>Market regime</span><span>${escapeHtml(mr.regime)} — P(turbulent) ${num(mr.p_turbulent, 2)}</span>` : "") +
+      (ev.evidence_weight ? `<span>Evidence weight</span><span>×${num(ev.evidence_weight, 2)} from its replayed and real record</span>` : "") +
+      `</div>`);
+  }
+  const skip = new Set(["signal", "dcf", "football_field", "spark", "verdict", "peer_median", "target_multiples", "peers",
+    "price_character", "vol_forecast", "market_regime", "evidence_weight", "at_entry", "hold_from_half_life"]);
   const rest = Object.entries(ev).filter(([k]) => !skip.has(k));
   if (rest.length) {
     blocks.push(`<h4>Signal detail</h4><div class="kv">` +

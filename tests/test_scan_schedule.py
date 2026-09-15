@@ -35,13 +35,13 @@ def test_the_next_session_change_is_exact():
 # ---------------------------------------------------------------- scan settings and schedule
 def test_scan_settings_are_validated():
     s = ScanSettings()
-    assert s.changed(premarket_time="07:05", cycle_minutes="30").as_dict() == {
-        "premarket_time": "07:05", "cycle_minutes": 30, "hot_list_size": 20, "sector_queue_size": 25}
+    assert s.changed(premarket_time="07:05", cycle_minutes="4").as_dict() == {
+        "premarket_time": "07:05", "cycle_minutes": 4, "hot_list_size": 20, "sector_queue_size": 25}
     with pytest.raises(ValueError, match="04:00 to 09:00"):
         s.changed(premarket_time="09:15")
     with pytest.raises(ValueError, match="look like"):
         s.changed(premarket_time="soon")
-    with pytest.raises(ValueError, match="between 5 and 60"):
+    with pytest.raises(ValueError, match="between 3 and 5"):
         s.changed(cycle_minutes=2)
     assert ScanSettings.load({"cycle_minutes": 999}, s) == s               # a bad saved value falls back
     assert ScanSettings.load({"hot_list_size": 30, "bogus": 1}, s).hot_list_size == 30
@@ -129,6 +129,13 @@ def test_a_cycle_replaces_only_the_plays_for_the_symbols_it_scanned():
     new_hot = _play("HOT")
     board.replace([new_hot], scanned=["HOT", "BUF"])
     assert set(board.plays) == {swing.id, new_hot.id}                          # the expired one went too
-    assert board.keep_only(lambda p: p.symbol != "SWG") == 1
+    assert [c.play.symbol for c in board.drop(lambda p: p.symbol != "SWG", "its strategy was switched off")] == ["SWG"]
     board.replace([], scanned=None)                                             # a full scan covers everything
     assert len(board) == 0
+
+
+def test_settings_saved_under_the_old_limits_are_pulled_into_range():
+    defaults = ScanSettings(cycle_minutes=15)                     # an old config.yaml
+    assert ScanSettings.load({"cycle_minutes": 15, "hot_list_size": 30}, defaults).as_dict() == {
+        "premarket_time": "08:30", "cycle_minutes": 5, "hot_list_size": 30, "sector_queue_size": 25}
+    assert ScanSettings.load(None, defaults).cycle_minutes == 5

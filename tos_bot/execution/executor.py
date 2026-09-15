@@ -77,6 +77,31 @@ class Executor:
             n += 1
         return n
 
+    def flatten_untracked(self, symbol: str, position_side: str, qty: float) -> bool:
+        """Close shares the broker holds that have no trade record - what's left when an order filled
+        but booking it failed. A market order, audited like any other."""
+        req = build_exit_order(symbol, position_side, qty, cfg=self.cfg, tag=f"unwind:{symbol}")
+        try:
+            res = self.broker.place_order(req)
+        except BrokerError as e:
+            self._audit("PLACE", req, {"error": str(e)}, ok=False, msg=str(e))
+            log.error("could not close %s %s shares that have no trade record: %s", qty, symbol, e)
+            return False
+        self._audit("PLACE", req, res.raw or {"status": res.status}, ok=True, msg="closing shares without a trade record")
+        log.warning("closed %s %s shares left without a trade record", qty, symbol)
+        return True
+
+    def cancel_entries_for(self, play_id: str) -> int:
+        """Call off the entry orders still working for one play - a pair leg whose other leg failed."""
+        n = 0
+        for oid, p in list(self._pending.items()):
+            if p.kind == "entry" and p.play.id == play_id:
+                self._cancel_quietly(oid)
+                self._pending.pop(oid, None)
+                p.play.status = PlayStatus.CANCELED
+                n += 1
+        return n
+
     def pending_exit_trade_ids(self) -> set:
         """Trades whose close order is still working at the broker."""
         return {p.trade_id for p in list(self._pending.values()) if p.kind == "exit" and p.trade_id}
