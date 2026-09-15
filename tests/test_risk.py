@@ -78,3 +78,11 @@ def test_paper_mode_never_blocks():
     assert "paper" in d.reason.lower()
     # counter is still surfaced so the operator can see it
     assert d.day_trades_used == 9
+
+
+def test_one_stock_never_takes_more_than_its_share_of_equity():
+    cfg = SimpleNamespace(**{**vars(RISK_CFG), "max_symbol_pct_of_equity": 15.0})
+    p = _play(100, 90)                                   # $10 risk/share: 10 shares by risk alone
+    r = size_play(p, _acct(10000), cfg, symbol_notional=1_000.0)
+    assert r.qty == 5 and "max exposure per stock" in r.caps_hit      # $1,500 cap - $1,000 already held
+    assert size_play(_play(100, 90), _acct(10000), cfg, symbol_notional=1_600.0).qty == 0

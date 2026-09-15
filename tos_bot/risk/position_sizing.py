@@ -1,8 +1,8 @@
 """Turn a Play's entry/stop geometry into a share count the account can bear.
 
 Fixed-fractional risk: risk at most ``max_risk_per_trade_pct`` of equity
-between entry and the protective stop, then clip by a notional cap and by
-available buying power.
+between entry and the protective stop, then clip by a notional cap per trade,
+a cap on everything held in the same stock, and available buying power.
 """
 
 from __future__ import annotations
@@ -26,7 +26,10 @@ class SizingResult:
         return self.__dict__.copy()
 
 
-def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0) -> SizingResult:
+def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
+              symbol_notional: float = 0.0) -> SizingResult:
+    """``symbol_notional``: dollars already in this stock - shares held at the
+    broker and entry orders still working."""
     entry = play.entry
     stop = play.stop
     rps = abs(entry - stop)
@@ -51,6 +54,14 @@ def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0) ->
     if qty * entry > max_notional:
         qty = math.floor(max_notional / entry)
         caps.append("max position % of equity")
+
+    # everything in one stock together, however it got there
+    symbol_cap = getattr(cfg, "max_symbol_pct_of_equity", None)
+    if symbol_cap is not None:
+        room_in_symbol = max(0.0, equity * symbol_cap / 100.0 - symbol_notional)
+        if qty * entry > room_in_symbol:
+            qty = math.floor(room_in_symbol / entry)
+            caps.append("max exposure per stock")
 
     # buying power
     bp = account.buying_power if account.buying_power else equity

@@ -425,10 +425,10 @@ class IbkrBroker(BrokerAdapter):
 
     def history_many(self, requests: Mapping[str, Tuple[str, str]],
                      con_ids: Optional[Mapping[str, int]] = None,
-                     timeout: float = 30.0) -> Dict[str, pd.DataFrame]:
+                     timeout: float = 30.0, end: Optional[dt.datetime] = None) -> Dict[str, pd.DataFrame]:
         """Candles for many symbols at once. ``requests`` maps a symbol to
-        (bar size, duration), e.g. ("1 day", "1 Y") or ("5 mins", "5 D").
-        Symbols IBKR has nothing for are left out of the result."""
+        (bar size, duration), e.g. ("1 day", "1 Y") or ("5 mins", "5 D"), ending at
+        ``end`` (default: now). Symbols IBKR has nothing for are left out of the result."""
         if not self.is_connected:
             raise AuthError("IBKR not connected")
         if not requests:
@@ -439,7 +439,7 @@ class IbkrBroker(BrokerAdapter):
             async with gate:
                 try:
                     bars = await ib.reqHistoricalDataAsync(
-                        self._contract_for_history(symbol, con_ids.get(symbol)), endDateTime="",
+                        self._contract_for_history(symbol, con_ids.get(symbol)), endDateTime=end or "",
                         durationStr=duration, barSizeSetting=bar, whatToShow="TRADES", useRTH=True,
                         formatDate=2, keepUpToDate=False, timeout=timeout)
                 except Exception:  # noqa: BLE001
@@ -499,13 +499,14 @@ class IbkrBroker(BrokerAdapter):
                  else LimitOrder(action, qty, float(req.limit_price)))
         order.tif = _tif(req.tif)
         order.outsideRth = req.session in ("EXTENDED", "SEAMLESS")
+        order.orderRef = req.client_tag            # lets a restarted app recognise its own working orders
         if self.account_id:
             order.account = self.account_id
         trade = self._session.call(lambda ib: ib.placeOrder(contract, order), timeout=10)
         oid = str(getattr(trade.order, "orderId", "") or getattr(trade.order, "permId", ""))
         status = getattr(trade.orderStatus, "status", "") or "Submitted"
         return OrderResult(order_id=oid, status=_norm_status(status), symbol=req.symbol,
-                           submitted_qty=req.quantity, raw={"tif": order.tif})
+                           submitted_qty=req.quantity, raw={"tif": order.tif}, side=req.side, tag=req.client_tag)
 
     def _find_trade(self, order_id: str):
         def _find(ib):
@@ -525,30 +526,33 @@ class IbkrBroker(BrokerAdapter):
         t = self._find_trade(order_id)
         if t is None:
             return OrderResult(order_id=str(order_id), status="UNKNOWN", symbol="?", submitted_qty=0.0)
-        os_ = t.orderStatus
-        fills = [Fill(order_id=str(order_id), symbol=t.contract.symbol,
-                      side=Side.LONG if t.order.action == "BUY" else Side.SHORT,
-                      quantity=float(f.execution.shares), price=float(f.execution.price))
-                 for f in (t.fills or [])]
-        return OrderResult(order_id=str(order_id), status=_norm_status(os_.status), symbol=t.contract.symbol,
-                           submitted_qty=float(t.order.totalQuantity or 0.0), filled_qty=float(os_.filled or 0.0),
-                           avg_fill_price=float(os_.avgFillPrice or 0.0), fills=fills, message=_order_message(t))
+        return self._result(t)
 
     def list_orders(self, status: Optional[str] = None) -> List[OrderResult]:
         if not self.is_connected:
             return []
-        open_only = status in (None, "OPEN", "WORKING")
-        trades = self._session.call(lambda ib: list(ib.openTrades() if open_only else ib.trades()), timeout=8) or []
-        out = []
-        for t in trades:
-            s = _norm_status(getattr(t.orderStatus, "status", ""))
-            if status and status.upper() not in (s, "OPEN", "WORKING"):
-                continue
-            out.append(OrderResult(order_id=str(getattr(t.order, "orderId", "")), status=s,
-                                   symbol=t.contract.symbol,
-                                   submitted_qty=float(getattr(t.order, "totalQuantity", 0.0) or 0.0),
-                                   filled_qty=float(getattr(t.orderStatus, "filled", 0.0) or 0.0)))
-        return out
+        if status in (None, "OPEN", "WORKING"):
+            # every open order on the account, including ones an earlier run of the app left working.
+            # reqAllOpenOrdersAsync hands back a future, not a coroutine, so it is awaited in one.
+            async def open_orders(ib):
+                return await ib.reqAllOpenOrdersAsync()
+            trades = self._session.run_coro(open_orders, timeout=15) or []
+        else:
+            trades = self._session.call(lambda ib: list(ib.trades()), timeout=8) or []
+        results = [self._result(t) for t in trades]
+        return [r for r in results if not status or status.upper() in (r.status, "OPEN", "WORKING")]
+
+    def _result(self, t) -> OrderResult:
+        o, os_ = t.order, t.orderStatus
+        side = Side.LONG if o.action == "BUY" else Side.SHORT
+        fills = [Fill(order_id=str(o.orderId), symbol=t.contract.symbol, side=side,
+                      quantity=float(f.execution.shares), price=float(f.execution.price))
+                 for f in (t.fills or [])]
+        return OrderResult(order_id=str(o.orderId), status=_norm_status(os_.status), symbol=t.contract.symbol,
+                           submitted_qty=float(o.totalQuantity or 0.0), filled_qty=float(os_.filled or 0.0),
+                           avg_fill_price=float(os_.avgFillPrice or 0.0), fills=fills, message=_order_message(t),
+                           side=side, tag=getattr(o, "orderRef", "") or "",
+                           raw={"mine": getattr(o, "clientId", None) == self.client_id})
 
 
 async def _sleep(seconds: float) -> None:

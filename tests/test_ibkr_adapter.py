@@ -121,8 +121,23 @@ class FakeIB:
     def openTrades(self):
         return self.trades()
 
+    def reqAllOpenOrdersAsync(self):
+        return _Finished(self.trades())          # like ib_async: an awaitable, not a coroutine
+
     def cancelOrder(self, order):
         order._cancelled = True
+
+
+class _Finished:
+    """An awaitable that has already finished - what several ib_async request methods return."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __await__(self):
+        if False:
+            yield
+        return self.value
 
 
 class FakeSession:
@@ -133,7 +148,10 @@ class FakeSession:
         pass
 
     def run_coro(self, factory, timeout=30.0):
-        return asyncio.new_event_loop().run_until_complete(factory(self.ib))
+        coro = factory(self.ib)
+        if not asyncio.iscoroutine(coro):          # asyncio.run_coroutine_threadsafe refuses anything else
+            raise TypeError("A coroutine object is required")
+        return asyncio.new_event_loop().run_until_complete(coro)
 
     def call(self, fn, timeout=15.0):
         return fn(self.ib)
@@ -394,3 +412,10 @@ def test_not_subscribed_switches_to_delayed_data(broker):
     broker._on_error(5, 354, "Requested market data is not subscribed. Delayed market data is available.", None)
     assert broker._data_is_delayed and broker.quotes_from_bars
     assert broker._session.ib.market_data_type == 3
+
+
+def test_open_orders_carry_direction_and_tag_so_a_restart_can_match_them(broker):
+    broker.place_order(build_exit_order("AAPL", "LONG", 10, tag="exit:trd_1"))
+    [order] = broker.list_orders("WORKING")
+    assert (order.symbol, order.side, order.tag, order.submitted_qty) == ("AAPL", Side.SHORT, "exit:trd_1", 10)
+    assert broker._session.ib.placed[-1][1].orderRef == "exit:trd_1"

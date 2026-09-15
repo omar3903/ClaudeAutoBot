@@ -49,14 +49,26 @@ class _Repo:
         self.t[tid].update(status="CLOSED", exit_price=exit_price, exit_reason=exit_reason)
         return dict(self.t[tid])
 
+    def get_play(self, play_id):
+        return {"id": play_id, "symbol": "AAA", "side": "LONG", "strategy": "vwap_reclaim", "kind": "TECHNICAL",
+                "timeframe": "INTRADAY", "entry": 100.0, "stop": 98.0, "targets": [104.0], "confidence": 0.7,
+                "sector": "Technology"} if play_id == "play_left" else None
+
+
+def _working(order_id, qty=10, side=Side.SHORT, tag="", **raw):
+    """An order an earlier run of the app left working at the broker."""
+    return OrderResult(order_id=order_id, status="SUBMITTED", symbol="AAA", submitted_qty=qty,
+                       side=side, tag=tag, raw=raw)
+
 
 class _Broker:
     """An account that takes orders and leaves them working until a test reports otherwise."""
 
     name, paper, supports_bracket_native = "ibkr", False, False
 
-    def __init__(self, positions=None):
+    def __init__(self, positions=None, working=None):
         self.positions = dict(positions or {})
+        self.working = list(working or [])      # orders an earlier run left working
         self.orders, self.cancelled, self.reports = [], [], {}
 
     def place_order(self, req):
@@ -72,7 +84,7 @@ class _Broker:
         self.cancelled.append(order_id)
 
     def list_orders(self, status=None):
-        return []
+        return [o for o in self.working if o.order_id not in self.cancelled] if status == "WORKING" else []
 
     def get_account(self):
         return Account(account_id="DU", positions=[Position(symbol=s, quantity=q, avg_price=100.0)
@@ -160,3 +172,61 @@ def test_an_entry_cancelled_after_a_partial_fill_books_the_shares_bought():
     ex.sync_open_orders()
     assert ex.working_entries() == []
     assert [(t["symbol"], t["quantity"], t["entry_price"]) for t in repo.open_trades()] == [("AAA", 4.0, 100.02)]
+
+
+# ---------------------------------------------------------------- after a restart
+def test_after_a_restart_the_exit_already_working_is_followed_not_sent_again():
+    broker = _Broker({"AAA": 10}, working=[_working("7")])
+    repo = _Repo([_trade()])
+    ex = _executor(broker, repo)
+    em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=90, ask=90, last=90), cfg=CFG,
+                     bus=SILENT, venue=VENUE)
+
+    assert [a["order_id"] for a in ex.adopt_working_orders()] == ["7"]
+    em.run_once()                                       # under the stop, but the exit is already out
+    assert broker.orders == [] and ex.pending_exit_trade_ids() == {"t1"}
+
+    broker.reports["7"] = OrderResult(order_id="7", status="FILLED", symbol="AAA", submitted_qty=10,
+                                      filled_qty=10, avg_fill_price=89.9)
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["status"] == "CLOSED"
+
+
+def test_duplicate_exits_the_app_left_working_are_cancelled():
+    broker = _Broker({"AAA": 10}, working=[_working("7", mine=True), _working("15", mine=True)])
+    ex = _executor(broker, _Repo([_trade()]))
+    ex.adopt_working_orders()
+    assert ex.pending_exit_trade_ids() == {"t1"} and broker.cancelled == ["15"]
+
+
+def test_a_closing_order_placed_by_hand_is_followed_but_never_cancelled():
+    broker = _Broker({"AAA": 10}, working=[_working("7"), _working("99", mine=False)])
+    ex = _executor(broker, _Repo([_trade()]))
+    ex.adopt_working_orders()
+    assert broker.cancelled == []
+
+
+def test_an_exit_click_follows_an_exit_already_at_the_broker():
+    broker = _Broker({"AAA": 10}, working=[_working("7", tag="exit:t1")])
+    ex = _executor(broker, _Repo([_trade()]))
+    out = ex.close_trade("t1")
+    assert out["ok"] and out["adopted"] and broker.orders == []
+
+
+def test_a_brackets_target_order_is_never_taken_for_the_exit():
+    broker = _Broker({"AAA": 10}, working=[_working("8", tag="play_abc:TP")])
+    ex = _executor(broker, _Repo([_trade()]))
+    assert ex.close_trade("t1")["ok"]
+    assert [o.quantity for o in broker.orders] == [10]                  # a real exit went out
+
+
+def test_an_entry_left_working_is_followed_and_booked_when_it_fills():
+    broker, repo = _Broker(working=[_working("21", side=Side.LONG, tag="play_left")]), _Repo([])
+    ex = _executor(broker, repo)
+    assert [a["kind"] for a in ex.adopt_working_orders()] == ["entry"]
+    assert [w["play_id"] for w in ex.working_entries()] == ["play_left"]
+
+    broker.reports["21"] = OrderResult(order_id="21", status="FILLED", symbol="AAA", submitted_qty=10,
+                                       filled_qty=10, avg_fill_price=100.05)
+    ex.sync_open_orders()
+    assert [(t["symbol"], t["quantity"]) for t in repo.open_trades()] == [("AAA", 10.0)]

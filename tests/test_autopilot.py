@@ -46,6 +46,8 @@ class FakeEngine:
         self.approved = []
         self.can_execute = True
         self.est_risk = 200.0
+        self.gross = 0.0                        # dollars already in positions
+        self.records = {}                       # replayed strategy records
         self._plays = {}                        # pid -> Play, populated by _run
 
     def assess_play(self, pid):
@@ -54,8 +56,14 @@ class FakeEngine:
             "ok": True,
             "can_execute": self.can_execute,
             "reasons": [] if self.can_execute else ["not executable in this session"],
-            "order_preview": {"qty": 10, "est_risk": self.est_risk},
+            "order_preview": {"qty": 10, "est_risk": self.est_risk, "est_cost": 1_000.0},
         }
+
+    def gross_exposure(self):
+        return self.gross
+
+    def strategy_record(self, key):
+        return self.records.get(key)
 
     def approve_play(self, pid, operator="operator"):
         self.approved.append((pid, operator))
@@ -89,6 +97,7 @@ def _cfg(**over):
         require_catalyst=False, dry_run=False,
         # cap tests below isolate one cap at a time; keep these wide open
         max_per_strategy=99, max_new_per_cycle=99, cooldown_after_loss=False,
+        min_confirmations=1, skip_noise=[], require_proven=False,
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -321,3 +330,55 @@ def test_no_entry_in_a_symbol_the_account_already_holds():
     eng._account.positions.append(Position(symbol="AAA", quantity=500, avg_price=5.0))
     _run(AutoPilot(eng, _cfg(), bus=SILENT), mkplay(sym="AAA"))
     assert eng.approved == []
+
+
+def test_autopilot_never_puts_more_than_the_account_into_positions():
+    eng = FakeEngine(equity=100_000.0)
+    eng.gross = 99_500.0                         # positions already use almost the whole account
+    ap = AutoPilot(eng, _cfg(max_gross_exposure_pct=100.0), bus=SILENT)
+    _run(ap, mkplay(sym="AAA"))
+    assert eng.approved == []
+    eng.gross = 50_000.0
+    p = mkplay(sym="BBB")
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]
+
+
+# --------------------------------------------------------------------------- #
+#  noise
+# --------------------------------------------------------------------------- #
+def test_autopilot_skips_plays_flagged_by_the_noise_checks_switched_on():
+    eng = FakeEngine()
+    p = mkplay(sym="AAA")
+    p.noise = ["against_trend"]
+    _run(AutoPilot(eng, _cfg(skip_noise=["against_trend"]), bus=SILENT), p)
+    assert eng.approved == []
+    q = mkplay(sym="BBB")
+    q.noise = ["against_trend"]
+    _run(AutoPilot(eng, _cfg(skip_noise=["conflict"]), bus=SILENT), q)
+    assert eng.approved_ids() == [q.id]
+
+
+def test_a_day_trade_setup_must_show_up_twice_before_autopilot_takes_it():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(min_confirmations=2), bus=SILENT)
+    p = mkplay()
+    _run(ap, p)
+    assert eng.approved == []
+    p.confirmations = 2
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]
+
+
+def test_autopilot_only_trades_strategies_the_replay_has_proven():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(require_proven=True, min_replay_trades=30, min_replay_expectancy_r=0.05), bus=SILENT)
+    p = mkplay()
+    _run(ap, p)
+    assert eng.approved == []                                                   # never replayed
+    eng.records["opening_range_breakout"] = {"trades": 40, "expectancy_r": -0.10}
+    _run(ap, p)
+    assert eng.approved == []                                                   # replayed, and it lost
+    eng.records["opening_range_breakout"] = {"trades": 40, "expectancy_r": 0.20}
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]

@@ -153,6 +153,11 @@ class Strategy:
     #: may this setup be entered pre- or post-market too? (limit orders only there)
     extended_hours_ok: bool = False
 
+    #: how the setup relates to the move in progress: "momentum" trades with it,
+    #: "reversal" fades it on purpose, "value" ignores price action. The noise
+    #: checks for going against the trend, VWAP or the gap apply to momentum only.
+    style: str = "momentum"
+
     #: how the setup behaves across Aziz's intraday sessions (Ch. 7). Momentum /
     #: breakout setups fade at midday; reversal setups hold up; trend setups get
     #: better into the close. Scales confidence only, never the geometry.
@@ -175,6 +180,7 @@ class Strategy:
     MAX_STOP_PCT = 0.25
     MIN_STOP_PCT = {"INTRADAY": 0.006, "SWING": 0.015}
     MIN_STOP_ATR = 0.9
+    MIN_STOP_DAILY_ATR = {"INTRADAY": 0.25, "SWING": 1.0}
     MAX_TARGET_PCT = {"INTRADAY": 0.15, "SWING": 0.45}
     MIN_TARGET_PCT = 0.002
     RR_BOUNDS = (0.4, 8.0)
@@ -206,10 +212,16 @@ class Strategy:
         max_stop = entry * self.MAX_STOP_PCT
         stop = max(stop, entry - max_stop) if side is Side.LONG else min(stop, entry + max_stop)
 
-        # widen a noise-tight stop to a real floor (% of price and intraday ATR)
+        # widen a noise-tight stop to a real floor: % of price, the intraday ATR, and
+        # a slice of the stock's usual daily range - a stop well inside a normal
+        # day's swing is noise, not a level
         floor = entry * self.MIN_STOP_PCT.get(self.timeframe.value, 0.006)
         if self.timeframe is Timeframe.INTRADAY and ctx.intraday_atr > 0:
             floor = max(floor, self.MIN_STOP_ATR * ctx.intraday_atr)
+        if self.kind is StrategyKind.TECHNICAL and ctx.daily_atr > 0:
+            floor = max(floor, self.MIN_STOP_DAILY_ATR.get(self.timeframe.value, 0.25) * ctx.daily_atr)
+        if floor > max_stop:
+            return None                           # too volatile for this setup's stop
         if abs(entry - stop) < floor:
             stop = entry - floor if side is Side.LONG else entry + floor
 

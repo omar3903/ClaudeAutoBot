@@ -55,6 +55,10 @@ from ..persistence.db import init_db
 from ..persistence.repository import Repository
 from ..risk.pdt_guard import PdtGuard
 from ..risk.position_sizing import size_play
+from ..research.history import IntradayHistory, replay_symbols
+from ..research.replay import ReplaySettings
+from ..research.runner import ReplayRunner
+from ..scanner.noise import LABELS as NOISE_LABELS, NoiseSettings
 from ..scanner import schedule
 from ..scanner.filters import TradeFilters
 from ..scanner.scanner import Scanner
@@ -134,6 +138,8 @@ class TradingEngine:
 
         self.board = PlayBoard()
         self.position_check = PositionCheck()
+        self.replay = ReplayRunner(data_dir / "research" / "replay.json",
+                                   IntradayHistory(data_dir / "research" / "intraday"))
         self.executor: Optional[Executor] = None
         self.exit_manager: Optional[ExitManager] = None
         self.pdt: Optional[PdtGuard] = None
@@ -234,6 +240,7 @@ class TradingEngine:
             self.executor = Executor(broker, self.repo, cfg.execution, bus=BUS, venue=venue)
         else:
             self.executor.rebind(broker, venue=venue)
+        self.executor.adopt_working_orders()          # before any exit can be sent twice
         self.exit_manager = ExitManager(self.repo, self.executor, quote_fn=self.md.quote,
                                         cfg=cfg.exit_manager, bus=BUS, venue=venue)
         self.position_check.reset()
@@ -297,6 +304,45 @@ class TradingEngine:
     def working_entries(self) -> List[Dict[str, Any]]:
         """Entry orders sent but not filled yet (see Executor.working_entries)."""
         return self.executor.working_entries() if self.executor else []
+
+    def exposure_by_symbol(self) -> Dict[str, float]:
+        """Dollars at work per stock on the current account: every position at its
+        market price - whether or not the app has a record of it - plus entry
+        orders still working."""
+        out: Dict[str, float] = {}
+        for pos in (self._account.positions if self._account else []):
+            out[pos.symbol] = out.get(pos.symbol, 0.0) + abs(pos.quantity * (pos.market_price or pos.avg_price))
+        for w in self.working_entries():
+            out[w["symbol"]] = out.get(w["symbol"], 0.0) + w["notional"]
+        return out
+
+    def gross_exposure(self) -> float:
+        return sum(self.exposure_by_symbol().values())
+
+    # ------------------------------------------------------------------ #
+    #  Strategy replay                                                   #
+    # ------------------------------------------------------------------ #
+    def start_replay(self, sessions: int = 20, swing_sessions: int = 120) -> Dict[str, Any]:
+        """Replay the strategies over recent candles in the background (see research/)."""
+        if not self.md.attached:
+            return {"ok": False, "reason": "IB Gateway isn't connected, so there are no candles to replay."}
+        symbols = replay_symbols(self.scanner.watchlist)
+        if not symbols["swing"]:
+            return {"ok": False, "reason": "Run the full scan first - the replay uses the stocks on its watchlist."}
+        cfg = self.settings.config
+        return self.replay.start(
+            strategies=self.scanner.strategies, source=self.md.source, daily_frame=self.md.daily_frame,
+            intraday_symbols=symbols["intraday"], swing_symbols=symbols["swing"],
+            sessions=max(5, min(60, int(sessions))), swing_sessions=max(20, min(250, int(swing_sessions))),
+            settings=ReplaySettings.from_exit_rules(cfg.exit_manager), noise=NoiseSettings.from_config(cfg.noise),
+            con_ids=self.scanner.con_ids(symbols["intraday"]))
+
+    def replay_state(self) -> Dict[str, Any]:
+        return self.replay.state(self.autopilot.skip_noise, self.autopilot.min_confirmations)
+
+    def strategy_record(self, key: str) -> Optional[Dict[str, Any]]:
+        """A strategy's replayed record over the trades Autopilot would have taken."""
+        return self.replay.records(self.autopilot.skip_noise, self.autopilot.min_confirmations).get(key)
 
     def _switch_blocked(self, target_venue: str) -> Optional[str]:
         """Refuse to move orders to another venue while positions are open on the
@@ -547,8 +593,9 @@ class TradingEngine:
                 self._last_cycle_at = mono
         sizing = self.sizing_account()
         if sizing is not None:
+            exposure = self.exposure_by_symbol()
             for p in result.plays:
-                size_play(p, sizing, self.settings.config.risk)
+                size_play(p, sizing, self.settings.config.risk, symbol_notional=exposure.get(p.symbol, 0.0))
         self.board.replace(result.plays, None if kind == "full" else result.symbols)
         self._last_scans[kind] = result.summary()
         try:
@@ -714,7 +761,8 @@ class TradingEngine:
             return {"ok": False, "reason": "no account data"}
         cfg = self.settings.config
         # sized against the trading capital; the PDT rule and the floor see the real account
-        size_play(p, self.sizing_account() or acc, cfg.risk)
+        sizing = size_play(p, self.sizing_account() or acc, cfg.risk,
+                           symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0))
         decision = self.pdt.assess(acc, p)
         session = clock.current_session()
         plan = plan_order(p, session, cfg.execution)
@@ -735,7 +783,9 @@ class TradingEngine:
         if not acc.usd_per_base:
             reasons.append(f"no {acc.base_currency}->USD exchange rate yet, so the trade can't be sized")
         elif p.suggested_qty <= 0:
-            reasons.append("position size rounds to zero for this risk budget")
+            reasons.append(f"{p.symbol} already takes up the {cfg.risk.max_symbol_pct_of_equity:.0f}% of equity "
+                           "allowed in one stock" if "max exposure per stock" in sizing.caps_hit
+                           else "position size rounds to zero for this risk budget")
         if p.reward_risk < cfg.risk.min_reward_risk and p.kind.value != "FUNDAMENTAL":
             reasons.append(f"reward:risk {p.reward_risk:.1f} below minimum")
         filtered = self.filters.refusal(p.side.value, p.timeframe.value, p.sector)
@@ -746,6 +796,7 @@ class TradingEngine:
         return {
             "ok": True, "can_execute": not reasons, "already_executed": acted_on,
             "reasons": reasons, "mode": self.mode, "session": session.value,
+            "noise": [NOISE_LABELS.get(n, n) for n in p.noise],
             "play": self._decorate(p), "pdt": decision.as_dict(), "order_plan": plan,
             "order_preview": {
                 "side": p.side.entry_action, "qty": p.suggested_qty, "order_type": plan.get("order_type"),
@@ -1054,9 +1105,10 @@ class TradingEngine:
     def _resize_plays(self) -> None:
         sizing = self.sizing_account()
         if sizing is not None:
+            exposure = self.exposure_by_symbol()
             for p in self.board.plays.values():
                 if p.status not in _ACTED_ON:
-                    size_play(p, sizing, self.settings.config.risk)
+                    size_play(p, sizing, self.settings.config.risk, symbol_notional=exposure.get(p.symbol, 0.0))
         self._publish_plays()
 
     # ------------------------------------------------------------------ #

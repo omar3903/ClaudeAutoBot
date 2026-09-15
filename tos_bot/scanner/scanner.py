@@ -44,6 +44,7 @@ from ..strategies.base import Strategy
 from ..util import clock
 from . import schedule
 from .evaluator import evaluate
+from .noise import NoiseSettings
 from .filters import TradeFilters
 from .heat import DailyMetrics, daily_metrics, intraday_metrics, liquid, rank_by_daily_heat
 from .schedule import ScanSettings
@@ -108,6 +109,7 @@ class Scanner:
         self.account: Optional[Account] = None
         self.strategies: List[Strategy] = list(strategies)
         self._params = {"valuation": settings.config.valuation.model_dump()}
+        self._noise = NoiseSettings.from_config(settings.config.noise)
 
     def set_strategies(self, strategies: Sequence[Strategy]) -> None:
         """Swap the active setups. A scan already running keeps the set it started with."""
@@ -135,7 +137,7 @@ class Scanner:
         through = schedule.last_completed_session(now)
         with self._timed(result, "daily_candles"):
             everyone = tradable + [BENCHMARK]
-            self.md.update_daily(everyone, through, self._con_ids(everyone),
+            self.md.update_daily(everyone, through, self.con_ids(everyone),
                                  progress=lambda done, total: self._progress(result, "daily candles", done, total))
         with self._timed(result, "ranking"):
             ranked = self._rank(tradable, through, cfg.prefilter, result)
@@ -159,7 +161,7 @@ class Scanner:
                 daily = self.md.daily_frame(m.symbol)
                 if daily is not None:
                     result.plays += evaluate(m.symbol, swing, daily, None, run_id=result.run_id,
-                                             equity=self._equity, params=self._params, activity=m)
+                                             equity=self._equity, params=self._params, activity=m, noise=self._noise)
         with self._timed(result, "valuation_setups"):
             valuation = [s for s in strategies if swing_on and s.kind is StrategyKind.FUNDAMENTAL]
             if valuation:
@@ -204,7 +206,8 @@ class Scanner:
             peers = [f for p in self.symbols.peers(m.symbol, pool, self.PEERS)
                      if (f := self._financials(p, benchmark)) is not None]
             plays += evaluate(m.symbol, strategies, self.md.daily_frame(m.symbol), None, run_id=run_id,
-                              equity=self._equity, params=self._params, activity=m, fundamentals=fin, peers=peers)
+                              equity=self._equity, params=self._params, activity=m, fundamentals=fin, peers=peers,
+                              noise=self._noise)
         return plays
 
     def _financials(self, symbol: str, benchmark: Optional[pd.DataFrame]) -> Optional[Financials]:
@@ -232,7 +235,7 @@ class Scanner:
             buffer = [] if fast else wl.kept_symbols() + [c.symbol for cs in picks.values() for c in cs]
             symbols = list(dict.fromkeys(wl.hot_symbols() + buffer))
         with self._timed(result, "intraday_candles"):
-            intraday = self.md.intraday(symbols, self._con_ids(symbols))
+            intraday = self.md.intraday(symbols, self.con_ids(symbols))
         daily = self.md.daily(symbols)
         result.universe_size, result.scanned, result.symbols = len(symbols), len(intraday), symbols
 
@@ -246,7 +249,7 @@ class Scanner:
                     continue
                 activity = intraday_metrics(symbol, intraday[symbol], daily[symbol])
                 plays = evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
-                                 equity=self._equity, params=self._params, activity=activity)
+                                 equity=self._equity, params=self._params, activity=activity, noise=self._noise)
                 result.plays += plays
                 if activity is not None:
                     heat[symbol] = activity.heat + (_PLAY_BONUS if plays else 0.0)
@@ -262,7 +265,7 @@ class Scanner:
     def _equity(self) -> float:
         return self.account.equity if self.account else 0.0
 
-    def _con_ids(self, symbols: Iterable[str]) -> Dict[str, int]:
+    def con_ids(self, symbols: Iterable[str]) -> Dict[str, int]:
         return {s: info.con_id for s in symbols if (info := self.symbols.get(s)) is not None and info.found}
 
     def _finish(self, result: ScanResult, filters: TradeFilters) -> ScanResult:

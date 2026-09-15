@@ -140,6 +140,7 @@ class OpeningRangeBreakout(Strategy):
 @register
 class VwapReclaim(Strategy):
     key = "vwap_reclaim"
+    style = "reversal"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.INTRADAY
     tod_profile = "reversal"
@@ -311,6 +312,7 @@ class EmaPullbackTrend(Strategy):
 @register
 class Rsi2MeanReversion(Strategy):
     key = "rsi2_mean_reversion"
+    style = "reversal"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.SWING
     expected_hold = (3.0, 7.0)      # trading days
@@ -379,6 +381,7 @@ class Rsi2MeanReversion(Strategy):
 @register
 class BollingerFade(Strategy):
     key = "bollinger_fade"
+    style = "reversal"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.SWING
     expected_hold = (4.0, 9.0)      # trading days
@@ -650,7 +653,8 @@ class AbcdPattern(Strategy):
         "and beyond) is the higher-probability path. You enter near C - never "
         "chase B - so the stop (a break of C) is small (Aziz, Strategy 1)."
     )
-    default_params = {"window": 14, "near_c_pct": 1.5, "rvol_min": 1.3}
+    default_params = {"window": 14, "near_c_pct": 1.5, "rvol_min": 1.3,
+                      "max_retrace": 0.70, "min_higher_low_atr": 0.5}
 
     def generate(self, ctx: StrategyContext) -> List[Play]:
         if not ctx.enough_intraday(10):
@@ -669,15 +673,24 @@ class AbcdPattern(Strategy):
 
         highs = seg["high"].to_numpy()
         lows = seg["low"].to_numpy()
+        volume = seg["volume"].to_numpy()
         b_i = int(highs.argmax())
         if b_i == 0 or b_i >= len(seg) - 1:
             return []                       # need a leg before and a pullback after
-        B = float(highs[b_i])
-        A = float(lows[:b_i].min())
+        a_i = int(lows[:b_i].argmin())
+        B, A = float(highs[b_i]), float(lows[a_i])
         C = float(lows[b_i:].min())
         price = ctx.price
         if not (A < C < B):
             return []                       # C must be a HIGHER low than A
+        move = B - A
+        retrace = (B - C) / move
+        if C - A < self.params["min_higher_low_atr"] * atr or retrace > self.params["max_retrace"]:
+            return []                       # a wiggle above A, or a pullback that gave back most of the push
+        push_volume = float(volume[a_i:b_i + 1].mean())
+        pullback_volume = float(volume[b_i + 1:].mean())
+        if push_volume <= 0 or pullback_volume > push_volume:
+            return []                       # sellers leaned on the pullback harder than buyers pushed
         if rvol < self.params["rvol_min"]:
             return []
         # price must be back near C (defending it), not still up at B
@@ -690,13 +703,15 @@ class AbcdPattern(Strategy):
 
         entry = max(price, C)
         stop = C - max(0.25 * atr, 0.03)
-        move = B - A
         targets = [B, B + move]             # D = retest of B, then measured move
-        conf = min(0.80, 0.44 + 0.12 * (rvol - 1) + 0.10 * ((C - A) / move if move else 0))
+        # the cleaner pattern: a shallow pullback on drying-up volume
+        shallow = 1.0 - retrace / self.params["max_retrace"]
+        drying = min(1.0, push_volume / pullback_volume - 1.0) if pullback_volume > 0 else 1.0
+        conf = min(0.80, 0.46 + 0.12 * shallow + 0.10 * drying + 0.04 * min(2.0, rvol - 1.0))
         detail = (
-            f"Leg A {A:.2f} -> B {B:.2f} (+{move:.2f}), pullback held at C {C:.2f} "
-            f"(a higher low), price back at {price:.2f} on {rvol:.1f}x volume. "
-            f"Buyers are defending C."
+            f"Leg A {A:.2f} -> B {B:.2f} (+{move:.2f}), pullback held at C {C:.2f} - a higher low, "
+            f"giving back {retrace:.0%} of the leg on {pullback_volume / push_volume:.0%} of its volume; "
+            f"price back at {price:.2f}. Buyers are defending C."
         )
         note = ("Volume should spike again as it pushes back toward B (that is D). "
                 "Scale half at D, stop to break-even, exit the rest on a fresh "
@@ -706,7 +721,8 @@ class AbcdPattern(Strategy):
             ctx, Side.LONG, entry, stop, targets, conf,
             rationale=f"ABCD - C {C:.2f} holding above A {A:.2f}",
             detail=detail,
-            evidence={"A": round(A, 2), "B": round(B, 2), "C": round(C, 2),
+            evidence={"A": round(A, 2), "B": round(B, 2), "C": round(C, 2), "retrace": round(retrace, 2),
+                      "pullback_volume_ratio": round(pullback_volume / push_volume, 2),
                       "rvol": round(rvol, 2), "atr": round(atr, 3)},
             tags=["intraday", "momentum", "abcd"],
             edge_note=note, invalidation=inval,
@@ -795,6 +811,7 @@ class MomentumFlag(Strategy):
 @register
 class RedToGreen(Strategy):
     key = "red_to_green"
+    style = "reversal"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.INTRADAY
     tod_profile = "momentum"
@@ -880,6 +897,7 @@ class RedToGreen(Strategy):
 @register
 class IntradayReversal(Strategy):
     key = "intraday_reversal"
+    style = "reversal"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.INTRADAY
     tod_profile = "reversal"
@@ -975,6 +993,7 @@ class IntradayReversal(Strategy):
 @register
 class SupportResistanceBounce(Strategy):
     key = "sr_bounce"
+    style = "reversal"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.INTRADAY
     tod_profile = "reversal"
@@ -1080,6 +1099,7 @@ class SupportResistanceBounce(Strategy):
 @register
 class DivergenceReversal(Strategy):
     key = "divergence_reversal"
+    style = "reversal"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.SWING
     tod_profile = "swing"

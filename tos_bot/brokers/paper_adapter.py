@@ -44,6 +44,7 @@ class _Order:
             avg_fill_price=self.avg_price, fills=list(self.fills),
             raw={"parent_id": self.parent_id, "oco_group": self.oco_group,
                  "client_tag": self.req.client_tag},
+            side=self.req.side, tag=self.req.client_tag,
         )
 
 

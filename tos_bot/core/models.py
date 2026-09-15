@@ -145,6 +145,8 @@ class OrderResult:
     fills: List[Fill] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
     message: str = ""
+    side: Optional[Side] = None              # the order's direction, when the broker says
+    tag: str = ""                            # what it was sent for: a play id, or exit:<trade id>
 
 
 # --------------------------------------------------------------------------- #
@@ -197,6 +199,10 @@ class Play:
     expires_at: Optional[datetime] = None
     scan_run_id: Optional[str] = None
     trade_id: Optional[str] = None          # set once this play becomes a trade
+    #: why it's probably noise right now (see scanner/noise.py); empty = no flags
+    noise: List[str] = field(default_factory=list)
+    #: scans in a row that found this setup (see PlayBoard.replace)
+    confirmations: int = 1
 
     # ---- convenience ---------------------------------------------------- #
     @property
@@ -245,6 +251,8 @@ class Play:
             "expected_hold_unit": "min" if self.timeframe is Timeframe.INTRADAY else "d",
             "status": self.status.value,
             "trade_id": self.trade_id,
+            "noise": list(self.noise),
+            "confirmations": self.confirmations,
             "created_at": self.created_at.isoformat(),
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
         }

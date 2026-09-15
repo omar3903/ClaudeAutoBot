@@ -7,6 +7,10 @@ here decides *whether* to trade - only *how*.
 Every order sent is followed until the broker finishes it. A fill opens or
 closes the trade; a rejection, cancellation or expiry is published with the
 broker's reason, and whatever part of the order did fill is booked.
+
+Orders outlive the app: after a restart, the orders an earlier run left working
+at the broker are taken over (see :meth:`Executor.adopt_working_orders`), so an
+exit is never sent twice.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from ..brokers.base import DONE_STATUSES, BrokerAdapter, BrokerError
 from ..brokers.venues import venue_label
 from ..core.enums import PlayStatus, Side, StrategyKind, Timeframe
 from ..core.eventbus import BUS
-from ..core.models import Account, OrderRequest, Play
+from ..core.models import Account, OrderRequest, OrderResult, Play
 from ..util import clock
 from .order_builder import build_entry_order, build_exit_order, plan_order
 
@@ -81,13 +85,86 @@ class Executor:
         """Entry orders sent but not filled yet. Anything that limits positions has
         to count these too, or a slow fill gets doubled up."""
         return [{"order_id": oid, "play_id": p.play.id, "symbol": p.play.symbol,
-                 "strategy": p.play.strategy, "qty": p.qty,
+                 "strategy": p.play.strategy, "qty": p.qty, "notional": p.play.entry * p.qty,
                  "risk": abs(p.play.entry - p.play.stop) * p.qty}
                 for oid, p in list(self._pending.items()) if p.kind == "entry"]
 
     def symbols_in_flight(self) -> set:
         """Symbols with an order still working - their share counts are about to change."""
         return {p.play.symbol for p in list(self._pending.values())}
+
+    # ------------------------------------------------------------------ #
+    def adopt_working_orders(self) -> List[Dict[str, Any]]:
+        """Take over the orders an earlier run of the app left working at the broker,
+        so a restart never sends a second exit or loses track of an entry.
+
+        An exit is matched to its open trade by its tag, or else by symbol, direction
+        and share count. Extra copies of an exit the app itself sent - more shares
+        than the open trades hold - are cancelled. An entry is matched to its play by
+        its tag."""
+        working = self._working_at_broker()
+        if not working:
+            return []
+        trades = [t for t in self.repo.open_trades() if (t.get("broker") or "paper") == self.venue]
+        adopted: List[Dict[str, Any]] = []
+        for t in sorted(trades, key=lambda t: t.get("entry_time") or ""):
+            order = _match_exit(t, working, set(self._pending))
+            if order is not None and t["id"] not in self.pending_exit_trade_ids():
+                self._track_exit(t, order, reason="exit")
+                adopted.append({"kind": "exit", "symbol": t["symbol"], "order_id": order.order_id,
+                                "trade_id": t["id"], "qty": _remaining(order)})
+        for order in working:
+            play = self._play_for(order) if order.order_id not in self._pending else None
+            if play is not None:
+                self._pending[order.order_id] = _Pending(order.order_id, play, "entry", qty=_remaining(order))
+                adopted.append({"kind": "entry", "symbol": play.symbol, "order_id": order.order_id,
+                                "play_id": play.id, "qty": _remaining(order)})
+        cancelled = self._cancel_extra_exits(working, trades)
+        if adopted or cancelled:
+            msg = (f"Following {len(adopted)} order(s) already working at {venue_label(self.venue)}"
+                   + (f"; cancelled {len(cancelled)} duplicate exit(s): "
+                      + ", ".join(f"{o.symbol} {_remaining(o):,.0f}" for o in cancelled) if cancelled else "")
+                   + ".")
+            log.warning("%s %s", msg, adopted)
+            self.bus.publish("orders.adopted", adopted=adopted,
+                             cancelled=[o.order_id for o in cancelled], msg=msg)
+        return adopted
+
+    def _working_at_broker(self) -> List[OrderResult]:
+        try:
+            return [o for o in self.broker.list_orders("WORKING")
+                    if o.status not in DONE_STATUSES and o.side is not None]
+        except Exception:  # noqa: BLE001
+            log.debug("could not list the orders working at the broker", exc_info=True)
+            return []
+
+    def _track_exit(self, t: Dict[str, Any], order: OrderResult, reason: str) -> None:
+        self._pending[order.order_id] = _Pending(order.order_id, Play(**_min_play(t)), "exit",
+                                                 trade_id=t["id"], qty=_remaining(order), reason=reason)
+
+    def _play_for(self, order: OrderResult) -> Optional[Play]:
+        """The play an entry order left working was sent for, from the play log."""
+        if not order.tag.startswith("play_"):
+            return None
+        row = self.repo.get_play(order.tag)
+        if row is None or Side(row["side"]) is not order.side:
+            return None
+        return _play_from_row(row)
+
+    def _cancel_extra_exits(self, working: List[OrderResult], trades: List[Dict[str, Any]]) -> List[OrderResult]:
+        recorded: Dict[str, float] = {}
+        for t in trades:
+            recorded[t["symbol"]] = recorded.get(t["symbol"], 0.0) + abs(float(t["quantity"]))
+        sides = {t["symbol"]: _exit_side(t["side"]) for t in trades}
+        extra: List[OrderResult] = []
+        for o in working:
+            mine = o.tag.startswith("exit:") or (o.raw or {}).get("mine")
+            if o.order_id in self._pending or o.symbol not in recorded or o.side is not sides[o.symbol] or not mine:
+                continue
+            if self._exiting_quantity(o.symbol) + _remaining(o) > recorded[o.symbol] + 1e-9:
+                self._cancel_quietly(o.order_id)
+                extra.append(o)
+        return extra
 
     # ------------------------------------------------------------------ #
     def execute_play(self, play: Play, account: Account,
@@ -150,6 +227,14 @@ class Executor:
                                            f"switch back to that platform to close it."}
         if trade_id in self.pending_exit_trade_ids():
             return {"ok": False, "reason": f"An exit order for this {t['symbol']} position is already working."}
+        working = self._working_at_broker()
+        order = _match_exit(t, working, set(self._pending))
+        if order is not None:
+            # an earlier run of the app already sent this exit - follow it rather than send another
+            self._track_exit(t, order, reason)
+            log.warning("exit for %s is already working at the broker (order %s) - following it", trade_id,
+                        order.order_id)
+            return {"ok": True, "status": order.status, "order_id": order.order_id, "adopted": True}
         qty = abs(float(t["quantity"]))
         held = self._held_quantity(t["symbol"])
         if held is not None:
@@ -158,8 +243,11 @@ class Executor:
                 return {"ok": False, "not_held": True,
                         "reason": f"{venue_label(held_on)} doesn't show a {t['side'].lower()} {t['symbol']} "
                                   f"position (closed or removed outside the app?) - no exit sent."}
-            # never sell more than is there, counting exits already working on the same shares
-            qty = min(qty, abs(held) - self._exiting_quantity(t["symbol"]))
+            # never sell more than is there, counting exits already working on the same shares -
+            # the app's own, and any other closing orders at the broker
+            untracked = sum(_remaining(o) for o in working if o.order_id not in self._pending
+                            and o.symbol == t["symbol"] and o.side is _exit_side(t["side"]) and _may_close(o))
+            qty = min(qty, abs(held) - self._exiting_quantity(t["symbol"]) - untracked)
             if qty <= 0:
                 return {"ok": False, "reason": f"Exit orders already working cover all {abs(held):,.0f} "
                                                f"{t['symbol']} shares held - no exit sent."}
@@ -326,3 +414,37 @@ def _min_play(t: dict) -> dict:
                 kind=StrategyKind(t["kind"]), timeframe=Timeframe(t["timeframe"]),
                 entry=float(t["entry_price"] or 0), stop=float(t["stop_price"] or 0),
                 targets=[float(t["target_price"] or 0)] if t.get("target_price") else [])
+
+
+def _play_from_row(row: dict) -> Play:
+    return Play(symbol=row["symbol"], side=Side(row["side"]), strategy=row["strategy"],
+                kind=StrategyKind(row["kind"]), timeframe=Timeframe(row["timeframe"]),
+                entry=float(row["entry"] or 0), stop=float(row["stop"] or 0),
+                targets=[float(x) for x in (row.get("targets") or [])],
+                confidence=float(row.get("confidence") or 0.5), sector=row.get("sector") or "",
+                id=row["id"], status=PlayStatus.SUBMITTED)
+
+
+def _remaining(o: OrderResult) -> float:
+    return max(0.0, float(o.submitted_qty or 0.0) - float(o.filled_qty or 0.0))
+
+
+def _exit_side(position_side: str) -> Side:
+    return Side.SHORT if position_side == "LONG" else Side.LONG
+
+
+def _may_close(o: OrderResult) -> bool:
+    """An order that may be closing a position: one the app tagged as an exit, or an
+    untagged one (sent by hand, or before orders were tagged). Never a bracket's
+    target or stop child - that belongs to its entry."""
+    return o.tag.startswith("exit:") or (not o.tag and not (o.raw or {}).get("parent_id"))
+
+
+def _match_exit(t: dict, orders: List[OrderResult], taken: set) -> Optional[OrderResult]:
+    """The working order that is this trade's exit: tagged with its id, or else an
+    untagged closing order for exactly its share count."""
+    side, qty = _exit_side(t["side"]), abs(float(t["quantity"]))
+    candidates = [o for o in orders if o.order_id not in taken and o.symbol == t["symbol"]
+                  and o.side is side and _may_close(o)]
+    tagged = next((o for o in candidates if o.tag == f"exit:{t['id']}"), None)
+    return tagged or next((o for o in candidates if not o.tag and abs(_remaining(o) - qty) < 1e-6), None)
