@@ -3,15 +3,19 @@
 The engine only calls :meth:`execute_play` after the operator has clicked
 "Yes" in the dashboard and the PDT / sizing checks have passed. Nothing
 here decides *whether* to trade - only *how*.
+
+Every order sent is followed until the broker finishes it. A fill opens or
+closes the trade; a rejection, cancellation or expiry is published with the
+broker's reason, and whatever part of the order did fill is booked.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from ..brokers.base import BrokerAdapter, BrokerError
+from ..brokers.base import DONE_STATUSES, BrokerAdapter, BrokerError
 from ..brokers.venues import venue_label
 from ..core.enums import PlayStatus, Side, StrategyKind, Timeframe
 from ..core.eventbus import BUS
@@ -31,9 +35,14 @@ class _Pending:
     qty: float = 0.0
     order_type: str = "LIMIT"
     order_session: str = "REGULAR"
+    reason: str = ""                # why an exit was sent: stop, target, manual...
+    unseen: int = 0                 # polls in a row the broker didn't know the order
 
 
 class Executor:
+    #: polls in a row (the sync loop runs every 4 s) a connected broker may not know an order before it's given up
+    LOST_AFTER_POLLS = 5
+
     def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS,
                  venue: Optional[str] = None) -> None:
         self.broker = broker
@@ -59,10 +68,7 @@ class Executor:
         for oid, p in list(self._pending.items()):
             if p.kind != "entry":
                 continue
-            try:
-                self.broker.cancel_order(oid)
-            except Exception:  # noqa: BLE001
-                log.debug("cancel %s failed", oid, exc_info=True)
+            self._cancel_quietly(oid)
             self._pending.pop(oid, None)
             n += 1
         return n
@@ -70,6 +76,18 @@ class Executor:
     def pending_exit_trade_ids(self) -> set:
         """Trades whose close order is still working at the broker."""
         return {p.trade_id for p in list(self._pending.values()) if p.kind == "exit" and p.trade_id}
+
+    def working_entries(self) -> List[Dict[str, Any]]:
+        """Entry orders sent but not filled yet. Anything that limits positions has
+        to count these too, or a slow fill gets doubled up."""
+        return [{"order_id": oid, "play_id": p.play.id, "symbol": p.play.symbol,
+                 "strategy": p.play.strategy, "qty": p.qty,
+                 "risk": abs(p.play.entry - p.play.stop) * p.qty}
+                for oid, p in list(self._pending.items()) if p.kind == "entry"]
+
+    def symbols_in_flight(self) -> set:
+        """Symbols with an order still working - their share counts are about to change."""
+        return {p.play.symbol for p in list(self._pending.values())}
 
     # ------------------------------------------------------------------ #
     def execute_play(self, play: Play, account: Account,
@@ -130,6 +148,8 @@ class Executor:
             # never send an exit to an account that doesn't hold the position
             return {"ok": False, "reason": f"This position is on {venue_label(held_on)} - "
                                            f"switch back to that platform to close it."}
+        if trade_id in self.pending_exit_trade_ids():
+            return {"ok": False, "reason": f"An exit order for this {t['symbol']} position is already working."}
         qty = abs(float(t["quantity"]))
         held = self._held_quantity(t["symbol"])
         if held is not None:
@@ -138,7 +158,11 @@ class Executor:
                 return {"ok": False, "not_held": True,
                         "reason": f"{venue_label(held_on)} doesn't show a {t['side'].lower()} {t['symbol']} "
                                   f"position (closed or removed outside the app?) - no exit sent."}
-            qty = min(qty, abs(held))           # never sell more than is there
+            # never sell more than is there, counting exits already working on the same shares
+            qty = min(qty, abs(held) - self._exiting_quantity(t["symbol"]))
+            if qty <= 0:
+                return {"ok": False, "reason": f"Exit orders already working cover all {abs(held):,.0f} "
+                                               f"{t['symbol']} shares held - no exit sent."}
         req = build_exit_order(t["symbol"], t["side"], qty,
                                limit_price=limit_price, cfg=self.cfg, tag=f"exit:{trade_id}")
         try:
@@ -156,7 +180,7 @@ class Executor:
             return {"ok": True, "status": "FILLED", "trade": out}
 
         self._pending[res.order_id] = _Pending(res.order_id, Play(**_min_play(t)), "exit",
-                                               trade_id=trade_id, qty=qty)
+                                               trade_id=trade_id, qty=qty, reason=reason)
         return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id}
 
     def _held_quantity(self, symbol: str) -> Optional[float]:
@@ -167,6 +191,10 @@ class Executor:
         except Exception:  # noqa: BLE001
             return None
         return float(pos.quantity) if pos is not None else 0.0
+
+    def _exiting_quantity(self, symbol: str) -> float:
+        """Shares of ``symbol`` that exit orders still working are already selling (or covering)."""
+        return sum(p.qty for p in list(self._pending.values()) if p.kind == "exit" and p.play.symbol == symbol)
 
     # ------------------------------------------------------------------ #
     def sync_open_orders(self) -> None:
@@ -198,23 +226,56 @@ class Executor:
         p = self._pending.get(res.order_id)
         if p is None:
             return
-        if res.status not in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
+        if res.status == "UNKNOWN":
+            p.unseen += 1
+            if p.unseen < self.LOST_AFTER_POLLS:
+                return
+        elif res.status not in DONE_STATUSES:
+            p.unseen = 0
             return
         self._pending.pop(res.order_id, None)
-        if res.status != "FILLED":
-            self.bus.publish("order.done", order_id=res.order_id, status=res.status,
-                             symbol=res.symbol)
-            return
+        if res.status == "FILLED":
+            self._on_filled(p, res)
+        else:
+            self._on_unfilled(p, res)
+
+    def _on_filled(self, p: _Pending, res) -> None:
         px = res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0)
         if p.kind == "entry":
-            tid = self._open_trade(p.play, px, res.filled_qty or p.qty, res.order_id,
-                                   p.order_type, p.order_session)
-            self.bus.publish("order.filled", kind="entry", trade_id=tid, symbol=res.symbol,
-                             price=round(px, 4), qty=res.filled_qty or p.qty)
+            self._open_trade(p.play, px, res.filled_qty or p.qty, res.order_id,
+                             p.order_type, p.order_session)
         else:
-            out = self.repo.close_trade(p.trade_id, float(px), exit_reason="order")
+            out = self.repo.close_trade(p.trade_id, float(px), exit_reason=p.reason or "order")
             self._open_by_symbol.pop(res.symbol, None)
             self.bus.publish("trade.closed", trade=out)
+
+    def _on_unfilled(self, p: _Pending, res) -> None:
+        """The broker finished an order without filling all of it - rejected,
+        cancelled, expired - or no longer knows it. What did fill is booked and the
+        reason is published; the exit manager sends an exit again."""
+        filled = float(res.filled_qty or 0.0)
+        if p.kind == "entry":
+            if filled > 0:
+                px = res.avg_fill_price or (res.fills[-1].price if res.fills else p.play.entry)
+                self._open_trade(p.play, px, filled, res.order_id, p.order_type, p.order_session)
+            else:
+                p.play.status = PlayStatus.CANCELED if res.status in ("CANCELED", "EXPIRED") else PlayStatus.ERROR
+        if res.status == "REJECTED":
+            self._cancel_quietly(res.order_id)          # an inactive order must stay dead
+        what = "is no longer known to the broker" if res.status == "UNKNOWN" else f"was {res.status.lower()}"
+        part = f" after {filled:,.0f} of {p.qty:,.0f} shares filled" if filled else ""
+        reason = res.message or "no reason given"
+        msg = f"{p.play.symbol} {p.kind} order {res.order_id} {what}{part}: {reason}"
+        log.warning("ORDER NOT FILLED  %s", msg)
+        self.bus.publish("order.failed", kind=p.kind, order_id=res.order_id, status=res.status,
+                         symbol=p.play.symbol, trade_id=p.trade_id, filled_qty=filled,
+                         reason=reason, msg=msg)
+
+    def _cancel_quietly(self, order_id: str) -> None:
+        try:
+            self.broker.cancel_order(order_id)
+        except Exception:  # noqa: BLE001
+            log.debug("cancel %s failed", order_id, exc_info=True)
 
     def _maybe_close_from_bracket(self, o) -> None:
         sym = o.symbol

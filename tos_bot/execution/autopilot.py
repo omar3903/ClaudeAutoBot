@@ -54,6 +54,7 @@ class AutoPilot:
 
         self._acted: set[str] = set()          # play ids already handled
         self._auto_trade_ids: set[str] = set()  # trades this pilot opened (this session)
+        self._auto_play_ids: set[str] = set()   # plays it sent entries for - a late fill carries only this
         self._day: str = ""
         self._count_today: int = 0
         self._last_reason: Dict[str, str] = {}  # play_id -> why skipped (for the UI)
@@ -157,7 +158,7 @@ class AutoPilot:
     # ------------------------------------------------------------------ #
     def status(self) -> Dict[str, Any]:
         self._roll_day()
-        open_auto = len(self._open_auto_trades())
+        open_auto = len(self._open_auto_trades()) + len(self._working_auto_entries())
         blocked = ""
         if self.enabled and not self._live_ok():
             blocked = ("Autopilot is paper-only until you set  autopilot.allow_live: true  "
@@ -187,10 +188,14 @@ class AutoPilot:
             opens = self.engine.repo.open_trades()
         except Exception:  # noqa: BLE001
             return []
-        return [t for t in opens if t["id"] in self._auto_trade_ids]
+        return [t for t in opens if t["id"] in self._auto_trade_ids or t.get("play_id") in self._auto_play_ids]
+
+    def _working_auto_entries(self) -> List[Dict[str, Any]]:
+        """Auto entries sent but not filled yet - they count against every cap."""
+        return [w for w in self.engine.working_entries() if w["play_id"] in self._auto_play_ids]
 
     def _open_risk_dollars(self) -> float:
-        total = 0.0
+        total = sum(w["risk"] for w in self._working_auto_entries())
         for t in self._open_auto_trades():
             entry = t.get("entry_price") or 0.0
             stp = t.get("initial_stop_price") or t.get("stop_price") or 0.0
@@ -237,7 +242,7 @@ class AutoPilot:
             if self._count_today >= self.max_auto_trades_per_day:
                 self._last_reason[p.id] = f"daily auto-trade cap ({self.max_auto_trades_per_day}) reached"
                 continue
-            opens = self._open_auto_trades()
+            opens = self._open_auto_trades() + self._working_auto_entries()   # orders still working count too
             if len(opens) >= self.max_auto_positions:
                 self._last_reason[p.id] = f"max concurrent auto positions ({self.max_auto_positions}) reached"
                 continue
@@ -284,6 +289,7 @@ class AutoPilot:
             if out.get("ok"):
                 self._count_today += 1
                 taken += 1
+                self._auto_play_ids.add(p.id)
                 tid = out.get("trade_id") or getattr(p, "trade_id", None)
                 if tid:
                     self._auto_trade_ids.add(tid)
@@ -329,6 +335,12 @@ class AutoPilot:
                 return f"already holding {p.symbol}"
         except Exception:  # noqa: BLE001
             pass
+        if any(w["symbol"] == p.symbol for w in self.engine.working_entries()):
+            return f"an entry order for {p.symbol} is still working"
+        account = getattr(self.engine, "_account", None)
+        pos = account.position(p.symbol) if account is not None else None
+        if pos is not None and abs(pos.quantity) > 1e-9:
+            return f"the account already holds {abs(pos.quantity):,.0f} {p.symbol} shares"
         # cooldown: a name that already stopped out today is not a re-entry -
         # going straight back in turns one loss into long<->short chop.
         if self.cooldown_after_loss:

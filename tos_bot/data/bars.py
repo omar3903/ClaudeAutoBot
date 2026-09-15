@@ -42,7 +42,7 @@ class DailyBarStore:
                 self._frames.move_to_end(symbol)
                 return self._frames[symbol]
         try:
-            frame = pd.read_pickle(self._path(symbol))
+            frame = _on_session_dates(pd.read_pickle(self._path(symbol)))
         except (OSError, ValueError, EOFError, pickle.UnpicklingError):
             self._last[symbol] = None
             return None
@@ -90,3 +90,14 @@ class DailyBarStore:
 
     def _path(self, symbol: str) -> Path:
         return self.directory / f"{symbol.replace(' ', '_')}.pkl"
+
+
+def _on_session_dates(frame: pd.DataFrame) -> pd.DataFrame:
+    """Candles saved before daily bar dates were read correctly sit at 8 pm New
+    York time the evening before their session; put them back on the session."""
+    index = frame.index
+    if not len(index) or (index.hour == 0).all():
+        return frame
+    fixed = frame.copy()
+    fixed.index = index.tz_convert("UTC").normalize().tz_localize(None).tz_localize(index.tz)
+    return fixed

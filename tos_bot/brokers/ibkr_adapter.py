@@ -18,8 +18,10 @@ synchronous.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import math
+import re
 import threading
 import time
 from concurrent.futures import Future
@@ -491,7 +493,7 @@ class IbkrBroker(BrokerAdapter):
         from ib_async import LimitOrder, MarketOrder
 
         contract = self._contract(req.symbol)
-        action = "BUY" if (req.side is Side.LONG) == bool(req.is_entry) else "SELL"
+        action = "BUY" if req.side is Side.LONG else "SELL"      # the side is the order's direction, exits too
         qty = abs(float(req.quantity))
         order = (MarketOrder(action, qty) if req.order_type is OrderType.MARKET or not req.limit_price
                  else LimitOrder(action, qty, float(req.limit_price)))
@@ -530,7 +532,7 @@ class IbkrBroker(BrokerAdapter):
                  for f in (t.fills or [])]
         return OrderResult(order_id=str(order_id), status=_norm_status(os_.status), symbol=t.contract.symbol,
                            submitted_qty=float(t.order.totalQuantity or 0.0), filled_qty=float(os_.filled or 0.0),
-                           avg_fill_price=float(os_.avgFillPrice or 0.0), fills=fills)
+                           avg_fill_price=float(os_.avgFillPrice or 0.0), fills=fills, message=_order_message(t))
 
     def list_orders(self, status: Optional[str] = None) -> List[OrderResult]:
         if not self.is_connected:
@@ -579,22 +581,36 @@ def _tif(tif: TimeInForce) -> str:
 
 
 def _norm_status(s: str) -> str:
+    """IBKR's order states in the app's words. Cancelled, ApiCancelled and Inactive
+    are final (an order IBKR rejects arrives as Cancelled); ValidationError is only
+    a warning on an order that's still working."""
     s = (s or "").upper()
     return {
         "PENDINGSUBMIT": "SUBMITTED", "PRESUBMITTED": "SUBMITTED", "APIPENDING": "PENDING",
-        "SUBMITTED": "WORKING", "FILLED": "FILLED", "CANCELLED": "CANCELLED",
-        "APICANCELLED": "CANCELLED", "PENDINGCANCEL": "WORKING", "INACTIVE": "ERROR",
+        "SUBMITTED": "WORKING", "FILLED": "FILLED", "CANCELLED": "CANCELED",
+        "APICANCELLED": "CANCELED", "PENDINGCANCEL": "WORKING", "INACTIVE": "REJECTED",
+        "VALIDATIONERROR": "WORKING", "APIUPDATE": "WORKING",
     }.get(s, s or "SUBMITTED")
 
 
+def _order_message(trade) -> str:
+    """IBKR's latest complaint about an order - why it was rejected, say."""
+    for entry in reversed(getattr(trade, "log", None) or []):
+        if getattr(entry, "errorCode", 0):
+            text = re.sub(r"^(Error|Warning) -?\d+, reqId -?\d+: ", "", entry.message or "")
+            return " ".join(text.replace("<br>", " ").split())
+    return ""
+
+
 def _bars_to_df(bars) -> pd.DataFrame:
-    """ib_async bars -> an OHLCV frame on a New York DatetimeIndex. IBKR reports
-    US stock volume in shares."""
+    """ib_async bars -> an OHLCV frame on a New York DatetimeIndex. Daily bars
+    arrive as session dates and sit at midnight New York time; intraday bars
+    arrive as UTC times. IBKR reports US stock volume in shares."""
     df = pd.DataFrame([{"date": b.date, "open": float(b.open), "high": float(b.high), "low": float(b.low),
                         "close": float(b.close), "volume": float(getattr(b, "volume", 0.0) or 0.0)}
                        for b in bars])
-    stamps = pd.to_datetime(df["date"], utc=True, errors="coerce")
-    if stamps.isna().all():                 # daily bars arrive as dates
-        stamps = pd.to_datetime(df["date"].astype(str), errors="coerce").dt.tz_localize("America/New_York")
-    df.index = pd.DatetimeIndex(stamps).tz_convert("America/New_York")
+    if isinstance(bars[0].date, dt.datetime):
+        df.index = pd.DatetimeIndex(pd.to_datetime(df["date"], utc=True)).tz_convert("America/New_York")
+    else:
+        df.index = pd.DatetimeIndex(pd.to_datetime(df["date"])).tz_localize("America/New_York")
     return df[["open", "high", "low", "close", "volume"]].dropna().sort_index()

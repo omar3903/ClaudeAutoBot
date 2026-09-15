@@ -346,9 +346,9 @@ def test_nothing_is_removed_on_an_answer_that_cant_be_trusted(engine, monkeypatc
     assert all(engine._reconcile_open_trades() == [] for _ in range(3))
 
     engine._refresh_account()
-    engine.exit_manager._closing.add(tid)                                   # its exit is going through
+    engine.executor.pending_exit_trade_ids = lambda: {tid}                  # its exit is going through
     assert all(engine._reconcile_open_trades() == [] for _ in range(3))
-    engine.exit_manager._closing.discard(tid)
+    del engine.executor.pending_exit_trade_ids
 
     monkeypatch.setattr(type(engine.broker), "is_connected", property(lambda self: False))
     assert all(engine._reconcile_open_trades() == [] for _ in range(3))     # disconnected
@@ -367,6 +367,24 @@ def test_young_trades_and_held_positions_are_kept(engine):
     engine._reconcile_open_trades()
     assert [r["id"] for r in engine._reconcile_open_trades()] == [young]
     assert engine.repo.get_trade(held)
+
+
+def test_a_position_of_another_size_than_its_records_is_reported_and_left_alone(engine):
+    tid = _open(engine, "AAPL", qty=5)
+    engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAPL", quantity=20, avg_price=100.0)]
+
+    engine._reconcile_open_trades()
+    assert engine.snapshot()["mismatches"] == []                            # confirmed on the next check
+    engine._reconcile_open_trades()
+    [m] = engine.snapshot()["mismatches"]
+    assert (m["symbol"], m["recorded"], m["held"]) == ("AAPL", 5.0, 20.0) and "20 shares long" in m["note"]
+    assert engine.repo.get_trade(tid)["quantity"] == 5                      # nothing traded or deleted
+
+    engine._account.positions[0].quantity = 5                               # back in agreement
+    engine._reconcile_open_trades()
+    assert engine.snapshot()["mismatches"] == []
 
 
 def test_resetting_paper_deletes_the_simulators_open_records_only(engine):

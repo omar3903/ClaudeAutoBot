@@ -11,6 +11,10 @@ For each OPEN trade it:
           the trade is past ``trail_start_r`` R
      The stop only ever moves in your favour and never past the last price.
 
+A trade whose close order is still working is left alone. An exit that can't
+be sent, or that the broker rejects or cancels, is sent again - waiting a
+little longer after each try (``RETRY_DELAYS_S``).
+
 Entries always need your click; exits never do.
 """
 
@@ -18,8 +22,9 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, FrozenSet, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..core.eventbus import BUS
 from ..util import clock
@@ -28,6 +33,9 @@ log = logging.getLogger(__name__)
 
 
 class ExitManager:
+    #: seconds to wait before the next exit for a trade, after its 1st, 2nd, ... one
+    RETRY_DELAYS_S = (5.0, 15.0, 30.0, 60.0, 120.0, 300.0)
+
     def __init__(self, repo, executor, quote_fn: Callable[[str], Any], cfg, bus=BUS,
                  venue: Optional[str] = None) -> None:
         self.repo = repo
@@ -36,15 +44,11 @@ class ExitManager:
         self.quote_fn = quote_fn
         self.cfg = cfg
         self.bus = bus
-        self._closing: set = set()          # trade ids we've already sent a close for
+        self._tries: Dict[str, Tuple[int, float]] = {}  # trade id -> (exits sent, monotonic time the next may go)
+        self._last_failure: Dict[str, str] = {}         # trade id -> the failure last published
         self._overdue_seen: set = set()     # trade ids we've already flagged as overdue
         self._not_held: set = set()         # trade ids whose position the broker doesn't show
         self._prices: Dict[str, Optional[float]] = {}   # this pass's quotes
-
-    @property
-    def closing(self) -> FrozenSet[str]:
-        """Trades whose automatic close has been sent."""
-        return frozenset(self._closing)
 
     # ------------------------------------------------------------------ #
     def run_once(self) -> List[Dict[str, Any]]:
@@ -55,8 +59,11 @@ class ExitManager:
         except Exception:  # noqa: BLE001
             log.exception("exit manager: could not list open trades")
             return []
-        # only trades held on this venue - an exit can't be sent anywhere else
-        mine = [t for t in open_trades if t["id"] not in self._closing
+        self._forget_all_but({t["id"] for t in open_trades})
+        # only trades held on this venue - an exit can't be sent anywhere else -
+        # and not while one of their close orders is still working
+        in_flight = self.executor.pending_exit_trade_ids()
+        mine = [t for t in open_trades if t["id"] not in in_flight
                 and not (self.venue and (t.get("broker") or self.venue) != self.venue)]
         self._prices = self._fetch_prices({t["symbol"] for t in mine})
         acted: List[Dict[str, Any]] = []
@@ -97,21 +104,41 @@ class ExitManager:
         return float(px) if px else None
 
     def _close(self, tid: str, reason: str) -> Optional[Dict[str, Any]]:
-        self._closing.add(tid)
-        out = self.executor.close_trade(tid, reason=reason)
-        if out and out.get("ok"):
+        tries, next_at = self._tries.get(tid, (0, 0.0))
+        now = time.monotonic()
+        if now < next_at:
+            return None                     # the last exit didn't take - wait before sending another
+        out = self.executor.close_trade(tid, reason=reason) or {}
+        if out.get("not_held"):
+            # nothing to sell: say it once; the engine's broker check removes the record once confirmed
+            if tid not in self._not_held:
+                self._not_held.add(tid)
+                log.warning("AUTO-EXIT %s skipped: %s", tid, out.get("reason"))
+                self.bus.publish("exit.not_held", trade_id=tid, reason=out.get("reason"))
+            return None
+        tries += 1
+        wait = self.RETRY_DELAYS_S[min(tries, len(self.RETRY_DELAYS_S)) - 1]
+        self._tries[tid] = (tries, now + wait)
+        if out.get("ok"):
             trade = out.get("trade") or {}
-            log.info("AUTO-EXIT %s: %s  P/L %.2f", tid, reason, trade.get("realized_pl") or 0.0)
+            log.info("AUTO-EXIT %s: %s  P/L %.2f%s", tid, reason, trade.get("realized_pl") or 0.0,
+                     f"  (try {tries})" if tries > 1 else "")
             self.bus.publish("exit.triggered", trade_id=tid, reason=reason, trade=trade)
             return {"trade_id": tid, "reason": reason, "trade": trade}
-        # close didn't take (order working / market shut / nothing held) - allow a retry next tick
-        self._closing.discard(tid)
-        if out and out.get("not_held") and tid not in self._not_held:
-            # say it once; the engine's broker check removes the record once confirmed
-            self._not_held.add(tid)
-            log.warning("AUTO-EXIT %s skipped: %s", tid, out.get("reason"))
-            self.bus.publish("exit.not_held", trade_id=tid, reason=out.get("reason"))
+        why = out.get("reason") or "unknown error"
+        log.warning("AUTO-EXIT %s (%s) not sent, try %d - next in %.0fs: %s", tid, reason, tries, wait, why)
+        if self._last_failure.get(tid) != why:
+            self._last_failure[tid] = why
+            self.bus.publish("exit.failed", trade_id=tid, reason=why, attempt=tries, retry_in_s=round(wait))
         return None
+
+    def _forget_all_but(self, open_ids: set) -> None:
+        """Drop what's remembered about trades that are no longer open."""
+        for book in (self._tries, self._last_failure):
+            for tid in [k for k in book if k not in open_ids]:
+                del book[tid]
+        self._not_held &= open_ids
+        self._overdue_seen &= open_ids
 
     # ------------------------------------------------------------------ #
     def _manage(self, t: Dict[str, Any]) -> Optional[Dict[str, Any]]:

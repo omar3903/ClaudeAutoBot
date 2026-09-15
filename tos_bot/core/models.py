@@ -107,7 +107,7 @@ class Account:
 @dataclass
 class OrderRequest:
     symbol: str
-    side: Side
+    side: Side                  # the order's direction: LONG buys, SHORT sells - exits too
     quantity: float
     order_type: OrderType = OrderType.LIMIT
     limit_price: Optional[float] = None

@@ -28,6 +28,9 @@ class FakeExecutor:
         self.repo = repo
         self.closed = []
 
+    def pending_exit_trade_ids(self):
+        return set()
+
     def close_trade(self, tid, reason="manual", limit_price=None):
         t = self.repo._t.get(tid)
         if not t or t["status"] == "CLOSED":
