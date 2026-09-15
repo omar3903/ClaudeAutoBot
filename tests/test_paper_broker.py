@@ -60,3 +60,9 @@ def test_short_then_cover(paper):
     paper.place_order(OrderRequest("DDD", Side.LONG, 3, OrderType.MARKET, is_entry=False))
     acc = paper.get_account()
     assert acc.position("DDD") is None or abs(acc.position("DDD").quantity) < 1e-9
+
+
+def test_a_working_order_reports_its_type_price_and_time_in_force(paper):
+    paper.place_order(OrderRequest("LMT", Side.LONG, 5, OrderType.LIMIT, limit_price=1.0))
+    [order] = paper.list_orders("WORKING")
+    assert (order.order_type, order.limit_price, order.stop_price, order.tif) == ("LIMIT", 1.0, None, "DAY")

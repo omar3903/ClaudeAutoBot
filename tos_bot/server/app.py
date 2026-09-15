@@ -95,6 +95,10 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
         repo = eng().repo
         return {"trades": repo.open_trades() if status == "OPEN" else repo.recent_trades(limit)}
 
+    @app.get("/api/orders")
+    def orders(fresh: bool = False):
+        return eng().active_orders(max_age_s=0.0 if fresh else None)
+
     @app.post("/api/trades/close-all", dependencies=LOCAL_ONLY)
     def close_all():
         return _result(eng().close_all_positions())

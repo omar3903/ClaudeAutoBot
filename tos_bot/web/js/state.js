@@ -10,12 +10,13 @@ export const S = {
   drawer: null,       // what the side drawer shows: connections | strategies | settings | record
   recordId: null,     // trade shown in the record drawer
   scanRun: null,      // {kind, stage, done, total} while a scan runs
+  orders: { orders: [], ok: false },   // what's working at the broker (/api/orders, orders.updated)
   stopped: false,     // the app has shut down
 };
 
 const listeners = new Map();
 
-/** Topics: state, plays, filters, strategies, scan. */
+/** Topics: state, plays, filters, strategies, scan, orders. */
 export function on(topic, fn) {
   if (!listeners.has(topic)) listeners.set(topic, []);
   listeners.get(topic).push(fn);

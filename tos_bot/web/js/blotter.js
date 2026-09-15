@@ -1,5 +1,5 @@
-/* The bottom panel: open positions, trade history, P/L summary, the watchlist,
-   and the trade-record drawer. */
+/* The bottom panel: open positions, active orders (see orders.js), trade history,
+   P/L summary, the watchlist, and the trade-record drawer. */
 import {
   $, $$, SECTOR_SHORT, VENUE_SHORT, api, escapeHtml, fmtTime, num, pct, plural, positionList, post,
   sectorTag, sideBadge, tfLabel, usd,
@@ -8,8 +8,11 @@ import { S, refreshState } from "./state.js";
 import { closeDrawer, drawerOpen, openDrawer, openModal, toast, toastResult } from "./ui.js";
 import { stratLabel } from "./strategies.js";
 import { loadWatchlist } from "./watchlist.js";
+import { loadOrders } from "./orders.js";
 
-const LOADERS = { open: loadOpen, history: loadHistory, stats: loadStats, watchlist: loadWatchlist };
+const LOADERS = {
+  open: loadOpen, orders: () => loadOrders(true), history: loadHistory, stats: loadStats, watchlist: loadWatchlist,
+};
 
 export const tabVisible = name => !$("#tab-" + name).classList.contains("hidden");
 const isLive = () => S.state.mode === "live";
@@ -62,7 +65,9 @@ function exposureHTML(trades) {
 function openRow(t, here) {
   const venue = t.broker || "paper", parked = venue !== here;
   const pos = (S.state.positions || []).find(x => x.symbol === t.symbol) || {};
-  const upl = parked ? null : pos.unrealized_pl;
+  // this record's own open P/L - the broker's figure covers every share of the stock, recorded or not
+  const upl = parked || pos.market_price == null ? null
+    : (pos.market_price - t.entry_price) * Math.abs(t.quantity) * (t.side === "SHORT" ? -1 : 1);
   const moved = t.initial_stop_price != null && Math.abs((t.stop_price ?? 0) - t.initial_stop_price) > 0.01;
   const stopCell = moved ? `<span title="moved from ${num(t.initial_stop_price)}">${num(t.stop_price)} ▲</span>` : num(t.stop_price);
   const status = t.time_status || "on_track";
@@ -239,14 +244,13 @@ export function recordGone(ids) {
   if (drawerOpen("record") && ids.includes(S.recordId)) closeDrawer();
 }
 
+export function showTab(name) {
+  $$(".blotter .tab").forEach(x => x.classList.toggle("active", x.dataset.tab === name));
+  Object.keys(LOADERS).forEach(key => $("#tab-" + key).classList.toggle("hidden", key !== name));
+  LOADERS[name]();
+}
+
 export function initBlotter() {
-  $$(".tab").forEach(tab => {
-    tab.onclick = () => {
-      $$(".tab").forEach(x => x.classList.remove("active"));
-      tab.classList.add("active");
-      Object.keys(LOADERS).forEach(name => $("#tab-" + name).classList.toggle("hidden", name !== tab.dataset.tab));
-      LOADERS[tab.dataset.tab]();
-    };
-  });
+  $$(".blotter .tab").forEach(tab => { tab.onclick = () => showTab(tab.dataset.tab); });
   $("#btn-exit-all").onclick = exitAll;
 }

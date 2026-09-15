@@ -419,3 +419,12 @@ def test_open_orders_carry_direction_and_tag_so_a_restart_can_match_them(broker)
     [order] = broker.list_orders("WORKING")
     assert (order.symbol, order.side, order.tag, order.submitted_qty) == ("AAPL", Side.SHORT, "exit:trd_1", 10)
     assert broker._session.ib.placed[-1][1].orderRef == "exit:trd_1"
+
+
+def test_open_orders_report_their_type_prices_and_time_in_force(broker):
+    broker.place_order(OrderRequest(symbol="AAPL", side=Side.LONG, quantity=5, order_type=OrderType.LIMIT,
+                                    limit_price=123.45, tif=TimeInForce.GTC, client_tag="play_1"))
+    [order] = broker.list_orders("WORKING")
+    assert order.order_type == "LIMIT" and order.limit_price == pytest.approx(123.45)
+    assert order.stop_price is None                     # IBKR's "unset" price is not a price
+    assert order.tif == "GTC" and order.raw["parent_id"] is None
