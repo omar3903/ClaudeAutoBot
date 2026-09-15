@@ -99,3 +99,11 @@ def test_describe_never_returns_secret_values(env):
     assert rows["IBKR_PAPER_PORT"]["default"] == "4002"
     assert all(key.startswith("IBKR_") for key in rows)
     assert ss.mask("DU1234567") == "…4567" and ss.mask("") == ""
+
+
+def test_the_news_key_has_its_own_group_and_stays_secret(env, monkeypatch):
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    assert "FINNHUB_API_KEY" not in {r["key"] for r in ss.describe(env)}
+    assert ss.write({"FINNHUB_API_KEY": "abcd1234efgh5678"}, env) == ["FINNHUB_API_KEY"]
+    [row] = ss.describe(env, fields=ss.SIGNAL_FIELDS)
+    assert row["secret"] and row["set"] and row["hint"] == "…5678" and "abcd1234" not in repr(row)

@@ -542,6 +542,28 @@ class IbkrBroker(BrokerAdapter):
         results = [self._result(t) for t in trades]
         return [r for r in results if not status or status.upper() in (r.status, "OPEN", "WORKING")]
 
+    def news_headlines(self, con_ids: Mapping[str, int], days: int = 3,
+                       per_symbol: int = 10) -> Dict[str, List[Tuple[dt.datetime, str, str, str]]]:
+        """Recent headlines per stock from every news feed this account can read, as
+        (time in UTC, provider code, article id, raw headline). Empty when not connected."""
+        if not self.is_connected or not con_ids:
+            return {}
+        since = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - dt.timedelta(days=days)
+
+        async def run(ib):
+            # reqNewsProvidersAsync hands back a future, not a coroutine, so it is awaited in one
+            codes = "+".join(p.code for p in (await ib.reqNewsProvidersAsync()) or [])
+            out: Dict[str, List[Tuple[dt.datetime, str, str, str]]] = {}
+            for symbol, con_id in (con_ids.items() if codes else ()):
+                try:
+                    found = await asyncio.wait_for(ib.reqHistoricalNewsAsync(con_id, codes, since, "", per_symbol), 10)
+                except Exception:  # noqa: BLE001
+                    continue
+                out[symbol] = [(h.time, h.providerCode, h.articleId, h.headline) for h in (found or [])]
+            return out
+
+        return self._session.run_coro(run, timeout=15 + 10 * len(con_ids)) or {}
+
     def _result(self, t) -> OrderResult:
         o, os_ = t.order, t.orderStatus
         side = Side.LONG if o.action == "BUY" else Side.SHORT

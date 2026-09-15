@@ -53,6 +53,9 @@ class Secrets(BaseSettings):
     ibkr_market_data: str = "auto"   # auto | live | delayed | delayed-frozen
     ibkr_readonly: bool = False      # true = connect for data only, never send orders
 
+    # Finnhub company news (free key from finnhub.io; optional)
+    finnhub_api_key: str = ""
+
     # database
     database_url: str = ""
     db_host: str = "127.0.0.1"
@@ -182,6 +185,28 @@ class NoiseCfg(_Model):
     min_expected_r: float = 0.15
 
 
+class SignalsCfg(_Model):
+    """Insider trades, company news and headline sentiment - see tos_bot/signals/."""
+
+    enabled: bool = True
+    insider_poll_minutes: float = 3.0          # how often SEC's live feed of Form 4 filings is read
+    backfill_days: int = 5                     # trading days of Form 4 filings read on the first start
+    insider_window_days: int = 30              # insider trades this close together count as one wave
+    insider_history_days: int = 365            # how far back "its insiders rarely buy" looks
+    buy_floor: float = 25_000.0                # a wave of buying below this is a token
+    buy_full: float = 1_000_000.0
+    sell_floor: float = 250_000.0
+    sell_full: float = 10_000_000.0
+    unusual_buying: float = 0.55               # insider score from which buying is unusual
+    unusual_selling: float = 0.65
+    news_poll_minutes: float = 15.0            # news for the hot list and open positions
+    news_lookback_days: int = 3
+    sentiment: bool = True                     # score headlines with FinBERT when it is installed
+    boost_insider_buying: float = 0.10         # added to a long play's score at an insider score of 1
+    boost_insider_selling: float = 0.08        # taken off a long play's score at an insider score of 1
+    boost_news: float = 0.06                   # at a news sentiment of +1 or -1
+
+
 class DatabaseCfg(_Model):
     echo_sql: bool = False
     pool_size: int = 5
@@ -203,6 +228,7 @@ class AppConfig(_Model):
     exit_manager: ExitManagerCfg = Field(default_factory=ExitManagerCfg)
     autopilot: AutopilotCfg = Field(default_factory=AutopilotCfg)
     noise: NoiseCfg = Field(default_factory=NoiseCfg)
+    signals: SignalsCfg = Field(default_factory=SignalsCfg)
     database: DatabaseCfg = Field(default_factory=DatabaseCfg)
 
 
@@ -236,6 +262,8 @@ def _apply_env_overrides(cfg: AppConfig) -> None:
         cfg.account.paper_start_cash = float(os.environ["PAPER_START_CASH"])
     except (KeyError, ValueError):
         pass
+    if os.getenv("SIGNALS_ENABLED"):
+        cfg.signals.enabled = os.environ["SIGNALS_ENABLED"].strip().lower() in ("1", "true", "yes", "on")
 
 
 @functools.lru_cache(maxsize=1)

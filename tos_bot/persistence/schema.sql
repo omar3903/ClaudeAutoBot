@@ -153,3 +153,56 @@ CREATE TABLE IF NOT EXISTS fills (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE INDEX ix_fills_trade_id ON fills (trade_id);
 CREATE INDEX ix_fills_ts ON fills (ts);
+
+CREATE TABLE IF NOT EXISTS filings_read (
+	accession VARCHAR(24) NOT NULL, 
+	form VARCHAR(12) NOT NULL, 
+	filed DATE, 
+	trades INTEGER NOT NULL, 
+	read_at DATETIME NOT NULL, 
+	PRIMARY KEY (accession)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE INDEX ix_filings_read_filed ON filings_read (filed);
+
+CREATE TABLE IF NOT EXISTS insider_trades (
+	accession VARCHAR(24) NOT NULL, 
+	line INTEGER NOT NULL, 
+	symbol VARCHAR(16) NOT NULL, 
+	issuer_cik BIGINT NOT NULL, 
+	issuer_name VARCHAR(160) NOT NULL, 
+	owner_cik BIGINT NOT NULL, 
+	owner_name VARCHAR(160) NOT NULL, 
+	`role` VARCHAR(20) NOT NULL, 
+	title VARCHAR(160) NOT NULL, 
+	code VARCHAR(2) NOT NULL, 
+	trade_date DATE NOT NULL, 
+	shares NUMERIC(20, 6) NOT NULL, 
+	price NUMERIC(20, 6) NOT NULL, 
+	shares_after NUMERIC(20, 6) NOT NULL, 
+	planned BOOL NOT NULL, 
+	direct BOOL NOT NULL, 
+	offering BOOL NOT NULL, 
+	filed DATE, 
+	PRIMARY KEY (accession, line)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE INDEX ix_insider_trades_symbol ON insider_trades (symbol);
+CREATE INDEX ix_insider_trades_trade_date ON insider_trades (trade_date);
+
+CREATE TABLE IF NOT EXISTS news_items (
+	`key` VARCHAR(32) NOT NULL, 
+	symbol VARCHAR(16) NOT NULL, 
+	source VARCHAR(12) NOT NULL, 
+	provider VARCHAR(40) NOT NULL, 
+	kind VARCHAR(12) NOT NULL, 
+	headline VARCHAR(500) NOT NULL, 
+	url VARCHAR(500) NOT NULL, 
+	ref VARCHAR(80) NOT NULL, 
+	items VARCHAR(60) NOT NULL, 
+	published_at DATETIME NOT NULL, 
+	sentiment FLOAT, 
+	sentiment_conf FLOAT, 
+	fetched_at DATETIME NOT NULL, 
+	PRIMARY KEY (`key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE INDEX ix_news_items_published_at ON news_items (published_at);
+CREATE INDEX ix_news_items_symbol ON news_items (symbol);

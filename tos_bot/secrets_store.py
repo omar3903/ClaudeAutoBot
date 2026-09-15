@@ -1,6 +1,6 @@
 """Read and update the machine-local ``.env`` from the dashboard.
 
-Only a fixed allow-list of IB Gateway settings can be written. Values are
+Only a fixed allow-list - the IB Gateway settings and the signals' news key - can be written. Values are
 validated (no line breaks, so nothing can smuggle extra lines into the file),
 the file is replaced atomically with comments and unrelated lines preserved,
 and secret values are never sent back to the browser - only whether they're
@@ -45,7 +45,12 @@ FIELDS: Tuple[EnvField, ...] = (
              help="auto = real-time if you're subscribed, otherwise delayed"),
     EnvField("IBKR_READONLY", "Read-only (data only, never send orders)", kind="bool"),
 )
-_BY_KEY = {f.key: f for f in FIELDS}
+#: keys for the signals' news feeds - shown in their own part of the Connections panel
+SIGNAL_FIELDS: Tuple[EnvField, ...] = (
+    EnvField("FINNHUB_API_KEY", "Finnhub API key", secret=True,
+             help="Optional: a free key from finnhub.io adds company news to the signals"),
+)
+_BY_KEY = {f.key: f for f in FIELDS + SIGNAL_FIELDS}
 
 _MAX_LEN = 512
 _SAFE_UNQUOTED = re.compile(r"[A-Za-z0-9_\-.:/@+=,]*")
@@ -59,12 +64,12 @@ def read_env(path: Path = ENV_PATH) -> Dict[str, str]:
     return {k: (v or "") for k, v in dotenv_values(path).items()}
 
 
-def describe(path: Path = ENV_PATH) -> List[Dict[str, Any]]:
-    """The editable fields with their current state - never a secret's value."""
+def describe(path: Path = ENV_PATH, fields: Tuple[EnvField, ...] = FIELDS) -> List[Dict[str, Any]]:
+    """The editable ``fields`` with their current state - never a secret's value."""
     env = read_env(path)
     defaults = Secrets.model_fields
     out = []
-    for f in FIELDS:
+    for f in fields:
         value = env.get(f.key, "")
         default = defaults.get(f.key.lower())
         row: Dict[str, Any] = {

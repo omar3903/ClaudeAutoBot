@@ -22,7 +22,10 @@ websockets>=12.0
 
 # --- market data ---
 ib_async>=1.0.3          # Interactive Brokers, via a running IB Gateway / TWS
-requests>=2.31           # US listings (Nasdaq Trader), SEC EDGAR financials, ECB exchange rates
+requests>=2.31           # US listings (Nasdaq Trader), SEC EDGAR financials and insider filings, ECB rates
+
+# --- optional: headline sentiment for the signals (FinBERT, runs on this computer) ---
+# pip install transformers torch   # several hundred MB; without them headlines carry no sentiment
 
 # --- dev ---
 pytest>=8.0

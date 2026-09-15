@@ -5,7 +5,7 @@ every figure it has filed; the latest annual values are read off it and the
 result is cached on disk for a week, since statements only change with new
 filings. Companies that don't file annual US-GAAP figures (most foreign ADRs,
 which use IFRS) aren't covered, so their valuation setups sit out. SEC asks for
-at most 10 requests a second.
+at most 10 requests a second (see sec_http.py).
 """
 
 from __future__ import annotations
@@ -15,23 +15,19 @@ import datetime as dt
 import json
 import logging
 import math
-import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
-import requests
-
 from .fundamentals import Financials, FundamentalsProvider
+from .sec_http import SEC
 
 log = logging.getLogger(__name__)
 
 _TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 _FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
-_HEADERS = {"User-Agent": "AutoTradeBot/1.0 (personal research tool)", "Accept-Encoding": "gzip, deflate"}
 _FACTS_TTL_S = 7 * 86400
 _TICKERS_TTL_S = 86400
-_MIN_GAP_S = 0.12
 _ANNUAL_FORMS = ("10-K", "20-F", "40-F")
 _YEARS = 5
 _STALE_AFTER_DAYS = 550
@@ -182,11 +178,7 @@ def financials_from_facts(symbol: str, facts: Mapping[str, dict], today: dt.date
 class SecEdgarFundamentals(FundamentalsProvider):
     def __init__(self, cache_dir: Path, fetch_json: Optional[Callable[[str], dict]] = None) -> None:
         self.cache_dir = cache_dir
-        self._fetch_json = fetch_json or self._http_json
-        self._http = requests.Session()
-        self._http.headers.update(_HEADERS)
-        self._lock = threading.Lock()
-        self._next_start = 0.0
+        self._fetch_json = fetch_json or SEC.json
         self._ciks: Dict[str, int] = {}
         self._ciks_at = 0.0
 
@@ -216,17 +208,6 @@ class SecEdgarFundamentals(FundamentalsProvider):
             except Exception as e:  # noqa: BLE001
                 log.warning("SEC ticker list download failed: %s", e)
         return self._ciks.get(sec_ticker(symbol))
-
-    def _http_json(self, url: str) -> dict:
-        with self._lock:
-            now = time.monotonic()
-            start = max(now, self._next_start)
-            self._next_start = start + _MIN_GAP_S
-        if start > now:
-            time.sleep(start - now)
-        r = self._http.get(url, timeout=30)
-        r.raise_for_status()
-        return r.json()
 
     def _cache_path(self, symbol: str) -> Path:
         return self.cache_dir / f"{sec_ticker(symbol)}.json"

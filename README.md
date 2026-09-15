@@ -448,6 +448,41 @@ shows it (`Autopilot: day ⚡60s`).
 
 ---
 
+## Signals — insider trades and company news
+
+A background service (`tos_bot/signals/`) watches what happens off the price chart. It is on by default
+(`signals.enabled` in `config.yaml`; `SIGNALS_ENABLED=0` turns it off, and the tests do).
+
+**Insider trades (SEC Form 4, no key needed)**
+- SEC's live feed of Form 4 filings is read every 3 minutes. Trading days the app missed are read from SEC's
+  daily indexes (the last 5 on the first start). Each filing is read once, within SEC's 10-requests-a-second limit.
+- Only purchases (code P) and sales (code S) count. Trades under a 10b5-1 plan, and purchases the filing says
+  were made in a private placement or offering, are left out.
+- A wave of buying is scored 0–1 from who bought (a CEO or CFO counts most), how much in dollars, how much it
+  grew their holding, how many insiders bought within 30 days, and whether the company's insiders rarely buy.
+  From 0.55 it is unusual; selling needs 0.65. Several insiders paying exactly one price on one day look like a
+  placement and never count as unusual. "Rarely buys" is only claimed once the company's past year of filings
+  has been read.
+
+**Company news**
+- Every 15 minutes, for the stocks held, the hot list and those with unusual insider buying (up to 40): IBKR
+  headlines (on a paper account mostly Briefing.com columns and analyst actions), SEC 8-K filings (material items
+  such as earnings or an officer leaving), and Finnhub stories with a free key (Connections → Company news).
+- Headlines are scored by FinBERT on this computer when it is installed - `pip install transformers torch`, a
+  download of several hundred MB. Without it they simply carry no sentiment.
+
+**What the signals do**
+- **Insider buying** (`insider_buying`, a swing setup): unusual buying in the last 10 days, while the stock is no
+  more than 15% above what the insiders paid. The stop goes under the recent swing low, one to two daily ranges
+  away, and the target is three times the risk. It is on in `config.example.yaml`; if your own `config.yaml`
+  doesn't list it, switch it on in the Strategies panel. The strategy replay has no insider history to test it
+  on, so Autopilot won't take it while `autopilot.require_proven` is on.
+- **Score nudges** on every other play: unusual insider buying adds up to 0.10 to a long (and takes it from a
+  short), unusual selling takes up to 0.08 from a long (and adds half that to a short), and the news moves a play
+  by up to 0.06 once two or more headlines are scored. The play's evidence shows each nudge and why.
+- `GET /api/signals` lists the current signals; they are kept in the `insider_trades`, `filings_read` and
+  `news_items` tables.
+
 ## Dashboard controls
 
 * **Paper / Live** — which side you're trading. Going Live asks for confirmation.

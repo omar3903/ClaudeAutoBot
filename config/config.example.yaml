@@ -69,6 +69,8 @@ strategies:
     atr_channel_breakout:   { enabled: true,  weight: 0.9, params: { length: 20, mult: 1.5 } }
     divergence_reversal:    { enabled: true,  weight: 0.8, params: { lookback: 40, stop_atr: 1.5 } }
     week52_breakout:        { enabled: true,  weight: 0.9, params: { proximity_pct: 1.0 } }
+    # -- signal setups (tos_bot/signals): unusual insider buying from SEC Form 4 filings --
+    insider_buying:         { enabled: true,  weight: 1.0, params: { min_score: 0.55, max_days_since: 10, stop_atr: 2.0, target_r: 3.0 } }
   fundamental:
     relative_value_comps:   { enabled: true,  weight: 1.2, params: { peer_count: 8, discount_trigger: 0.20, premium_trigger: 0.20 } }
     dcf_fair_value_gap:     { enabled: true,  weight: 1.2, params: { projection_years: 5, perpetuity_growth: 0.025, mos: 0.25 } }
@@ -140,6 +142,29 @@ noise:
   volume_ratio: 1.5                   # opposing volume this many times the supporting volume
   volume_bars: 6                      # closed 5-minute bars the volume check looks back over
   min_expected_r: 0.15                # expected value (in R) below which a play isn't worth the risk
+
+signals:
+  # What a company's insiders buy and sell (SEC Form 4 filings) and what the news says
+  # about it (IBKR news, SEC 8-K filings, and Finnhub with a free key in Connections).
+  # Unusual insider buying creates swing buy plays; insider selling and the news only
+  # nudge the scores of other plays. Headlines are scored by FinBERT on this computer.
+  enabled: true
+  insider_poll_minutes: 3             # how often SEC's live feed of Form 4 filings is read
+  backfill_days: 5                    # trading days of Form 4 filings read on the first start
+  insider_window_days: 30             # insider trades this close together count as one wave
+  insider_history_days: 365           # how far back "its insiders rarely buy" looks
+  buy_floor: 25000                    # a wave of buying below this many dollars is a token
+  buy_full: 1000000
+  sell_floor: 250000
+  sell_full: 10000000
+  unusual_buying: 0.55                # insider score (0-1) from which buying counts as unusual
+  unusual_selling: 0.65
+  news_poll_minutes: 15               # news for the hot list and open positions
+  news_lookback_days: 3
+  sentiment: true                     # score headlines with FinBERT when it is installed
+  boost_insider_buying: 0.10          # added to a long play's score at an insider score of 1
+  boost_insider_selling: 0.08         # taken off a long play's score at an insider score of 1
+  boost_news: 0.06                    # at a news sentiment of +1 or -1
 
 database:
   echo_sql: false
