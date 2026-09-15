@@ -85,4 +85,7 @@ def test_settings_round_trip_and_the_dashboard_loads(client):
     assert r["ok"] and r["scan"]["settings"]["cycle_minutes"] == 20
     assert client.post("/api/settings", json={"premarket_time": "10:00"}).status_code == 400
     assert client.get("/").status_code == 200
-    assert "javascript" in client.get("/static/js/main.js").headers["content-type"]
+    main = client.get("/static/js/main.js")
+    assert "javascript" in main.headers["content-type"]
+    assert main.headers["cache-control"] == "no-cache"             # an update never mixes with cached modules
+    assert client.get("/").headers["cache-control"] == "no-cache"

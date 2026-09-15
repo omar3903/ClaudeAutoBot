@@ -33,6 +33,17 @@ LOCAL_ONLY = [Depends(require_local)]
 # Windows can map .js to text/plain, and browsers refuse to run modules served that way
 mimetypes.add_type("text/javascript", ".js")
 
+#: the dashboard is plain ES modules; a browser that reuses a cached copy of one of them after an
+#: update mixes old and new code and the page stops working, so every load re-checks each file
+NO_CACHE = {"Cache-Control": "no-cache"}
+
+
+class _FreshStaticFiles(StaticFiles):
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers.update(NO_CACHE)
+        return response
+
 
 def _result(res: Dict[str, Any]) -> JSONResponse:
     return JSONResponse(res, status_code=200 if res.get("ok") else 400)
@@ -261,11 +272,11 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
 
     # ---- the dashboard ------------------------------------------------------ #
     if WEB_DIR.exists():
-        app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+        app.mount("/static", _FreshStaticFiles(directory=str(WEB_DIR)), name="static")
 
         @app.get("/")
         def index():
-            return FileResponse(str(WEB_DIR / "index.html"))
+            return FileResponse(str(WEB_DIR / "index.html"), headers=NO_CACHE)
 
     return app
 
