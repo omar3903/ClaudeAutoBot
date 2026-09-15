@@ -63,7 +63,8 @@ def test_executor_refuses_to_close_a_position_held_on_another_venue():
 def test_exit_manager_only_manages_trades_on_its_own_venue():
     repo = _Repo([_trade(broker="paper")])                   # stop 98, price 90 -> would stop out
     closed = []
-    ex = SimpleNamespace(close_trade=lambda tid, reason="manual": closed.append(tid) or {"ok": True, "trade": {}})
+    ex = SimpleNamespace(close_trade=lambda tid, reason="manual": closed.append(tid) or {"ok": True, "trade": {}},
+                         pending_exit_trade_ids=set)
     em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=90, ask=90, last=90),
                      cfg=CFG, bus=SILENT, venue="ibkr-live")
     em.run_once()
@@ -124,9 +125,11 @@ def test_the_exit_still_goes_out_when_the_broker_cant_say():
 def test_exit_manager_reports_a_missing_position_once():
     events = []
     bus = SimpleNamespace(publish=lambda topic, **kw: events.append(topic))
-    ex = SimpleNamespace(close_trade=lambda tid, reason="manual": {"ok": False, "not_held": True, "reason": "gone"})
+    tries = []
+    ex = SimpleNamespace(close_trade=lambda tid, reason="manual": tries.append(tid) or
+                         {"ok": False, "not_held": True, "reason": "gone"}, pending_exit_trade_ids=set)
     em = ExitManager(_Repo([_trade()]), ex, quote_fn=lambda s: Quote(symbol=s, bid=90, ask=90, last=90),
                      cfg=CFG, bus=bus, venue="paper")
     for _ in range(3):
         em.run_once()
-    assert events.count("exit.not_held") == 1 and "t1" not in em._closing
+    assert events.count("exit.not_held") == 1 and len(tries) == 3        # checked every pass, no waiting

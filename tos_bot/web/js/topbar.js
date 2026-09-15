@@ -33,6 +33,14 @@ function renderTop() {
   $("#pill-conn").title = `${c.detail || ""}\nClick to open Connections`;
   if (s.strategies_on != null) $("#btn-strategies").textContent = `Strategies · ${s.strategies_on}`;
   renderBanner(c);
+  renderMismatches(s.mismatches || []);
+}
+
+function renderMismatches(list) {
+  // positions a different size than their records add up to - shown until they agree again
+  const b = $("#records-banner");
+  b.classList.toggle("hidden", !list.length);
+  b.innerHTML = list.map(m => `<span>⚠ ${escapeHtml(m.note)}</span>`).join("");
 }
 
 function renderMarket(mk, open) {

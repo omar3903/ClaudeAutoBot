@@ -31,6 +31,17 @@ def test_the_bar_store_downloads_once_then_tops_up(tmp_path):
     assert restarted.last_session("AAA") == through and restarted.frame("AAA").equals(frame)
 
 
+def test_candles_saved_a_day_early_are_read_back_on_their_session(tmp_path):
+    full = fakes.daily_bars("CCC")
+    early = full.copy()
+    early.index = full.index.tz_localize(None).tz_localize("UTC").tz_convert("America/New_York")  # the old bug
+    early.to_pickle(tmp_path / "CCC.pkl")
+    store = DailyBarStore(tmp_path)
+    assert store.frame("CCC").index.equals(full.index)
+    assert store.last_session("CCC") == full.index[-1].date()
+    assert store.duration_needed("CCC", full.index[-1].date()) is None      # nothing to re-download
+
+
 def test_the_bar_store_never_keeps_an_unfinished_session(tmp_path):
     store = DailyBarStore(tmp_path)
     full = fakes.daily_bars("BBB")

@@ -78,6 +78,17 @@ function handle(topic, p) {
     case "exit.not_held":
       toast("Auto-exit skipped: " + (p.reason || "the broker doesn't show that position"), "warn");
       break;
+    case "exit.failed":
+      toast(`⚠ Auto-exit not sent (try ${p.attempt}, again in ${p.retry_in_s}s): ${p.reason}`, "bad");
+      break;
+    case "order.failed":
+      toast("⚠ " + p.msg, "bad");
+      loadOpen(); refreshState();
+      break;
+    case "positions.mismatch":
+      (p.mismatches || []).forEach(m => toast("⚠ " + m.note, "bad"));
+      refreshState();
+      break;
     case "exit.stop_moved":
       toast(`${p.symbol}: stop → ${num(p.new_stop)} (${num(p.r, 1)}R locked)`, "good");
       loadOpen();
