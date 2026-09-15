@@ -27,6 +27,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional
 
 from ..core.eventbus import BUS
+from ..scanner.noise import LABELS as NOISE_LABELS
 from ..util import clock
 
 log = logging.getLogger(__name__)
@@ -50,6 +51,12 @@ class AutoPilot:
         self.max_per_strategy: int = int(getattr(cfg, "max_per_strategy", 2))
         self.max_new_per_cycle: int = int(getattr(cfg, "max_new_per_cycle", 1))
         self.cooldown_after_loss: bool = bool(getattr(cfg, "cooldown_after_loss", True))
+        self.max_gross_exposure_pct: float = float(getattr(cfg, "max_gross_exposure_pct", 100.0))
+        self.min_confirmations: int = int(getattr(cfg, "min_confirmations", 2))
+        self.skip_noise: List[str] = [str(n) for n in getattr(cfg, "skip_noise", list(NOISE_LABELS))]
+        self.require_proven: bool = bool(getattr(cfg, "require_proven", True))
+        self.min_replay_trades: int = int(getattr(cfg, "min_replay_trades", 30))
+        self.min_replay_expectancy_r: float = float(getattr(cfg, "min_replay_expectancy_r", 0.05))
         self.dry_run: bool = bool(cfg.dry_run)
 
         self._acted: set[str] = set()          # play ids already handled
@@ -74,6 +81,10 @@ class AutoPilot:
             "max_per_strategy": self.max_per_strategy,
             "max_new_per_cycle": self.max_new_per_cycle,
             "cooldown_after_loss": self.cooldown_after_loss,
+            "max_gross_exposure_pct": self.max_gross_exposure_pct,
+            "min_confirmations": self.min_confirmations,
+            "skip_noise": list(self.skip_noise),
+            "require_proven": self.require_proven,
             "dry_run": self.dry_run,
             "day": self._day,
             "count_today": self._count_today,
@@ -86,15 +97,19 @@ class AutoPilot:
         tt = d.get("trade_types")
         if isinstance(tt, list) and tt:
             self.trade_types = [str(x).upper() for x in tt if str(x).upper() in ("INTRADAY", "SWING")] or self.trade_types
-        for k in ("min_confidence", "min_reward_risk"):
+        for k in ("min_confidence", "min_reward_risk", "max_gross_exposure_pct"):
             if isinstance(d.get(k), (int, float)):
                 setattr(self, k, float(d[k]))
         for k in ("max_auto_positions", "max_auto_trades_per_day",
-                  "max_per_strategy", "max_new_per_cycle"):
+                  "max_per_strategy", "max_new_per_cycle", "min_confirmations"):
             if isinstance(d.get(k), int):
                 setattr(self, k, int(d[k]))
+        if isinstance(d.get("skip_noise"), list):
+            self.skip_noise = [str(n) for n in d["skip_noise"] if str(n) in NOISE_LABELS]
         if "cooldown_after_loss" in d:
             self.cooldown_after_loss = bool(d["cooldown_after_loss"])
+        if "require_proven" in d:
+            self.require_proven = bool(d["require_proven"])
         self.dry_run = bool(d.get("dry_run", self.dry_run))
         # only restore the day counter if it is still the same session
         if d.get("day") == clock.session_date().isoformat():
@@ -127,6 +142,14 @@ class AutoPilot:
             self.max_new_per_cycle = max(1, int(kw["max_new_per_cycle"]))
         if "cooldown_after_loss" in kw:
             self.cooldown_after_loss = bool(kw["cooldown_after_loss"])
+        if "require_proven" in kw:
+            self.require_proven = bool(kw["require_proven"])
+        if isinstance(kw.get("max_gross_exposure_pct"), (int, float)):
+            self.max_gross_exposure_pct = max(10.0, min(400.0, float(kw["max_gross_exposure_pct"])))
+        if isinstance(kw.get("min_confirmations"), int):
+            self.min_confirmations = max(1, min(10, int(kw["min_confirmations"])))
+        if isinstance(kw.get("skip_noise"), list):
+            self.skip_noise = [str(n) for n in kw["skip_noise"] if str(n) in NOISE_LABELS]
         self._persist()
         self.bus.publish("autopilot.config", **self.status())
         log.info("autopilot reconfigured: %s", self.status())
@@ -175,6 +198,13 @@ class AutoPilot:
             "max_per_strategy": self.max_per_strategy,
             "max_new_per_cycle": self.max_new_per_cycle,
             "cooldown_after_loss": self.cooldown_after_loss,
+            "max_gross_exposure_pct": round(self.max_gross_exposure_pct, 1),
+            "min_confirmations": self.min_confirmations,
+            "skip_noise": list(self.skip_noise),
+            "noise_labels": NOISE_LABELS,
+            "require_proven": self.require_proven,
+            "min_replay_trades": self.min_replay_trades,
+            "min_replay_expectancy_r": self.min_replay_expectancy_r,
             "open_auto_positions": open_auto,
             "auto_trades_today": self._count_today,
             "mode": getattr(self.engine, "mode", "paper"),
@@ -271,6 +301,11 @@ class AutoPilot:
                 self._last_reason[p.id] = (f"would exceed {self.cfg.max_open_risk_pct:.0f}% aggregate open "
                                            f"auto-risk")
                 continue
+            est_cost = float(pre["order_preview"].get("est_cost", 0.0) or 0.0)
+            if equity and self.engine.gross_exposure() + est_cost > equity * self.max_gross_exposure_pct / 100.0:
+                self._last_reason[p.id] = (f"would put more than {self.max_gross_exposure_pct:.0f}% of equity "
+                                           "into positions")
+                continue
 
             self._acted.add(p.id)
             if self.dry_run:
@@ -328,6 +363,14 @@ class AutoPilot:
             return f"reward:risk {p.reward_risk:.1f} < {self.min_reward_risk:.1f}"
         if p.kind.value == "FUNDAMENTAL":
             return "valuation plays are not day/swing entries - not auto-traded"
+        noisy = [n for n in p.noise if n in self.skip_noise]
+        if noisy:
+            return "noise: " + ", ".join(NOISE_LABELS.get(n, n) for n in noisy)
+        if tf == "INTRADAY" and p.confirmations < self.min_confirmations:
+            return f"not confirmed yet - seen in {p.confirmations} of {self.min_confirmations} scans in a row"
+        unproven = self._unproven(p.strategy)
+        if unproven:
+            return unproven
         if self.cfg.require_catalyst and not any(t in ("catalyst", "gap") for t in (p.tags or [])):
             return "no catalyst tag (autopilot.require_catalyst is on)"
         try:
@@ -355,6 +398,19 @@ class AutoPilot:
                 pass
         return None
 
+    def _unproven(self, strategy: str) -> Optional[str]:
+        """Why a strategy's replayed record isn't good enough to auto-trade, if it isn't."""
+        if not self.require_proven:
+            return None
+        record = self.engine.strategy_record(strategy) or {}
+        trades = int(record.get("trades", 0))
+        if trades < self.min_replay_trades:
+            return (f"{strategy} isn't proven yet: the replay has {trades} of the {self.min_replay_trades} "
+                    "trades it needs (Strategies -> Run replay)")
+        if record["expectancy_r"] < self.min_replay_expectancy_r:
+            return f"{strategy} averaged {record['expectancy_r']:+.2f}R over {trades} replayed trades"
+        return None
+
     # ------------------------------------------------------------------ #
     def decorate_play(self, row: Dict[str, Any]) -> Dict[str, Any]:
         """Tag a play row so the dashboard can show a '🤖 auto' badge."""
@@ -366,6 +422,9 @@ class AutoPilot:
             and float(row.get("reward_risk", 0)) >= self.min_reward_risk
             and row.get("kind") != "FUNDAMENTAL"
             and row.get("status") == "PROPOSED"
+            and not any(n in self.skip_noise for n in row.get("noise", []))
+            and (row.get("timeframe") != "INTRADAY" or int(row.get("confirmations", 1)) >= self.min_confirmations)
+            and not self._unproven(row.get("strategy", ""))
         )
         row["autopilot"] = {
             "eligible": bool(will),

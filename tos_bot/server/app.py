@@ -200,6 +200,15 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     def set_autopilot(body: dict):
         return _result(eng().set_autopilot(**(body or {})))
 
+    @app.get("/api/replay")
+    def replay():
+        return eng().replay_state()
+
+    @app.post("/api/replay")
+    def start_replay(body: dict):
+        b = body or {}
+        return _result(eng().start_replay(sessions=b.get("sessions", 20), swing_sessions=b.get("swing_sessions", 120)))
+
     # ---- scans, scan settings, watchlist -------------------------------- #
     @app.post("/api/scan")
     def scan(body: dict):

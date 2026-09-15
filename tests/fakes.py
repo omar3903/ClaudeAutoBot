@@ -138,7 +138,7 @@ class FakeGateway:
         return quote_from_price(symbol, float(intraday_bars(symbol)["close"].iloc[-1]))
 
     def history_many(self, requests: Mapping[str, Tuple[str, str]],
-                     con_ids: Optional[Mapping[str, int]] = None) -> Dict[str, pd.DataFrame]:
+                     con_ids: Optional[Mapping[str, int]] = None, end=None) -> Dict[str, pd.DataFrame]:
         out = {}
         for symbol, (bar, duration) in requests.items():
             self.requests.append((symbol, bar, duration))

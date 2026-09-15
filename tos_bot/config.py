@@ -97,7 +97,8 @@ class AccountCfg(_Model):
 class RiskCfg(_Model):
     max_risk_per_trade_pct: float = 1.0
     max_open_risk_pct: float = 4.0
-    max_position_pct_of_equity: float = 35.0
+    max_position_pct_of_equity: float = 12.0   # one trade's notional
+    max_symbol_pct_of_equity: float = 15.0     # everything in one stock: shares held + entries working + this trade
     min_reward_risk: float = 1.5
     round_lot: int = 1
 
@@ -160,9 +161,25 @@ class AutopilotCfg(_Model):
     max_open_risk_pct: float = 4.0
     max_per_strategy: int = 2
     max_new_per_cycle: int = 1
+    max_gross_exposure_pct: float = 100.0  # all positions together, as % of equity - 100 = never on margin
+    min_confirmations: int = 2            # a day-trade setup must show up in this many scans in a row
+    skip_noise: list = Field(default_factory=lambda: ["against_trend", "wrong_side_of_vwap", "against_gap",
+                                                       "volume_against", "conflict", "low_expected_value"])
+    require_proven: bool = True           # only strategies whose replayed record is good enough
+    min_replay_trades: int = 30
+    min_replay_expectancy_r: float = 0.05
     cooldown_after_loss: bool = True
     require_catalyst: bool = False
     dry_run: bool = False
+
+
+class NoiseCfg(_Model):
+    """What the noise checks count as a bad moment for a setup - see scanner/noise.py."""
+
+    gap_pct: float = 2.0
+    volume_ratio: float = 1.5
+    volume_bars: int = 6
+    min_expected_r: float = 0.15
 
 
 class DatabaseCfg(_Model):
@@ -185,6 +202,7 @@ class AppConfig(_Model):
     execution: ExecutionCfg = Field(default_factory=ExecutionCfg)
     exit_manager: ExitManagerCfg = Field(default_factory=ExitManagerCfg)
     autopilot: AutopilotCfg = Field(default_factory=AutopilotCfg)
+    noise: NoiseCfg = Field(default_factory=NoiseCfg)
     database: DatabaseCfg = Field(default_factory=DatabaseCfg)
 
 

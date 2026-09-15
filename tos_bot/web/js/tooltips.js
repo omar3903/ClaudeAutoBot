@@ -14,6 +14,8 @@ const GLOSSARY = {
   symbol: ["Symbol", "The ticker and its sector. Hover a row for the reasoning; click it for the numbers and the order."],
   side: ["Side", "LONG profits when the price rises, SHORT when it falls. Hover a badge for more."],
   strategy_col: ["Strategy", "The setup that found the play. Hover a name for how it works; switch setups on or off under Strategies."],
+  noise: ["Noise flags", "Signs this is a bad moment for the setup: against the daily trend, the wrong side of VWAP, against today's gap, heavier volume against it, another setup pointing the other way, or too little expected value. Autopilot skips flagged plays; you can still take one. The strategy replay shows whether each check removes worse trades than it keeps."],
+  hide_noisy: ["Hide noisy", "Hide plays with noise flags from the list. They are still scanned, recorded and measured."],
   tf: ["Timeframe", "day = intraday, closed the same session.\nswing = held for days to weeks."],
   entry: ["Entry", "The price the order aims to get in at."],
   stop: ["Stop", "Where the idea is proven wrong. Hitting it exits the trade, capping the loss near the $ risk shown."],

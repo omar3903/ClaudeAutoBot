@@ -45,6 +45,7 @@ def _clamp_target(price: float, target: float, side: Side, max_move: float = 0.2
 @register
 class RelativeValueComps(Strategy):
     key = "relative_value_comps"
+    style = "value"
     kind = StrategyKind.FUNDAMENTAL
     timeframe = Timeframe.SWING
     expected_hold = (15.0, 35.0)    # trading days
@@ -126,6 +127,7 @@ class RelativeValueComps(Strategy):
 @register
 class DcfFairValueGap(Strategy):
     key = "dcf_fair_value_gap"
+    style = "value"
     kind = StrategyKind.FUNDAMENTAL
     timeframe = Timeframe.SWING
     expected_hold = (20.0, 45.0)    # trading days
@@ -201,6 +203,7 @@ class DcfFairValueGap(Strategy):
 @register
 class ValuationFootballField(Strategy):
     key = "valuation_football_field"
+    style = "value"
     kind = StrategyKind.FUNDAMENTAL
     timeframe = Timeframe.SWING
     expected_hold = (18.0, 40.0)    # trading days

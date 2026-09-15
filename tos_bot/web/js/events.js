@@ -9,7 +9,7 @@ import { onScanEvent } from "./scan.js";
 import { mergePlay, selectPlay } from "./plays.js";
 import { loadHistory, loadOpen, loadStats, openRecord, recordGone, tabVisible } from "./blotter.js";
 import { renderWatchlist } from "./watchlist.js";
-import { indexStrategies } from "./strategies.js";
+import { indexStrategies, onReplayEvent } from "./strategies.js";
 
 export function connect() {
   if (S.stopped) return;
@@ -81,6 +81,10 @@ function handle(topic, p) {
     case "exit.failed":
       toast(`⚠ Auto-exit not sent (try ${p.attempt}, again in ${p.retry_in_s}s): ${p.reason}`, "bad");
       break;
+    case "orders.adopted":
+      toast(p.msg, p.cancelled && p.cancelled.length ? "bad" : "warn");
+      loadOpen();
+      break;
     case "order.failed":
       toast("⚠ " + p.msg, "bad");
       loadOpen(); refreshState();
@@ -122,6 +126,12 @@ function handle(topic, p) {
       break;
     case "strategies.updated":
       indexStrategies(p.strategies);
+      break;
+
+    case "replay.progress":
+    case "replay.completed":
+    case "replay.failed":
+      onReplayEvent(topic, p);
       break;
 
     case "quit.requested":

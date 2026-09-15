@@ -3,7 +3,8 @@
 Builds the symbol's context once - the stored daily candles with today's
 partial candle appended from the intraday bars, the latest price, today's
 activity - and runs every given strategy on it. Indicators are computed once
-per context and shared by the strategies (see StrategyContext).
+per context and shared by the strategies (see StrategyContext). Each play
+leaves with its expected value, its noise flags (see noise.py) and its rank.
 """
 
 from __future__ import annotations
@@ -18,7 +19,8 @@ from ..core.models import Play
 from ..data.fundamentals import Financials
 from ..data.market_data import quote_from_price
 from ..strategies.base import Strategy, StrategyContext
-from .filters import rank_score
+from .filters import expected_r, rank_score
+from .noise import NoiseSettings, context_flags
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +44,8 @@ def with_today(daily: pd.DataFrame, intraday: Optional[pd.DataFrame]) -> pd.Data
 def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
              intraday: Optional[pd.DataFrame], *, run_id: str, equity: float, params: Dict[str, Any],
              activity: Any = None, fundamentals: Optional[Financials] = None,
-             peers: Optional[List[Financials]] = None) -> List[Play]:
+             peers: Optional[List[Financials]] = None, noise: Optional[NoiseSettings] = None) -> List[Play]:
+    noise = noise or NoiseSettings()
     full_daily = with_today(daily, intraday)
     latest = intraday if intraday is not None and len(intraday) else full_daily
     ctx = StrategyContext(
@@ -56,6 +59,10 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
         try:
             for p in strategy.generate(ctx):
                 p.scan_run_id = run_id
+                p.evidence["expected_r"] = round(expected_r(p, ctx.daily_atr), 3)
+                p.noise = context_flags(p, ctx, strategy.style, noise)
+                if p.evidence["expected_r"] < noise.min_expected_r:
+                    p.noise.append("low_expected_value")
                 p.score = rank_score(p, activity, strategy.weight)
                 p.evidence.setdefault("spark", ctx.spark())
                 plays.append(p)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Tuple
 
@@ -61,19 +62,31 @@ def _pick(values: Optional[Iterable[str]], allowed: Tuple[str, ...]) -> Tuple[st
     return tuple(a for a in allowed if a in chosen)
 
 
+def expected_r(play: Play, daily_atr: float = math.nan) -> float:
+    """What a play is worth per unit of risk, before costs: the odds it pays
+    times the reward, less the odds it doesn't. A stop inside the stock's normal
+    daily swing gets hit more often than the setup's own odds assume, so the odds
+    are cut when the stop is under ~0.4 of the daily range."""
+    odds = play.probability
+    if daily_atr > 0:
+        odds *= min(1.0, 0.6 + abs(play.entry - play.stop) / daily_atr)
+    return odds * min(play.reward_risk, 4.0) - (1.0 - odds)
+
+
 def rank_score(play: Play, activity: Any = None, strategy_weight: float = 1.0) -> float:
-    """One comparable number per play (higher = better): the strategy's own
-    confidence and the reward:risk, scaled by the strategy weight, plus a bump
-    for unusual volume, a gap (day trades) and enough range to move."""
-    conf = max(0.0, min(1.0, play.confidence))
-    rr = min(play.reward_risk, 4.0) / 4.0
-    score = (0.6 * conf + 0.4 * rr) * max(0.1, strategy_weight)
+    """One comparable number per play (higher = better): its expected value in R,
+    scaled by the strategy weight, plus a small bump for unusual volume, a gap (day
+    trades) and enough range to move. Reward:risk only counts through the expected
+    value, so a stop tightened to fake a big ratio doesn't win the ranking."""
+    ev = play.evidence.get("expected_r")
+    ev = expected_r(play) if ev is None else float(ev)
+    score = max(0.0, 0.5 + 0.25 * ev) * max(0.1, strategy_weight)
     if activity is not None:
         rvol = float(getattr(activity, "rvol", 1.0) or 1.0)
         if play.is_day_trade:
-            score += 0.10 * min(2.5, max(0.0, rvol - 1.0))
-            score += 0.05 * min(3.0, abs(float(getattr(activity, "gap_pct", 0.0) or 0.0)) / 2.0)
-        score += 0.03 * min(2.0, float(getattr(activity, "atr_pct", 0.0) or 0.0) / 2.0)
+            score += 0.05 * min(2.5, max(0.0, rvol - 1.0))
+            score += 0.03 * min(3.0, abs(float(getattr(activity, "gap_pct", 0.0) or 0.0)) / 2.0)
+        score += 0.02 * min(2.0, float(getattr(activity, "atr_pct", 0.0) or 0.0) / 2.0)
     if play.kind.value == "FUNDAMENTAL":
         score += 0.05
     return round(score, 4)

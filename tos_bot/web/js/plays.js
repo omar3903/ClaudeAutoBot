@@ -4,11 +4,13 @@ import { S, on } from "./state.js";
 import { toast } from "./ui.js";
 import { hideTip, showTipAt } from "./tooltips.js";
 import { stratLabel } from "./strategies.js";
-import { hideExecuted } from "./filters.js";
+import { hideExecuted, hideNoisy } from "./filters.js";
 import { loadOpen, openRecord } from "./blotter.js";
 
 const DONE = new Set(["ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED", "ERROR"]);
 const isDone = p => DONE.has(p.status);
+const isNoisy = p => (p.noise || []).length > 0;
+const noiseLabel = flag => ((S.state.autopilot || {}).noise_labels || {})[flag] || flag.replace(/_/g, " ");
 
 export function mergePlay(row) {
   const i = S.plays.findIndex(x => x.id === row.id);
@@ -18,7 +20,8 @@ export function mergePlay(row) {
 function visiblePlays() {
   const f = S.state.filters || {};
   const sides = f.sides || ["LONG", "SHORT"], tfs = f.timeframes || ["INTRADAY", "SWING"];
-  return S.plays.filter(p => sides.includes(p.side) && tfs.includes(p.timeframe) && (!hideExecuted() || !isDone(p)));
+  return S.plays.filter(p => sides.includes(p.side) && tfs.includes(p.timeframe) && (!hideExecuted() || !isDone(p))
+    && (!hideNoisy() || isDone(p) || !isNoisy(p)));
 }
 
 function emptyText() {
@@ -31,7 +34,9 @@ function emptyText() {
 export function renderPlays() {
   const rows = visiblePlays();
   $("#plays-count").textContent = rows.length ? `(${rows.length})` : "";
-  $("#plays-empty").innerHTML = emptyText();
+  $("#plays-empty").innerHTML = S.plays.length && !rows.length
+    ? `All ${S.plays.length} plays are hidden by the view options above — untick <b>Hide noisy</b> or <b>Hide executed</b> to see them.`
+    : emptyText();
   $("#plays-empty").classList.toggle("hidden", rows.length > 0);
   const body = $("#plays-body");
   body.innerHTML = "";
@@ -52,7 +57,7 @@ function playRow(p) {
     ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
     : `<span class="info-dot">i</span>`;
   tr.innerHTML = `
-    <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${apMark}${p.extended_hours_ok ? '<span class="ext" data-term="ext">ext</span>' : ""}</td>
+    <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${apMark}${p.extended_hours_ok ? '<span class="ext" data-term="ext">ext</span>' : ""}${isNoisy(p) && !done ? `<span class="badge warn" data-term="noise" title="${escapeHtml(p.noise.map(noiseLabel).join(", "))}">noisy</span>` : ""}</td>
     <td>${sideBadge(p.side)}</td>
     <td>${stratLabel(p.strategy)}</td>
     <td class="tf">${tfLabel(p.timeframe)}</td>
@@ -113,7 +118,8 @@ function detailHTML(a) {
        </div>`;
   return `
     <h3>${escapeHtml(p.symbol)} ${sectorTag(p.sector)} ${sideBadge(p.side)}${executed ? ' <span class="badge good" data-term="executed">executed</span>' : ""}</h3>
-    <div class="sub">${stratLabel(p.strategy)} · ${tfLabel(p.timeframe)} · conf ${num(p.confidence, 2)} · score ${num(p.score, 2)} · session ${a.session}</div>
+    <div class="sub">${stratLabel(p.strategy)} · ${tfLabel(p.timeframe)} · conf ${num(p.confidence, 2)} · expected ${num((p.evidence || {}).expected_r, 2)}R · score ${num(p.score, 2)}${p.timeframe === "INTRADAY" ? ` · seen in ${p.confirmations || 1} scan${(p.confirmations || 1) === 1 ? "" : "s"} in a row` : ""} · session ${a.session}</div>
+    ${(a.noise || []).length && !executed ? `<div class="warn-box" data-term="noise">⚠ Probably noise right now: ${a.noise.map(escapeHtml).join(" · ")}. Autopilot won't take it; you still can.</div>` : ""}
     ${sparkSvg(p.evidence && p.evidence.spark, p)}
     <div class="explain">${escapeHtml(p.explanation || p.rationale)}</div>
     <div class="kv">

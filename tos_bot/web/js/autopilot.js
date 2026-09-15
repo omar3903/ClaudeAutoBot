@@ -1,5 +1,5 @@
 /* Autopilot: hands-off entry. Exits are automatic either way. */
-import { $, post } from "./util.js";
+import { $, $$, escapeHtml, post } from "./util.js";
 import { S, on } from "./state.js";
 import { openModal, toast } from "./ui.js";
 
@@ -72,6 +72,14 @@ function configure() {
         <span><label>Max per strategy</label><input type="number" id="ap-maxstrat" min="1" max="10" step="1" value="${ap.max_per_strategy ?? 2}"></span>
         <span><label>New per scan</label><input type="number" id="ap-maxcycle" min="1" max="10" step="1" value="${ap.max_new_per_cycle ?? 1}"></span>
       </div>
+      <div class="ap-row">
+        <span><label>Day trades: seen in scans in a row</label><input type="number" id="ap-confirm" min="1" max="10" step="1" value="${ap.min_confirmations ?? 2}"></span>
+        <span><label>Max % of equity in positions</label><input type="number" id="ap-gross" min="10" max="400" step="5" value="${ap.max_gross_exposure_pct ?? 100}"></span>
+      </div>
+      <label data-term="noise">Skip plays flagged as noise</label>
+      <div class="ap-noise">${Object.entries(ap.noise_labels || {}).map(([flag, label]) =>
+        `<label><input type="checkbox" class="ap-noise-check" value="${escapeHtml(flag)}" ${(ap.skip_noise || []).includes(flag) ? "checked" : ""}> ${escapeHtml(label)}</label>`).join("")}</div>
+      <label><input type="checkbox" id="ap-proven" ${ap.require_proven !== false ? "checked" : ""}> Only trade strategies the replay has proven (Strategies panel)</label>
       <label><input type="checkbox" id="ap-cooldown" ${ap.cooldown_after_loss !== false ? "checked" : ""}> Cool off a ticker for the day after it stops out</label>
       <label><input type="checkbox" id="ap-dry" ${ap.dry_run ? "checked" : ""}> Dry run (log what it would do, place nothing)</label>
       <p class="muted">Live routing also needs <code>autopilot.allow_live: true</code> in config.yaml. The Long / Short, Intraday / Swing and
@@ -91,6 +99,10 @@ function configure() {
         max_auto_trades_per_day: int("#ap-maxday"),
         max_per_strategy: int("#ap-maxstrat"),
         max_new_per_cycle: int("#ap-maxcycle"),
+        min_confirmations: int("#ap-confirm"),
+        max_gross_exposure_pct: parseFloat($("#ap-gross").value),
+        skip_noise: $$(".ap-noise-check").filter(c => c.checked).map(c => c.value),
+        require_proven: $("#ap-proven").checked,
         cooldown_after_loss: $("#ap-cooldown").checked,
         dry_run: $("#ap-dry").checked,
       });

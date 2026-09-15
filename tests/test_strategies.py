@@ -164,3 +164,38 @@ def test_intraday_setups_never_crash_and_stay_framed(key):
                 level = p.evidence["level"]
                 assert (p.stop < level) if p.side is Side.LONG else (p.stop > level)
                 assert p.reward_risk >= 2.0
+
+
+def test_abcd_needs_a_real_higher_low_on_a_lighter_pullback():
+    from tos_bot.strategies.technical import AbcdPattern
+
+    quiet, push = [100.0] * 12, [100.4, 100.9, 101.5, 102.0]
+
+    def abcd(pullback, pullback_volume):
+        closes = quiet + push + pullback
+        vol = [3e5] * 12 + [8e5] * 4 + [pullback_volume] * len(pullback)
+        ctx = build_context("ABCD", _session_intraday(100.0, closes, vol=vol), _flat_daily(100.0),
+                            _quote("ABCD", pullback[-1] - 0.05), activity={"rvol": 2.0})
+        return AbcdPattern().generate(ctx)
+
+    assert abcd([101.7, 101.4, 101.3], 3e5)                  # a shallow pullback on drying volume
+    assert not abcd([101.2, 100.7, 100.4], 3e5)              # gave back most of the push
+    assert not abcd([101.7, 101.4, 101.3], 1.2e6)            # sold harder than it was bought
+
+
+def test_stops_are_floored_at_a_slice_of_the_stocks_daily_range():
+    from tos_bot.core.enums import StrategyKind, Timeframe
+    from tos_bot.strategies.base import Strategy
+
+    class _T(Strategy):
+        key, kind, timeframe = "t", StrategyKind.TECHNICAL, Timeframe.INTRADAY
+        title, thesis = "T", "t"
+
+    idx = pd.date_range(pd.Timestamp(f"{clock.session_date()} 09:30", tz="America/New_York"), periods=30, freq="5min")
+    c = np.full(30, 50.0)
+    intraday = pd.DataFrame({"open": c, "high": c + 0.05, "low": c - 0.05, "close": c, "volume": np.full(30, 5e5)},
+                            index=idx)
+    ctx = build_context("X", intraday, _flat_daily(50.0), _quote("X", 50.0))          # a $2 daily range
+    p = _T()._mk_play(ctx, Side.LONG, entry=50.0, stop=49.7, targets=[52.0],
+                      confidence=0.7, rationale="r", detail="d", evidence={}, tags=["intraday"])
+    assert p is not None and p.entry - p.stop >= 0.25 * 2.0 - 1e-9                 # a quarter of the day's range

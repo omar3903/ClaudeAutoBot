@@ -428,10 +428,10 @@ def test_trading_capital_shrinks_what_the_bot_uses_not_the_account(engine):
     capped = size_play(_tight_play(), sizing, risk)
     assert capped.notional <= 20_000 * risk.max_position_pct_of_equity / 100 < whole.notional
 
-    _open(engine, "MSFT", qty=150)                                         # 15,000 of it now invested
+    _open(engine, "MSFT", qty=190)                                         # 19,000 of it now invested
     left = size_play(_tight_play(), engine.sizing_account(), risk)
-    assert left.notional <= 5_000 and "trading capital" in left.caps_hit
-    assert engine.capital_state()["available"] == pytest.approx(5_000)
+    assert left.notional <= 1_000 and "trading capital" in left.caps_hit
+    assert engine.capital_state()["available"] == pytest.approx(1_000)
 
     assert engine.set_capital(None)["ok"] and engine.sizing_account() is engine._account
     assert engine.runtime.read()["capital"] == {}

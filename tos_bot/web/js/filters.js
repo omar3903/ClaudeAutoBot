@@ -66,15 +66,23 @@ async function pickSectors() {
 }
 
 export const hideExecuted = () => $("#f-hide-done").checked;
+export const hideNoisy = () => $("#f-hide-noisy").checked;
+
+// per-browser view options: checkbox id -> [storage key, on by default]
+const VIEW_OPTIONS = { "f-hide-done": ["atb-hide-done", false], "f-hide-noisy": ["atb-hide-noisy", true] };
 
 export function initFilters() {
   on("state", syncControls);
   on("filters", syncControls);
   Object.keys(BOXES).forEach(id => { $("#" + id).onchange = e => changeFilter(e.target); });
   $("#btn-sectors").onclick = pickSectors;
-  $("#f-hide-done").checked = store.get("atb-hide-done") === "1";
-  $("#f-hide-done").onchange = e => { store.set("atb-hide-done", e.target.checked ? "1" : "0"); emit("plays"); };
+  for (const [id, [key, byDefault]] of Object.entries(VIEW_OPTIONS)) {
+    const saved = store.get(key);
+    $("#" + id).checked = saved == null ? byDefault : saved === "1";
+    $("#" + id).onchange = e => { store.set(key, e.target.checked ? "1" : "0"); emit("plays"); };
+  }
   window.addEventListener("storage", e => {
-    if (e.key === "atb-hide-done") { $("#f-hide-done").checked = e.newValue === "1"; emit("plays"); }
+    const id = Object.keys(VIEW_OPTIONS).find(k => VIEW_OPTIONS[k][0] === e.key);
+    if (id) { $("#" + id).checked = e.newValue === "1"; emit("plays"); }
   });
 }

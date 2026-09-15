@@ -149,6 +149,11 @@ class Repository:
         with session_scope() as s:
             s.merge(_play_row(play))
 
+    def get_play(self, play_id: str) -> Optional[Dict[str, Any]]:
+        with session_scope() as s:
+            row = s.get(PlayLog, play_id)
+            return play_to_dict(row) if row else None
+
     def set_play_status(self, play_id: str, status: str, decided_by: str = "") -> None:
         with session_scope() as s:
             row = s.get(PlayLog, play_id)
