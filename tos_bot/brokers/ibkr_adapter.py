@@ -544,6 +544,7 @@ class IbkrBroker(BrokerAdapter):
 
     def _result(self, t) -> OrderResult:
         o, os_ = t.order, t.orderStatus
+        kind = getattr(o, "orderType", "") or ""
         side = Side.LONG if o.action == "BUY" else Side.SHORT
         fills = [Fill(order_id=str(o.orderId), symbol=t.contract.symbol, side=side,
                       quantity=float(f.execution.shares), price=float(f.execution.price))
@@ -552,7 +553,11 @@ class IbkrBroker(BrokerAdapter):
                            submitted_qty=float(o.totalQuantity or 0.0), filled_qty=float(os_.filled or 0.0),
                            avg_fill_price=float(os_.avgFillPrice or 0.0), fills=fills, message=_order_message(t),
                            side=side, tag=getattr(o, "orderRef", "") or "",
-                           raw={"mine": getattr(o, "clientId", None) == self.client_id})
+                           order_type=_ORDER_TYPES.get(kind, kind), limit_price=_price(getattr(o, "lmtPrice", None)),
+                           stop_price=_price(getattr(o, "trailStopPrice" if kind == "TRAIL" else "auxPrice", None)),
+                           tif=getattr(o, "tif", "") or "",
+                           raw={"mine": getattr(o, "clientId", None) == self.client_id,
+                                "parent_id": str(getattr(o, "parentId", 0) or "") or None})
 
 
 async def _sleep(seconds: float) -> None:
@@ -582,6 +587,19 @@ def _default_fx(currency: str) -> Optional[float]:
 def _tif(tif: TimeInForce) -> str:
     return {TimeInForce.DAY: "DAY", TimeInForce.GTC: "GTC",
             TimeInForce.IOC: "IOC", TimeInForce.FOK: "FOK"}.get(tif, "DAY")
+
+
+_ORDER_TYPES = {"LMT": "LIMIT", "MKT": "MARKET", "STP": "STOP", "STP LMT": "STOP_LIMIT", "TRAIL": "TRAILING_STOP",
+                "MOC": "MARKET_ON_CLOSE", "LOC": "LIMIT_ON_CLOSE", "MIT": "MARKET_IF_TOUCHED", "LIT": "LIMIT_IF_TOUCHED"}
+
+
+def _price(value) -> Optional[float]:
+    """An order's price, or None where IBKR leaves it unset (zero, or its huge "unset" number)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if 0 < v < 1e300 else None
 
 
 def _norm_status(s: str) -> str:

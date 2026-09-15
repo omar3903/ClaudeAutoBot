@@ -10,6 +10,7 @@ import { mergePlay, selectPlay } from "./plays.js";
 import { loadHistory, loadOpen, loadStats, openRecord, recordGone, tabVisible } from "./blotter.js";
 import { renderWatchlist } from "./watchlist.js";
 import { indexStrategies, onReplayEvent } from "./strategies.js";
+import { loadOrders, ordersChanged } from "./orders.js";
 
 export function connect() {
   if (S.stopped) return;
@@ -31,6 +32,7 @@ function handle(topic, p) {
     case "engine.started":
       setState(p.state || p);
       if (tabVisible("open")) loadOpen();
+      if (topic === "hello") loadOrders();
       break;
     case "plays.updated":
       S.plays = p.plays || [];
@@ -80,6 +82,10 @@ function handle(topic, p) {
       break;
     case "exit.failed":
       toast(`⚠ Auto-exit not sent (try ${p.attempt}, again in ${p.retry_in_s}s): ${p.reason}`, "bad");
+      break;
+    case "orders.updated":
+      S.orders = p;
+      ordersChanged();
       break;
     case "orders.adopted":
       toast(p.msg, p.cancelled && p.cancelled.length ? "bad" : "warn");

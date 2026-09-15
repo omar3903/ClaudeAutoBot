@@ -13,7 +13,7 @@ import pytest
 
 import fakes
 from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Account, Play, Position
+from tos_bot.core.models import Account, OrderResult, Play, Position
 from tos_bot.engine import TradingEngine
 from tos_bot.engine.reconcile import PositionCheck
 from tos_bot.engine.runtime import load_filters
@@ -452,3 +452,17 @@ def test_capital_is_checked_and_shown_in_the_accounts_own_currency(engine, monke
 
     engine._account = dataclasses.replace(cad, equity=0.0, usd_per_base=0.0)
     assert not engine.set_capital(400_000)["ok"]                            # no rate, nothing to size with
+
+
+def test_the_dashboard_lists_the_orders_working_at_the_broker(engine, monkeypatch):
+    working = []
+    monkeypatch.setattr(engine.executor.broker, "list_orders", lambda status=None: list(working))
+    assert engine.active_orders(max_age_s=0)["orders"] == []
+
+    working.append(OrderResult(order_id="1", status="WORKING", symbol="AAPL", submitted_qty=5, side=Side.LONG,
+                               tag="play_waiting", order_type="LIMIT", limit_price=1.0))
+    assert engine.active_orders()["orders"] == []       # the last answer is still fresh
+    listed = engine.active_orders(max_age_s=0)
+    assert listed["ok"]
+    assert [(o["symbol"], o["purpose"], o["play_id"], o["limit_price"]) for o in listed["orders"]] == [
+        ("AAPL", "entry", "play_waiting", 1.0)]

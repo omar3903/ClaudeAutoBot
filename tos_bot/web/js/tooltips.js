@@ -1,6 +1,7 @@
 /* What the terms mean: hover or focus anything with a data-term attribute. */
-import { $, escapeHtml, pretty } from "./util.js";
+import { $, escapeHtml, plural, pretty } from "./util.js";
 import { S } from "./state.js";
+import { orderLine, ordersFor } from "./orders.js";
 
 const GLOSSARY = {
   long: ["Long", "Buy first, sell later. You profit when the price rises above your entry; the stop sits below it and caps the loss."],
@@ -25,7 +26,9 @@ const GLOSSARY = {
   risk: ["$ Risk", "What you lose if the stop is hit: quantity × |entry − stop|, before slippage."],
   score: ["Score", "The rank: the setup's confidence and reward:risk, times its strategy weight, plus a bump for unusual volume or a gap."],
   mark: ["Mark", "The broker's current price for the position."],
-  unrealized: ["Unrealized", "Open profit or loss at the current mark."],
+  unrealized: ["Unrealized", "This record's open profit or loss at the current mark: (mark − entry) × its shares. The broker's figure for all the shares it holds of the stock is in the trade record."],
+  order_for: ["For", "entry: opens a position for a play.\nexit: closes an open position.\nbracket stop / target: attached to an entry.\nplaced outside the app: by hand or by another program - listed, but the app never changes or cancels it."],
+  order_status: ["Status", "accepted, not live yet: the broker holds it but hasn't sent it to the exchange - a regular-hours order placed before the open waits for 9:30, a stop waits for its price.\nworking: live at the exchange, waiting to fill.\npart filled: some shares are done, the rest are still working."],
   age: ["Age / Expected", "How long it's been held against how long this setup usually takes. Past the review time it's flagged for a look - the stop isn't touched."],
   mfe: ["MFE / MAE", "The best and worst open P/L seen while holding (max favourable / adverse excursion)."],
   auto_exit: ["Auto exit", "On: the exit manager handles the stop, target, break-even and trailing moves, and flattens day trades before the close. Off: you manage the exit."],
@@ -42,6 +45,11 @@ function termContent(el) {
     const s = el.dataset.sector || "Unknown";
     const sel = (S.state.filters || {}).sectors || [];
     return [s, `This play's sector. ${sel.length ? `Only scanning and trading: ${sel.join(", ")}.` : "Every sector is being scanned."} Change it with the Sectors button.`];
+  }
+  if (k === "active_order") {
+    const list = ordersFor(el.dataset.symbol);
+    return [`${plural(list.length, "order")} working on ${el.dataset.symbol}`,
+      `${list.map(orderLine).join("\n") || "None any more."}\n\nClick to open Active orders.`];
   }
   if (k === "strategy") {
     const s = S.strategies[el.dataset.key];

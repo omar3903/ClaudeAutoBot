@@ -14,6 +14,7 @@ import { initScan } from "./scan.js";
 import { initPlays } from "./plays.js";
 import { initBlotter, loadOpen } from "./blotter.js";
 import { initStrategies, loadStrategies } from "./strategies.js";
+import { loadOrders } from "./orders.js";
 import { initSettings } from "./settings.js";
 import { connect } from "./events.js";
 
@@ -24,5 +25,6 @@ refreshState();
 loadStrategies().catch(() => { /* names fall back to their keys */ });
 api("/api/plays").then(d => { S.plays = d.plays || []; emit("plays"); }).catch(() => { });
 loadOpen();
+loadOrders();
 connect();
 setInterval(refreshState, 15000);
