@@ -93,6 +93,31 @@ class Executor:
         """Symbols with an order still working - their share counts are about to change."""
         return {p.play.symbol for p in list(self._pending.values())}
 
+    def active_orders(self) -> List[Dict[str, Any]]:
+        """Every order still working at the broker and what it is for: an entry, an exit,
+        a bracket's stop or target, or an order placed outside the app. Raises when the
+        broker can't be asked, so a failed check never reads as "no orders"."""
+        trades = {t["id"]: t for t in self.repo.open_trades()}
+        return [self._describe(o, trades) for o in self.broker.list_orders("WORKING")
+                if o.status not in DONE_STATUSES]
+
+    def _describe(self, o: OrderResult, trades: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        p = self._pending.get(o.order_id)
+        followed = p is not None
+        trade_id = p.trade_id if followed else (o.tag[len("exit:"):] if o.tag.startswith("exit:") else None)
+        play_id = (p.play.id if p.kind == "entry" else None) if followed else \
+            (o.tag.split(":")[0] if o.tag.startswith("play_") else None)
+        trade = trades.get(trade_id or "") or {}
+        return {"order_id": o.order_id, "symbol": o.symbol,
+                "action": {Side.LONG: "BUY", Side.SHORT: "SELL"}.get(o.side, ""),
+                "qty": float(o.submitted_qty or 0.0), "filled": float(o.filled_qty or 0.0),
+                "remaining": _remaining(o), "order_type": o.order_type, "limit_price": o.limit_price,
+                "stop_price": o.stop_price, "tif": o.tif, "status": o.status,
+                "purpose": p.kind if followed else _purpose(o), "reason": p.reason if followed else "",
+                "trade_id": trade_id, "play_id": play_id,
+                "strategy": (p.play.strategy if followed else "") or trade.get("strategy") or "",
+                "message": o.message}
+
     # ------------------------------------------------------------------ #
     def adopt_working_orders(self) -> List[Dict[str, Any]]:
         """Take over the orders an earlier run of the app left working at the broker,
@@ -448,3 +473,17 @@ def _match_exit(t: dict, orders: List[OrderResult], taken: set) -> Optional[Orde
                   and o.side is side and _may_close(o)]
     tagged = next((o for o in candidates if o.tag == f"exit:{t['id']}"), None)
     return tagged or next((o for o in candidates if not o.tag and abs(_remaining(o) - qty) < 1e-6), None)
+
+
+def _purpose(o: OrderResult) -> str:
+    """What an order the app isn't following is for, read from its tag: an entry, an
+    exit, the stop or target of a bracket, "app" for an untagged order the app sent,
+    or "outside" for one placed by hand or by another program."""
+    raw = o.raw or {}
+    if raw.get("parent_id"):
+        return "stop" if o.order_type in ("STOP", "STOP_LIMIT", "TRAILING_STOP") else "target"
+    if o.tag.startswith("exit:"):
+        return "exit"
+    if o.tag.startswith("play_"):
+        return "entry"
+    return "app" if raw.get("mine", True) else "outside"

@@ -72,6 +72,8 @@ def test_scan_watchlist_approve_close(client):
     assert trade_id, "no play could be executed"
 
     assert trade_id in [t["id"] for t in client.get("/api/trades?status=OPEN").json()["trades"]]
+    orders = client.get("/api/orders?fresh=true").json()
+    assert orders["ok"] and isinstance(orders["orders"], list)
     assert client.post(f"/api/trades/{trade_id}/close").json()["ok"]
     assert client.get("/api/pnl").json()["n_closed"] >= 1
     closed = [t for t in client.get("/api/trades?limit=50").json()["trades"] if t["status"] == "CLOSED"]

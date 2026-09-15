@@ -306,3 +306,7 @@ tr.clickable-row{cursor:pointer}
 .replay-noise th{text-align:left; font-weight:600}
 .record{font-size:12px; margin-top:6px}
 .ap-noise{display:grid; grid-template-columns:1fr 1fr; gap:2px 12px}
+
+/* ---- active orders ---- */
+.order-mark{margin-left:5px; font-size:11px; cursor:pointer; vertical-align:middle}
+.orders-table .purpose{white-space:nowrap}

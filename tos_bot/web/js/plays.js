@@ -5,7 +5,8 @@ import { toast } from "./ui.js";
 import { hideTip, showTipAt } from "./tooltips.js";
 import { stratLabel } from "./strategies.js";
 import { hideExecuted, hideNoisy } from "./filters.js";
-import { loadOpen, openRecord } from "./blotter.js";
+import { loadOpen, openRecord, showTab } from "./blotter.js";
+import { orderMark } from "./orders.js";
 
 const DONE = new Set(["ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED", "ERROR"]);
 const isDone = p => DONE.has(p.status);
@@ -57,7 +58,7 @@ function playRow(p) {
     ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
     : `<span class="info-dot">i</span>`;
   tr.innerHTML = `
-    <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${apMark}${p.extended_hours_ok ? '<span class="ext" data-term="ext">ext</span>' : ""}${isNoisy(p) && !done ? `<span class="badge warn" data-term="noise" title="${escapeHtml(p.noise.map(noiseLabel).join(", "))}">noisy</span>` : ""}</td>
+    <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${orderMark(p.symbol)}${apMark}${p.extended_hours_ok ? '<span class="ext" data-term="ext">ext</span>' : ""}${isNoisy(p) && !done ? `<span class="badge warn" data-term="noise" title="${escapeHtml(p.noise.map(noiseLabel).join(", "))}">noisy</span>` : ""}</td>
     <td>${sideBadge(p.side)}</td>
     <td>${stratLabel(p.strategy)}</td>
     <td class="tf">${tfLabel(p.timeframe)}</td>
@@ -69,7 +70,7 @@ function playRow(p) {
     <td class="num">${usd(p.dollar_risk)}</td>
     <td class="num"><span class="score-bar"><i style="width:${Math.min(100, (p.score || 0) * 100)}%"></i></span></td>
     <td>${last}</td>`;
-  tr.addEventListener("click", () => selectPlay(p.id));
+  tr.addEventListener("click", e => { if (e.target.closest(".order-mark")) showTab("orders"); else selectPlay(p.id); });
   tr.addEventListener("mousemove", e => {
     if (e.target.closest("[data-term]")) return;      // the term's own explanation is showing
     showTipAt(e.clientX, e.clientY, ((S.strategies[p.strategy] || {}).title || pretty(p.strategy)).toUpperCase(),
@@ -231,4 +232,5 @@ export function initPlays() {
   on("plays", renderPlays);
   on("filters", renderPlays);
   on("strategies", renderPlays);
+  on("orders", renderPlays);
 }

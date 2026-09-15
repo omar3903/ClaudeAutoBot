@@ -147,6 +147,10 @@ class OrderResult:
     message: str = ""
     side: Optional[Side] = None              # the order's direction, when the broker says
     tag: str = ""                            # what it was sent for: a play id, or exit:<trade id>
+    order_type: str = ""                     # MARKET | LIMIT | STOP | STOP_LIMIT ..., when the broker says
+    limit_price: Optional[float] = None
+    stop_price: Optional[float] = None       # a stop order's trigger
+    tif: str = ""                            # time in force: DAY | GTC ...
 
 
 # --------------------------------------------------------------------------- #

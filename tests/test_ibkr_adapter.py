@@ -436,3 +436,12 @@ def test_news_headlines_come_from_every_feed_the_account_can_read(broker):
     assert got == {"AAPL": [(dt.datetime(2026, 9, 14, 13, 0), "BRFG", "BRFG$1",
                              "{A:800015:L:en}Example Holdings beats on revenue")]}
     assert broker._session.ib.news_requests == [(265598, "BRFG+BRFUPDN", 5)]
+
+
+def test_open_orders_report_their_type_prices_and_time_in_force(broker):
+    broker.place_order(OrderRequest(symbol="AAPL", side=Side.LONG, quantity=5, order_type=OrderType.LIMIT,
+                                    limit_price=123.45, tif=TimeInForce.GTC, client_tag="play_1"))
+    [order] = broker.list_orders("WORKING")
+    assert order.order_type == "LIMIT" and order.limit_price == pytest.approx(123.45)
+    assert order.stop_price is None                     # IBKR's "unset" price is not a price
+    assert order.tif == "GTC" and order.raw["parent_id"] is None

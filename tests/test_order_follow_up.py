@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from tos_bot.config import get_settings
 from tos_bot.core.enums import Side, StrategyKind, Timeframe
 from tos_bot.core.models import Account, OrderResult, Play, Position, Quote
@@ -230,3 +232,33 @@ def test_an_entry_left_working_is_followed_and_booked_when_it_fills():
                                        filled_qty=10, avg_fill_price=100.05)
     ex.sync_open_orders()
     assert [(t["symbol"], t["quantity"]) for t in repo.open_trades()] == [("AAA", 10.0)]
+
+
+# ---------------------------------------------------------------- the dashboard's list of working orders
+def test_each_working_order_says_what_it_is_for():
+    broker = _Broker({"AAA": 10}, working=[
+        _working("7", tag="exit:t1"),
+        _working("8", side=Side.LONG, tag="play_left"),
+        _working("9", tag="play_left:tp", parent_id="8"),
+        _working("10", side=Side.LONG, mine=False),
+    ])
+    ex = _executor(broker, _Repo([_trade()]))
+    ex.adopt_working_orders()
+
+    orders = {o["order_id"]: o for o in ex.active_orders()}
+    assert (orders["7"]["purpose"], orders["7"]["trade_id"], orders["7"]["action"]) == ("exit", "t1", "SELL")
+    assert (orders["8"]["purpose"], orders["8"]["play_id"], orders["8"]["action"]) == ("entry", "play_left", "BUY")
+    assert (orders["9"]["purpose"], orders["9"]["play_id"]) == ("target", "play_left")
+    assert orders["10"]["purpose"] == "outside"
+    assert broker.cancelled == []
+
+
+def test_a_broker_that_cant_be_asked_never_reads_as_having_no_orders():
+    broker = _Broker()
+
+    def unreachable(status=None):
+        raise ConnectionError("IB Gateway went away")
+
+    broker.list_orders = unreachable
+    with pytest.raises(ConnectionError):
+        _executor(broker, _Repo([])).active_orders()

@@ -78,6 +78,11 @@ from .runtime import RuntimeFile, load_capital, load_filters, load_strategy_over
 
 log = logging.getLogger(__name__)
 
+#: how often the orders working at the broker are re-checked for the dashboard
+ORDERS_POLL_S = 5.0
+#: how old that list may be before a dashboard request asks the broker again
+ORDERS_MAX_AGE_S = 8.0
+
 #: play statuses that must never be executed again
 _ACTED_ON = frozenset({PlayStatus.ACCEPTED, PlayStatus.SUBMITTED, PlayStatus.WORKING,
                        PlayStatus.PARTIAL, PlayStatus.FILLED, PlayStatus.ERROR})
@@ -176,6 +181,13 @@ class TradingEngine:
         self._last_fast_at = float("-inf")
         self._scan_retry_at = 0.0
 
+        # the orders working at the broker, for the dashboard (see active_orders)
+        self._orders: List[Dict[str, Any]] = []
+        self._orders_ok = False
+        self._orders_at = float("-inf")
+        self._orders_checked: Optional[str] = None
+        self._orders_lock = threading.Lock()
+
         self._quit_lock = threading.Lock()
         self._quit_retry_at = 0.0
         self._quit_rounds = 0
@@ -199,7 +211,7 @@ class TradingEngine:
             log.warning("resuming an unfinished quit - closing the remaining positions first")
         self._threads = [threading.Thread(target=loop, name=name, daemon=True) for name, loop in (
             ("scan-loop", self._scan_loop), ("sync-loop", self._sync_loop), ("snapshot-loop", self._snapshot_loop),
-            ("signals-loop", self._signals_loop))]
+            ("orders-loop", self._orders_loop), ("signals-loop", self._signals_loop))]
         for t in self._threads:
             t.start()
         BUS.publish("engine.started", state=self.snapshot())
@@ -330,6 +342,38 @@ class TradingEngine:
 
     def gross_exposure(self) -> float:
         return sum(self.exposure_by_symbol().values())
+
+    def active_orders(self, max_age_s: Optional[float] = None) -> Dict[str, Any]:
+        """The orders still working at the broker orders go to, and what each is for (see
+        Executor.active_orders). The broker is asked again when the last answer is older
+        than ``max_age_s`` seconds."""
+        if time.monotonic() - self._orders_at >= (ORDERS_MAX_AGE_S if max_age_s is None else max_age_s):
+            self._refresh_orders()
+        return self._orders_payload()
+
+    def _orders_payload(self) -> Dict[str, Any]:
+        return {"orders": list(self._orders), "ok": self._orders_ok, "checked_at": self._orders_checked,
+                "venue_label": venue_label(self._venue)}
+
+    def _refresh_orders(self) -> None:
+        """Ask the broker for its working orders, and publish orders.updated when they
+        changed. When it can't be asked, the last list is kept and marked as not current."""
+        if not self._orders_lock.acquire(blocking=False):
+            return                                      # another thread is asking right now
+        try:
+            orders, ok = self._orders, False
+            if self.executor and self._broker and self._broker.is_connected:
+                try:
+                    orders, ok = self.executor.active_orders(), True
+                except Exception:  # noqa: BLE001
+                    log.debug("could not list the orders working at the broker", exc_info=True)
+            changed = (ok, _order_signature(orders)) != (self._orders_ok, _order_signature(self._orders))
+            self._orders, self._orders_ok = orders, ok
+            self._orders_at, self._orders_checked = time.monotonic(), clock.now_ny().isoformat()
+            if changed:
+                BUS.publish("orders.updated", **self._orders_payload())
+        finally:
+            self._orders_lock.release()
 
     # ------------------------------------------------------------------ #
     #  Strategy replay                                                   #
@@ -555,6 +599,17 @@ class TradingEngine:
             except Exception:  # noqa: BLE001
                 log.exception("snapshot failed")
             self._stop.wait(10.0 if self._autopilot_day_active() else 30.0)
+
+    def _orders_loop(self) -> None:
+        """Keeps the dashboard's list of working orders current. It runs on its own, so a
+        slow answer from the broker never holds up the automatic exits."""
+        self._stop.wait(3.0)
+        while not self._stop.is_set():
+            try:
+                self._refresh_orders()
+            except Exception:  # noqa: BLE001
+                log.exception("working orders check failed")
+            self._stop.wait(ORDERS_POLL_S)
 
     # ------------------------------------------------------------------ #
     #  Scans                                                             #
@@ -1286,3 +1341,9 @@ class TradingEngine:
 
     def current_plays(self) -> List[Dict[str, Any]]:
         return [self._decorate(p) for p in self.board.ranked()]
+
+
+def _order_signature(orders: List[Dict[str, Any]]) -> tuple:
+    """What has to change for the dashboard to be told about the working orders."""
+    keys = ("order_id", "status", "filled", "remaining", "limit_price", "stop_price", "purpose", "trade_id")
+    return tuple(sorted((tuple(o.get(k) for k in keys) for o in orders), key=lambda row: str(row[0])))
