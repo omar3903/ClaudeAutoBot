@@ -9,9 +9,12 @@ import { closeDrawer, drawerOpen, openDrawer, openModal, toast, toastResult } fr
 import { stratLabel } from "./strategies.js";
 import { loadWatchlist } from "./watchlist.js";
 import { loadOrders } from "./orders.js";
+import { loadJournal } from "./journal.js";
+import { loadPairs } from "./pairs.js";
 
 const LOADERS = {
   open: loadOpen, orders: () => loadOrders(true), history: loadHistory, stats: loadStats, watchlist: loadWatchlist,
+  journal: loadJournal, pairs: loadPairs,
 };
 
 export const tabVisible = name => !$("#tab-" + name).classList.contains("hidden");
@@ -79,7 +82,8 @@ function openRow(t, here) {
   const parkedTag = parked
     ? ` <span class="badge warn" title="Opened on another platform. Its automatic exits pause until you switch back to it.">on ${VENUE_SHORT[venue] || escapeHtml(venue)}</span>` : "";
   return `<tr class="clickable-row ${status === "overdue" ? "row-overdue" : ""}" data-record="${escapeHtml(t.id)}">
-    <td class="sym">${escapeHtml(t.symbol)} ${sectorTag(t.sector)}${parkedTag}</td><td>${sideBadge(t.side)}</td>
+    <td class="sym">${escapeHtml(t.symbol)} ${sectorTag(t.sector)}${parkedTag}${t.pair_id
+      ? ' <span class="badge" title="One leg of a pair trade - the pair desk closes both legs together (Pairs tab)">pair</span>' : ""}</td><td>${sideBadge(t.side)}</td>
     <td>${stratLabel(t.strategy)}</td>
     <td class="muted">${t.order_type || "—"}${t.order_session === "EXTENDED" ? " · ext" : ""}</td>
     <td class="num">${num(t.quantity, 0)}</td>
@@ -90,7 +94,7 @@ function openRow(t, here) {
     <td class="num">${num(t.target_price)}</td>
     <td>${timeCell}</td>
     <td class="num muted">${usd(t.mfe)} / ${usd(t.mae == null ? null : -t.mae)}</td>
-    <td class="no-row-click"><label class="switch lockable"><input type="checkbox" data-managed="${escapeHtml(t.id)}" ${t.managed_exit ? "checked" : ""}><span></span></label></td>
+    <td class="no-row-click"><label class="switch lockable"><input type="checkbox" data-managed="${escapeHtml(t.id)}" ${t.managed_exit ? "checked" : ""} ${t.pair_id ? "disabled" : ""}><span></span></label></td>
     <td class="no-row-click"><button class="danger mini" data-exit="${escapeHtml(t.id)}" ${parked
       ? `disabled title="Switch back to ${VENUE_SHORT[venue] || escapeHtml(venue)} to exit this"` : 'title="Exit this position at the market"'}>Exit</button></td></tr>`;
 }

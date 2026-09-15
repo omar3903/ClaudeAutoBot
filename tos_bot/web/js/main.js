@@ -15,11 +15,12 @@ import { initPlays } from "./plays.js";
 import { initBlotter, loadOpen } from "./blotter.js";
 import { initStrategies, loadStrategies } from "./strategies.js";
 import { loadOrders } from "./orders.js";
+import { initNotes } from "./notes.js";
 import { initSettings } from "./settings.js";
 import { connect } from "./events.js";
 
 [initUi, initTooltips, initTopbar, initQuit, initAutopilot, initFilters, initScan, initPlays,
-  initBlotter, initStrategies, initSettings].forEach(init => init());
+  initBlotter, initStrategies, initSettings, initNotes].forEach(init => init());
 
 refreshState();
 loadStrategies().catch(() => { /* names fall back to their keys */ });

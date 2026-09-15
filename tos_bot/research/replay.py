@@ -17,6 +17,18 @@ Two things come out of it:
   A check whose removed trades did better than the kept ones is throwing winners
   away, and shows up that way.
 
+Chan's rules for a backtest worth believing (*Quantitative Trading*, ch. 3):
+
+* **costs** - every fill pays ``commission_bps``, and market fills ``slippage_bps`` on
+  top; a strategy that only wins before costs doesn't win.
+* **out of sample** - the latest third of the sessions replayed is held out: every
+  record and every noise verdict is also given for those sessions alone, and Autopilot
+  wants a strategy to have made money there too. A result that holds up only on the
+  earlier sessions was probably luck.
+* **no look-ahead** - the market's regime on a day comes from a model fitted on earlier
+  days only, tomorrow's volatility from completed candles, and an earnings report counts
+  from the moment SEC accepted the filing.
+
 What it can't know: a fill is assumed at the next bar's open (and skipped when
 that open has already run away from the entry), a stop and a target in the same
 bar count as the stop, and slippage is a flat fraction of price.
@@ -26,7 +38,8 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -35,7 +48,7 @@ from ..core.models import Play
 from ..data.market_data import quote_from_price
 from ..scanner.evaluator import with_today
 from ..scanner.filters import expected_r
-from ..scanner.noise import CHECKS, NoiseSettings, context_flags
+from ..scanner.noise import CHECKS, QUANT_CHECKS, NoiseSettings, context_flags
 from ..strategies.base import Strategy, StrategyContext
 from ..util import clock
 
@@ -45,11 +58,13 @@ LIVE_INTRADAY_BARS = 5 * 78          # the scans look at five sessions of 5-minu
 #: fewer removed trades than this and a check's verdict is only noise itself
 MIN_SAMPLE = 10
 MEASURED_CHECKS = CHECKS + ("unconfirmed",)
+HELD_OUT_FRACTION = 1 / 3
 
 
 @dataclass(frozen=True)
 class ReplaySettings:
     slippage_bps: float = 5.0             # on market fills, each way
+    commission_bps: float = 1.0           # on every fill
     max_entry_drift_atr: float = 0.5      # skip a day-trade fill whose open ran this many intraday ATRs from the entry
     max_entry_drift_daily_atr: float = 1.0
     warmup_bars: int = 3                  # bars into the session before the first signal
@@ -61,11 +76,14 @@ class ReplaySettings:
     max_swing_hold_days: int = 10
 
     @classmethod
-    def from_exit_rules(cls, cfg) -> "ReplaySettings":
+    def from_exit_rules(cls, cfg, costs=None) -> "ReplaySettings":
+        """``cfg``: the exit manager's settings; ``costs``: the replay's (slippage and commission)."""
+        extra = {} if costs is None else {"slippage_bps": float(costs.slippage_bps),
+                                          "commission_bps": float(costs.commission_bps)}
         return cls(breakeven_at_r=float(cfg.breakeven_at_r), breakeven_lock_r=float(cfg.breakeven_lock_r),
                    trail_start_r=float(cfg.trail_start_r), trail_lock_ratio=float(cfg.trail_lock_ratio),
                    flatten_before_close_min=int(cfg.flatten_intraday_before_close_min),
-                   max_swing_hold_days=int(cfg.max_swing_hold_days) or 10)
+                   max_swing_hold_days=int(cfg.max_swing_hold_days) or 10, **extra)
 
 
 @dataclass
@@ -82,6 +100,7 @@ class SimTrade:
     exit_reason: str
     noise: List[str] = field(default_factory=list)
     confirmed: bool = True                # the setup had also shown up on the bar before
+    mfe_r: float = 0.0                    # the best it got, in R, before it closed
 
 
 @dataclass
@@ -105,8 +124,11 @@ class _Position:
 # ---------------------------------------------------------------- day trades
 def replay_intraday(strategies: Sequence[Strategy], symbol: str, bars: pd.DataFrame, daily: pd.DataFrame,
                     settings: ReplaySettings = ReplaySettings(), noise: NoiseSettings = NoiseSettings(),
-                    sessions: Optional[int] = None) -> List[SimTrade]:
-    """``bars``: 5-minute candles over several sessions; ``daily``: completed daily candles."""
+                    sessions: Optional[int] = None, market: Optional[Mapping[dt.date, float]] = None,
+                    earnings: Sequence[str] = ()) -> List[SimTrade]:
+    """``bars``: 5-minute candles over several sessions; ``daily``: completed daily candles;
+    ``market``: the probability of the turbulent regime for each day, known before it opened;
+    ``earnings``: when SEC accepted the stock's earnings filings (8-K item 2.02), ISO times in UTC."""
     day_trades = [s for s in strategies if s.kind is StrategyKind.TECHNICAL and s.timeframe is Timeframe.INTRADAY]
     days = sorted(set(bars.index.date))
     trades: List[SimTrade] = []
@@ -116,13 +138,14 @@ def replay_intraday(strategies: Sequence[Strategy], symbol: str, bars: pd.DataFr
         if not day_trades or len(prior_daily) < 20 or len(session) < settings.warmup_bars + 2:
             continue
         flatten_at = _at(day, clock.regular_close_time(day)) - pd.Timedelta(minutes=settings.flatten_before_close_min)
-        trades += _replay_session(day_trades, symbol, session, bars, prior_daily, flatten_at, settings, noise)
+        trades += _replay_session(day_trades, symbol, session, bars, prior_daily, flatten_at, settings, noise,
+                                  regime(market, day), earnings_signals(earnings, day))
     return trades
 
 
 def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.DataFrame, history: pd.DataFrame,
                     prior_daily: pd.DataFrame, flatten_at: pd.Timestamp, settings: ReplaySettings,
-                    noise: NoiseSettings) -> List[SimTrade]:
+                    noise: NoiseSettings, market: Dict[str, Any], signals: Any) -> List[SimTrade]:
     trades: List[SimTrade] = []
     open_positions: Dict[str, _Position] = {}
     seen_before: set = set()
@@ -134,15 +157,15 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
         window = history.iloc[max(0, end - LIVE_INTRADAY_BARS):end]
         ctx = StrategyContext(symbol=symbol, intraday=window, daily=with_today(prior_daily, window),
                               quote=quote_from_price(symbol, float(window["close"].iloc[-1])),
-                              now=closed_at.to_pydatetime())
-        signals = _signals(strategies, ctx, noise)
-        for strategy, play, flags in signals:
+                              now=closed_at.to_pydatetime(), signals=signals, market=dict(market))
+        signals_now = _signals(strategies, ctx, noise)
+        for strategy, play, flags in signals_now:
             if strategy.key not in open_positions:
                 position = _enter(strategy.key, play, flags, (strategy.key, play.side) in seen_before, next_at,
                                   float(next_bar["open"]), settings.max_entry_drift_atr * ctx.intraday_atr, settings)
                 if position is not None:
                     open_positions[strategy.key] = position
-        seen_before = {(s.key, p.side) for s, p, _ in signals}
+        seen_before = {(s.key, p.side) for s, p, _ in signals_now}
 
         flatten = next_at + BAR >= flatten_at
         for key, position in list(open_positions.items()):
@@ -158,7 +181,7 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
 # ---------------------------------------------------------------- swing trades
 def replay_swing(strategies: Sequence[Strategy], symbol: str, daily: pd.DataFrame,
                  settings: ReplaySettings = ReplaySettings(), noise: NoiseSettings = NoiseSettings(),
-                 sessions: int = 120) -> List[SimTrade]:
+                 sessions: int = 250, market: Optional[Mapping[dt.date, float]] = None) -> List[SimTrade]:
     """Signals at each session's close, fills at the next open. Trades still open
     when the candles run out are left out - their result isn't known yet."""
     swing = [s for s in strategies if s.kind is StrategyKind.TECHNICAL and s.timeframe is Timeframe.SWING]
@@ -169,7 +192,8 @@ def replay_swing(strategies: Sequence[Strategy], symbol: str, daily: pd.DataFram
         closed_on = history.index[-1].date()
         ctx = StrategyContext(symbol=symbol, intraday=None, daily=history,
                               quote=quote_from_price(symbol, float(history["close"].iloc[-1])),
-                              now=_at(closed_on, clock.regular_close_time(closed_on)).to_pydatetime())
+                              now=_at(closed_on, clock.regular_close_time(closed_on)).to_pydatetime(),
+                              market=regime(market, next_at.date()))
         for strategy, play, flags in _signals(swing, ctx, noise) if swing else []:
             if strategy.key not in open_positions:
                 position = _enter(strategy.key, play, flags, True, next_at, float(next_bar["open"]),
@@ -185,7 +209,50 @@ def replay_swing(strategies: Sequence[Strategy], symbol: str, daily: pd.DataFram
     return trades
 
 
+# ---------------------------------------------------------------- plays that weren't taken
+def shadow_trade(play: Play, session: pd.DataFrame, seen_at: pd.Timestamp,
+                 settings: ReplaySettings = ReplaySettings()) -> Optional[SimTrade]:
+    """How a day-trade play seen at ``seen_at`` would have gone if it had been taken: filled
+    at the open of the next 5-minute bar, then managed like any other trade on the rest of
+    ``session``. None when the price had already run away from the entry, or no bars follow."""
+    if not len(session):
+        return None
+    day = session.index[0].date()
+    flatten_at = _at(day, clock.regular_close_time(day)) - pd.Timedelta(minutes=settings.flatten_before_close_min)
+    after = session[session.index >= seen_at]
+    if len(after) < 2:
+        return None
+    position = _enter(play.strategy, play, list(play.noise), play.confirmations > 1, after.index[0],
+                      float(after["open"].iloc[0]), 0.0, settings)
+    if position is None:
+        return None
+    for at, bar in after.iterrows():
+        done = _step(position, bar, at + BAR, settings, "eod-flatten" if at + BAR >= flatten_at else None)
+        if done is not None:
+            return done
+    return _close(position, float(after["close"].iloc[-1]), after.index[-1] + BAR, "eod-flatten", settings)
+
+
 # ---------------------------------------------------------------- shared
+def regime(market: Optional[Mapping[dt.date, float]], day: dt.date) -> Dict[str, Any]:
+    p = (market or {}).get(day)
+    return {} if p is None else {"p_turbulent": round(float(p), 3), "regime": "turbulent" if p >= 0.5 else "calm"}
+
+
+def earnings_signals(accepted: Sequence[str], day: dt.date) -> Any:
+    """The stock's signals as a day-trade setup saw them on ``day``: the earnings filings SEC
+    accepted since the previous session's close, shaped like the signal book's filings."""
+    if not accepted:
+        return None
+    since = _at(clock.prev_trading_day(day), clock.regular_close_time(clock.prev_trading_day(day)))
+    until = _at(day, dt.time(16, 0))
+    found = [stamp for stamp in accepted if since <= pd.Timestamp(stamp).tz_convert(NY) < until]
+    if not found:
+        return None
+    return SimpleNamespace(filings=[{"items": "2.02", "published_at": stamp, "kind": "filing"} for stamp in found],
+                           buying=None, selling=None, news=None)
+
+
 def _signals(strategies: Sequence[Strategy], ctx: StrategyContext,
              noise: NoiseSettings) -> List[Tuple[Strategy, Play, List[str]]]:
     """Each strategy's play at this moment, flagged the way the scans flag it."""
@@ -212,7 +279,7 @@ def _enter(key: str, play: Play, flags: List[str], confirmed: bool, at: pd.Times
     if abs(open_price - play.entry) > limit:
         return None                                  # ran away before it could be filled
     sign = 1 if play.side is Side.LONG else -1
-    fill = open_price * (1 + sign * settings.slippage_bps / 1e4)
+    fill = open_price * (1 + sign * (settings.slippage_bps + settings.commission_bps) / 1e4)
     risk = (fill - play.stop) * sign
     if risk <= 0:
         return None                                  # opened through the stop
@@ -232,6 +299,7 @@ def _step(position: _Position, bar: pd.Series, bar_end: pd.Timestamp, settings: 
         return _close(position, price, bar_end, reason, settings)
     target = position.play.targets[0]
     if (h >= target) if long else (low <= target):
+        position.best = max(position.best, target) if long else min(position.best, target)
         return _close(position, max(o, target) if long else min(o, target), bar_end, "target", settings, limit=True)
 
     position.best = max(position.best, h) if long else min(position.best, low)
@@ -249,14 +317,15 @@ def _tighten(position: _Position, stop: float) -> None:
 
 def _close(position: _Position, price: float, at: pd.Timestamp, reason: str, settings: ReplaySettings,
            limit: bool = False) -> SimTrade:
-    if not limit:
-        price *= 1 - position.sign * settings.slippage_bps / 1e4
+    cost_bps = settings.commission_bps + (0.0 if limit else settings.slippage_bps)
+    price *= 1 - position.sign * cost_bps / 1e4
     play = position.play
     return SimTrade(strategy=position.strategy, symbol=play.symbol, side=play.side.value,
                     timeframe=play.timeframe.value, entered_at=position.entered_at.isoformat(),
                     exited_at=at.isoformat(), entry=round(position.entry, 4), exit=round(price, 4),
                     r=round((price - position.entry) * position.sign / position.risk, 3), exit_reason=reason,
-                    noise=list(position.noise), confirmed=position.confirmed)
+                    noise=list(position.noise), confirmed=position.confirmed,
+                    mfe_r=round(max(0.0, (position.best - position.entry) * position.sign / position.risk), 3))
 
 
 def _at(day: dt.date, time: dt.time) -> pd.Timestamp:
@@ -264,6 +333,18 @@ def _at(day: dt.date, time: dt.time) -> pd.Timestamp:
 
 
 # ---------------------------------------------------------------- what it means
+def held_out_from(last_session: dt.date, sessions: int, fraction: float = HELD_OUT_FRACTION) -> Optional[str]:
+    """The first session of the held-out latest ``fraction`` of ``sessions`` ending on ``last_session``."""
+    days = sorted(clock.last_n_sessions(last_session, max(1, int(sessions))))
+    held = max(1, int(round(len(days) * fraction)))
+    return days[-held].isoformat() if len(days) > held else None
+
+
+def held_out(trade: SimTrade, split: Optional[Mapping[str, Optional[str]]]) -> bool:
+    since = (split or {}).get(trade.timeframe)
+    return bool(since) and trade.entered_at[:10] >= since
+
+
 def summarize(trades: Iterable[SimTrade]) -> Dict[str, Any]:
     rs = [t.r for t in sorted(trades, key=lambda t: t.exited_at)]
     if not rs:
@@ -289,13 +370,41 @@ def flagged(trade: SimTrade, check: str) -> bool:
     return check in trade.noise
 
 
-def noise_report(trades: Sequence[SimTrade]) -> Dict[str, Dict[str, Any]]:
-    """For each check: the trades it removes and how they did against the ones it keeps."""
-    report = {check: _compare([t for t in trades if flagged(t, check)], [t for t in trades if not flagged(t, check)])
-              for check in MEASURED_CHECKS}
-    report["all_checks"] = _compare([t for t in trades if any(flagged(t, c) for c in MEASURED_CHECKS)],
-                                    [t for t in trades if not any(flagged(t, c) for c in MEASURED_CHECKS)])
+def noise_report(trades: Sequence[SimTrade], split: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, Dict[str, Any]]:
+    """For each check: the trades it removes and how they did against the ones it keeps -
+    over every session, and over the held-out sessions alone when ``split`` says which."""
+    late = [t for t in trades if held_out(t, split)] if split else []
+
+    def measure(test) -> Dict[str, Any]:
+        out = _compare(*_partition(trades, test))
+        if split:
+            out["held_out"] = _compare(*_partition(late, test))
+        return out
+
+    report = {check: measure(lambda t, c=check: flagged(t, c)) for check in MEASURED_CHECKS}
+    report["all_checks"] = measure(lambda t: any(flagged(t, c) for c in MEASURED_CHECKS))
     return report
+
+
+def _partition(trades: Sequence[SimTrade], test) -> Tuple[List[SimTrade], List[SimTrade]]:
+    """The trades ``test`` picks out and the rest, in one pass."""
+    picked: List[SimTrade] = []
+    rest: List[SimTrade] = []
+    for t in trades:
+        (picked if test(t) else rest).append(t)
+    return picked, rest
+
+
+def learned_skips(report: Optional[Mapping[str, Mapping[str, Any]]]) -> List[str]:
+    """The checks from the books' statistics that the replay shows are worth skipping: the
+    trades they remove did worse over every session and over the held-out sessions too."""
+    out = []
+    for check in QUANT_CHECKS:
+        row = (report or {}).get(check) or {}
+        if str(row.get("verdict", "")).startswith("helps") and \
+                str((row.get("held_out") or {}).get("verdict", "")).startswith("helps"):
+            out.append(check)
+    return out
 
 
 def _compare(removed: Sequence[SimTrade], kept: Sequence[SimTrade]) -> Dict[str, Any]:
@@ -311,14 +420,30 @@ def _compare(removed: Sequence[SimTrade], kept: Sequence[SimTrade]) -> Dict[str,
     return out
 
 
-def strategy_records(trades: Sequence[SimTrade], skip_noise: Iterable[str] = (),
-                     min_confirmations: int = 1) -> Dict[str, Dict[str, Any]]:
-    """Each strategy's record over the trades Autopilot would actually have taken:
-    none with a skipped noise flag, and day trades confirmed when it asks for that."""
+def taken(trades: Sequence[SimTrade], skip_noise: Iterable[str] = (), min_confirmations: int = 1) -> List[SimTrade]:
+    """The trades Autopilot would actually have taken: none with a skipped noise flag, and
+    day trades confirmed when it asks for that."""
     skip = set(skip_noise)
-    taken = [t for t in trades if not skip.intersection(t.noise)
-             and not (min_confirmations > 1 and flagged(t, "unconfirmed"))]
+    return [t for t in trades if not skip.intersection(t.noise)
+            and not (min_confirmations > 1 and flagged(t, "unconfirmed"))]
+
+
+def strategy_records(trades: Sequence[SimTrade], skip_noise: Iterable[str] = (), min_confirmations: int = 1,
+                     split: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, Dict[str, Any]]:
+    """Each strategy's record over the trades Autopilot would have taken, with the held-out
+    sessions' record alongside when ``split`` says where they start."""
+    return records_by_strategy(taken(trades, skip_noise, min_confirmations), split)
+
+
+def records_by_strategy(trades: Iterable[SimTrade],
+                        split: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, Dict[str, Any]]:
+    """Each strategy's record over ``trades``, with the held-out sessions' record alongside."""
     by_strategy: Dict[str, List[SimTrade]] = {}
-    for t in taken:
+    for t in trades:
         by_strategy.setdefault(t.strategy, []).append(t)
-    return {key: summarize(ts) for key, ts in by_strategy.items()}
+    records = {}
+    for key, ts in by_strategy.items():
+        records[key] = summarize(ts)
+        if split:
+            records[key]["out_of_sample"] = summarize([t for t in ts if held_out(t, split)])
+    return records

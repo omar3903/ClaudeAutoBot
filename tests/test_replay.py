@@ -17,7 +17,7 @@ from tos_bot.strategies.base import Strategy
 
 NY = "America/New_York"
 DAY = dt.date(2026, 9, 10)                     # an ordinary full session
-EXACT = ReplaySettings(slippage_bps=0.0, breakeven_at_r=0.0, trail_start_r=0.0)
+EXACT = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, breakeven_at_r=0.0, trail_start_r=0.0)
 QUIET = NoiseSettings(min_expected_r=-99.0)
 
 

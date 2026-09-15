@@ -33,7 +33,8 @@ def _config_specs(settings) -> Dict[str, Dict[str, Any]]:
 def _effective(key: str, specs: Dict[str, Dict[str, Any]],
                overrides: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     spec = specs.get(key)
-    cfg_enabled = bool(spec.get("enabled", True)) if spec is not None else False
+    cfg_enabled = (bool(spec.get("enabled", True)) if spec is not None
+                   else bool(getattr(REGISTRY.get(key), "enabled_by_default", False)))
     cfg_weight = float((spec or {}).get("weight", 1.0))
     ov = overrides.get(key) or {}
     return {

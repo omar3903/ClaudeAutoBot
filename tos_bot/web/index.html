@@ -35,6 +35,7 @@
     <div class="statuses">
       <span class="pill" id="pill-market">market</span>
       <span class="pill" id="pill-data">data</span>
+      <span class="pill hidden" id="pill-regime">market</span>
       <span class="pill clickable" id="pill-conn" role="button" tabindex="0">connection</span>
       <span class="pill hidden" id="pill-armed"
         title="LIVE only: the engine will route orders you approve. It disarms if account equity falls below the configured floor.">armed</span>
@@ -69,7 +70,7 @@
           <label class="lockable" data-term="intraday"><input type="checkbox" id="f-intraday" checked /> Intraday</label>
           <label class="lockable" data-term="swing"><input type="checkbox" id="f-swing" checked /> Swing</label>
           <label data-term="hide_done"><input type="checkbox" id="f-hide-done" /> Hide executed</label>
-          <label data-term="hide_noisy"><input type="checkbox" id="f-hide-noisy" checked /> Hide noisy</label>
+          <label data-term="hide_noisy"><input type="checkbox" id="f-hide-noisy" checked /> Hide noise</label>
           <button id="btn-sectors" class="ghost mini lockable">Sectors: all</button>
           <span class="muted scan-meta" id="scan-meta"></span>
         </div>
@@ -93,6 +94,11 @@
     </section>
 
     <aside class="detail" id="detail">
+      <section id="ap-notes" class="ap-notes hidden" aria-live="polite">
+        <div class="ap-notes-head"><b>Autopilot notes <span class="muted" id="ap-notes-count"></span></b>
+          <button class="ghost mini" id="ap-notes-clear">Clear all</button></div>
+        <div id="ap-notes-list"></div>
+      </section>
       <div class="detail-empty" id="detail-empty">
         <p>Select a play to see the full explanation, the numbers behind it, and the order you would send.</p>
         <p class="muted">Nothing is ever sent without your click. Hover any badge or column name for what it means.</p>
@@ -109,6 +115,8 @@
         <button class="tab" data-tab="history">Trade history</button>
         <button class="tab" data-tab="stats">P/L summary</button>
         <button class="tab" data-tab="watchlist">Watchlist</button>
+        <button class="tab" data-tab="pairs" title="Pairs trading: two cointegrated stocks, one long and one short">Pairs</button>
+        <button class="tab" data-tab="journal" title="Each session's review: trades, mistakes, the plays not taken, lessons">Journal</button>
       </div>
       <button id="btn-exit-all" class="danger mini hidden" title="Exit every open position at the market">Exit all</button>
     </div>
@@ -117,6 +125,8 @@
     <div class="tab-body hidden" id="tab-history"></div>
     <div class="tab-body hidden" id="tab-stats"></div>
     <div class="tab-body hidden" id="tab-watchlist"></div>
+    <div class="tab-body hidden" id="tab-pairs"></div>
+    <div class="tab-body hidden" id="tab-journal"></div>
   </section>
 
   <div id="tooltip" class="tooltip hidden" role="tooltip"></div>

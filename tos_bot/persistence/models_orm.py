@@ -76,6 +76,9 @@ class PlayLog(Base):
     explanation: Mapped[str] = mapped_column(sa.Text, default="")
     evidence: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     tags: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
+    #: the noise flags and the scans in a row that found it, when it was recorded (see scanner/noise.py)
+    noise: Mapped[Optional[list]] = mapped_column(sa.JSON, nullable=True)
+    confirmations: Mapped[Optional[int]] = mapped_column(sa.Integer, nullable=True, default=1)
     status: Mapped[str] = mapped_column(sa.String(16), default="PROPOSED", index=True)
     decided_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
     decided_by: Mapped[str] = mapped_column(sa.String(32), default="")
@@ -129,6 +132,8 @@ class Trade(Base):
     mfe: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)   # max favourable excursion
     is_day_trade: Mapped[bool] = mapped_column(sa.Boolean, default=False, index=True)
     session_date: Mapped[Optional[dt.date]] = mapped_column(sa.Date, nullable=True, index=True)
+    #: the pair trade this is one leg of (see pairs/desk.py); its exits belong to the pair desk
+    pair_id: Mapped[Optional[str]] = mapped_column(sa.String(32), nullable=True, index=True)
 
     notes: Mapped[str] = mapped_column(sa.Text, default="")
     created_at: Mapped[dt.datetime] = mapped_column(sa.DateTime, default=_utcnow)
@@ -235,3 +240,59 @@ class NewsLog(Base):
     sentiment: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)  # -1 .. 1
     sentiment_conf: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
     fetched_at: Mapped[dt.datetime] = mapped_column(sa.DateTime, default=_utcnow)
+
+
+class DailyReviewLog(Base):
+    """One session's review - its trades, mistakes, the plays not taken and the lessons (research/journal.py)."""
+
+    __tablename__ = "daily_reviews"
+
+    session_date: Mapped[dt.date] = mapped_column(sa.Date, primary_key=True)
+    created_at: Mapped[dt.datetime] = mapped_column(sa.DateTime, default=_utcnow)
+    trades: Mapped[int] = mapped_column(sa.Integer, default=0)
+    total_r: Mapped[float] = mapped_column(sa.Float, default=0.0)
+    realized_pl: Mapped[float] = mapped_column(MONEY, default=0)
+    mistakes: Mapped[int] = mapped_column(sa.Integer, default=0)
+    review: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
+
+
+class PairTradeLog(Base):
+    """A pair trade: both legs of a pair, entered and closed together (pairs/desk.py)."""
+
+    __tablename__ = "pair_trades"
+
+    id: Mapped[str] = mapped_column(sa.String(32), primary_key=True)
+    pair: Mapped[str] = mapped_column(sa.String(40), index=True)                 # FIRST/SECOND
+    first_symbol: Mapped[str] = mapped_column(sa.String(16))                     # bought on a long spread
+    second_symbol: Mapped[str] = mapped_column(sa.String(16))
+    side: Mapped[str] = mapped_column(sa.String(12))                             # LONG_SPREAD / SHORT_SPREAD
+    status: Mapped[str] = mapped_column(sa.String(12), default="ENTERING", index=True)
+    venue: Mapped[str] = mapped_column(sa.String(16), default="paper")
+    by: Mapped[str] = mapped_column(sa.String(32), default="")
+    hedge: Mapped[float] = mapped_column(sa.Float, default=0.0)
+    lookback: Mapped[int] = mapped_column(sa.Integer, default=0)
+    half_life: Mapped[float] = mapped_column(sa.Float, default=0.0)
+    entry_z: Mapped[float] = mapped_column(sa.Float, default=0.0)               # the z-score it was entered at
+    band_z: Mapped[float] = mapped_column(sa.Float, default=0.0)
+    stop_z: Mapped[float] = mapped_column(sa.Float, default=0.0)
+    exit_z: Mapped[float] = mapped_column(sa.Float, default=0.0)
+    time_stop_days: Mapped[int] = mapped_column(sa.Integer, default=0)
+    spread_sd: Mapped[float] = mapped_column(sa.Float, default=0.0)
+    qty_first: Mapped[float] = mapped_column(MONEY, default=0)
+    qty_second: Mapped[float] = mapped_column(MONEY, default=0)
+    price_first: Mapped[float] = mapped_column(MONEY, default=0)                # at the decision
+    price_second: Mapped[float] = mapped_column(MONEY, default=0)
+    entry_first: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)  # fills
+    entry_second: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
+    dollar_risk: Mapped[float] = mapped_column(MONEY, default=0)
+    trade_first_id: Mapped[Optional[str]] = mapped_column(sa.String(32), nullable=True)
+    trade_second_id: Mapped[Optional[str]] = mapped_column(sa.String(32), nullable=True)
+    opened_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True, index=True)
+    closed_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True, index=True)
+    exit_reason: Mapped[str] = mapped_column(sa.String(24), default="")
+    exit_z_at: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
+    realized_pl: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
+    r_multiple: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
+    model: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
+    notes: Mapped[str] = mapped_column(sa.Text, default="")
+    created_at: Mapped[dt.datetime] = mapped_column(sa.DateTime, default=_utcnow, index=True)

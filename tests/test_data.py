@@ -115,3 +115,17 @@ def test_symbols_ibkr_doesnt_know_are_asked_about_again_after_a_month(tmp_path, 
     later = symbols_module.time.time() + 31 * 86400
     monkeypatch.setattr(symbols_module.time, "time", lambda: later)
     assert master.unknown(["ZZZ"]) == ["ZZZ"]
+
+
+def test_the_quick_refresh_merges_the_latest_candles_into_the_cache(tmp_path):
+    from tos_bot.data.market_data import INTRADAY_DURATION, REFRESH_DURATION
+
+    first_symbol, second_symbol = fakes.SYMBOLS[:2]
+    gateway, md = fakes.FakeGateway(), MarketData(DailyBarStore(tmp_path))
+    md.attach(gateway)
+    first = md.intraday([first_symbol])[first_symbol]
+    got = md.refresh_intraday([first_symbol, second_symbol])
+    assert [r for r in gateway.requests if r[0] == second_symbol] == [(second_symbol, "5 mins", INTRADAY_DURATION)]
+    assert (first_symbol, "5 mins", REFRESH_DURATION) in gateway.requests       # cached: only the last half hour
+    assert got[first_symbol].index.is_unique and len(got[first_symbol]) == len(first)
+    assert set(got) == {first_symbol, second_symbol}

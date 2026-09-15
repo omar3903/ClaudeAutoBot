@@ -55,8 +55,12 @@ function recordLine(key) {
   const all = ((rp.records || {}).all || {})[key], auto = ((rp.records || {}).autopilot || {})[key];
   if (!all || !all.trades) return `<div class="record muted">Replay: no trades from this setup.</div>`;
   const ap = S.state.autopilot || {};
-  const proven = !!auto && auto.trades >= (ap.min_replay_trades ?? 30) && auto.expectancy_r >= (ap.min_replay_expectancy_r ?? 0.05);
-  return `<div class="record">Replay: ${recordText(all)}${auto && auto.trades ? ` · the ones Autopilot would take: ${recordText(auto)}` : ""}
+  const held = auto && auto.out_of_sample;
+  const heldOk = !held || (held.trades >= 10 && held.expectancy_r > 0);
+  const proven = !!auto && auto.trades >= (ap.min_replay_trades ?? 30) && auto.expectancy_r >= (ap.min_replay_expectancy_r ?? 0.05) && heldOk;
+  const ev = (rp.evidence || {})[key];
+  const weight = ev && Math.abs(ev.multiplier - 1) > 0.001 ? ` · evidence weight ×${num(ev.multiplier, 2)}` : "";
+  return `<div class="record">Replay: ${recordText(all)}${auto && auto.trades ? ` · the ones Autopilot would take: ${recordText(auto)}` : ""}${held && held.trades ? ` · held-out sessions: ${recordText(held)}` : ""}${weight}
     <span class="badge ${proven ? "good" : "warn"}">${proven ? "proven" : "not proven"}</span></div>`;
 }
 
@@ -65,19 +69,24 @@ function replayHTML() {
   const labels = { ...((S.state.autopilot || {}).noise_labels || {}), ...EXTRA_CHECK_LABELS };
   const progress = rp.running && rp.progress
     ? `<span class="muted">${escapeHtml(rp.progress.stage)} ${rp.progress.done}/${rp.progress.total}…</span>` : "";
+  const heldFrom = rp.held_out_from || {}, costs = rp.costs || {};
   const when = rp.ran_at
-    ? `Last replay ${escapeHtml(new Date(rp.ran_at).toLocaleString())}: ${rp.trade_count} simulated trades — day-trade setups over the last ${rp.sessions} sessions, swing setups over ${rp.swing_sessions}.`
+    ? `Last replay ${escapeHtml(new Date(rp.ran_at).toLocaleString())}: ${rp.trade_count} simulated trades — day-trade setups over the last ${rp.sessions} sessions, swing setups over ${rp.swing_sessions}.` +
+      (heldFrom.INTRADAY || heldFrom.SWING ? ` Held out to test on: day trades from ${escapeHtml(heldFrom.INTRADAY || "–")}, swing trades from ${escapeHtml(heldFrom.SWING || "–")}.` : "") +
+      (costs.commission_bps != null ? ` Costs: ${num(costs.slippage_bps, 1)} bps slippage on market fills, ${num(costs.commission_bps, 1)} bps commission on every fill.` : "")
     : "No replay yet. Autopilot only trades a strategy once the replay has proven it.";
+  const learned = new Set(rp.learned_skips || []);
   const noise = rp.noise
-    ? `<table class="ev-table replay-noise"><tr><th>Noise check</th><th class="num">Removes</th><th class="num">Their average</th><th class="num">Kept average</th><th>Verdict</th></tr>` +
-      Object.entries(rp.noise).map(([check, n]) => `<tr><td>${escapeHtml(labels[check] || check)}</td><td class="num">${n.removes}</td>
-        <td class="num">${inR(n.removed_avg_r)}</td><td class="num">${inR(n.kept_avg_r)}</td><td>${escapeHtml(n.verdict)}</td></tr>`).join("") +
+    ? `<table class="ev-table replay-noise"><tr><th>Noise check</th><th class="num">Removes</th><th class="num">Their average</th><th class="num">Kept average</th><th>Verdict</th><th>Held-out sessions</th></tr>` +
+      Object.entries(rp.noise).map(([check, n]) => `<tr><td>${escapeHtml(labels[check] || check)}${learned.has(check) ? ` <span class="badge good" title="It removed losers on every session and on the held-out ones, so Autopilot skips it">Autopilot skips it</span>` : ""}</td><td class="num">${n.removes}</td>
+        <td class="num">${inR(n.removed_avg_r)}</td><td class="num">${inR(n.kept_avg_r)}</td><td>${escapeHtml(n.verdict)}</td><td>${escapeHtml((n.held_out || {}).verdict || "–")}</td></tr>`).join("") +
       `</table>`
     : "";
   return `<div class="replay-box">
     <div class="group-title">Replay</div>
     <p class="muted">${when} A noise check earns its place when the trades it removes did worse than the ones it keeps.</p>
-    <div class="row-gap"><label>Day-trade sessions <input type="number" id="replay-sessions" min="5" max="60" step="1" value="${rp.sessions || 20}"></label>
+    <div class="row-gap"><label title="60 gives most setups the 30+ trades a record needs, with the latest third held out">Day-trade sessions <input type="number" id="replay-sessions" min="5" max="120" step="1" value="${rp.sessions || (rp.defaults || {}).sessions || 60}"></label>
+      <label title="Up to a year - as far back as the stored daily candles go">Swing sessions <input type="number" id="replay-swing" min="20" max="250" step="10" value="${rp.swing_sessions || (rp.defaults || {}).swing_sessions || 250}"></label>
       <button class="mini lockable" id="replay-run" ${rp.running ? "disabled" : ""}>${rp.running ? "Replaying…" : "Run replay"}</button> ${progress}</div>
     ${noise}
   </div>`;
@@ -123,7 +132,8 @@ function renderStrategies() {
     };
   });
   $("#replay-run").onclick = async () => {
-    const r = await post("/api/replay", { sessions: parseInt($("#replay-sessions").value, 10) || 20 });
+    const r = await post("/api/replay", { sessions: parseInt($("#replay-sessions").value, 10) || 60,
+                                          swing_sessions: parseInt($("#replay-swing").value, 10) || 250 });
     toastResult(r);
     if (r.ok) {
       S.replay = { ...(S.replay || {}), running: true, progress: { stage: "starting", done: 0, total: 1 } };

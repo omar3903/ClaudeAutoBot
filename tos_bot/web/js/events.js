@@ -11,6 +11,9 @@ import { loadHistory, loadOpen, loadStats, openRecord, recordGone, tabVisible } 
 import { renderWatchlist } from "./watchlist.js";
 import { indexStrategies, onReplayEvent } from "./strategies.js";
 import { loadOrders, ordersChanged } from "./orders.js";
+import { addNotes } from "./notes.js";
+import { loadJournal } from "./journal.js";
+import { loadPairs, showPairs } from "./pairs.js";
 
 export function connect() {
   if (S.stopped) return;
@@ -37,6 +40,9 @@ function handle(topic, p) {
     case "plays.updated":
       S.plays = p.plays || [];
       emit("plays");
+      break;
+    case "plays.changes":
+      addNotes(p.notes);
       break;
 
     case "scan.started":
@@ -130,6 +136,32 @@ function handle(topic, p) {
       S.state.filters = p.filters;
       emit("filters");
       break;
+    case "pairs.updated":
+      if (tabVisible("pairs")) showPairs(p);
+      break;
+
+    case "pairs.entered":
+    case "pairs.opened":
+    case "pairs.exiting":
+    case "pairs.closed":
+    case "pairs.failed":
+    case "pairs.broken": {
+      const what = {
+        "pairs.entered": `Pair ${p.pair}: orders sent`, "pairs.opened": `Pair ${p.pair} is on`,
+        "pairs.exiting": `Pair ${p.pair}: closing (${p.reason})`, "pairs.closed": `Pair ${p.pair} closed: ${usd(p.realized_pl)}`,
+        "pairs.failed": `Pair ${p.pair} not entered: ${p.reason}`, "pairs.broken": `Pair ${p.pair}: the ${p.leg} leg was closed - closing the other`,
+      }[topic];
+      toast(what, topic === "pairs.failed" || topic === "pairs.broken" ? "bad" : topic === "pairs.closed" ? (p.realized_pl >= 0 ? "good" : "bad") : undefined);
+      loadOpen();
+      if (tabVisible("pairs")) loadPairs();
+      break;
+    }
+
+    case "journal.updated":
+      if (tabVisible("journal")) loadJournal();
+      toast(`The review of ${p.session} is in the Journal tab${p.mistakes ? ` — ${p.mistakes} thing${p.mistakes === 1 ? "" : "s"} to learn from` : ""}.`);
+      break;
+
     case "strategies.updated":
       indexStrategies(p.strategies);
       break;

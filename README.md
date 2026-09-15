@@ -22,6 +22,16 @@ Analysis of the Financial Markets*** (horizontal S/R, oscillator divergence,
 volume confirmation) and **Pignataro, *Financial Modeling and Valuation*** (the
 DCF / comps overlay).
 
+A second shelf decides **whether a setup can be trusted right now, how much to
+risk on it and how its record is judged**: **Chan, *Quantitative Trading*** and
+***Algorithmic Trading*** (mean-reversion and momentum tests, backtests with costs
+and held-out data, half-Kelly, the gap and post-earnings setups), **Tsay,
+*Analysis of Financial Time Series*** and **Enders, *Applied Econometric Time
+Series*** (volatility forecasts), **Hamilton, *Time Series Analysis*** (calm and
+turbulent market regimes), and **Vidyamurthy, *Pairs Trading***, **Johansen** and
+**Juselius** (cointegration) - see
+[What the books taught it](#what-the-books-taught-it--the-quantitative-layer).
+
 - **One data source: IB Gateway** — prices, candles and each stock's sector come
   from IBKR. Company financials come from the SEC's own filings (EDGAR) and
   exchange rates from the European Central Bank: official, free, no keys.
@@ -44,8 +54,16 @@ DCF / comps overlay).
   about it. An open-trade record whose position no longer exists at the broker
   is deleted automatically.
 - **Trading capital** — tell the bot to use only part of the account.
+- **A journal that learns from every session** — after the close the bot reviews
+  the day: each trade with what it was taken on, the mistakes, how the plays it
+  didn't take would have done, and each strategy's real record against its replay.
+- **Proof before Autopilot trades** — every strategy is replayed on past candles
+  with costs, and has to make money on the held-out latest third of them too.
+- **Pairs trading** — cointegrated stocks from one industry, one long and one short,
+  entered and closed together (see [Pairs trading](#pairs-trading)).
 - **Light / dark theme** — follows your OS setting; one click to switch.
-- **Strategies:** 14 technical day-trade / swing setups + 3 valuation setups from
+- **Strategies:** 16 technical day-trade / swing setups (2 statistical ones from Chan),
+  insider buying from SEC Form 4 filings, + 3 valuation setups from
   *Pignataro* (comps, a UFCF DCF with exit-multiple **and** perpetuity terminal
   value, a blended "football-field" band).
 - **Guard rails (live mode):** a $2,000 equity floor and a rolling 5-session
@@ -425,7 +443,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 |---|---|---|
 | master switch | off | `enabled` (UI toggle) |
 | **route real orders** | **off** | `allow_live` — *config-file only*; with it off, Autopilot is armed for **paper only** even in Live mode, and says so |
-| which trade types it may take | `["INTRADAY"]` | `trade_types` |
+| which trade types it may take | `["INTRADAY"]` (or `SWING`, `PAIRS`) | `trade_types` |
 | minimum strategy confidence | 0.62 | `min_confidence` |
 | minimum reward : risk | 2.0 | `min_reward_risk` (Aziz Rule 5) |
 | concurrent open auto positions | 2 | `max_auto_positions` |
@@ -440,6 +458,18 @@ The filters and the Strategies panel apply to Autopilot too, and it takes no
 entries while the app is quitting. It still passes every other check — session
 validity, position sizing, the PDT guard, the $2,000 live floor. Valuation plays
 are never auto-traded. Eligible plays get a **🤖** marker.
+
+**Proof, noise and size.** A day-trade setup must show up in `min_confirmations`
+(2) scans in a row, and plays carrying a flag in `skip_noise` are skipped. With
+`require_proven` on, a strategy is auto-traded only once the replay (**Strategies
+→ Run replay**) has at least `min_replay_trades` (30) trades Autopilot would have
+taken, averaging at least `min_replay_expectancy_r` (+0.05R) — **and** at least 10
+of them in the held-out latest third of the sessions, averaging more than 0R
+there. The statistical noise checks (`not_trending`, `not_mean_reverting`,
+`turbulent_market`) are skipped by themselves once the replay shows that the
+trades they remove did worse on every session and on the held-out ones. Each
+entry risks no more than `risk.max_risk_per_trade_pct`, lowered to **half-Kelly**
+when the strategy's record calls for less.
 
 **Faster loop while day-trading.** When Autopilot is armed with `INTRADAY` and
 the regular session is open, the hot list is rescanned every
@@ -487,6 +517,7 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 
 * **Paper / Live** — which side you're trading. Going Live asks for confirmation.
 * **Data pill** — `data: IBKR`, `data: IBKR (delayed)` or `data: none`.
+* **Market pill** — `market: calm` or `market: turbulent`, from Hamilton's regime model on SPY; hover for the numbers.
 * **Connection pill** — what orders go to and whether it's healthy: `Simulator`,
   `IBKR paper ●`, `IBKR live ✕`. Click it to open **Connections**. A banner
   appears when the Gateway needs you.
@@ -506,7 +537,143 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 * **Reset paper** (simulator only) — reset the balance.
 * **Exit** / **Exit all** — close one position, or all of them, at the market.
 * **Quit** — close out, then shut down.
-* Bottom tabs: **Open positions**, **Trade history**, **P/L summary**, **Watchlist**.
+* Bottom tabs: **Open positions**, **Active orders**, **Trade history**, **P/L summary**, **Watchlist**, **Pairs**, **Journal**.
+
+---
+
+## What the books taught it — the quantitative layer
+
+The setups come from Aziz, Murphy and Pignataro. A second shelf of books on
+algorithmic trading and time-series econometrics decides whether a setup can be
+trusted *right now*, how much to risk on it, and how its record is judged. The
+models are plain numpy in `tos_bot/quant/` (no statistics packages), and each one
+is tested on simulated series whose answer is known.
+
+| book | what it adds | where |
+|---|---|---|
+| Chan, *Algorithmic Trading* | Hurst exponent, variance ratio, ADF test and half-life (ch. 2, 6); buy-on-gap (ch. 4); post-earnings drift (ch. 7); regimes and risk (ch. 8) | `quant/stationarity.py`, `quant/readings.py`, the noise checks, `strategies/statistical.py` |
+| Chan, *Quantitative Trading* | backtests with transaction costs and an out-of-sample test (ch. 3); Kelly sizing (ch. 6) | the replay, `quant/sizing.py`, `research/weights.py` |
+| Tsay, *Analysis of Financial Time Series*; Enders, *Applied Econometric Time Series* | GARCH(1,1) and RiskMetrics volatility forecasts | `quant/volatility.py`, the stop floor |
+| Hamilton, *Time Series Analysis* | the Markov switching model of calm and turbulent markets (ch. 22) | `quant/regime.py`, `engine/market_regime.py` |
+| Vidyamurthy, *Pairs Trading*; Johansen; Juselius | cointegration (Engle–Granger, Johansen), zero crossings, the entry-band design | `quant/cointegration.py`, `quant/bands.py`, `pairs/` — see [Pairs trading](#pairs-trading) |
+
+**On every play** (open a play → *Statistics*):
+
+* **Price character** — the Hurst exponent and variance ratio of the candles the
+  setup trades on (three sessions of 5-minute closes for a day trade, 120 daily
+  closes for a swing): *trending*, *mean reverting* or *random walk*. A momentum
+  setup on a price that keeps snapping back is flagged `not_trending`; a reversal
+  setup on a trending price, `not_mean_reverting`. A reversal setup's expected
+  hold is its price's half-life.
+* **Tomorrow's volatility** — the GARCH(1,1) forecast from the completed daily
+  candles. While it is above the last 60 days' volatility, stops are floored at
+  1.4 forecast standard deviations for a swing trade and 0.35 for a day trade:
+  volatility clusters, so a normal-looking stop would sit inside tomorrow's noise.
+* **The market's regime** — Hamilton's two-regime model on SPY's daily returns,
+  refitted once a session and shown on the header's **market** pill. Momentum
+  setups are flagged `turbulent_market` while the chance of the turbulent regime
+  is 70 % or more.
+* **Evidence weight** — each strategy's weight in the ranking is multiplied by
+  what its record says (0.5× to 1.5×): its replayed trades and its real ones,
+  each real trade counting twice, shrunk toward "no edge" as if 50 trades at 0R
+  came first. A strategy losing money on the held-out sessions or in real
+  trading is never raised.
+* **Half-Kelly risk** — half of Kelly's mean ÷ variance of the strategy's R
+  multiples (its real trades once there are 30, otherwise the replayed ones),
+  capped at `risk.max_risk_per_trade_pct`. It can only lower the risk.
+
+**Two statistical day trades** (`tos_bot/strategies/statistical.py`; on even when
+an older `config.yaml` doesn't list them):
+
+| key | idea |
+|---|---|
+| `gap_reversion` | an open more than one standard deviation of daily returns below yesterday's low while still above the 20-day average (the mirror for shorts): the gap tends to be partly won back during the day. Targets yesterday's low, then its close. |
+| `earnings_drift` | an earnings release (SEC 8-K item 2.02) accepted after the previous close or before the open, and a gap of more than half a standard deviation of the stock's usual overnight moves: the price tends to keep drifting that way through the day. |
+
+### The replay — judged the way Chan judges a backtest
+
+**Strategies → Run replay** walks recorded candles the way the scans see them and
+follows every play the way the automatic exits would. Its settings are in
+`config/config.yaml → replay`:
+
+* **60 day-trade sessions and 250 swing sessions** by default. Sixty sessions give
+  most setups the 30+ trades a record needs *with* a month held out; 250 is a
+  year, as far back as the stored daily candles go. Up to 120 day-trade sessions
+  can be asked for — 5-minute candles are downloaded once and kept.
+* **Costs**: 5 bps slippage on every market fill and 1 bp commission on every fill.
+* **Held out**: the latest third of the sessions. Every strategy record and every
+  noise verdict is also given for those sessions alone, and Autopilot wants a
+  strategy to have made money there too.
+* **No look-ahead**: a day's regime comes from a model fitted on the days before
+  the replay, the volatility forecast from completed candles, and an earnings
+  report counts from the moment SEC accepted it.
+* Every run is summarised in `data/research/replay_runs.jsonl`, so the records
+  can be followed from one run to the next.
+
+## Journal — learning from every session
+
+At `journal.review_at` (16:15 ET) the bot writes a review of the session, kept in
+the database (`daily_reviews`) and in `data/journal/`. The **Journal** tab shows:
+
+* **the trades** that closed, each with what it was taken on — noise flags, scans
+  in a row, price character, the market's regime, who took it;
+* **mistakes** — a loss beyond the planned 1R, a winner of 1R or more closed at a
+  loss, a trade taken through a noise flag or before it was confirmed, going
+  straight back into a stock that had just lost, a strategy without a proven
+  record;
+* **the plays not taken**, each followed on the session's 5-minute candles as if
+  it had been — grouped by noise flag and by whether Autopilot's checks passed
+  it, so every check is tested on live plays every day;
+* **each strategy's real record** over the last 20 sessions against its replay,
+  flagged when it falls more than 0.3R a trade short;
+* **lessons**, in plain sentences. **Review the last session** rebuilds it on demand.
+
+---
+
+## Pairs trading
+
+`tos_bot/pairs/`. Two stocks from one industry whose log prices are cointegrated drift
+apart and come back together. When their spread strays past its band the bot buys one
+and shorts the other, and both legs come off together. From Vidyamurthy's *Pairs
+Trading* and Chan's *Algorithmic Trading* (ch. 2-4 and 8).
+
+**Finding them** - after each full scan, among the watchlist's stocks grouped by IBKR
+industry, plus the ETF pairs in `config/config.yaml → pairs.etf_pairs`:
+
+* daily returns correlated 0.6 or more (only to narrow the search), $10M+ traded a day, $5+;
+* Engle–Granger cointegration at 5% with a positive hedge ratio, and Johansen's trace test agreeing at 90%;
+* a spread half-life of 2-30 sessions and at least 6 crossings of its mean;
+* at most two pairs per industry, each stock in one pair, the 12 most strongly cointegrated kept;
+* fitted on the last 200 sessions - and tested on the latest 100 after being fitted on the 200
+  before them. A pair that wasn't a pair back then isn't watched: Chan's warning is that stock
+  pairs often stop being pairs.
+
+**The rules** - the spread's z-score over a lookback equal to its half-life; an entry band from
+Vidyamurthy's design, net of costs (between 1 and 2.5 standard deviations); exit back at the mean;
+a stop 2 standard deviations beyond the band; a time stop of two half-lives. Entries and those
+exits are decided in the last 30 minutes of the session, the way the replay reads its closes;
+a pair that has lost twice its planned risk is closed at once, any time of day.
+
+**Size** - the first stock's dollars are the risk per trade (half-Kelly when the pairs' record
+calls for less) over the z distance to the stop times the spread's standard deviation; the
+second leg is the hedge ratio times that. Each leg stays within `max_position_pct_of_equity`,
+both together within the buying power and the trading capital.
+
+**Safety** - both legs are market orders in the regular session. If the second can't be sent,
+or both haven't filled within two minutes, what did fill is closed again: a pair is never left
+half on. The legs carry no stop or target of their own, so the regular exit manager leaves them
+to the pair desk; if one leg is closed outside it (Exit, Exit all, quitting, the broker check),
+the other is closed too. Live pairs need $25,000+ in a margin account.
+
+**The Pairs tab** - the pair trades on (both legs, z at entry and now, open P/L and R, sessions
+held, **Exit pair**); the pairs being watched (hedge ratio, half-life, band and stop, where the
+spread is now, the signal, how the rules did out of sample, **Enter**, and a 📈 chart of the
+spread with its band, stop and past trades); and the recent pair trades.
+
+**Replay and Autopilot** - **Strategies → Run replay** also chooses pairs on the sessions *before*
+the replayed ones and trades them only on those, paying costs on both legs; their record is
+`pairs_reversion`. Autopilot takes pairs only with **Pairs** among its trade types, once that
+record is proven (held-out sessions included), and at most `pairs.max_new_per_day` a day.
 
 ---
 
@@ -547,6 +714,8 @@ volume, the S/R map, the daily trend) are computed once per stock per scan.
 | `atr_channel_breakout` | swing | close beyond a Keltner/ATR channel with ADX rising through 20 |
 | `divergence_reversal` | swing | RSI / MACD-histogram divergence **at a horizontal level** (Murphy) |
 | `week52_breakout` | swing | push to a new 52-week high/low on volume expansion |
+
+Also: `gap_reversion` and `earnings_drift` (see [What the books taught it](#what-the-books-taught-it--the-quantitative-layer)) and `insider_buying` (see [Signals](#signals--insider-trades-and-company-news)).
 
 ### Valuation — from *Pignataro, Financial Modeling and Valuation* (2nd ed.)
 
@@ -613,12 +782,19 @@ tos_bot/
     reconcile.py             when an open-trade record counts as gone at the broker
     runtime.py               data/runtime.json
     views.py                 pieces of the dashboard snapshot
+    market_regime.py         calm or turbulent, from SPY's daily returns (Hamilton ch. 22)
+    chart.py                 a play's candles and its exit routes
   core/                    enums + framework-free dataclasses + event bus
   data/                    listings, symbols, daily bar store, market data, SEC EDGAR, fx, sectors
   indicators/ta.py         vectorised TA (no TA-Lib) incl. divergence, relative volume, beta
   analysis/                horizontal S/R clustering + candlestick reads (Aziz / Murphy)
   valuation/               EV, multiples, DCF, football field, projections   (Pignataro)
   strategies/              base (shared indicators, Douglas-framed explanations) + registry + technical + fundamental
+                           + insider + statistical (Chan's gap and earnings setups)
+  quant/                   the books' models in numpy: stationarity, cointegration, volatility, regime, sizing, bands, readings
+  research/                the replay (replay, runner, history), the evidence weights and the daily journal
+  signals/                 SEC Form 4 insider trades, company news, 8-K earnings dates, the signal book
+  pairs/                   pairs trading: the model, the finder, the backtest and the desk that trades both legs
   scanner/                 schedule, heat, watchlist, evaluator, filters, the scans
   risk/                    position sizing + PDT guard
   execution/               order_builder + executor + exit_manager + autopilot
@@ -645,12 +821,14 @@ the listings directory, SEC financials, the daily bar store, the strategies, the
 Autopilot gate, the exit manager, the IBKR adapter against a fake `ib_async.IB`,
 routing and the open-position switch guard, the `.env` writer, the same-machine
 guard, live dashboard changes, quitting, the broker-vs-database record check,
-trading capital and exchange rates. The real IB Gateway isn't exercised in tests.
+trading capital and exchange rates. The quantitative models are tested on simulated
+series whose answers are known (a mean-reverting series' half-life, a cointegrated
+pair's hedge ratio, a GARCH process's parameters, a two-regime market), and the
+journal on a scripted session. The real IB Gateway isn't exercised in tests.
 
 ## Roadmap
 
 - a native stop resting at the broker as a crash-safety backup, kept in sync with the exit manager
 - streaming IBKR ticks (`reqMktData` subscriptions) for the hot list instead of candle polls
-- per-strategy backtester + walk-forward on the persisted play log
 - options plays
 - equity-curve chart in the dashboard

@@ -111,8 +111,9 @@ class ScannerCfg(_Model):
     in data/runtime.json and win over these."""
 
     premarket_time: str = "08:30"         # ET - the daily full scan (04:00 to 09:00)
-    cycle_minutes: int = 15               # intraday rescan of the hot list + buffer
+    cycle_minutes: int = 5                # intraday rescan of the hot list + buffer (3-5)
     fast_cycle_seconds: int = 60          # hot list only, while Autopilot is day-trading
+    plays_refresh_seconds: int = 15       # re-check the stocks with plays on the board (0 = off)
     hot_list_size: int = 20
     sector_queue_size: int = 25           # buffer candidates lined up per sector
     buffer_picks_per_sector: int = 2      # new buffer names scanned per sector per cycle
@@ -183,6 +184,53 @@ class NoiseCfg(_Model):
     volume_ratio: float = 1.5
     volume_bars: int = 6
     min_expected_r: float = 0.15
+    trending_hurst: float = 0.55          # a Hurst exponent from here up reads as trending...
+    reverting_hurst: float = 0.45         # ...and from here down as mean reverting
+    turbulent_probability: float = 0.7    # the market counts as turbulent from this regime probability
+
+
+class ReplayCfg(_Model):
+    """How the strategy replay tests the setups - see research/replay.py."""
+
+    sessions: int = 60                    # day-trade sessions of 5-minute candles (5-120)
+    swing_sessions: int = 250             # swing sessions of daily candles (20-250)
+    slippage_bps: float = 5.0             # on every market fill, each way
+    commission_bps: float = 1.0           # on every fill
+    held_out_fraction: float = 0.3334     # the latest sessions kept out of sample
+
+
+class PairsCfg(_Model):
+    """Pairs trading - see tos_bot/pairs/."""
+
+    enabled: bool = True
+    max_pairs: int = 12                   # pairs on the watch list
+    per_group: int = 2                    # at most this many from one industry
+    min_correlation: float = 0.6
+    min_price: float = 5.0
+    min_dollar_volume: float = 10_000_000.0
+    fit_days: int = 200                   # sessions the hedge ratio and band are fitted on
+    test_days: int = 100                  # the latest sessions each pair is tested on, fitted on the ones before
+    require_stable: bool = True           # only watch pairs that were already pairs on the sessions before
+    half_life_days: list = Field(default_factory=lambda: [2.0, 30.0])
+    min_crossings: int = 6
+    entry_z: list = Field(default_factory=lambda: [1.0, 2.5])   # the band's bounds, in standard deviations
+    exit_z: float = 0.0
+    stop_beyond_entry: float = 2.0
+    time_stop_half_lives: float = 2.0
+    cost_bps: float = 6.0                 # each leg, each fill - for the band and the replay
+    window_minutes: list = Field(default_factory=lambda: [30, 5])   # entries and exits are decided in this window before the close
+    max_open_pairs: int = 3
+    max_new_per_day: int = 2              # Autopilot
+    emergency_loss_r: float = 2.0         # close at once when a pair has lost this many times its planned risk
+    etf_pairs: list = Field(default_factory=lambda: [["EWA", "EWC"], ["GLD", "GDX"], ["XLE", "XOP"], ["KBE", "KRE"]])
+
+
+class JournalCfg(_Model):
+    """The daily review - see research/journal.py."""
+
+    enabled: bool = True
+    review_at: str = "16:15"              # ET, after the close
+    keep_days: int = 0                    # 0 = keep every review
 
 
 class SignalsCfg(_Model):
@@ -228,6 +276,9 @@ class AppConfig(_Model):
     exit_manager: ExitManagerCfg = Field(default_factory=ExitManagerCfg)
     autopilot: AutopilotCfg = Field(default_factory=AutopilotCfg)
     noise: NoiseCfg = Field(default_factory=NoiseCfg)
+    replay: ReplayCfg = Field(default_factory=ReplayCfg)
+    journal: JournalCfg = Field(default_factory=JournalCfg)
+    pairs: PairsCfg = Field(default_factory=PairsCfg)
     signals: SignalsCfg = Field(default_factory=SignalsCfg)
     database: DatabaseCfg = Field(default_factory=DatabaseCfg)
 

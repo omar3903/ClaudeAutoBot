@@ -32,12 +32,13 @@ scanner:
   # sector are rescanned on a cycle. The dashboard's Settings override the first
   # four values.
   premarket_time: "08:30"              # ET, 04:00-09:00 - the daily full scan
-  cycle_minutes: 15                    # 5-60 - rescan the hot list and buffer names
+  cycle_minutes: 5                     # 3-5 - rescan the hot list and buffer names
   hot_list_size: 20                    # 5-50 - no more than a third from one sector
   sector_queue_size: 25                # 10-50 - buffer candidates lined up per sector
   buffer_picks_per_sector: 2           # new buffer names looked at per sector each cycle
   kept_per_sector: 2                   # promising buffer names kept waiting for a hot-list slot
   fast_cycle_seconds: 60               # hot list only, while Autopilot day-trades an open session
+  plays_refresh_seconds: 15            # re-check the stocks with plays on the board this often (0 = off)
   fundamentals_leaders: 8              # valuation setups (SEC EDGAR financials) on this many top names
   max_universe: 0                      # 0 = every listing; a smaller number caps it (for testing)
   sectors: []                          # only scan + trade these, e.g. ["Technology", "Energy"]; [] = all.
@@ -71,6 +72,9 @@ strategies:
     week52_breakout:        { enabled: true,  weight: 0.9, params: { proximity_pct: 1.0 } }
     # -- signal setups (tos_bot/signals): unusual insider buying from SEC Form 4 filings --
     insider_buying:         { enabled: true,  weight: 1.0, params: { min_score: 0.55, max_days_since: 10, stop_atr: 2.0, target_r: 3.0 } }
+    # -- statistical setups (Chan, Algorithmic Trading ch. 4 and 7); on even when this file doesn't list them --
+    gap_reversion:          { enabled: true,  weight: 1.0, params: { sigma_days: 90, ma_days: 20, max_minutes: 30, min_gap_sigmas: 1.0 } }
+    earnings_drift:         { enabled: true,  weight: 1.0, params: { sigma_days: 90, min_gap_sigmas: 0.5, max_minutes: 30, target_r: 2.0 } }
   fundamental:
     relative_value_comps:   { enabled: true,  weight: 1.2, params: { peer_count: 8, discount_trigger: 0.20, premium_trigger: 0.20 } }
     dcf_fair_value_gap:     { enabled: true,  weight: 1.2, params: { projection_years: 5, perpetuity_growth: 0.025, mos: 0.25 } }
@@ -115,7 +119,7 @@ autopilot:
   # tunable live from the dashboard.
   enabled: false                     # master switch
   allow_live: false                  # HARD gate - Autopilot NEVER routes a real order unless true
-  trade_types: ["INTRADAY"]          # what it may auto-take: INTRADAY and/or SWING
+  trade_types: ["INTRADAY"]          # what it may auto-take: INTRADAY, SWING and/or PAIRS
   min_confidence: 0.62               # skip plays the strategy itself isn't confident in
   min_reward_risk: 2.0               # never auto-take a play worse than this (Aziz Rule 5)
   max_auto_positions: 2              # most concurrent open autopilot trades
@@ -126,7 +130,9 @@ autopilot:
   max_gross_exposure_pct: 100.0      # all positions together as % of equity - 100 = Autopilot never uses margin
   min_confirmations: 2               # a day-trade setup must show up in this many scans in a row
   skip_noise: [against_trend, wrong_side_of_vwap, against_gap, volume_against, conflict, low_expected_value]
-                                     # noise flags Autopilot won't trade - see noise: below
+                                     # noise flags Autopilot won't trade - see noise: below. It also skips
+                                     # not_trending / not_mean_reverting / turbulent_market once the replay
+                                     # shows they remove losers, on every session and the held-out ones
   require_proven: true               # only trade strategies the replay (Strategies panel) has proven...
   min_replay_trades: 30              # ...over at least this many replayed trades
   min_replay_expectancy_r: 0.05      # ...averaging at least this much per trade, in R
@@ -142,6 +148,55 @@ noise:
   volume_ratio: 1.5                   # opposing volume this many times the supporting volume
   volume_bars: 6                      # closed 5-minute bars the volume check looks back over
   min_expected_r: 0.15                # expected value (in R) below which a play isn't worth the risk
+  # From the books' statistics (Chan ch. 2 and 6; Hamilton ch. 22): the Hurst exponent of the candles a
+  # setup trades on says whether the price has been trending or snapping back, and SPY's Markov switching
+  # model whether the market is calm or turbulent.
+  trending_hurst: 0.55                # from here up the price reads as trending (reversal setups get flagged)
+  reverting_hurst: 0.45               # from here down as mean reverting (momentum setups get flagged)
+  turbulent_probability: 0.7          # momentum setups are flagged from this probability of the turbulent regime
+
+replay:
+  # How the Strategies panel's replay tests the setups (Chan, Quantitative Trading ch. 3). 60 day-trade
+  # sessions give most setups the 30+ trades a record needs, with 20 sessions - about a month - held out;
+  # 250 swing sessions is a year, as far back as the stored daily candles go.
+  sessions: 60                        # day-trade sessions of 5-minute candles (5-120)
+  swing_sessions: 250                 # swing sessions of daily candles (20-250)
+  slippage_bps: 5.0                   # on every market fill, each way
+  commission_bps: 1.0                 # on every fill
+  held_out_fraction: 0.3334           # the latest sessions kept out of sample; Autopilot wants profits there too
+
+pairs:
+  # Pairs trading (tos_bot/pairs): two stocks from one industry whose log prices are cointegrated
+  # (Vidyamurthy, Pairs Trading; Chan, Algorithmic Trading ch. 2-4). The spread is bought or sold past
+  # its band and both legs are closed together at the mean, the stop, the time stop - or at once when
+  # the pair has lost emergency_loss_r times its planned risk. Live pairs need a $25k margin account.
+  enabled: true
+  max_pairs: 12                       # pairs on the watch list
+  per_group: 2                        # at most this many from one industry
+  min_correlation: 0.6                # daily returns, over the fitting window - only narrows the search
+  min_price: 5.0
+  min_dollar_volume: 10000000         # a day, on average over 20 sessions
+  fit_days: 200                       # sessions the hedge ratio and the band are fitted on
+  test_days: 100                      # the latest sessions each pair is tested on, fitted on the ones before
+  require_stable: true                # only watch pairs that were already pairs on the sessions before
+  half_life_days: [2, 30]
+  min_crossings: 6                    # crossings of the spread's mean in the fitting window
+  entry_z: [1.0, 2.5]                 # the band's bounds; Vidyamurthy's design picks it inside them
+  exit_z: 0.0                         # exit back at the mean
+  stop_beyond_entry: 2.0              # the stop, in standard deviations beyond the band
+  time_stop_half_lives: 2.0
+  cost_bps: 6.0                       # each leg, each fill - used for the band
+  window_minutes: [30, 5]             # entries and exits are decided between these minutes before the close
+  max_open_pairs: 3
+  max_new_per_day: 2                  # for Autopilot, with PAIRS in autopilot.trade_types
+  emergency_loss_r: 2.0
+  etf_pairs: [[EWA, EWC], [GLD, GDX], [XLE, XOP], [KBE, KRE]]
+
+journal:
+  # The daily review in the Journal tab: every trade with the readings it was taken on, the mistakes,
+  # the plays that weren't taken and how they would have done, and what the strategies' records say.
+  enabled: true
+  review_at: "16:15"                  # ET, after the close
 
 signals:
   # What a company's insiders buy and sell (SEC Form 4 filings) and what the news says

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import logging
 import mimetypes
 from pathlib import Path
@@ -95,6 +96,10 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     @app.post("/api/plays/{play_id}/approve")
     def approve(play_id: str):
         return _result(eng().approve_play(play_id))
+
+    @app.get("/api/plays/{play_id}/chart")
+    def play_chart(play_id: str):
+        return eng().play_chart(play_id)
 
     @app.post("/api/plays/{play_id}/reject")
     def reject(play_id: str):
@@ -226,7 +231,53 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     @app.post("/api/replay")
     def start_replay(body: dict):
         b = body or {}
-        return _result(eng().start_replay(sessions=b.get("sessions", 20), swing_sessions=b.get("swing_sessions", 120)))
+        return _result(eng().start_replay(sessions=b.get("sessions"), swing_sessions=b.get("swing_sessions")))
+
+    @app.get("/api/replay/history")
+    def replay_history(limit: int = 30):
+        return {"runs": eng().replay_history(max(1, min(200, limit)))}
+
+    # ---- the journal: one review per session ------------------------------- #
+    @app.get("/api/journal")
+    def journal(limit: int = 60):
+        return eng().journal_state(max(1, min(400, limit)))
+
+    @app.get("/api/journal/{session}")
+    def journal_session(session: str):
+        try:
+            day = dt.date.fromisoformat(session)
+        except ValueError:
+            raise HTTPException(400, "the session must be a date like 2026-09-15")
+        review = eng().journal_review(day)
+        if review is None:
+            raise HTTPException(404, "no review for that session")
+        return review
+
+    @app.post("/api/journal/review")
+    def journal_build(body: dict):
+        session = (body or {}).get("session")
+        try:
+            day = dt.date.fromisoformat(session) if session else None
+        except ValueError:
+            return _result({"ok": False, "reason": "the session must be a date like 2026-09-15"})
+        return _result(eng().review_session(day))
+
+    # ---- pairs trading --------------------------------------------------------- #
+    @app.get("/api/pairs")
+    def pairs(live: bool = False):
+        return eng().pairs_state(live=live)
+
+    @app.post("/api/pairs/enter")
+    def enter_pair(body: dict):
+        return _result(eng().enter_pair(str((body or {}).get("pair") or "")))
+
+    @app.post("/api/pairs/trades/{pair_trade_id}/close")
+    def close_pair(pair_trade_id: str):
+        return _result(eng().close_pair(pair_trade_id))
+
+    @app.get("/api/pairs/chart")
+    def pair_chart(pair: str):
+        return eng().pair_chart(pair)
 
     # ---- scans, scan settings, watchlist -------------------------------- #
     @app.post("/api/scan")

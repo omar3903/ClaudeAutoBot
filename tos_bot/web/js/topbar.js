@@ -23,6 +23,7 @@ function renderTop() {
   $("#btn-reset-paper").classList.toggle("hidden", v.trading_on !== "paper");
   renderMarket(s.market || {}, s.market_open);
   renderData(s.data || {});
+  renderRegime(s.regime);
   // "armed" only means something in LIVE mode (the equity floor)
   $("#pill-armed").classList.toggle("hidden", s.mode === "paper");
   if (s.mode !== "paper") setPill("#pill-armed", s.armed ? "armed" : "disarmed", s.armed ? "good" : "bad");
@@ -49,6 +50,17 @@ function renderMarket(mk, open) {
     session === "REGULAR" ? "good" : session === "CLOSED" ? "bad" : "warn");
   $("#pill-market").title = mk.label
     ? mk.label + (mk.next_holiday ? `\nNext holiday: ${mk.next_holiday.name} (${mk.next_holiday.date})` : "") : "";
+}
+
+function renderRegime(r) {
+  const el = $("#pill-regime");
+  if (!el) return;
+  if (!r) { el.classList.add("hidden"); return; }
+  setPill("#pill-regime", `market: ${r.regime}`, r.regime === "turbulent" ? "warn" : "good");
+  const leg = x => x ? `${(x.vol * 100).toFixed(2)}% a day, lasting ~${Math.round(x.days)} sessions` : "–";
+  el.title = `Hamilton's Markov switching model on SPY's daily returns: a ${Math.round(r.p_turbulent * 100)}% chance the market ` +
+    `is in its turbulent regime on ${r.for_session}.\nCalm: ${leg(r.calm)}. Turbulent: ${leg(r.turbulent)}.\n` +
+    "Momentum setups are flagged while it's turbulent; Autopilot skips that flag once the replay shows it helps.";
 }
 
 function renderData(d) {

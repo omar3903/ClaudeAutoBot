@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS play_logs (
 	explanation TEXT NOT NULL, 
 	evidence JSON, 
 	tags JSON, 
+	noise JSON, 
+	confirmations INTEGER, 
 	status VARCHAR(16) NOT NULL, 
 	decided_at DATETIME, 
 	decided_by VARCHAR(32) NOT NULL, 
@@ -123,6 +125,7 @@ CREATE TABLE IF NOT EXISTS trades (
 	mfe NUMERIC(20, 6), 
 	is_day_trade BOOL NOT NULL, 
 	session_date DATE, 
+	pair_id VARCHAR(32), 
 	notes TEXT NOT NULL, 
 	created_at DATETIME NOT NULL, 
 	updated_at DATETIME NOT NULL, 
@@ -136,6 +139,7 @@ CREATE INDEX ix_trades_entry_time ON trades (entry_time);
 CREATE INDEX ix_trades_strategy ON trades (strategy);
 CREATE INDEX ix_trades_exit_time ON trades (exit_time);
 CREATE INDEX ix_trades_is_day_trade ON trades (is_day_trade);
+CREATE INDEX ix_trades_pair_id ON trades (pair_id);
 CREATE INDEX ix_trades_symbol ON trades (symbol);
 
 CREATE TABLE IF NOT EXISTS fills (
@@ -206,3 +210,58 @@ CREATE TABLE IF NOT EXISTS news_items (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE INDEX ix_news_items_published_at ON news_items (published_at);
 CREATE INDEX ix_news_items_symbol ON news_items (symbol);
+
+CREATE TABLE IF NOT EXISTS daily_reviews (
+	session_date DATE NOT NULL,
+	created_at DATETIME NOT NULL,
+	trades INTEGER NOT NULL,
+	total_r FLOAT NOT NULL,
+	realized_pl NUMERIC(20, 6) NOT NULL,
+	mistakes INTEGER NOT NULL,
+	review JSON,
+	PRIMARY KEY (session_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS pair_trades (
+	id VARCHAR(32) NOT NULL,
+	pair VARCHAR(40) NOT NULL,
+	first_symbol VARCHAR(16) NOT NULL,
+	second_symbol VARCHAR(16) NOT NULL,
+	side VARCHAR(12) NOT NULL,
+	status VARCHAR(12) NOT NULL,
+	venue VARCHAR(16) NOT NULL,
+	by VARCHAR(32) NOT NULL,
+	hedge FLOAT NOT NULL,
+	lookback INTEGER NOT NULL,
+	half_life FLOAT NOT NULL,
+	entry_z FLOAT NOT NULL,
+	band_z FLOAT NOT NULL,
+	stop_z FLOAT NOT NULL,
+	exit_z FLOAT NOT NULL,
+	time_stop_days INTEGER NOT NULL,
+	spread_sd FLOAT NOT NULL,
+	qty_first NUMERIC(20, 6) NOT NULL,
+	qty_second NUMERIC(20, 6) NOT NULL,
+	price_first NUMERIC(20, 6) NOT NULL,
+	price_second NUMERIC(20, 6) NOT NULL,
+	entry_first NUMERIC(20, 6),
+	entry_second NUMERIC(20, 6),
+	dollar_risk NUMERIC(20, 6) NOT NULL,
+	trade_first_id VARCHAR(32),
+	trade_second_id VARCHAR(32),
+	opened_at DATETIME,
+	closed_at DATETIME,
+	exit_reason VARCHAR(24) NOT NULL,
+	exit_z_at FLOAT,
+	realized_pl NUMERIC(20, 6),
+	r_multiple FLOAT,
+	model JSON,
+	notes TEXT NOT NULL,
+	created_at DATETIME NOT NULL,
+	PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE INDEX ix_pair_trades_pair ON pair_trades (pair);
+CREATE INDEX ix_pair_trades_status ON pair_trades (status);
+CREATE INDEX ix_pair_trades_opened_at ON pair_trades (opened_at);
+CREATE INDEX ix_pair_trades_closed_at ON pair_trades (closed_at);
+CREATE INDEX ix_pair_trades_created_at ON pair_trades (created_at);

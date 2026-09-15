@@ -207,6 +207,8 @@ class Play:
     noise: List[str] = field(default_factory=list)
     #: scans in a row that found this setup (see PlayBoard.replace)
     confirmations: int = 1
+    #: set on the two legs of a pair trade (see pairs/desk.py) - the pair desk handles their exits
+    pair_id: Optional[str] = None
 
     # ---- convenience ---------------------------------------------------- #
     @property

@@ -63,7 +63,7 @@ class ExitManager:
         # only trades held on this venue - an exit can't be sent anywhere else -
         # and not while one of their close orders is still working
         in_flight = self.executor.pending_exit_trade_ids()
-        mine = [t for t in open_trades if t["id"] not in in_flight
+        mine = [t for t in open_trades if t["id"] not in in_flight and not t.get("pair_id")   # the pair desk's
                 and not (self.venue and (t.get("broker") or self.venue) != self.venue)]
         self._prices = self._fetch_prices({t["symbol"] for t in mine})
         acted: List[Dict[str, Any]] = []
