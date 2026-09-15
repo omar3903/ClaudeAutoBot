@@ -19,6 +19,7 @@ from ..core.models import Play
 from ..data.fundamentals import Financials
 from ..data.market_data import quote_from_price
 from ..strategies.base import Strategy, StrategyContext
+from ..signals.book import SignalBook
 from .filters import expected_r, rank_score
 from .noise import NoiseSettings, context_flags
 
@@ -44,7 +45,8 @@ def with_today(daily: pd.DataFrame, intraday: Optional[pd.DataFrame]) -> pd.Data
 def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
              intraday: Optional[pd.DataFrame], *, run_id: str, equity: float, params: Dict[str, Any],
              activity: Any = None, fundamentals: Optional[Financials] = None,
-             peers: Optional[List[Financials]] = None, noise: Optional[NoiseSettings] = None) -> List[Play]:
+             peers: Optional[List[Financials]] = None, noise: Optional[NoiseSettings] = None,
+             signals: Optional[SignalBook] = None) -> List[Play]:
     noise = noise or NoiseSettings()
     full_daily = with_today(daily, intraday)
     latest = intraday if intraday is not None and len(intraday) else full_daily
@@ -53,6 +55,7 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
         quote=quote_from_price(symbol, float(latest["close"].iloc[-1]), float(latest["volume"].iloc[-1])),
         fundamentals=fundamentals, peers=peers, params=params, account_equity=equity,
         activity=asdict(activity) if is_dataclass(activity) else {},
+        signals=signals.get(symbol) if signals is not None else None,
     )
     plays: List[Play] = []
     for strategy in strategies:
@@ -64,6 +67,8 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
                 if p.evidence["expected_r"] < noise.min_expected_r:
                     p.noise.append("low_expected_value")
                 p.score = rank_score(p, activity, strategy.weight)
+                if signals is not None:
+                    signals.apply(p)
                 p.evidence.setdefault("spark", ctx.spark())
                 plays.append(p)
         except Exception as e:  # noqa: BLE001

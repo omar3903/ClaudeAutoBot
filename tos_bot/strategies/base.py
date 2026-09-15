@@ -36,6 +36,8 @@ class StrategyContext:
     account_equity: float = 0.0
     #: what the scanner measured for this symbol (rvol, gap_pct, atr_pct, ...)
     activity: Dict[str, Any] = field(default_factory=dict)
+    #: what insiders and the news say about the stock (signals/book.py SymbolSignals), when known
+    signals: Any = None
     _memo: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     def _cached(self, key: str, compute: Callable[[], Any]) -> Any:

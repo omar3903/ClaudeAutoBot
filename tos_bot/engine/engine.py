@@ -58,6 +58,9 @@ from ..risk.position_sizing import size_play
 from ..research.history import IntradayHistory, replay_symbols
 from ..research.replay import ReplaySettings
 from ..research.runner import ReplayRunner
+from ..signals.book import BoostSettings, SignalBook
+from ..signals.service import SignalService
+from ..signals.store import SignalStore
 from ..scanner.noise import LABELS as NOISE_LABELS, NoiseSettings
 from ..scanner import schedule
 from ..scanner.filters import TradeFilters
@@ -136,6 +139,14 @@ class TradingEngine:
             data_dir / "watchlists", build_strategies(self.settings, self.strategy_overrides))
         self.scanner.filters = self.filters
 
+        # insider trades and company news (see signals/): they nudge play scores and create insider-buying plays
+        self.signal_book = SignalBook(BoostSettings.from_config(cfg.signals))
+        self.scanner.signals = self.signal_book if cfg.signals.enabled else None
+        self.signals = SignalService(cfg.signals, SignalStore(), self.signal_book, data_dir / "signals" / "state.json",
+                                     watched=self._signal_watchlist,
+                                     news_source=lambda: self.md.source if self.md.attached else None,
+                                     con_ids=self.scanner.con_ids)
+
         #: set while quitting with positions still open - everything but exits is locked
         self.quit_state: Optional[Dict[str, Any]] = saved["quit"] if isinstance(saved.get("quit"), dict) else None
         #: called once quitting has finished (the server wires it to its own shutdown)
@@ -200,7 +211,7 @@ class TradingEngine:
             log.warning("resuming an unfinished quit - closing the remaining positions first")
         self._threads = [threading.Thread(target=loop, name=name, daemon=True) for name, loop in (
             ("scan-loop", self._scan_loop), ("sync-loop", self._sync_loop), ("snapshot-loop", self._snapshot_loop),
-            ("orders-loop", self._orders_loop))]
+            ("orders-loop", self._orders_loop), ("signals-loop", self._signals_loop))]
         for t in self._threads:
             t.start()
         BUS.publish("engine.started", state=self.snapshot())
@@ -487,7 +498,8 @@ class TradingEngine:
         except ValueError as e:
             return {"ok": False, "reason": str(e)}
         self.settings.secrets = Secrets()             # the same Settings object everyone holds
-        out: Dict[str, Any] = {"ok": True, "changed": changed, "fields": secrets_store.describe()}
+        out: Dict[str, Any] = {"ok": True, "changed": changed, "fields": secrets_store.describe(),
+                               "signal_fields": secrets_store.describe(fields=secrets_store.SIGNAL_FIELDS)}
         if not changed:
             out["note"] = "Nothing changed."
             return out
@@ -517,6 +529,7 @@ class TradingEngine:
         return {
             "venue": self._venue_state(),
             "fields": secrets_store.describe(),
+            "signal_fields": secrets_store.describe(fields=secrets_store.SIGNAL_FIELDS),
             "ibkr": {"host": sec.ibkr_host, "ports": ports,
                      "listening": {a: self.connections.port_open(p) for a, p in ports.items()},
                      "installed": find_spec("ib_async") is not None, "steps": list(IBKR_STEPS)},
@@ -532,6 +545,15 @@ class TradingEngine:
             return self.autopilot.day_mode_active(clock.is_market_open())
         except Exception:  # noqa: BLE001
             return False
+
+    def _signals_loop(self) -> None:
+        if self.settings.config.signals.enabled:
+            self.signals.run(self._stop)
+
+    def _signal_watchlist(self) -> List[str]:
+        """The stocks whose news the signals follow: those held, then the day's hot list."""
+        wl = self.scanner.watchlist
+        return list(dict.fromkeys([t["symbol"] for t in self._open_trades()] + (wl.hot_symbols() if wl else [])))
 
     def _scan_loop(self) -> None:
         self._stop.wait(2.0)

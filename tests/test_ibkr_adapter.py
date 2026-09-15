@@ -127,6 +127,16 @@ class FakeIB:
     def cancelOrder(self, order):
         order._cancelled = True
 
+    # news
+    def reqNewsProvidersAsync(self):
+        return _Finished([SimpleNamespace(code="BRFG", name="Briefing.com General Market Columns"),
+                          SimpleNamespace(code="BRFUPDN", name="Briefing.com Analyst Actions")])
+
+    async def reqHistoricalNewsAsync(self, conId, providerCodes, startDateTime, endDateTime, totalResults):
+        self.__dict__.setdefault("news_requests", []).append((conId, providerCodes, totalResults))
+        return [SimpleNamespace(time=dt.datetime(2026, 9, 14, 13, 0), providerCode="BRFG", articleId="BRFG$1",
+                                headline="{A:800015:L:en}Example Holdings beats on revenue")]
+
 
 class _Finished:
     """An awaitable that has already finished - what several ib_async request methods return."""
@@ -419,6 +429,13 @@ def test_open_orders_carry_direction_and_tag_so_a_restart_can_match_them(broker)
     [order] = broker.list_orders("WORKING")
     assert (order.symbol, order.side, order.tag, order.submitted_qty) == ("AAPL", Side.SHORT, "exit:trd_1", 10)
     assert broker._session.ib.placed[-1][1].orderRef == "exit:trd_1"
+
+
+def test_news_headlines_come_from_every_feed_the_account_can_read(broker):
+    got = broker.news_headlines({"AAPL": 265598}, days=3, per_symbol=5)
+    assert got == {"AAPL": [(dt.datetime(2026, 9, 14, 13, 0), "BRFG", "BRFG$1",
+                             "{A:800015:L:en}Example Holdings beats on revenue")]}
+    assert broker._session.ib.news_requests == [(265598, "BRFG+BRFUPDN", 5)]
 
 
 def test_open_orders_report_their_type_prices_and_time_in_force(broker):

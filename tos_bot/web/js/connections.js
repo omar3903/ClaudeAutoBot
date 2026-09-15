@@ -46,6 +46,14 @@ function render(d) {
       <details><summary>Setup steps</summary><ol class="steps">${ib.steps.map(s => `<li>${escapeHtml(s)}</li>`).join("")}</ol></details>
     </section>
 
+    <section class="conn">
+      <h4>Company news <span class="muted">· optional, for the signals</span></h4>
+      <p class="muted small">Insider trades and 8-K filings come from SEC, and headlines from IBKR, without any key.
+        A free Finnhub key adds more company news.</p>
+      <form class="field-grid" id="form-signals" onsubmit="return false">${(d.signal_fields || []).map(fieldHTML).join("")}</form>
+      <div class="row-gap"><button class="mini" id="signals-save">Save</button></div>
+    </section>
+
     <p class="muted small">Settings are saved to <code>.env</code> on this computer. The account id is never shown again — only its
       last 4 characters. These settings can only be changed from this machine.</p>`;
 
@@ -56,6 +64,7 @@ function render(d) {
     openConnections();
   };
   $("#ibkr-save").onclick = e => saveFields(e.currentTarget);
+  $("#signals-save").onclick = e => saveFields(e.currentTarget, "#form-signals");
   $$("[data-probe]").forEach(b => { b.onclick = () => probe(b); });
   $$(".field-clear").forEach(a => {
     a.onclick = ev => {
@@ -89,9 +98,9 @@ function fieldHTML(f) {
     <div>${input}${f.help ? `<div class="help">${escapeHtml(f.help)}</div>` : ""}</div>`;
 }
 
-async function saveFields(btn) {
+async function saveFields(btn, form = "#form-ibkr") {
   const values = {};
-  $$("#form-ibkr [data-key]").forEach(i => {
+  $$(`${form} [data-key]`).forEach(i => {
     const key = i.dataset.key;
     if (i.type === "password") {
       if (i.dataset.clear === "1") values[key] = "";

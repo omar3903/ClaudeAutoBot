@@ -15,6 +15,7 @@ os.environ["ATB_DATA_DIR"] = os.path.join(_RUN_DIR, "data")
 os.environ["TOS_RUNTIME_PATH"] = os.path.join(_RUN_DIR, "runtime.json")
 os.environ["OPEN_BROWSER_ON_START"] = "0"
 os.environ["PAPER_PERSIST"] = "0"
+os.environ["SIGNALS_ENABLED"] = "0"            # no test reaches SEC, IBKR news or Finnhub
 
 
 @pytest.fixture(scope="session", autouse=True)

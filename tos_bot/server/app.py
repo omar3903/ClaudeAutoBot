@@ -204,6 +204,10 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     def set_autopilot(body: dict):
         return _result(eng().set_autopilot(**(body or {})))
 
+    @app.get("/api/signals")
+    def signals_state():
+        return eng().signals.state()
+
     @app.get("/api/replay")
     def replay():
         return eng().replay_state()

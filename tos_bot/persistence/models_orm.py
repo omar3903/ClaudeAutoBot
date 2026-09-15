@@ -8,6 +8,9 @@ trades             an executed position's full lifecycle + realised P/L
 fills              individual executions attached to a trade
 account_snapshots  periodic equity / cash / buying-power / day-trade count
 order_audit        raw order request + broker response
+insider_trades     open-market insider purchases and sales, from SEC Form 4 filings
+filings_read       the SEC filings already read, so none is fetched twice
+news_items         company headlines and 8-K filings, with their sentiment
 """
 
 from __future__ import annotations
@@ -181,3 +184,54 @@ class OrderAudit(Base):
     response: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     ok: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     message: Mapped[str] = mapped_column(sa.String(400), default="")
+
+
+class InsiderTradeLog(Base):
+    __tablename__ = "insider_trades"
+
+    accession: Mapped[str] = mapped_column(sa.String(24), primary_key=True)
+    line: Mapped[int] = mapped_column(sa.Integer, primary_key=True)           # the transaction's place in the filing
+    symbol: Mapped[str] = mapped_column(sa.String(16), index=True)
+    issuer_cik: Mapped[int] = mapped_column(sa.BigInteger, default=0)
+    issuer_name: Mapped[str] = mapped_column(sa.String(160), default="")
+    owner_cik: Mapped[int] = mapped_column(sa.BigInteger, default=0)
+    owner_name: Mapped[str] = mapped_column(sa.String(160), default="")
+    role: Mapped[str] = mapped_column(sa.String(20), default="other")         # ceo_cfo / officer / director ...
+    title: Mapped[str] = mapped_column(sa.String(160), default="")
+    code: Mapped[str] = mapped_column(sa.String(2))                           # P purchase / S sale
+    trade_date: Mapped[dt.date] = mapped_column(sa.Date, index=True)
+    shares: Mapped[float] = mapped_column(MONEY, default=0)
+    price: Mapped[float] = mapped_column(MONEY, default=0)
+    shares_after: Mapped[float] = mapped_column(MONEY, default=0)
+    planned: Mapped[bool] = mapped_column(sa.Boolean, default=False)          # under a 10b5-1 plan
+    direct: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    offering: Mapped[bool] = mapped_column(sa.Boolean, default=False)         # bought in a placement or offering
+    filed: Mapped[Optional[dt.date]] = mapped_column(sa.Date, nullable=True)
+
+
+class FilingRead(Base):
+    __tablename__ = "filings_read"
+
+    accession: Mapped[str] = mapped_column(sa.String(24), primary_key=True)
+    form: Mapped[str] = mapped_column(sa.String(12), default="4")
+    filed: Mapped[Optional[dt.date]] = mapped_column(sa.Date, nullable=True, index=True)
+    trades: Mapped[int] = mapped_column(sa.Integer, default=0)                # open-market trades found in it
+    read_at: Mapped[dt.datetime] = mapped_column(sa.DateTime, default=_utcnow)
+
+
+class NewsLog(Base):
+    __tablename__ = "news_items"
+
+    key: Mapped[str] = mapped_column(sa.String(32), primary_key=True)
+    symbol: Mapped[str] = mapped_column(sa.String(16), index=True)
+    source: Mapped[str] = mapped_column(sa.String(12))                        # ibkr / sec / finnhub
+    provider: Mapped[str] = mapped_column(sa.String(40), default="")
+    kind: Mapped[str] = mapped_column(sa.String(12), default="news")          # news / analyst / filing
+    headline: Mapped[str] = mapped_column(sa.String(500))
+    url: Mapped[str] = mapped_column(sa.String(500), default="")
+    ref: Mapped[str] = mapped_column(sa.String(80), default="")
+    items: Mapped[str] = mapped_column(sa.String(60), default="")              # an 8-K's item numbers
+    published_at: Mapped[dt.datetime] = mapped_column(sa.DateTime, index=True)  # UTC
+    sentiment: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)  # -1 .. 1
+    sentiment_conf: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
+    fetched_at: Mapped[dt.datetime] = mapped_column(sa.DateTime, default=_utcnow)

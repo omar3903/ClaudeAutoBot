@@ -26,7 +26,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
+from typing import Any, Collection, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -43,6 +43,7 @@ from ..indicators import ta
 from ..strategies.base import Strategy
 from ..util import clock
 from . import schedule
+from ..signals.book import SignalBook
 from .evaluator import evaluate
 from .noise import NoiseSettings
 from .filters import TradeFilters
@@ -110,6 +111,8 @@ class Scanner:
         self.strategies: List[Strategy] = list(strategies)
         self._params = {"valuation": settings.config.valuation.model_dump()}
         self._noise = NoiseSettings.from_config(settings.config.noise)
+        #: insider and news signals (filled by the signals service); None leaves scores alone
+        self.signals: Optional[SignalBook] = None
 
     def set_strategies(self, strategies: Sequence[Strategy]) -> None:
         """Swap the active setups. A scan already running keeps the set it started with."""
@@ -161,7 +164,10 @@ class Scanner:
                 daily = self.md.daily_frame(m.symbol)
                 if daily is not None:
                     result.plays += evaluate(m.symbol, swing, daily, None, run_id=result.run_id,
-                                             equity=self._equity, params=self._params, activity=m, noise=self._noise)
+                                             equity=self._equity, params=self._params, activity=m, noise=self._noise,
+                                             signals=self.signals)
+            result.plays += self._signal_plays(swing, {m.symbol for m in ranked[:self.SWING_LEADERS]},
+                                               result.run_id)[0]
         with self._timed(result, "valuation_setups"):
             valuation = [s for s in strategies if swing_on and s.kind is StrategyKind.FUNDAMENTAL]
             if valuation:
@@ -207,7 +213,7 @@ class Scanner:
                      if (f := self._financials(p, benchmark)) is not None]
             plays += evaluate(m.symbol, strategies, self.md.daily_frame(m.symbol), None, run_id=run_id,
                               equity=self._equity, params=self._params, activity=m, fundamentals=fin, peers=peers,
-                              noise=self._noise)
+                              noise=self._noise, signals=self.signals)
         return plays
 
     def _financials(self, symbol: str, benchmark: Optional[pd.DataFrame]) -> Optional[Financials]:
@@ -249,16 +255,41 @@ class Scanner:
                     continue
                 activity = intraday_metrics(symbol, intraday[symbol], daily[symbol])
                 plays = evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
-                                 equity=self._equity, params=self._params, activity=activity, noise=self._noise)
+                                 equity=self._equity, params=self._params, activity=activity, noise=self._noise,
+                                 signals=self.signals)
                 result.plays += plays
                 if activity is not None:
                     heat[symbol] = activity.heat + (_PLAY_BONUS if plays else 0.0)
+            extra, looked_at = self._signal_plays([s for s in active if s.timeframe is Timeframe.SWING], set(symbols),
+                                                  result.run_id)
+            result.plays += extra
+            result.symbols = symbols + looked_at
         with self._watchlist_lock:
             if not fast:
                 result.decisions = wl.apply_cycle(heat, picks, cfg.kept_per_sector)
                 wl.save(self.watchlist_dir)
             result.hot = wl.hot_symbols()
         return self._finish(result, filters)
+
+    def _signal_plays(self, strategies: Sequence[Strategy], done: Collection[str],
+                      run_id: str) -> Tuple[List[Play], List[str]]:
+        """Swing setups on the stocks with unusual insider buying that this scan hasn't
+        looked at already - most of them aren't among the day's hottest. Returns the
+        plays and the stocks looked at."""
+        if self.signals is None or not strategies:
+            return [], []
+        plays: List[Play] = []
+        looked_at: List[str] = []
+        for symbol in self.signals.unusual_buying_symbols():
+            if symbol in done or not sector_allowed(self.symbols.sector(symbol), self.filters.sectors):
+                continue
+            daily = self.md.daily_frame(symbol)
+            if daily is None or len(daily) < 20:
+                continue
+            looked_at.append(symbol)
+            plays += evaluate(symbol, strategies, daily, None, run_id=run_id, equity=self._equity, params=self._params,
+                              activity=daily_metrics(symbol, daily), noise=self._noise, signals=self.signals)
+        return plays, looked_at
 
     # ---- shared ------------------------------------------------------------- #
     @property
