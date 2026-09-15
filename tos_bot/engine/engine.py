@@ -294,6 +294,10 @@ class TradingEngine:
         """OPEN trades held on the venue orders currently go to."""
         return [t for t in self._open_trades() if (t.get("broker") or "paper") == self._venue]
 
+    def working_entries(self) -> List[Dict[str, Any]]:
+        """Entry orders sent but not filled yet (see Executor.working_entries)."""
+        return self.executor.working_entries() if self.executor else []
+
     def _switch_blocked(self, target_venue: str) -> Optional[str]:
         """Refuse to move orders to another venue while positions are open on the
         current one - their automatic exits would go to the wrong account."""
@@ -655,24 +659,34 @@ class TradingEngine:
 
     def _reconcile_open_trades(self, force: bool = False) -> List[Dict[str, Any]]:
         """Delete OPEN trade records whose position no longer exists at the broker
-        that holds it (see reconcile.py for when an answer is trusted)."""
+        that holds it, and report positions of a different size than their records
+        add up to (see reconcile.py for when an answer is trusted)."""
         broker, venue, acc = self._broker, self._venue, self._account
         if broker is None or not broker.is_connected or acc is None or self.executor is None:
             return []
         now = time.monotonic()
-        busy = self.executor.pending_exit_trade_ids()
-        if self.exit_manager is not None:
-            busy |= self.exit_manager.closing
+        account_age_s, connection_age_s = now - self._account_at, now - self._broker_since
+        mine = [t for t in self._open_trades() if (t.get("broker") or "paper") == venue]
+        held = {p.symbol: float(p.quantity) for p in acc.positions if abs(p.quantity) > 1e-9}
         gone = self.position_check.gone(
-            venue, [t for t in self._open_trades() if (t.get("broker") or "paper") == venue],
-            held={p.symbol for p in acc.positions if abs(p.quantity) > 1e-9}, busy=busy,
-            account_age_s=now - self._account_at, connection_age_s=now - self._broker_since, force=force)
+            venue, mine, held=set(held), busy=self.executor.pending_exit_trade_ids(),
+            account_age_s=account_age_s, connection_age_s=connection_age_s, force=force)
         removed = [{"id": t["id"], "symbol": t["symbol"], "side": t["side"], "quantity": t["quantity"]}
                    for t in gone if self.repo.delete_trade(t["id"])]
         if removed:
             log.warning("removed %d trade record(s) no longer held at %s: %s", len(removed), venue,
                         ", ".join(r["symbol"] for r in removed))
             BUS.publish("trades.removed", trades=removed, venue=venue, venue_label=venue_label(venue))
+
+        removed_ids = {r["id"] for r in removed}
+        new = self.position_check.share_counts(
+            venue, venue_label(venue), [t for t in mine if t["id"] not in removed_ids], held=held,
+            in_flight=self.executor.symbols_in_flight(),
+            account_age_s=account_age_s, connection_age_s=connection_age_s)
+        for m in new:
+            log.warning("share counts disagree: %s", m["note"])
+        if new:
+            BUS.publish("positions.mismatch", mismatches=new)
         return removed
 
     def refresh_account_now(self) -> Dict[str, Any]:
@@ -1188,6 +1202,7 @@ class TradingEngine:
             "capital": self.capital_state(),
             "account": views.account(acc, cfg.account, paper=self.mode == "paper") if acc else None,
             "positions": views.positions(acc),
+            "mismatches": self.position_check.mismatches,
             "day_trades_5d": self.repo.count_day_trades(5),
             "day_trade_limit": cfg.account.max_day_trades_under_threshold,
             "pnl": self._pnl(),

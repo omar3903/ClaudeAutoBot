@@ -1,4 +1,4 @@
-"""Which OPEN trade records no longer have a position behind them.
+"""What the broker's positions say about the OPEN trade records.
 
 A position can disappear outside the app - closed in the broker's own window,
 or wiped by a simulator reset. Its record should go, but a slow or dropped
@@ -10,6 +10,10 @@ feed must never erase a live position, so a record only counts as gone when:
 * it's been missing on consecutive checks.
 
 A forced check (right after a simulator reset) skips the last three.
+
+A position can also be a different size than its records add up to - an order
+that filled twice, or shares traded in the broker's own window. That is only
+reported, never traded or deleted on: which number is right is the operator's call.
 """
 
 from __future__ import annotations
@@ -26,9 +30,14 @@ class PositionCheck:
 
     def __init__(self) -> None:
         self._misses: Dict[Tuple[str, str], int] = {}
+        self._apart: Dict[Tuple[str, str], Tuple[float, float]] = {}   # share counts last seen disagreeing
+        #: symbols whose records and broker position disagree, as of the last check
+        self.mismatches: List[Dict[str, Any]] = []
 
     def reset(self) -> None:
         self._misses.clear()
+        self._apart.clear()
+        self.mismatches = []
 
     def gone(self, venue: str, trades: Iterable[Mapping[str, Any]], held: Set[str], busy: Set[str],
              account_age_s: float, connection_age_s: float, force: bool = False) -> List[Mapping[str, Any]]:
@@ -57,6 +66,46 @@ class PositionCheck:
         for t in out:
             self._misses.pop((venue, t["symbol"]), None)
         return out
+
+    def share_counts(self, venue: str, where: str, trades: Iterable[Mapping[str, Any]],
+                     held: Mapping[str, float], in_flight: Set[str],
+                     account_age_s: float, connection_age_s: float) -> List[Dict[str, Any]]:
+        """Symbols whose open records add up to a different position than the broker
+        holds (``held``: signed shares per symbol), seen the same on consecutive
+        checks. ``self.mismatches`` becomes the current list; the ones not reported
+        before are returned."""
+        if account_age_s > self.FRESH_ACCOUNT_S or connection_age_s < self.SETTLE_S:
+            return []
+        recorded: Dict[str, float] = {}
+        records: Dict[str, int] = {}
+        for t in trades:
+            sign = 1.0 if t["side"] == "LONG" else -1.0
+            recorded[t["symbol"]] = recorded.get(t["symbol"], 0.0) + sign * abs(float(t["quantity"] or 0.0))
+            records[t["symbol"]] = records.get(t["symbol"], 0) + 1
+        previous, self._apart = self._apart, {}
+        found: List[Dict[str, Any]] = []
+        for symbol, mine in sorted(recorded.items()):
+            theirs = float(held.get(symbol, 0.0))
+            if symbol in in_flight or abs(theirs) < 1e-9 or abs(theirs - mine) < 1e-6:
+                continue            # orders still filling, gone entirely (see gone()), or in agreement
+            key = (venue, symbol)
+            self._apart[key] = (mine, theirs)
+            if previous.get(key) != (mine, theirs):
+                continue            # confirm on the next check - a fill may still be landing
+            n = records[symbol]
+            found.append({
+                "symbol": symbol, "recorded": mine, "held": theirs, "records": n,
+                "note": (f"{symbol}: {where} holds {_shares(theirs)}, but the app's "
+                         f"{'open trade is' if n == 1 else f'{n} open trades are'} for {_shares(mine)}. "
+                         f"Nothing is traded or deleted because of it - check the position at {where}."),
+            })
+        new = [m for m in found if m not in self.mismatches]
+        self.mismatches = found
+        return new
+
+
+def _shares(signed: float) -> str:
+    return f"{abs(signed):,.0f} shares {'long' if signed > 0 else 'short'}"
 
 
 def _age_s(entry_time: Optional[str]) -> float:

@@ -42,8 +42,8 @@ def setup_logging(level: str = "INFO") -> None:
     fileh.setFormatter(fmt)
     root.addHandler(fileh)
 
-    # third-party noise
-    for noisy in ("httpx", "urllib3", "asyncio"):
+    # third-party noise - ib_async logs every position, execution and order status at INFO
+    for noisy in ("httpx", "urllib3", "asyncio", "ib_async"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     _CONFIGURED = True

@@ -12,6 +12,10 @@ from typing import List, Optional
 from ..core.models import Account, OrderRequest, OrderResult, Quote
 
 
+#: order states after which an order never fills any further
+DONE_STATUSES = frozenset({"FILLED", "CANCELED", "REJECTED", "EXPIRED"})
+
+
 class BrokerError(RuntimeError):
     pass
 

@@ -1,9 +1,10 @@
 """IBKR adapter - exercised against a fake ``ib_async.IB`` (no socket, no loop).
 
-Covers the translation layer: interval -> barSize, order action (LONG/SHORT x
-entry/exit -> BUY/SELL), account parsing, quote NaN fallback, the delayed-data
-downgrade, bar-frame shaping, and connection state. The real Gateway path is
-not tested here (it needs a running IB Gateway).
+Covers the translation layer: interval -> barSize, order action (an order's
+side is its direction, exits included), order states and IBKR's rejection
+reasons, account parsing, quote NaN fallback, the delayed-data downgrade,
+bar-frame shaping, and connection state. The real Gateway path is not tested
+here (it needs a running IB Gateway).
 """
 
 from __future__ import annotations
@@ -13,11 +14,14 @@ import datetime as dt
 from types import SimpleNamespace
 
 import pytest
+from ib_async.order import OrderStatus
 
 from tos_bot.brokers import ibkr_adapter as mod
-from tos_bot.brokers.base import AuthError, OrderRejected
+from tos_bot.brokers.base import DONE_STATUSES, AuthError, OrderRejected
+from tos_bot.brokers.paper_adapter import PaperBroker
 from tos_bot.core.enums import OrderType, Side, TimeInForce
-from tos_bot.core.models import OrderRequest
+from tos_bot.core.models import OrderRequest, Quote
+from tos_bot.execution.order_builder import build_exit_order
 
 
 # --------------------------------------------------------------------------- #
@@ -158,8 +162,14 @@ def test_norm_status_and_tif():
     assert mod._norm_status("PreSubmitted") == "SUBMITTED"
     assert mod._norm_status("Submitted") == "WORKING"
     assert mod._norm_status("Filled") == "FILLED"
+    assert mod._norm_status("Cancelled") == "CANCELED" and mod._norm_status("Inactive") == "REJECTED"
     assert mod._tif(TimeInForce.GTC) == "GTC"
     assert mod._tif(TimeInForce.DAY) == "DAY"
+
+
+def test_ibkrs_finished_order_states_are_the_apps_finished_states():
+    assert {mod._norm_status(s) for s in OrderStatus.DoneStates} <= DONE_STATUSES
+    assert not {mod._norm_status(s) for s in OrderStatus.ActiveStates} & DONE_STATUSES
 
 
 def test_bars_to_df_shape_and_tz():
@@ -172,6 +182,16 @@ def test_bars_to_df_shape_and_tz():
     assert str(df.index.tz) == "America/New_York"
     assert df.index.is_monotonic_increasing
     assert df["volume"].iloc[0] == 3.0                # IBKR reports stock volume in shares
+
+
+def test_daily_bars_stay_on_their_session_date():
+    # IBKR sends daily bars as plain dates; read as UTC midnight they'd land on
+    # the previous evening in New York, a whole session early
+    bars = [SimpleNamespace(date=dt.date(2026, 9, day), open=1.0, high=2.0, low=0.5, close=1.5, volume=100)
+            for day in (10, 11)]
+    df = mod._bars_to_df(bars)
+    assert [t.date() for t in df.index] == [dt.date(2026, 9, 10), dt.date(2026, 9, 11)]
+    assert (df.index.hour == 0).all() and str(df.index.tz) == "America/New_York"
 
 
 def test_port_is_open_false_on_dead_port():
@@ -231,18 +251,48 @@ def test_contract_details_tell_stocks_from_unknown_symbols(broker):
 
 
 @pytest.mark.parametrize("side,is_entry,expect", [
-    (Side.LONG, True, "BUY"),      # open long
-    (Side.SHORT, True, "SELL"),    # open short
-    (Side.LONG, False, "SELL"),    # close long
-    (Side.SHORT, False, "BUY"),    # cover short
+    (Side.LONG, True, "BUY"),      # open a long
+    (Side.SHORT, True, "SELL"),    # open a short
+    (Side.SHORT, False, "SELL"),   # close a long
+    (Side.LONG, False, "BUY"),     # cover a short
 ])
-def test_order_action_mapping(broker, side, is_entry, expect):
+def test_an_orders_side_is_its_direction(broker, side, is_entry, expect):
     req = OrderRequest(symbol="AAPL", side=side, quantity=10,
                        order_type=OrderType.MARKET, is_entry=is_entry)
     res = broker.place_order(req)
     assert res.symbol == "AAPL" and res.order_id
     _, order = broker._session.ib.placed[-1]
     assert order.action == expect
+
+
+@pytest.mark.parametrize("position", [Side.LONG, Side.SHORT])
+def test_an_exit_closes_the_position_at_ibkr_and_in_the_simulator(broker, position):
+    # one exit order has to flatten the position on both brokers - IBKR once read
+    # the side as the position's and bought more instead of selling
+    exit_order = build_exit_order("AAPL", position.value, 10)
+    broker.place_order(exit_order)
+    assert broker._session.ib.placed[-1][1].action == ("SELL" if position is Side.LONG else "BUY")
+
+    sim = PaperBroker(quote=lambda s: Quote(symbol=s, bid=99.9, ask=100.1, last=100.0))
+    sim.connect()
+    sim.place_order(OrderRequest(symbol="AAPL", side=position, quantity=10, order_type=OrderType.MARKET))
+    sim.place_order(exit_order)
+    assert sim.get_account().position("AAPL") is None
+
+
+def test_a_rejected_order_is_finished_with_ibkrs_reason(broker):
+    res = broker.place_order(build_exit_order("AAPL", "LONG", 10))
+    contract, order = broker._session.ib.placed[-1]
+    rejected = SimpleNamespace(
+        order=order, contract=contract, fills=[],
+        orderStatus=SimpleNamespace(status="Cancelled", filled=0, avgFillPrice=0.0),
+        log=[SimpleNamespace(errorCode=0, message=""),
+             SimpleNamespace(errorCode=201, message="Error 201, reqId 1: Order rejected - reason:Your "
+                                                    "Available Funds are in sufficient<br>to cover it.")])
+    broker._session.ib.trades = lambda: [rejected]
+    got = broker.get_order(res.order_id)
+    assert got.status == "CANCELED" and got.status in DONE_STATUSES
+    assert got.message == "Order rejected - reason:Your Available Funds are in sufficient to cover it."
 
 
 def test_limit_order_carries_price_and_tif(broker):

@@ -10,7 +10,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from tos_bot.core.enums import AssetClass, Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
+from tos_bot.core.models import Account, Play, Position
 from tos_bot.execution.autopilot import AutoPilot
 
 SILENT = SimpleNamespace(publish=lambda *a, **k: None)
@@ -39,7 +39,9 @@ class FakeEngine:
     def __init__(self, mode="paper", equity=100_000.0):
         self.mode = mode
         self.repo = FakeRepo()
-        self._account = SimpleNamespace(equity=equity)
+        self._account = Account(account_id="SIM", equity=equity)
+        self.working = []                       # entry orders sent but not filled
+        self.fill_later = False                 # approve_play leaves the entry working
         self.assess_calls = []
         self.approved = []
         self.can_execute = True
@@ -59,6 +61,10 @@ class FakeEngine:
         self.approved.append((pid, operator))
         tid = f"trade_{pid}"
         pl = self._plays.get(pid)
+        if self.fill_later:
+            self.working.append({"order_id": f"o_{pid}", "play_id": pid, "symbol": pl.symbol,
+                                 "strategy": pl.strategy, "qty": 10, "risk": self.est_risk})
+            return {"ok": True, "status": "WORKING"}
         # an open position whose $-risk equals est_risk (entry 100, stop 80, x10)
         self.repo._open.append({
             "id": tid, "symbol": getattr(pl, "symbol", "X"),
@@ -67,6 +73,9 @@ class FakeEngine:
             "initial_stop_price": 100.0 - self.est_risk / 10.0, "quantity": 10,
         })
         return {"ok": True, "trade_id": tid}
+
+    def working_entries(self):
+        return list(self.working)
 
     def approved_ids(self):
         return [pid for pid, _ in self.approved]
@@ -211,16 +220,16 @@ def test_cooldown_after_loss_skips_a_stopped_name():
     eng = FakeEngine()
     from tos_bot.util import clock
     eng.repo._closed = [{
-        "symbol": "QCOM", "status": "CLOSED",
+        "symbol": "AAA", "status": "CLOSED",
         "session_date": clock.session_date().isoformat(),
-        "realized_pl": -197.0,
+        "realized_pl": -100.0,
     }]
     ap = AutoPilot(eng, _cfg(cooldown_after_loss=True), bus=SILENT)
-    _run(ap, mkplay(sym="QCOM"))
+    _run(ap, mkplay(sym="AAA"))
     assert eng.approved == []
     # a winner earlier today does NOT trigger the cooldown
     eng.repo._closed[0]["realized_pl"] = 50.0
-    _run(ap, mkplay(sym="QCOM"))
+    _run(ap, mkplay(sym="AAA"))
     assert eng.approved_ids() and eng.approved_ids()[0].startswith("play_")
 
 
@@ -277,3 +286,38 @@ def test_day_mode_active_truth_table():
     eng_live = FakeEngine(mode="live")
     ap_live = AutoPilot(eng_live, _cfg(enabled=True, allow_live=False, trade_types=["INTRADAY"]), bus=SILENT)
     assert ap_live.day_mode_active(market_open=True) is False
+
+
+# --------------------------------------------------------------------------- #
+#  orders still working
+# --------------------------------------------------------------------------- #
+def test_an_entry_still_working_counts_as_a_position_and_so_does_its_late_fill():
+    eng = FakeEngine()
+    eng.fill_later = True
+    ap = AutoPilot(eng, _cfg(max_auto_positions=1), bus=SILENT)
+    first = mkplay(sym="AAA")
+    _run(ap, first)
+    _run(ap, mkplay(sym="BBB"))
+    assert eng.approved_ids() == [first.id] and ap.status()["open_auto_positions"] == 1
+
+    # the fill lands after approve_play returned, so its trade only carries the play id
+    eng.working.clear()
+    eng.repo._open.append({"id": "late", "play_id": first.id, "symbol": "AAA", "strategy": first.strategy,
+                           "entry_price": 100.0, "initial_stop_price": 80.0, "quantity": 10})
+    _run(ap, mkplay(sym="CCC"))
+    assert eng.approved_ids() == [first.id] and ap.status()["open_auto_positions"] == 1
+
+
+def test_no_entry_while_an_order_for_the_symbol_is_working():
+    eng = FakeEngine()
+    eng.working.append({"order_id": "o1", "play_id": "someone_elses", "symbol": "AAA",
+                        "strategy": "vwap_reclaim", "qty": 10, "risk": 20.0})
+    _run(AutoPilot(eng, _cfg(), bus=SILENT), mkplay(sym="AAA"))
+    assert eng.approved == []
+
+
+def test_no_entry_in_a_symbol_the_account_already_holds():
+    eng = FakeEngine()
+    eng._account.positions.append(Position(symbol="AAA", quantity=500, avg_price=5.0))
+    _run(AutoPilot(eng, _cfg(), bus=SILENT), mkplay(sym="AAA"))
+    assert eng.approved == []
