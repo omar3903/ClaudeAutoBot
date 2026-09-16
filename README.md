@@ -555,7 +555,8 @@ are never auto-traded. Eligible plays get a **🤖** marker.
 taken, averaging at least `min_replay_expectancy_r` (+0.05R) — **and** at least 10
 of them in the held-out latest third of the sessions, averaging more than 0R
 there. The statistical noise checks (`not_trending`, `not_mean_reverting`,
-`turbulent_market`) are skipped by themselves once the replay shows that the
+`turbulent_market`) and the two news checks (`news_driven_move`,
+`move_without_news`) are skipped by themselves once the replay shows that the
 trades they remove did worse on every session and on the held-out ones. Each
 entry risks no more than `risk.max_risk_per_trade_pct`, lowered to **half-Kelly**
 when the strategy's record calls for less.
@@ -618,7 +619,10 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
   the move, the market's part, z and the stories found.
 - These three flags start as information: Autopilot doesn't skip them unless you add them to
   `autopilot.skip_noise`, and each day's journal compares how the flagged plays not taken would have done.
-  The replay can't test them yet - it has no news history.
+  The replay measures the two news flags from the headlines the app has stored (each story counts from
+  the moment it was published, and the S&P 500 ETF's candles feed the market model), so as the store
+  grows, Autopilot learns to skip them the way it learns the statistical checks. The earnings flag
+  needs a calendar history the app doesn't keep.
 - They are kept in the `insider_trades`, `filings_read` and `news_items` tables, and the calendar in
   `data/signals/earnings_calendar.json`.
 

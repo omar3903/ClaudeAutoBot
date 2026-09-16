@@ -30,7 +30,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .. import secrets_store
 from ..brokers import get_broker
@@ -482,7 +482,18 @@ class TradingEngine:
             noise=NoiseSettings.from_config(cfg.noise), con_ids=self.scanner.con_ids(symbols["intraday"]),
             market=self._regime_history, earnings=self.earnings.times if cfg.signals.enabled else None,
             pairs=self._pair_replay_inputs() if cfg.pairs.enabled else None,
-            held_out_fraction=float(cfg.replay.held_out_fraction))
+            held_out_fraction=float(cfg.replay.held_out_fraction),
+            news=self._news_history if cfg.signals.enabled else None, benchmark=BENCHMARK)
+
+    def _news_history(self, symbols: Sequence[str], first_day: dt.date) -> Dict[str, List[Dict[str, Any]]]:
+        """Each stock's stored stories since ``first_day`` - as far back as the app has been reading
+        the news - shaped like the signal book's, for the replay's news checks."""
+        since = dt.datetime.combine(first_day, dt.time(0, 0), tzinfo=dt.timezone.utc) - dt.timedelta(days=5)
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for row in self.signals.store.news(list(symbols), since):
+            out.setdefault(row["symbol"], []).append({"at": row["published_at"], "headline": row.get("headline"),
+                                                      "kind": row.get("kind"), "source": row.get("source")})
+        return out
 
     def _regime_history(self, first_day: dt.date) -> Dict[dt.date, float]:
         self._refresh_regime()

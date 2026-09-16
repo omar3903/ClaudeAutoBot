@@ -111,6 +111,48 @@ def test_an_open_day_trade_is_flattened_before_the_close():
     assert t.exit_reason == "eod-flatten" and t.r == 0.5 and t.exited_at.startswith(f"{DAY}T15:50")
 
 
+def _spy(day_prices):
+    """The S&P 500 ETF: daily closes with a little noise, and a flat session of 5-minute candles."""
+    rng = np.random.default_rng(3)
+    idx = pd.bdate_range(end=pd.Timestamp(DAY - dt.timedelta(days=1)), periods=45, tz=NY)
+    c = 500 * np.exp(np.cumsum(rng.normal(0.0, 0.006, len(idx))))
+    daily = pd.DataFrame({"open": c, "high": c + 1, "low": c - 1, "close": c, "volume": np.full(len(idx), 5e7)}, index=idx)
+    bars = _session([(day_prices, day_prices + 0.1, day_prices - 0.1, day_prices)] * 6)
+    return daily, bars
+
+
+def _noisy_daily():
+    rng = np.random.default_rng(5)
+    idx = pd.bdate_range(end=pd.Timestamp(DAY - dt.timedelta(days=1)), periods=45, tz=NY)
+    c = 100 * np.exp(np.cumsum(rng.normal(0.0, 0.004, len(idx))))
+    return pd.DataFrame({"open": c, "high": c + 0.5, "low": c - 0.5, "close": c, "volume": np.full(len(idx), 3e6)},
+                        index=idx)
+
+
+def test_the_news_checks_see_the_stories_out_by_each_bar_and_the_market_model():
+    daily = _noisy_daily()
+    prev = float(daily["close"].iloc[-1])
+    jump = round(prev * 1.06, 2)                                            # today the stock is up 6% on its own
+    spy_daily, spy_bars = _spy(500.0)
+    session = _session([(jump, jump + 0.05, jump - 0.05, jump)] * 6 + [(jump, jump + 0.1, jump - 0.1, jump),
+                                                                        (jump, jump + 2.5, jump - 0.1, jump + 2.2)])
+    kw = dict(settings=EXACT, noise=NoiseSettings(min_expected_r=-99.0, abnormal_z=2.0), benchmark_bars=spy_bars,
+              benchmark_daily=spy_daily)
+    # no stories out: a momentum long chasing the move is flagged as a move without news
+    [quiet] = replay_intraday([_LongAtBar()], "NWS", session, daily, news=[{"at": f"{DAY}T18:00:00+00:00"}], **kw)
+    assert "move_without_news" in quiet.noise
+    # a story published before the bar: the move came with news, so the flag is off
+    [told] = replay_intraday([_LongAtBar()], "NWS", session, daily, news=[{"at": f"{DAY}T12:00:00+00:00"}], **kw)
+    assert "move_without_news" not in told.noise
+    # no stories given at all: as live, the check stays silent
+    [unknown] = replay_intraday([_LongAtBar()], "NWS", session, daily, **kw)
+    assert "move_without_news" not in unknown.noise
+    # and without the benchmark there is no market model to read the move against
+    [blind] = replay_intraday([_LongAtBar()], "NWS", session, daily, settings=EXACT, noise=QUIET,
+                              news=[{"at": f"{DAY}T18:00:00+00:00"}])
+    assert "move_without_news" not in blind.noise
+
+
 def test_no_fill_when_the_next_open_has_already_run_away():
     assert _replay([(101.0, 101.1, 100.9, 101.0)]) == []
 

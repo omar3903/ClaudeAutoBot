@@ -26,8 +26,10 @@ Chan's rules for a backtest worth believing (*Quantitative Trading*, ch. 3):
   wants a strategy to have made money there too. A result that holds up only on the
   earlier sessions was probably luck.
 * **no look-ahead** - the market's regime on a day comes from a model fitted on earlier
-  days only, tomorrow's volatility from completed candles, and an earnings report counts
-  from the moment SEC accepted the filing.
+  days only, tomorrow's volatility from completed candles, an earnings report counts
+  from the moment SEC accepted the filing, and a headline from the moment it was
+  published - the news checks see, at each bar, the stories out by then and the S&P 500
+  ETF's candles up to then (as far back as the app has been storing headlines).
 
 What it can't know: a fill is assumed at the next bar's open (and skipped when
 that open has already run away from the entry), a stop and a target in the same
@@ -48,7 +50,7 @@ from ..core.models import Play
 from ..data.market_data import quote_from_price
 from ..scanner.evaluator import with_today
 from ..scanner.filters import expected_r
-from ..scanner.noise import CHECKS, QUANT_CHECKS, NoiseSettings, context_flags
+from ..scanner.noise import CHECKS, LEARNABLE_CHECKS, NoiseSettings, context_flags
 from ..strategies.base import Strategy, StrategyContext
 from ..util import clock
 
@@ -133,12 +135,18 @@ class _Position:
 def replay_intraday(strategies: Sequence[Strategy], symbol: str, bars: pd.DataFrame, daily: pd.DataFrame,
                     settings: ReplaySettings = ReplaySettings(), noise: NoiseSettings = NoiseSettings(),
                     sessions: Optional[int] = None, market: Optional[Mapping[dt.date, float]] = None,
-                    earnings: Sequence[str] = ()) -> List[SimTrade]:
+                    earnings: Sequence[str] = (), news: Sequence[Mapping[str, Any]] = (),
+                    benchmark_bars: Optional[pd.DataFrame] = None,
+                    benchmark_daily: Optional[pd.DataFrame] = None) -> List[SimTrade]:
     """``bars``: 5-minute candles over several sessions; ``daily``: completed daily candles;
     ``market``: the probability of the turbulent regime for each day, known before it opened;
-    ``earnings``: when SEC accepted the stock's earnings filings (8-K item 2.02), ISO times in UTC."""
+    ``earnings``: when SEC accepted the stock's earnings filings (8-K item 2.02), ISO times in UTC;
+    ``news``: the stock's stored stories, each with ``at`` (ISO, UTC) - the news checks see, at
+    every bar, the ones out by then; ``benchmark_bars`` / ``benchmark_daily``: the S&P 500 ETF's
+    5-minute and daily candles, for the market model behind those checks."""
     day_trades = [s for s in strategies if s.kind is StrategyKind.TECHNICAL and s.timeframe is Timeframe.INTRADAY]
     days = sorted(set(bars.index.date))
+    stories = _stories(news)
     trades: List[SimTrade] = []
     for day in days[-sessions:] if sessions else days:
         session = bars[bars.index.date == day]
@@ -146,14 +154,17 @@ def replay_intraday(strategies: Sequence[Strategy], symbol: str, bars: pd.DataFr
         if not day_trades or len(prior_daily) < 20 or len(session) < settings.warmup_bars + 2:
             continue
         flatten_at = _at(day, clock.regular_close_time(day)) - pd.Timedelta(minutes=settings.flatten_before_close_min)
+        benchmark = _Benchmark(benchmark_daily, benchmark_bars, day)
         trades += _replay_session(day_trades, symbol, session, bars, prior_daily, flatten_at, settings, noise,
-                                  regime(market, day), earnings_signals(earnings, day))
+                                  regime(market, day), earnings_signals(earnings, day), stories, benchmark)
     return trades
 
 
 def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.DataFrame, history: pd.DataFrame,
                     prior_daily: pd.DataFrame, flatten_at: pd.Timestamp, settings: ReplaySettings,
-                    noise: NoiseSettings, market: Dict[str, Any], signals: Any) -> List[SimTrade]:
+                    noise: NoiseSettings, market: Dict[str, Any], signals: Any,
+                    stories: Sequence[Tuple[pd.Timestamp, Mapping[str, Any]]] = (),
+                    benchmark: Optional["_Benchmark"] = None) -> List[SimTrade]:
     trades: List[SimTrade] = []
     open_positions: Dict[str, _Position] = {}
     seen_before: set = set()
@@ -165,7 +176,9 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
         window = history.iloc[max(0, end - LIVE_INTRADAY_BARS):end]
         ctx = StrategyContext(symbol=symbol, intraday=window, daily=with_today(prior_daily, window),
                               quote=quote_from_price(symbol, float(window["close"].iloc[-1])),
-                              now=closed_at.to_pydatetime(), signals=signals, market=dict(market))
+                              now=closed_at.to_pydatetime(), signals=signals, market=dict(market),
+                              news=news_at(stories, closed_at),
+                              benchmark=benchmark.closes_at(closed_at) if benchmark is not None else None)
         signals_now = _signals(strategies, ctx, noise)
         for strategy, play, flags in signals_now:
             if strategy.key not in open_positions:
@@ -189,19 +202,24 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
 # ---------------------------------------------------------------- swing trades
 def replay_swing(strategies: Sequence[Strategy], symbol: str, daily: pd.DataFrame,
                  settings: ReplaySettings = ReplaySettings(), noise: NoiseSettings = NoiseSettings(),
-                 sessions: int = 250, market: Optional[Mapping[dt.date, float]] = None) -> List[SimTrade]:
+                 sessions: int = 250, market: Optional[Mapping[dt.date, float]] = None,
+                 news: Sequence[Mapping[str, Any]] = (),
+                 benchmark_daily: Optional[pd.DataFrame] = None) -> List[SimTrade]:
     """Signals at each session's close, fills at the next open. Trades still open
     when the candles run out are left out - their result isn't known yet."""
     swing = [s for s in strategies if s.kind is StrategyKind.TECHNICAL and s.timeframe is Timeframe.SWING]
+    stories = _stories(news)
     trades: List[SimTrade] = []
     open_positions: Dict[str, _Position] = {}
     for i in range(max(60, len(daily) - sessions - 1), len(daily) - 1):
         history, next_at, next_bar = daily.iloc[:i + 1], daily.index[i + 1], daily.iloc[i + 1]
         closed_on = history.index[-1].date()
+        close_at = _at(closed_on, clock.regular_close_time(closed_on))
+        benchmark = _Benchmark(benchmark_daily, None, closed_on)
         ctx = StrategyContext(symbol=symbol, intraday=None, daily=history,
                               quote=quote_from_price(symbol, float(history["close"].iloc[-1])),
-                              now=_at(closed_on, clock.regular_close_time(closed_on)).to_pydatetime(),
-                              market=regime(market, next_at.date()))
+                              now=close_at.to_pydatetime(), market=regime(market, next_at.date()),
+                              news=news_at(stories, close_at), benchmark=benchmark.closes_at(close_at, whole_day=True))
         for strategy, play, flags in _signals(swing, ctx, noise) if swing else []:
             if strategy.key not in open_positions:
                 position = _enter(strategy.key, play, flags, True, next_at, float(next_bar["open"]),
@@ -245,6 +263,54 @@ def shadow_trade(play: Play, session: pd.DataFrame, seen_at: pd.Timestamp,
 def regime(market: Optional[Mapping[dt.date, float]], day: dt.date) -> Dict[str, Any]:
     p = (market or {}).get(day)
     return {} if p is None else {"p_turbulent": round(float(p), 3), "regime": "turbulent" if p >= 0.5 else "calm"}
+
+
+def _stories(news: Sequence[Mapping[str, Any]]) -> List[Tuple[pd.Timestamp, Mapping[str, Any]]]:
+    """The stories with a readable time, oldest first, each stamped as an aware timestamp."""
+    out = []
+    for story in news or ():
+        try:
+            at = pd.Timestamp(story["at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append((at.tz_localize("UTC") if at.tzinfo is None else at, story))
+    return sorted(out, key=lambda pair: pair[0])
+
+
+def news_at(stories: Sequence[Tuple[pd.Timestamp, Mapping[str, Any]]], now: pd.Timestamp,
+            days: int = 5) -> Optional[Dict[str, Any]]:
+    """The stock's news as it stood at ``now``: the stories out by then (the last few days), read
+    just now. None when the replay was given no stories for the stock - then, as live, the news
+    checks stay silent rather than claim the move came without news."""
+    if not stories:
+        return None
+    since = now - pd.Timedelta(days=days)
+    return {"checked_at": now.to_pydatetime(),
+            "stories": [dict(story, at=at.isoformat()) for at, story in stories if since <= at <= now]}
+
+
+class _Benchmark:
+    """The S&P 500 ETF's closes as the market model would see them at a moment of ``day``: the
+    completed sessions before it, plus the day's own price so far from its 5-minute candles."""
+
+    def __init__(self, daily: Optional[pd.DataFrame], bars: Optional[pd.DataFrame], day: dt.date) -> None:
+        self.before = daily["close"][daily.index.date < day] if daily is not None and len(daily) else None
+        self.through_day = daily["close"][daily.index.date <= day] if daily is not None and len(daily) else None
+        self.session = bars[bars.index.date == day] if bars is not None and len(bars) else None
+        self.day = day
+
+    def closes_at(self, now: pd.Timestamp, whole_day: bool = False) -> Optional[pd.Series]:
+        if self.before is None or len(self.before) < 2:
+            return None
+        if whole_day:                       # a swing signal comes at the close: the session is a completed candle
+            return self.through_day
+        if self.session is None:
+            return None
+        so_far = self.session[self.session.index < now]
+        if not len(so_far):
+            return None
+        today = pd.Series([float(so_far["close"].iloc[-1])], index=pd.DatetimeIndex([_at(self.day, dt.time(16, 0))]))
+        return pd.concat([self.before, today])
 
 
 def earnings_signals(accepted: Sequence[str], day: dt.date) -> Any:
@@ -417,10 +483,11 @@ def _partition(trades: Sequence[SimTrade], test) -> Tuple[List[SimTrade], List[S
 
 
 def learned_skips(report: Optional[Mapping[str, Mapping[str, Any]]]) -> List[str]:
-    """The checks from the books' statistics that the replay shows are worth skipping: the
-    trades they remove did worse over every session and over the held-out sessions too."""
+    """The checks from the books' statistics and the news that the replay shows are worth
+    skipping: the trades they remove did worse over every session and over the held-out
+    sessions too."""
     out = []
-    for check in QUANT_CHECKS:
+    for check in LEARNABLE_CHECKS:
         row = (report or {}).get(check) or {}
         if str(row.get("verdict", "")).startswith("helps") and \
                 str((row.get("held_out") or {}).get("verdict", "")).startswith("helps"):
