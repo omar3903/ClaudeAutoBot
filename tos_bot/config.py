@@ -213,6 +213,8 @@ class ReplayCfg(_Model):
     slippage_bps: float = 5.0             # on every market fill, each way
     commission_bps: float = 1.0           # on every fill
     held_out_fraction: float = 0.3334     # the latest sessions kept out of sample
+    workers: int = 0                      # processes replaying stocks side by side; 0 = every core but two
+    sessions_per_job: int = 10            # a day-trade job replays this many sessions of one stock, so the work spreads
 
 
 class PairsCfg(_Model):

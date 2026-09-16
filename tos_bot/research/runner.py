@@ -2,7 +2,12 @@
 
 One replay at a time runs on its own thread and reports its progress on the bus.
 Replaying is CPU work and every stock is independent, so the stocks are spread
-over a few worker processes. The simulated trades are saved, so the records
+over worker processes - all the machine's cores but two, unless config says
+otherwise. A day-trade replay of one stock is cut into chunks of a few sessions
+(each chunk carries the sessions before it that the rolling window needs, and a
+day trade never spans sessions), so the long jobs don't leave workers idle at
+the end; a swing replay carries positions from session to session and stays
+one job per stock. The simulated trades are saved, so the records
 survive a restart and can be re-read with different Autopilot settings (which
 noise flags it skips, how many confirmations it wants) without replaying again.
 
@@ -22,7 +27,7 @@ import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -37,6 +42,9 @@ from .replay import (HELD_OUT_FRACTION, ReplaySettings, SimTrade, held_out_from,
 log = logging.getLogger(__name__)
 
 HISTORY_FILE = "replay_runs.jsonl"
+SESSIONS_PER_JOB = 10
+#: sessions of 5-minute candles a day-trade context looks back over (replay.LIVE_INTRADAY_BARS)
+LOOKBACK_SESSIONS = 5
 
 
 class ReplayRunner:
@@ -45,7 +53,9 @@ class ReplayRunner:
         self.history = history
         self.bus = bus
         #: worker processes; 1 replays on the runner's own thread
-        self.workers = workers if workers is not None else max(1, min(6, (os.cpu_count() or 2) - 1))
+        self.workers = workers if workers else max(1, (os.cpu_count() or 2) - 2)
+        #: sessions per day-trade job (see the module docstring)
+        self.sessions_per_job = SESSIONS_PER_JOB
         self._thread: Optional[threading.Thread] = None
         self._progress: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()
@@ -112,9 +122,10 @@ class ReplayRunner:
             bench_daily = daily_frame(benchmark) if benchmark else None
             split = {"INTRADAY": held_out_from(last, sessions, fraction),
                      "SWING": held_out_from(last, swing_sessions, fraction)}
-            jobs = [("intraday", strategies, s, bars[s], daily, settings, noise, sessions, regime, reports.get(s, ()),
+            jobs = [("intraday", strategies, s, chunk, daily, settings, noise, n, regime, reports.get(s, ()),
                      stories.get(s, ()), bench_bars, bench_daily)
-                    for s in intraday_symbols if s in bars and (daily := daily_frame(s)) is not None]
+                    for s in intraday_symbols if s in bars and (daily := daily_frame(s)) is not None
+                    for chunk, n in session_chunks(bars[s], sessions, self.sessions_per_job)]
             jobs += [("swing", strategies, s, None, daily, settings, noise, swing_sessions, regime, (),
                       stories.get(s, ()), None, bench_daily)
                      for s in swing_symbols if (daily := daily_frame(s)) is not None]
@@ -257,6 +268,22 @@ class ReplayRunner:
                 f.write(json.dumps(summary) + "\n")
         except OSError:
             log.warning("could not add the replay to its history", exc_info=True)
+
+
+def session_chunks(bars: pd.DataFrame, sessions: int, size: int) -> List[Tuple[pd.DataFrame, int]]:
+    """Cut the last ``sessions`` sessions of a stock's 5-minute candles into jobs of ``size``
+    sessions. Each job's frame also holds the ``LOOKBACK_SESSIONS`` sessions before its first,
+    so every bar's rolling window is what the live scan would see; the job replays its last
+    ``n`` sessions only. Returns (frame, n) pairs, oldest first."""
+    days = sorted(set(bars.index.date))
+    wanted = days[-sessions:] if sessions else days
+    out: List[Tuple[pd.DataFrame, int]] = []
+    for start in range(0, len(wanted), max(1, size)):
+        chunk = wanted[start:start + max(1, size)]
+        first = days.index(chunk[0])
+        keep = set(days[max(0, first - LOOKBACK_SESSIONS):first]) | set(chunk)
+        out.append((bars[[d in keep for d in bars.index.date]], len(chunk)))
+    return out
 
 
 def replay_job(job: tuple) -> List[Dict[str, Any]]:

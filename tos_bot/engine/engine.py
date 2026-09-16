@@ -161,7 +161,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         self.board = PlayBoard()
         self.position_check = PositionCheck()
         self.replay = ReplayRunner(data_dir / "research" / "replay.json",
-                                   IntradayHistory(data_dir / "research" / "intraday"))
+                                   IntradayHistory(data_dir / "research" / "intraday"),
+                                   workers=self.settings.config.replay.workers or None)
         #: calm or turbulent, from SPY's daily returns (Hamilton's Markov switching model)
         self.regime = MarketRegime(data_dir / "research" / "benchmark_spy.pkl")
         #: when companies reported earnings (SEC 8-K item 2.02), for the replay
