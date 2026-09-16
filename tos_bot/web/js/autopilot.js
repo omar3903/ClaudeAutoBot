@@ -59,9 +59,9 @@ function configure() {
     title: "Autopilot settings",
     bodyHTML: `<div class="ap-form">
       <label>Auto-take these trade types</label>
+      <p class="muted small">Day trades and swing trades follow the <b>Intraday</b> and <b>Swing</b> filters above the plays -
+        now: <b>${(ap.trade_types || []).filter(t => t !== "PAIRS").map(typeName).join(", ") || "none"}</b>.</p>
       <div class="ap-row">
-        <label><input type="checkbox" id="ap-day" ${has("INTRADAY")}> Day trades</label>
-        <label><input type="checkbox" id="ap-swing" ${has("SWING")}> Swing trades</label>
         <label title="Only once the replay has proven the pair rules, at most pairs.max_new_per_day a day"><input type="checkbox" id="ap-pairs" ${has("PAIRS")}> Pairs</label>
       </div>
       <label>Minimum confidence <b id="ap-conf-v">${ap.min_confidence ?? 0.62}</b></label>
@@ -94,9 +94,7 @@ function configure() {
     </div>`,
     okText: "Save", okClass: "long",
     onOk: async () => {
-      const types = [];
-      if ($("#ap-day").checked) types.push("INTRADAY");
-      if ($("#ap-swing").checked) types.push("SWING");
+      const types = ["INTRADAY", "SWING"];                      // day and swing follow the filters
       if ($("#ap-pairs").checked) types.push("PAIRS");
       const int = sel => parseInt($(sel).value, 10);
       await postAutopilot({

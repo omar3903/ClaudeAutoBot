@@ -185,8 +185,20 @@ class AutoPilot:
         this to scan (and refresh the account) much more often."""
         return bool(
             self.enabled and self._live_ok() and market_open
-            and "INTRADAY" in self.trade_types
+            and "INTRADAY" in self.play_types()
         )
+
+    def play_types(self) -> List[str]:
+        """The plays Autopilot takes: day trades and swing trades as the Intraday / Swing filters over the
+        plays switch them on, so ticking Swing there is all it takes. (Pairs keep their own switch in
+        Autopilot's settings.) Without the engine's filters, its own trade types."""
+        kinds = getattr(getattr(self.engine, "filters", None), "timeframes", None)
+        if kinds:
+            return [t for t in ("INTRADAY", "SWING") if t in kinds]
+        return [t for t in self.trade_types if t != "PAIRS"]
+
+    def effective_trade_types(self) -> List[str]:
+        return self.play_types() + (["PAIRS"] if "PAIRS" in self.trade_types else [])
 
     # ------------------------------------------------------------------ #
     def status(self) -> Dict[str, Any]:
@@ -200,7 +212,7 @@ class AutoPilot:
             "enabled": self.enabled,
             "effective": self.enabled and self._live_ok(),
             "dry_run": self.dry_run,
-            "trade_types": list(self.trade_types),
+            "trade_types": self.effective_trade_types(),
             "min_confidence": round(self.min_confidence, 2),
             "min_reward_risk": round(self.min_reward_risk, 2),
             "max_auto_positions": self.max_auto_positions,
@@ -412,8 +424,8 @@ class AutoPilot:
         if getattr(p.status, "value", str(p.status)) != "PROPOSED":
             return "not a fresh proposed play"
         tf = p.timeframe.value
-        if tf not in self.trade_types:
-            return f"trade type {tf} not enabled for autopilot"
+        if tf not in self.play_types():
+            return f"{'day' if tf == 'INTRADAY' else tf.lower()} trades are switched off in the Intraday / Swing filters"
         if p.confidence < self.min_confidence:
             return f"confidence {p.confidence:.2f} < {self.min_confidence:.2f}"
         if p.reward_risk < self.min_reward_risk:
@@ -513,7 +525,7 @@ class AutoPilot:
         skipped = self.skipped_noise()
         will = (
             self.enabled and self._live_ok()
-            and row.get("timeframe") in self.trade_types
+            and row.get("timeframe") in self.play_types()
             and float(row.get("confidence", 0)) >= self.min_confidence
             and float(row.get("reward_risk", 0)) >= self.min_reward_risk
             and row.get("kind") != "FUNDAMENTAL"

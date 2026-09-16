@@ -520,3 +520,17 @@ def test_the_session_review_keeps_each_trade_with_what_it_was_taken_on(engine):
     assert out["ok"] and review["day"]["trades"] == 1 and abs(review["trades"][0]["r"] - 0.6) < 1e-9
     assert engine.journal_review(today)["session"] == today.isoformat()
     assert engine.journal_state()["days"][0]["session"] == today.isoformat()
+
+
+def test_autopilot_takes_the_trade_types_the_filters_switch_on(engine):
+    ap = engine.autopilot
+    ap.enabled, ap.trade_types = True, ["INTRADAY"]                        # its own setting said day trades only
+    assert engine.set_filters(timeframes=["SWING"])["ok"]                  # the filters say swing trades only
+    day = Play(symbol="MSFT", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+               timeframe=Timeframe.INTRADAY, entry=100.0, stop=95.0, targets=[110.0])
+    assert ap.play_types() == ["SWING"] and ap.status()["trade_types"] == ["SWING"]
+    assert "switched off" not in (ap._pre_gate(_play("AAPL"), 50_000) or "")
+    assert "day trades are switched off" in ap._pre_gate(day, 50_000)
+    assert not ap.day_mode_active(market_open=True)
+    assert engine.set_filters(timeframes=["INTRADAY", "SWING"])["ok"]
+    assert ap.play_types() == ["INTRADAY", "SWING"] and ap.day_mode_active(market_open=True)

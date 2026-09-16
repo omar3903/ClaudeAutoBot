@@ -799,7 +799,7 @@ class TradingEngine:
     def _passes_checks(self, row: Mapping[str, Any]) -> bool:
         """Whether a recorded play clears Autopilot's own checks on it (not the account's caps)."""
         ap = self.autopilot
-        return (row.get("timeframe") in ap.trade_types and float(row.get("confidence") or 0) >= ap.min_confidence
+        return (row.get("timeframe") in ap.play_types() and float(row.get("confidence") or 0) >= ap.min_confidence
                 and float(row.get("reward_risk") or 0) >= ap.min_reward_risk
                 and not set(ap.skipped_noise()).intersection(row.get("noise") or [])
                 and (row.get("timeframe") != "INTRADAY" or int(row.get("confirmations") or 1) >= ap.min_confirmations))
