@@ -5,10 +5,11 @@ holds. Position sizing then sees an account of that size, with only what's left
 of it available for new positions. The PDT rule and the live equity floor keep
 looking at the real account.
 
-It is split between day trades and swing trades: day trades may hold up to
-``day_pct`` of it at once and swing trades (pair trades among them) the rest. A
-trade that doesn't fit what's left of its share is made smaller; risk per trade
-is still measured against the whole trading capital.
+While the filters let the bot trade both kinds, it is split between day trades
+and swing trades: day trades may hold up to ``day_pct`` of it at once and swing
+trades (pair trades among them) the rest. With only one kind switched on, that
+kind gets all of it. A trade that doesn't fit what's left of its share is made
+smaller; risk per trade is still measured against the whole trading capital.
 
 Account amounts are in US dollars (US stocks are sized in dollars); an account
 kept in another currency converts with ``Account.usd_per_base``.

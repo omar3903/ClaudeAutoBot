@@ -1,7 +1,7 @@
 /* The top bar: paper / live, the market, data and connection pills, balances,
    trading capital, and the theme, refresh and paper-reset buttons. */
 import { $, $$, api, escapeHtml, money, num, post, shorten, store, usd } from "./util.js";
-import { S, on, setState } from "./state.js";
+import { S, emit, on, setState } from "./state.js";
 import { busy, closeModal, openModal, toast, toastResult, unbusy } from "./ui.js";
 import { openConnections } from "./connections.js";
 import { loadOpen } from "./blotter.js";
@@ -113,7 +113,7 @@ export function renderCapital(c) {
   b.classList.toggle("limited", !!c.limit && !c.clipped);
   b.classList.toggle("clipped", !!c.clipped);
   const sp = c.split;
-  const split = sp ? ` Day trades: up to ${money(sp.day.limit, c.currency)} (${sp.day.pct}%), swing trades: up to ${money(sp.swing.limit, c.currency)} (${sp.swing.pct}%).` : "";
+  const split = sp && sp.on ? ` Day trades: up to ${money(sp.day.limit, c.currency)} (${sp.day.pct}%), swing trades: up to ${money(sp.swing.limit, c.currency)} (${sp.swing.pct}%).` : "";
   b.title = (c.limit
     ? `The bot uses ${money(c.effective, c.currency)} of this ${money(c.account_value, c.currency)} account` +
       (c.clipped ? ` (you set ${money(c.limit, c.currency)}, but the account is worth less now)` : "") +
@@ -130,19 +130,7 @@ async function openCapital() {
   const save = async amount => {
     const r = await post("/api/capital", { amount });
     toastResult(r);
-    if (r.ok) { S.state.capital = r.capital; renderCapital(r.capital); }
-    return r.ok;
-  };
-  const sp = c.split || { day_pct: 75, day: {}, swing: {} };
-  const saveSplit = async pct => {
-    if (pct === sp.day_pct) return;
-    const r = await post("/api/capital/split", { day_pct: pct });
-    toastResult(r);
-    if (r.ok) { S.state.capital = r.capital; renderCapital(r.capital); }
-  };
-  const splitText = pct => {
-    const whole = parseFloat(($("#cap-amt") || {}).value) || c.effective;
-    return `Day trades up to <b>${money(whole * pct / 100, ccy)}</b> · swing trades up to <b>${money(whole * (100 - pct) / 100, ccy)}</b>`;
+    if (r.ok) { S.state.capital = r.capital; renderCapital(r.capital); emit("capital", r.capital); }
   };
   openModal({
     title: "Trading capital",
@@ -156,35 +144,16 @@ async function openCapital() {
       ${ccy !== "USD" && c.usd_per_base ? `<p class="muted small">Your account is in ${escapeHtml(ccy)}. US stocks are sized in
         US dollars at 1 ${escapeHtml(ccy)} = ${num(c.usd_per_base, 4)} USD.</p>` : ""}
       <div class="row-gap"><button class="ghost mini" id="cap-all">Use the whole account</button></div>
-      <h4>Day trades and swing trades</h4>
-      <p><label for="cap-split">Day trades get </label>
-        <input type="range" id="cap-split" min="0" max="100" step="5" value="${sp.day_pct}">
-        <b id="cap-split-pct">${sp.day_pct}% / ${100 - sp.day_pct}%</b> <span class="muted">swing</span></p>
-      <p id="cap-split-amounts">${splitText(sp.day_pct)}</p>
-      <p class="muted small">How much of the trading capital each kind may hold at once - pair trades count as swing
-        trades. A trade that doesn't fit what's left of its share is made smaller. Risk per trade is still measured
-        against the whole trading capital.${sp.day && sp.day.invested != null ? ` Held now: day trades ${money(sp.day.invested, ccy)},
-        swing trades ${money(sp.swing.invested, ccy)}.` : ""}</p>`,
+      <p class="muted small">The day/swing split is set with the slider next to the Intraday and Swing filters.</p>`,
     okText: "Save", okClass: "long",
-    onOk: async () => {
+    onOk: () => {
       const amt = parseFloat($("#cap-amt").value);
-      const pct = parseFloat($("#cap-split").value);
       if (!(amt > 0)) { toast("Enter an amount above zero", "bad"); return; }
       if (amt > c.account_value) { toast(`That's more than the account holds (${money(c.account_value, ccy)})`, "bad"); return; }
-      const unchanged = Math.round(amt) === Math.round(c.limit || c.account_value);
-      if (!unchanged && !(await save(amt))) return;
-      return saveSplit(pct);
+      return save(amt);
     },
   });
-  const slider = $("#cap-split");
-  const showSplit = () => {
-    const pct = parseFloat(slider.value);
-    $("#cap-split-pct").textContent = `${pct}% / ${100 - pct}%`;
-    $("#cap-split-amounts").innerHTML = splitText(pct);
-  };
-  slider.oninput = showSplit;
-  $("#cap-amt").oninput = showSplit;
-  $("#cap-all").onclick = async () => { closeModal(); await save(null); saveSplit(parseFloat(slider.value)); };
+  $("#cap-all").onclick = () => { closeModal(); save(null); };
 }
 
 /* ---------- paper / live ---------- */

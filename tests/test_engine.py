@@ -468,6 +468,14 @@ def test_trading_capital_is_split_between_day_trades_and_swing_trades(engine):
     whole = engine._account.equity
     assert engine.sizing_account("INTRADAY").raw["capital_room"] == pytest.approx(min(whole - 9_000, whole / 2))
 
+    assert engine.set_filters(timeframes=["SWING"])["ok"]                  # swing trades only: they get all of it
+    assert engine.sizing_account("SWING") is engine._account                # no limit and no split: the whole account
+    split = engine.capital_state()["split"]
+    assert (split["on"], split["day_pct"], split["set_pct"]) == (False, 0.0, 50.0)
+    assert "both switched on" in engine.set_capital_split(60)["note"]
+    assert engine.set_filters(timeframes=["INTRADAY", "SWING"])["ok"]      # both again: the split is back
+    assert engine.capital_state()["split"]["on"] and engine.effective_day_pct() == 60.0
+
 
 def test_capital_is_checked_and_shown_in_the_accounts_own_currency(engine, monkeypatch):
     cad = Account(account_id="DU1", equity=720_000.0, cash=720_000.0, buying_power=2_400_000.0,
