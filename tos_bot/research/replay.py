@@ -168,6 +168,7 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
     trades: List[SimTrade] = []
     open_positions: Dict[str, _Position] = {}
     seen_before: set = set()
+    shared = session_series(history, strategies)
     for i in range(settings.warmup_bars, len(session) - 1):
         closed_at, next_at, next_bar = session.index[i] + BAR, session.index[i + 1], session.iloc[i + 1]
         if closed_at >= flatten_at:
@@ -178,7 +179,8 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
                               quote=quote_from_price(symbol, float(window["close"].iloc[-1])),
                               now=closed_at.to_pydatetime(), signals=signals, market=dict(market),
                               news=news_at(stories, closed_at),
-                              benchmark=benchmark.closes_at(closed_at) if benchmark is not None else None)
+                              benchmark=benchmark.closes_at(closed_at) if benchmark is not None else None,
+                              shared=shared)
         signals_now = _signals(strategies, ctx, noise)
         for strategy, play, flags in signals_now:
             if strategy.key not in open_positions:
@@ -263,6 +265,20 @@ def shadow_trade(play: Play, session: pd.DataFrame, seen_at: pd.Timestamp,
 def regime(market: Optional[Mapping[dt.date, float]], day: dt.date) -> Dict[str, Any]:
     p = (market or {}).get(day)
     return {} if p is None else {"p_turbulent": round(float(p), 3), "regime": "turbulent" if p >= 0.5 else "calm"}
+
+
+def session_series(history: pd.DataFrame, strategies: Sequence[Strategy]) -> Dict[str, Any]:
+    """The series every bar of a session shares (StrategyContext.shared): the session VWAP over
+    the whole history, and the opening range for each width the setups ask for. A bar's value
+    depends only on its own session's candles up to it, so slicing these equals recomputing."""
+    from ..indicators import ta
+
+    out: Dict[str, Any] = {"session_vwap": ta.session_vwap(history)}
+    for strategy in strategies:
+        minutes = strategy.params.get("or_minutes") if isinstance(strategy.params, dict) else None
+        if minutes:
+            out.setdefault(f"opening_range_{int(minutes)}", ta.opening_range(history, int(minutes)))
+    return out
 
 
 def _stories(news: Sequence[Mapping[str, Any]]) -> List[Tuple[pd.Timestamp, Mapping[str, Any]]]:

@@ -84,7 +84,7 @@ class OpeningRangeBreakout(Strategy):
         if ctx.minutes_since_open < or_m + 4 or ctx.minutes_since_open > 150:
             return []
 
-        orr = ta.opening_range(ctx.intraday, or_m)
+        orr = ctx.opening_range(or_m)
         or_high, or_low = safe_last(orr["or_high"]), safe_last(orr["or_low"])
         vwap = ctx.vwap
         atr = ctx.intraday_atr

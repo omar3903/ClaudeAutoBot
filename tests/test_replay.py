@@ -13,7 +13,8 @@ from tos_bot.core.enums import Side, StrategyKind, Timeframe
 from tos_bot.research.replay import (ReplaySettings, SimTrade, noise_report, replay_intraday, strategy_records,
                                      summarize)
 from tos_bot.scanner.noise import NoiseSettings
-from tos_bot.strategies.base import Strategy
+from tos_bot.data.market_data import quote_from_price
+from tos_bot.strategies.base import Strategy, StrategyContext
 
 NY = "America/New_York"
 DAY = dt.date(2026, 9, 10)                     # an ordinary full session
@@ -151,6 +152,47 @@ def test_the_news_checks_see_the_stories_out_by_each_bar_and_the_market_model():
     [blind] = replay_intraday([_LongAtBar()], "NWS", session, daily, settings=EXACT, noise=QUIET,
                               news=[{"at": f"{DAY}T18:00:00+00:00"}])
     assert "move_without_news" not in blind.noise
+
+
+def test_session_chunks_carry_the_lookback_and_replay_only_their_own_sessions():
+    import fakes
+    from tos_bot.research.runner import LOOKBACK_SESSIONS, session_chunks
+
+    bars = fakes.intraday_bars("CHK")                            # five sessions
+    days = sorted(set(bars.index.date))
+    chunks = session_chunks(bars, sessions=4, size=3)
+    assert [n for _, n in chunks] == [3, 1]
+    first, last = chunks[0][0], chunks[1][0]
+    assert sorted(set(first.index.date)) == days[max(0, 1 - LOOKBACK_SESSIONS):4]   # its 3 sessions and the ones before
+    assert sorted(set(last.index.date))[-1] == days[-1] and len(set(last.index.date)) == 5
+    # the chunks replay exactly what one job over the same sessions does
+    whole = replay_intraday([_LongAtBar()], "CHK", bars, fakes.daily_bars("CHK"), EXACT, QUIET, sessions=4)
+    parts = [t for frame, n in chunks
+             for t in replay_intraday([_LongAtBar()], "CHK", frame, fakes.daily_bars("CHK"), EXACT, QUIET, sessions=n)]
+    assert [(t.entered_at, t.r) for t in parts] == [(t.entered_at, t.r) for t in whole]
+
+
+def test_series_shared_for_a_session_equal_the_ones_computed_per_bar():
+    import fakes
+    from tos_bot.indicators import ta
+    from tos_bot.research.replay import session_series
+    from tos_bot.strategies.technical import OpeningRangeBreakout
+
+    history = fakes.intraday_bars("SHR")
+    shared = session_series(history, [OpeningRangeBreakout()])
+    assert set(shared) == {"session_vwap", "opening_range_5"}
+    window = history.iloc[-200:-40]                                  # starts mid-session, like a rolling window
+    ctx = StrategyContext(symbol="SHR", intraday=window, daily=fakes.daily_bars("SHR"),
+                          quote=quote_from_price("SHR", float(window["close"].iloc[-1])), shared=shared)
+    today = window.index.date == window.index[-1].date()             # the session the setups read: complete
+    pd.testing.assert_series_equal(ctx.vwap_series[today], ta.session_vwap(window)[today], check_names=False)
+    pd.testing.assert_frame_equal(ctx.opening_range(5)[today], ta.opening_range(window, 5)[today])
+    # the window's first session is cut off at the front, and there the shared series is the true one
+    first = window.index.date == window.index[0].date()
+    assert not ctx.vwap_series[first].equals(ta.session_vwap(window)[first])
+    plain = StrategyContext(symbol="SHR", intraday=window, daily=fakes.daily_bars("SHR"),
+                            quote=quote_from_price("SHR", float(window["close"].iloc[-1])))
+    pd.testing.assert_series_equal(plain.vwap_series[today], ctx.vwap_series[today], check_names=False)
 
 
 def test_no_fill_when_the_next_open_has_already_run_away():

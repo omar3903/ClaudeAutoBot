@@ -54,6 +54,10 @@ class StrategyContext:
     #: what the gap check saw before the open - "high", "low", "gap_pct", "volume" (scanner/heat.py
     #: GapperMetrics.as_dict); {} when it hasn't run. The pre-market high and low are levels.
     premarket: Dict[str, Any] = field(default_factory=dict)
+    #: series that are the same for every bar of a session - the session VWAP, the opening range -
+    #: computed once and shared between the contexts of one session (the replay fills it; a live
+    #: scan builds one context per stock, so it has nothing to share)
+    shared: Dict[str, Any] = field(default_factory=dict, repr=False)
     _memo: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     def _cached(self, key: str, compute: Callable[[], Any]) -> Any:
@@ -158,7 +162,28 @@ class StrategyContext:
 
     @property
     def vwap_series(self) -> pd.Series:
-        return self._cached("vwap", lambda: ta.session_vwap(self.intraday))
+        """The session VWAP at each intraday bar. It only depends on the bar's own session, so a
+        series shared for the session is sliced rather than recomputed."""
+        def compute():
+            full = self.shared.get("session_vwap")
+            if full is not None:
+                sliced = full.reindex(self.intraday.index)
+                if not sliced.isna().any():
+                    return sliced
+            return ta.session_vwap(self.intraday)
+        return self._cached("vwap", compute)
+
+    def opening_range(self, minutes: int) -> pd.DataFrame:
+        """Each session's opening-range high and low at every bar (indicators/ta.py opening_range),
+        shared for the session when the replay has computed it."""
+        def compute():
+            full = self.shared.get(f"opening_range_{minutes}")
+            if full is not None:
+                sliced = full.reindex(self.intraday.index)
+                if not sliced.isna().all().all():
+                    return sliced
+            return ta.opening_range(self.intraday, minutes)
+        return self._cached(f"opening_range_{minutes}", compute)
 
     @property
     def vwap(self) -> float:
