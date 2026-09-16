@@ -9,7 +9,7 @@ from __future__ import annotations
 import abc
 from typing import List, Optional
 
-from ..core.models import Account, OrderRequest, OrderResult, Quote
+from ..core.models import Account, Fill, OrderRequest, OrderResult, Quote
 
 
 #: order states after which an order never fills any further
@@ -80,4 +80,9 @@ class BrokerAdapter(abc.ABC):
         ...
 
     def list_orders(self, status: Optional[str] = None) -> List[OrderResult]:
+        return []
+
+    def get_fills(self, symbol: Optional[str] = None) -> List[Fill]:
+        """The fills the venue reports for the current session, oldest first - what books a
+        position that was closed outside the app. Venues that can't say return []."""
         return []

@@ -5,6 +5,7 @@ removes open-trade records the broker no longer holds."""
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import os
 import threading
 import time
@@ -239,6 +240,7 @@ def test_scans_follow_the_schedule(engine, port, monkeypatch):
     engine._run_scan("full")
     assert engine.scanner.watchlist.hot_symbols() and engine.watchlist_state()["watchlist"]["hot"]
 
+    engine._gappers_session = engine.scanner.watchlist.session           # the gap check is covered below
     monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: False)
     assert engine._due_scan() is None                                     # built for this session; market shut
     monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: True)
@@ -257,6 +259,18 @@ def test_scans_follow_the_schedule(engine, port, monkeypatch):
     assert engine._due_scan() == "fast"
     status = engine.scan_status()
     assert status["last_full"]["kind"] == "full" and status["last_cycle"]["kind"] == "cycle"
+
+    # the gap check: due once between its time and the open, on today's watchlist; it moves no plays
+    session = engine.scanner.watchlist.session
+    engine._gappers_session = None
+    at = dt.datetime.combine(session, dt.time(9, 20), tzinfo=clock.NY)
+    monkeypatch.setattr(clock, "now_ny", lambda: at)
+    assert engine._due_scan() == "gappers"
+    before = set(engine.board.plays)
+    engine._run_scan("gappers")
+    assert engine._gappers_session == session and set(engine.board.plays) == before
+    assert engine.scan_status()["last_gappers"]["kind"] == "gappers" and engine._due_scan() != "gappers"
+    assert engine.request_scan("gappers")["ok"] and engine._scan_request == "gappers"
 
 
 # ---------------------------------------------------------------- quitting
@@ -391,6 +405,51 @@ def test_a_position_of_another_size_than_its_records_is_reported_and_left_alone(
     engine._account.positions[0].quantity = 5                               # back in agreement
     engine._reconcile_open_trades()
     assert engine.snapshot()["mismatches"] == []
+
+
+def test_a_position_closed_outside_the_app_is_booked_from_the_brokers_fills(engine):
+    import datetime as dt
+
+    from tos_bot.core.models import Fill
+
+    tid = _open(engine, "AAPL", qty=5)
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="tws-1", symbol="AAPL", side=Side.SHORT, quantity=2, price=102.0, ts=now, commission=0.5),
+        Fill(order_id="tws-2", symbol="AAPL", side=Side.SHORT, quantity=3, price=104.0, ts=now, commission=0.5),
+        Fill(order_id="old", symbol="AAPL", side=Side.LONG, quantity=5, price=100.0, ts=now),       # the entry
+    ]
+    assert engine._reconcile_open_trades() == []                            # first miss
+    settled = engine._reconcile_open_trades()                               # second miss: it's gone
+    assert [s["id"] for s in settled] == [tid] and settled[0]["fills"] == 2
+    t = engine.repo.get_trade(tid)
+    assert t["status"] == "CLOSED" and t["exit_reason"] == "closed-outside" and t["exit_price"] == 103.2
+    assert t["realized_pl"] == pytest.approx(5 * 3.2 - 1.0) and engine.repo.open_trades() == []
+    assert engine.snapshot()["mismatches"] == []
+
+
+def test_shares_without_a_record_are_listed_and_can_be_exited(engine):
+    _open(engine, "MSFT", qty=5)
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="MSFT", quantity=20, avg_price=100.0, market_price=101.0),
+                                 Position(symbol="AAPL", quantity=-7, avg_price=50.0, market_price=49.0),
+                                 Position(symbol="NVDA", quantity=0, avg_price=10.0)]
+    rows = {r["symbol"]: r for r in engine.untracked_positions()}
+    assert set(rows) == {"MSFT", "AAPL"}
+    assert (rows["MSFT"]["side"], rows["MSFT"]["qty"], rows["MSFT"]["recorded"], rows["MSFT"]["held"]) == ("LONG", 15, 5, 20)
+    assert (rows["AAPL"]["side"], rows["AAPL"]["qty"], rows["AAPL"]["unrealized_pl"]) == ("SHORT", 7, 7.0)
+    assert engine.snapshot()["untracked"] == list(rows.values())
+
+    sent = []
+    engine.executor.close_untracked = lambda symbol, side, qty: sent.append((symbol, side, qty)) or {"ok": True, "status": "FILLED"}
+    r = engine.close_untracked("AAPL")
+    assert r["ok"] and "7 AAPL shares" in r["note"] and sent == [("AAPL", "SHORT", 7.0)]
+    assert not engine.close_untracked("NVDA")["ok"]
+
+    engine._account.positions = [Position(symbol="MSFT", quantity=3, avg_price=100.0)]
+    assert engine.untracked_positions() == []                               # fewer than recorded: a mismatch, not untracked
 
 
 def test_resetting_paper_deletes_the_simulators_open_records_only(engine):

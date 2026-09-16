@@ -37,6 +37,9 @@ def test_market_fill_and_position(paper):
     assert r.status == "FILLED" and r.filled_qty == 10
     pos = paper.get_account().position("AAA")
     assert pos and pos.quantity == 10
+    [fill] = paper.get_fills("AAA")
+    assert (fill.symbol, fill.side, fill.quantity) == ("AAA", Side.LONG, 10) and fill.price > 0
+    assert paper.get_fills("ZZZ") == [] and len(paper.get_fills()) >= 1
 
 
 def test_realized_pnl_and_day_trade_count(paper):

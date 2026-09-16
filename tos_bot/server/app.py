@@ -130,6 +130,10 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     def close_trade(trade_id: str):
         return _result(eng().close_position(trade_id, reason="manual"))
 
+    @app.post("/api/positions/untracked/{symbol}/close")
+    def close_untracked(symbol: str):
+        return _result(eng().close_untracked(symbol.upper()))
+
     @app.post("/api/trades/{trade_id}/managed")
     def set_managed(trade_id: str, body: dict):
         return _result(eng().set_trade_managed(trade_id, bool((body or {}).get("on", True))))
@@ -312,7 +316,8 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     def set_scan_settings(body: dict):
         b = body or {}
         return _result(eng().set_scan_settings(
-            premarket_time=b.get("premarket_time"), cycle_minutes=b.get("cycle_minutes"),
+            premarket_time=b.get("premarket_time"), gapper_time=b.get("gapper_time"),
+            cycle_minutes=b.get("cycle_minutes"),
             hot_list_size=b.get("hot_list_size"), sector_queue_size=b.get("sector_queue_size")))
 
     @app.get("/api/watchlist")

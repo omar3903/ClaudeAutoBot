@@ -26,6 +26,7 @@ INTRADAY_BAR = "5 mins"
 INTRADAY_DURATION = "5 D"            # today plus four sessions, for relative volume
 _INTRADAY_TTL_S = 60.0
 REFRESH_DURATION = "1800 S"           # the quick re-check fetches the last half hour only
+PREMARKET_DURATION = "1 D"            # the pre-open gap check: today's extended-hours candles
 _QUOTE_TTL_S = 20.0
 #: candles and quotes nothing has asked for in this long are let go - the app runs for days
 _CACHE_KEEP_S = 1800.0
@@ -44,7 +45,7 @@ class PriceSource(Protocol):
 
     def history_many(self, requests: Mapping[str, Tuple[str, str]],
                      con_ids: Optional[Mapping[str, int]] = None,
-                     end: Optional[dt.datetime] = None) -> Dict[str, pd.DataFrame]: ...
+                     end: Optional[dt.datetime] = None, rth: bool = True) -> Dict[str, pd.DataFrame]: ...
 
     def contract_details_many(self, symbols: Sequence[str]) -> Dict[str, Optional[dict]]: ...
 
@@ -182,6 +183,25 @@ class MarketData:
                     out[s] = merged
             for s, frame in cached.items():
                 out.setdefault(s, frame)
+        return out
+
+    def premarket(self, symbols: Sequence[str],
+                  con_ids: Optional[Mapping[str, int]] = None) -> Dict[str, pd.DataFrame]:
+        """Today's pre-market 5-minute candles (before 09:30 ET) for ``symbols`` - one request
+        each, made once a day by the gap check. Stocks with no pre-market trade are left out."""
+        wanted = list(dict.fromkeys(symbols))
+        if not wanted:
+            return {}
+        got = self.source.history_many({s: (INTRADAY_BAR, PREMARKET_DURATION) for s in wanted}, con_ids, rth=False)
+        out: Dict[str, pd.DataFrame] = {}
+        for symbol, frame in got.items():
+            if frame is None or not len(frame):
+                continue
+            ny = frame.index.tz_convert("America/New_York")
+            day = ny.date.max()
+            early = (ny.date == day) & ((ny.hour < 9) | ((ny.hour == 9) & (ny.minute < 30)))
+            if early.any():
+                out[symbol] = frame[early]
         return out
 
     def quote(self, symbol: str) -> Quote:

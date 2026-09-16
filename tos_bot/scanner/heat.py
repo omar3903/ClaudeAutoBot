@@ -9,6 +9,10 @@ into a percentile across the universe so different units combine fairly.
 **Intraday heat** re-ranks the hot list and the buffer during the session from
 today's 5-minute candles, on an absolute 0-1 scale so a buffer stock can be
 compared with a hot-list stock in the same cycle.
+
+**Gapper heat** ranks, just before the open, the stocks that have gapped on
+pre-market volume - Aziz's "gappers" watchlist: the gap in average true ranges
+and the pre-market dollar volume, each as a percentile among the gappers.
 """
 
 from __future__ import annotations
@@ -113,3 +117,58 @@ def intraday_metrics(symbol: str, intraday: pd.DataFrame, daily: pd.DataFrame) -
     return IntradayMetrics(symbol=symbol, rvol=round(rvol, 2), change_pct=round(change_pct, 2),
                            gap_pct=round((float(today["open"].iloc[0]) / prev_close - 1.0) * 100.0, 2),
                            range_atr=round(range_atr, 2), atr_pct=round(atr_pct, 2), heat=round(heat, 4))
+
+
+# ---------------------------------------------------------------- before the open
+@dataclass(frozen=True)
+class GapperMetrics:
+    symbol: str
+    prev_close: float
+    last: float                 # the latest pre-market price
+    gap_pct: float              # vs. the previous close
+    gap_atr: float              # the gap in daily average true ranges
+    volume: float               # pre-market shares
+    dollar_volume: float
+    high: float                 # the pre-market high and low: the day's first levels
+    low: float
+    heat: float = 0.0
+
+    def as_dict(self) -> dict:
+        return {"gap_pct": self.gap_pct, "gap_atr": self.gap_atr, "volume": self.volume,
+                "dollar_volume": round(self.dollar_volume), "high": self.high, "low": self.low,
+                "last": self.last, "prev_close": self.prev_close, "heat": self.heat}
+
+
+def premarket_metrics(symbol: str, pre: Optional[pd.DataFrame],
+                      daily: Optional[pd.DataFrame]) -> Optional[GapperMetrics]:
+    """What a stock's pre-market candles say against its completed daily candles."""
+    if pre is None or daily is None or not len(pre) or len(daily) < 15:
+        return None
+    prior = daily[daily.index.date < pre.index[-1].date()]
+    if len(prior) < 15:
+        return None
+    prev_close = float(prior["close"].iloc[-1])
+    atr = float(ta.atr(prior.tail(30), 14).iloc[-1])
+    if prev_close <= 0 or not atr or atr != atr:
+        return None
+    last, volume = float(pre["close"].iloc[-1]), float(pre["volume"].sum())
+    return GapperMetrics(
+        symbol=symbol, prev_close=round(prev_close, 4), last=round(last, 4),
+        gap_pct=round((last / prev_close - 1.0) * 100.0, 2), gap_atr=round((last - prev_close) / atr, 2),
+        volume=round(volume), dollar_volume=float((pre["close"] * pre["volume"]).sum()),
+        high=round(float(pre["high"].max()), 4), low=round(float(pre["low"].min()), 4))
+
+
+def rank_gappers(metrics: List[GapperMetrics], min_gap_pct: float, min_volume: float) -> List[GapperMetrics]:
+    """The stocks in play before the open, hottest first: those gapping at least ``min_gap_pct``
+    either way on at least ``min_volume`` pre-market shares, ranked by the size of the gap in
+    ATRs (60%) and the pre-market dollar volume (40%). The top one's heat is 1."""
+    live = [m for m in metrics if abs(m.gap_pct) >= min_gap_pct and m.volume >= min_volume]
+    if not live:
+        return []
+    heat = np.zeros(len(live))
+    for name, weight in (("gap_atr", 0.6), ("dollar_volume", 0.4)):
+        values = np.array([abs(getattr(m, name)) for m in live])
+        heat += weight * (values.argsort().argsort() + 1) / len(values)
+    return sorted((replace(m, heat=round(float(h), 4)) for m, h in zip(live, heat)),
+                  key=lambda m: m.heat, reverse=True)

@@ -23,14 +23,16 @@ export function renderWatchlist(wl, scan) {
       Settings → Run full scan now once IB Gateway is connected.</p>`;
     return;
   }
+  const gapCell = g => g == null ? '<span class="muted">–</span>'
+    : `<span class="${g >= 0 ? "pl-pos" : "pl-neg"}">${g >= 0 ? "+" : ""}${num(g, 1)}%</span>`;
   const hot = wl.hot.map(c => `<tr><td class="sym">${escapeHtml(c.symbol)} ${sectorTag(c.sector)}</td>
-    <td>${heatBar(c.daily_heat)}</td><td>${heatBar(c.heat)}</td></tr>`).join("");
+    <td>${heatBar(c.daily_heat)}</td><td>${gapCell(c.gap_pct)}</td><td>${heatBar(c.heat)}</td></tr>`).join("");
   const sectors = wl.sectors.map(s => `<tr><td>${escapeHtml(s.sector)}</td>
     <td>${s.kept.map(c => `<span class="chip" title="intraday heat ${num(c.heat, 2)}">${escapeHtml(c.symbol)}</span>`).join(" ") || '<span class="muted">–</span>'}</td>
     <td class="num">${s.searched}</td><td class="num">${s.queued}</td></tr>`).join("");
   const decisions = wl.decisions.slice(0, 40).map(d => `<tr><td>${fmtClock(d.at)}</td>
     <td class="sym">${escapeHtml(d.symbol)}</td><td>${escapeHtml(SECTOR_SHORT[d.sector] || d.sector)}</td>
-    <td><span class="badge ${ACTION_CLASS[d.action] || ""}">${escapeHtml(d.action)}</span>${d.replaced ? ` <span class="muted">for ${escapeHtml(d.replaced)}</span>` : ""}</td>
+    <td><span class="badge ${ACTION_CLASS[d.action] || ""}">${escapeHtml(d.action)}</span>${d.replaced ? ` <span class="muted">for ${escapeHtml(d.replaced)}</span>` : ""}${d.note ? ` <span class="muted">· ${escapeHtml(d.note)}</span>` : ""}</td>
     <td class="num">${num(d.heat, 2)}</td></tr>`).join("");
 
   el.innerHTML = `
@@ -38,7 +40,7 @@ export function renderWatchlist(wl, scan) {
       ${count(wl.universe)} listed stocks (${count(wl.liquid)} liquid), daily candles through ${escapeHtml(wl.bars_through)}</div>
     <div class="wl-grid">
       <div><h4 data-term="hot">Hot list (${wl.hot.length})</h4>
-        <table><thead><tr><th>Symbol</th><th data-term="heat">Daily heat</th><th data-term="heat">Intraday heat</th></tr></thead><tbody>${hot}</tbody></table></div>
+        <table><thead><tr><th>Symbol</th><th data-term="heat">Daily heat</th><th data-term="gap">Pre-mkt gap</th><th data-term="heat">Intraday heat</th></tr></thead><tbody>${hot}</tbody></table></div>
       <div><h4 data-term="buffer">Sector buffers</h4>
         <table><thead><tr><th>Sector</th><th>Kept</th><th class="num">Looked at</th><th class="num">Queued</th></tr></thead><tbody>${sectors}</tbody></table></div>
       <div><h4 data-term="decision">Buffer decisions</h4>${decisions

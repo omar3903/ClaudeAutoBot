@@ -589,10 +589,12 @@ class IbkrBroker(BrokerAdapter):
 
     def history_many(self, requests: Mapping[str, Tuple[str, str]],
                      con_ids: Optional[Mapping[str, int]] = None,
-                     timeout: float = 30.0, end: Optional[dt.datetime] = None) -> Dict[str, pd.DataFrame]:
+                     timeout: float = 30.0, end: Optional[dt.datetime] = None,
+                     rth: bool = True) -> Dict[str, pd.DataFrame]:
         """Candles for many symbols at once. ``requests`` maps a symbol to
         (bar size, duration), e.g. ("1 day", "1 Y") or ("5 mins", "5 D"), ending at
-        ``end`` (default: now). Symbols IBKR has nothing for are left out of the result."""
+        ``end`` (default: now); ``rth`` False includes the pre-market and after-hours
+        candles. Symbols IBKR has nothing for are left out of the result."""
         if not self.is_connected:
             raise AuthError("IBKR not connected")
         if not requests:
@@ -604,7 +606,7 @@ class IbkrBroker(BrokerAdapter):
                 try:
                     bars = await ib.reqHistoricalDataAsync(
                         self._contract_for_history(symbol, con_ids.get(symbol)), endDateTime=end or "",
-                        durationStr=duration, barSizeSetting=bar, whatToShow="TRADES", useRTH=True,
+                        durationStr=duration, barSizeSetting=bar, whatToShow="TRADES", useRTH=rth,
                         formatDate=2, keepUpToDate=False, timeout=timeout)
                 except Exception:  # noqa: BLE001
                     return symbol, None
@@ -616,6 +618,46 @@ class IbkrBroker(BrokerAdapter):
 
         budget = timeout * (len(requests) / self.HISTORY_CONCURRENCY + 1) + 30
         return {s: f for s, f in self._session.run_coro(run, timeout=budget) if f is not None and len(f)}
+
+    def get_fills(self, symbol: Optional[str] = None, timeout: float = 15.0) -> List[Fill]:
+        """This session's executions on the account (IBKR keeps the current day's), oldest first.
+        They book a record whose position was closed in TWS, or by an exit that filled while the
+        app was down."""
+        if not self.is_connected:
+            return []
+        from ib_async import ExecutionFilter
+
+        wanted = ExecutionFilter(symbol=symbol or "", acctCode=self.account_id or "")
+
+        async def run(ib):
+            return await ib.reqExecutionsAsync(wanted)
+
+        try:
+            reported = self._session.run_coro(run, timeout=timeout) or []
+        except Exception as e:  # noqa: BLE001
+            log.debug("executions for %s unavailable: %s", symbol or "the account", e)
+            return []
+        out: List[Fill] = []
+        for item in reported:
+            execution, contract = getattr(item, "execution", None), getattr(item, "contract", None)
+            if execution is None or contract is None or (symbol and contract.symbol != symbol):
+                continue
+            shares = float(getattr(execution, "shares", 0.0) or 0.0)
+            if shares <= 0:
+                continue
+            when = getattr(execution, "time", None)
+            if not isinstance(when, dt.datetime):
+                when = dt.datetime.now(dt.timezone.utc)
+            elif when.tzinfo is None:
+                when = when.replace(tzinfo=dt.timezone.utc)
+            report = getattr(item, "commissionReport", None)
+            commission = float(getattr(report, "commission", 0.0) or 0.0)
+            out.append(Fill(order_id=str(getattr(execution, "orderId", "") or getattr(execution, "execId", "")),
+                            symbol=contract.symbol,
+                            side=Side.LONG if str(getattr(execution, "side", "")).upper().startswith("B") else Side.SHORT,
+                            quantity=shares, price=float(execution.price), ts=when,
+                            commission=commission if commission == commission else 0.0))
+        return sorted(out, key=lambda f: f.ts)
 
     def contract_details_many(self, symbols: Sequence[str], timeout: float = 20.0) -> Dict[str, Optional[dict]]:
         """Contract id, primary exchange, stock type and IBKR's industry / category

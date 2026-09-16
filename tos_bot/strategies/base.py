@@ -51,6 +51,9 @@ class StrategyContext:
     #: each strategy's record, {"trades", "win_rate"} pooled from the replay and real trades
     #: (research/weights.py pooled_odds) - it calibrates the odds a play states; {} in the replay
     records: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    #: what the gap check saw before the open - "high", "low", "gap_pct", "volume" (scanner/heat.py
+    #: GapperMetrics.as_dict); {} when it hasn't run. The pre-market high and low are levels.
+    premarket: Dict[str, Any] = field(default_factory=dict)
     _memo: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     def _cached(self, key: str, compute: Callable[[], Any]) -> Any:
@@ -170,7 +173,10 @@ class StrategyContext:
         return self._cached("rvol", compute)
 
     def levels(self) -> SupportResistance:
-        return self._cached("levels", lambda: find_levels(self.daily, self.price, self.intraday))
+        def compute():
+            extra = [(self.premarket.get(k), f"pre-market {k}") for k in ("high", "low")]
+            return find_levels(self.daily, self.price, self.intraday, extra_levels=[(v, s) for v, s in extra if v])
+        return self._cached("levels", compute)
 
     def daily_trend(self, lookback: int = 40) -> str:
         """Murphy: an uptrend is higher highs *and* higher lows; a downtrend the

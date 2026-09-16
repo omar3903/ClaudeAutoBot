@@ -132,6 +132,17 @@ Settings so it's done before the bell):
 6. **Setups.** Swing setups run on the 400 hottest liquid stocks; valuation
    setups on the top 8 that file US-GAAP 10-Ks, compared with same-industry peers.
 
+**The gap check — once, just before the open** (default 09:15 ET, 08:00–09:25 in
+Settings): the hot list and every buffer name (at most 400) get one request for
+today's pre-market 5-minute candles. A stock that has moved 2 % or more from
+yesterday's close on at least 50,000 pre-market shares is a **gapper** — Aziz's
+stocks in play — and takes the hot-list slot of the coolest name that isn't
+gapping itself (the cap of a third per sector still holds). The Watchlist tab
+shows each hot-list name's pre-market gap and the decisions with what was seen.
+Every stock's pre-market high and low are kept as the day's first support and
+resistance levels for the setups. **Settings → Check gappers now** runs it on
+demand.
+
 **The cycle — during the session** (default every 15 minutes, 5–60 in Settings):
 5-minute candles for the hot list, the buffer names being kept, and the next two
 names from each sector's buffer. Day-trade and swing setups run on all of them,
@@ -159,8 +170,10 @@ next buffer names.
 | Rescan every | 15 min | 5–60 | `cycle_minutes` |
 | Hot list size | 20 | 5–50 | `hot_list_size` |
 | Buffer per sector | 25 | 10–50 | `sector_queue_size` |
+| Gap check at | 09:15 ET | 08:00–09:25 | `gapper_time` |
 
-Also in `config.yaml`: `buffer_picks_per_sector` (2), `kept_per_sector` (2),
+Also in `config.yaml`: `gapper_symbols` (400), `gapper_min_gap_pct` (2), `gapper_min_volume`
+(50,000), `buffer_picks_per_sector` (2), `kept_per_sector` (2),
 `fast_cycle_seconds` (60), `fundamentals_leaders` (8), the liquidity `prefilter`,
 and `max_universe` (0 = every listing; `SCANNER_MAX_UNIVERSE` caps it without
 editing the file).
@@ -337,14 +350,16 @@ Times are New York time, with the default settings.
 |---|---|
 | overnight – 8:30 AM | Holds its connection to IB Gateway and watches open positions. Reads SEC's live feed of insider filings every 3 minutes and the news on the stocks it holds and on yesterday's hot list every 15. If the last session has no report yet, it writes one. No scanning — the market is closed. |
 | **8:30 AM** (`premarket_time`, 4:00–9:00) | **The full scan.** Every listed stock's daily candles, through yesterday's close, are brought up to date (after a report the evening before, there's almost nothing left to download). Every liquid stock is ranked by *yesterday's* heat: relative volume, the move in average daily ranges, closeness to a 20-day high or low, daily range and dollar volume. The hottest become today's **hot list** (at most a third per sector) and the next ones each sector's **buffer**. Swing and valuation setups are looked for, and pairs are fitted. |
-| 8:30 – 9:30 AM | News follows the new hot list. Nothing is scanned intraday yet — the scan reads regular-session candles, so pre-market moves aren't in it. |
+| 8:30 – 9:15 AM | News follows the new hot list. |
+| **9:15 AM** (`gapper_time`, 8:00–9:25) | **The gap check.** One read of the hot list and buffer names' pre-market candles. The stocks gapping 2 % or more on 50,000+ pre-market shares take hot-list slots, and every name's pre-market high and low become levels for the day's setups. |
 | **9:30 AM – 4:00 PM** | **Cycles** every 15 minutes rescan the hot list on 5-minute candles and try the next names from each sector's buffer — adopting a hotter one into the hot list, keeping or dropping the rest. With Autopilot day-trading, a fast cycle over the hot list every minute. Plays are offered, taken by you or Autopilot, and exits are managed. Pairs are decided in the last 30 minutes. |
 | **4:15 PM** (`journal.review_at`) | **The report**: the session's daily candles for every stock, the market's biggest movers and what the bot made of them, then the bot's own trades, mistakes and missed plays. |
 | 9:00 PM | IB Gateway's daily restart — the app rides through it (see below). |
 
 So yesterday's top movers *are* what the morning works from: the heat ranking is mostly
-yesterday's relative volume and move. What it can't see is a stock that starts moving
-overnight; the report counts those every day.
+yesterday's relative volume and move. A stock that starts moving overnight is caught by
+the gap check, as long as it was in the hot list or a buffer; the report counts the
+ones that weren't, every day.
 
 ## Running 24/7
 
@@ -399,14 +414,23 @@ exit, stop moves, what the broker holds right now, why it was taken (the play's
 explanation), every fill and every order sent to the broker — with an **Exit**
 button while it's open.
 
-An **open-trade record is deleted** once its position no longer exists where it
-was opened — closed in the broker's own app, removed, or wiped by **Reset
-paper**. A wrong deletion would orphan a real position, so the check is strict:
-it only acts on a connected broker's fresh account snapshot, after the
-connection has been up a minute, for trades older than 90 s whose close isn't in
-flight, and after two misses in a row. A paper reset removes the simulator's
-records straight away. Closed trades are never deleted, and the broker order
-audit log is always kept.
+An open-trade record whose position no longer exists where it was opened —
+closed in the broker's own app, or by an exit that filled while the app was down
+— is **closed from the broker's fills**: the exit-side fills of the stock since
+the entry give the exit price and time, so the trade's outcome reaches the
+history, the journal and the strategy records (exit reason `closed-outside`).
+When the broker reports no such fill (IBKR keeps only the current session's) the
+record is **deleted** instead, as after **Reset paper**. A wrong deletion would
+orphan a real position, so the check is strict: it only acts on a connected
+broker's fresh account snapshot, after the connection has been up a minute, for
+trades older than 90 s whose close isn't in flight, and after two misses in a
+row. Closed trades are never deleted, and the broker order audit log is always
+kept.
+
+The reverse case is shown too: **shares without a record** — held at the broker
+beyond what the open-trade records cover, because they were bought or sold
+outside the app or a fill couldn't be booked — are listed under **Open
+positions** with their own **Exit** button. The app doesn't manage their exits.
 
 ---
 
