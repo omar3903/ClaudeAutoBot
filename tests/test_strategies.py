@@ -204,6 +204,41 @@ def test_stops_are_floored_at_a_slice_of_the_stocks_daily_range():
 # --------------------------------------------------------------------------- #
 #  the odds a play states lean on the setup's record (Douglas, Chan)
 # --------------------------------------------------------------------------- #
+def test_the_52_week_setup_projects_todays_volume_during_the_session(monkeypatch):
+    import datetime as dt
+
+    from tos_bot.strategies.technical import Week52Breakout
+
+    symbol = "W52"
+    daily = fakes.daily_bars(symbol)
+    intraday = fakes.intraday_bars(symbol)
+    today = clock.session_date(clock.now_ny())
+    # a stock at its 52-week high, whose twenty prior sessions averaged 1M shares
+    daily = daily.copy()
+    daily.loc[:, "volume"] = 1_000_000.0
+    hi = float(daily["high"].max())
+    tail = daily.index[-20:]                                                         # a tight base under the high
+    daily.loc[tail, "open"], daily.loc[tail, "close"] = hi * 0.99, hi * 0.992
+    daily.loc[tail, "high"], daily.loc[tail, "low"] = hi * 0.998, hi * 0.985
+    partial = pd.DataFrame({"open": [hi * 1.001], "high": [hi * 1.02], "low": [hi * 0.999], "close": [hi * 1.015],
+                            "volume": [400_000.0]},                                  # 40% of a session's, early on
+                           index=pd.DatetimeIndex([pd.Timestamp(today).tz_localize("America/New_York")]))
+    with_today = pd.concat([daily[daily.index.date < today], partial])
+    quote = fakes.quote_from_price(symbol, float(partial["close"].iloc[0]))
+    ny = dt.datetime.combine(today, dt.time(10, 0), tzinfo=clock.NY)                 # 30 minutes in
+
+    ctx = build_context(symbol, intraday, with_today, quote)
+    ctx.now = ny
+    monkeypatch.setattr(clock, "minutes_since_open", lambda ts=None: 30.0)
+    plays = Week52Breakout().generate(ctx)
+    assert plays and plays[0].evidence["vol_mult"] == pytest.approx(400_000 * 13 / 1_000_000, rel=1e-3)   # projected x13
+
+    monkeypatch.setattr(clock, "minutes_since_open", lambda ts=None: 390.0)         # after the close: as printed
+    ctx2 = build_context(symbol, intraday, with_today, quote)
+    ctx2.now = ny
+    assert Week52Breakout().generate(ctx2) == []                                    # 0.4x average volume: no breakout
+
+
 def test_calibrated_probability_shrinks_toward_the_record_as_it_grows():
     from tos_bot.strategies.base import calibrated_probability
 

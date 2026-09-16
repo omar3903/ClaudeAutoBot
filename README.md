@@ -539,6 +539,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | new auto entries **per scan** | 1 | `max_new_per_cycle` |
 | **cool off** a ticker after it stops out today | on | `cooldown_after_loss` |
 | **stop for the day** once today's closed trades have lost this % of equity | 2 % | `max_daily_loss_pct` (Aziz's daily maximum loss; 0 = off) |
+| **stop for the day** once the day's realized gain has given back this % of its best | 30 % | `max_giveback_pct` (Aziz: never lose more than 30 % of what the morning made; `giveback_floor_pct` 0.25 % of equity is the smallest gain that counts; 0 = off) |
 | require a catalyst / dry-run | off | `require_catalyst`, `dry_run` |
 
 The filters and the Strategies panel apply to Autopilot too, and it takes no

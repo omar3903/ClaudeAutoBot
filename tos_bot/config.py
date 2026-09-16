@@ -181,6 +181,8 @@ class AutopilotCfg(_Model):
     min_replay_expectancy_r: float = 0.05
     cooldown_after_loss: bool = True
     max_daily_loss_pct: float = 2.0       # no new entries once today's closed trades have lost this % of equity (0 = off)
+    max_giveback_pct: float = 30.0        # ...or once the day's realized gain has given back this % of its peak (0 = off)
+    giveback_floor_pct: float = 0.25      # the give-back rule only counts a peak gain of at least this % of equity
     require_catalyst: bool = False
     dry_run: bool = False
 

@@ -17,6 +17,7 @@ from ..analysis import read_row
 from ..core.enums import Side, StrategyKind, Timeframe
 from ..core.models import Play
 from ..indicators import ta
+from ..util import clock
 from .base import Strategy, StrategyContext, safe_last, swing_high, swing_low
 from .registry import register
 
@@ -616,8 +617,15 @@ class Week52Breakout(Strategy):
         price = ctx.price
         atr = ctx.daily_atr
         vol = float(d["volume"].iloc[-1])
-        vol_avg = float(d["volume"].tail(20).mean())
-        if math.isnan(atr) or atr <= 0 or vol_avg <= 0:
+        elapsed = ctx.minutes_since_open
+        if d.index[-1].date() == clock.session_date(ctx.now) and ctx.intraday is not None and 0 < elapsed < 390:
+            # today's candle is still forming: its volume so far, projected to the full session,
+            # against the twenty completed sessions before it
+            vol *= 390.0 / max(30.0, elapsed)
+            vol_avg = float(d["volume"].iloc[-21:-1].mean()) if len(d) > 21 else float("nan")
+        else:
+            vol_avg = float(d["volume"].tail(20).mean())
+        if math.isnan(atr) or atr <= 0 or math.isnan(vol_avg) or vol_avg <= 0:
             return []
         vmult = vol / vol_avg
         near_hi = price >= hi_52 * (1 - self.params["proximity_pct"] / 100.0)

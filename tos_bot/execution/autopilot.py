@@ -56,6 +56,8 @@ class AutoPilot:
         self.max_new_per_cycle: int = int(getattr(cfg, "max_new_per_cycle", 1))
         self.cooldown_after_loss: bool = bool(getattr(cfg, "cooldown_after_loss", True))
         self.max_daily_loss_pct: float = float(getattr(cfg, "max_daily_loss_pct", 2.0))
+        self.max_giveback_pct: float = float(getattr(cfg, "max_giveback_pct", 30.0))
+        self.giveback_floor_pct: float = float(getattr(cfg, "giveback_floor_pct", 0.25))
         self.max_gross_exposure_pct: float = float(getattr(cfg, "max_gross_exposure_pct", 100.0))
         self.min_confirmations: int = int(getattr(cfg, "min_confirmations", 2))
         self.skip_noise: List[str] = [str(n) for n in getattr(cfg, "skip_noise", list(NOISE_LABELS))]
@@ -72,6 +74,7 @@ class AutoPilot:
         self._last_reason: Dict[str, str] = {}  # play_id -> why skipped (for the UI)
         self._blocked_note: str = ""
         self._loss_stop_day: str = ""           # the session the daily loss limit was reached on
+        self._peak_realized: float = 0.0        # the best the day's realized P/L has been
         self._realized: tuple = (float("-inf"), 0.0)   # (monotonic time read, realized P/L today)
 
     # ------------------------------------------------------------------ #
@@ -89,6 +92,8 @@ class AutoPilot:
             "max_new_per_cycle": self.max_new_per_cycle,
             "cooldown_after_loss": self.cooldown_after_loss,
             "max_daily_loss_pct": self.max_daily_loss_pct,
+            "max_giveback_pct": self.max_giveback_pct,
+            "peak_realized": self._peak_realized,
             "max_gross_exposure_pct": self.max_gross_exposure_pct,
             "min_confirmations": self.min_confirmations,
             "skip_noise": list(self.skip_noise),
@@ -105,7 +110,8 @@ class AutoPilot:
         tt = d.get("trade_types")
         if isinstance(tt, list) and tt:
             self.trade_types = [str(x).upper() for x in tt if str(x).upper() in TRADE_TYPES] or self.trade_types
-        for k in ("min_confidence", "min_reward_risk", "max_gross_exposure_pct", "max_daily_loss_pct"):
+        for k in ("min_confidence", "min_reward_risk", "max_gross_exposure_pct", "max_daily_loss_pct",
+                  "max_giveback_pct"):
             if isinstance(d.get(k), (int, float)):
                 setattr(self, k, float(d[k]))
         for k in ("max_auto_positions", "max_auto_trades_per_day",
@@ -123,6 +129,7 @@ class AutoPilot:
         if d.get("day") == clock.session_date().isoformat():
             self._day = d["day"]
             self._count_today = int(d.get("count_today", 0))
+            self._peak_realized = float(d.get("peak_realized", 0.0) or 0.0)
 
     # ------------------------------------------------------------------ #
     def configure(self, **kw: Any) -> Dict[str, Any]:
@@ -156,6 +163,8 @@ class AutoPilot:
             self.max_gross_exposure_pct = max(10.0, min(400.0, float(kw["max_gross_exposure_pct"])))
         if isinstance(kw.get("max_daily_loss_pct"), (int, float)):
             self.max_daily_loss_pct = max(0.0, min(50.0, float(kw["max_daily_loss_pct"])))
+        if isinstance(kw.get("max_giveback_pct"), (int, float)):
+            self.max_giveback_pct = max(0.0, min(100.0, float(kw["max_giveback_pct"])))
         if isinstance(kw.get("min_confirmations"), int):
             self.min_confirmations = max(1, min(10, int(kw["min_confirmations"])))
         if isinstance(kw.get("skip_noise"), list):
@@ -171,6 +180,7 @@ class AutoPilot:
         if today != self._day:
             self._day = today
             self._count_today = 0
+            self._peak_realized = 0.0
             self._acted.clear()
 
     def _live_ok(self) -> bool:
@@ -221,8 +231,10 @@ class AutoPilot:
             "max_new_per_cycle": self.max_new_per_cycle,
             "cooldown_after_loss": self.cooldown_after_loss,
             "max_daily_loss_pct": round(self.max_daily_loss_pct, 2),
+            "max_giveback_pct": round(self.max_giveback_pct, 1),
             "realized_today": round(self._realized_today(), 2),
-            "daily_loss_stop": bool(self._loss_stop_day) and self._loss_stop_day == self._day,
+            "peak_realized": round(self._peak_realized, 2),
+            "daily_loss_stop": self.stopped_for_the_day,
             "max_gross_exposure_pct": round(self.max_gross_exposure_pct, 1),
             "min_confirmations": self.min_confirmations,
             "skip_noise": list(self.skip_noise),
@@ -406,17 +418,30 @@ class AutoPilot:
         self._realized = (mono, total)
         return total
 
+    @property
+    def stopped_for_the_day(self) -> bool:
+        return bool(self._loss_stop_day) and self._loss_stop_day == self._day
+
     def daily_loss_reason(self, equity: float) -> Optional[str]:
-        """Why today's losses stop new entries, if they do. Aziz's daily maximum loss - "live to
-        trade another day" - and Chan's rule of cutting exposure after losses, never adding."""
-        if self.max_daily_loss_pct <= 0 or equity <= 0:
+        """Why today's results stop new entries, if they do. Aziz's daily maximum loss - "live to
+        trade another day" - and his give-back rule: he stops once he has lost 30% of what the
+        morning made. Chan's version: cut exposure after losses, never add."""
+        if equity <= 0:
             return None
         realized = self._realized_today()
-        limit = equity * self.max_daily_loss_pct / 100.0
-        if realized > -limit:
-            return None
-        return (f"today's closed trades have lost {-realized:,.0f}, past the daily limit of "
-                f"{self.max_daily_loss_pct:g}% of equity ({limit:,.0f}) - no more entries this session")
+        self._peak_realized = max(self._peak_realized, realized)
+        if self.max_daily_loss_pct > 0:
+            limit = equity * self.max_daily_loss_pct / 100.0
+            if realized <= -limit:
+                return (f"today's closed trades have lost {-realized:,.0f}, past the daily limit of "
+                        f"{self.max_daily_loss_pct:g}% of equity ({limit:,.0f}) - no more entries this session")
+        peak = self._peak_realized
+        if self.max_giveback_pct > 0 and peak >= equity * self.giveback_floor_pct / 100.0:
+            kept = realized / peak if peak else 1.0
+            if kept <= 1.0 - self.max_giveback_pct / 100.0:
+                return (f"today's realized gain has fallen from {peak:,.0f} to {realized:,.0f}, giving back more "
+                        f"than {self.max_giveback_pct:g}% of it - no more entries this session (Aziz's give-back rule)")
+        return None
 
     def _pre_gate(self, p: Any, equity: float) -> Optional[str]:
         """Cheap filters before we spend an engine assessment. Returns a reason
@@ -533,6 +558,7 @@ class AutoPilot:
             and not any(n in skipped for n in row.get("noise", []))
             and (row.get("timeframe") != "INTRADAY" or int(row.get("confirmations", 1)) >= self.min_confirmations)
             and not self._unproven(row.get("strategy", ""))
+            and not self.stopped_for_the_day
         )
         row["autopilot"] = {
             "eligible": bool(will),

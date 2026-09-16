@@ -29,6 +29,7 @@ def test_expected_exit_times_recorded(repo):
 
 
 def test_trade_lifecycle_and_pnl(repo):
+    before = repo.pnl_summary()                      # other tests share this database: count what this one adds
     p = _play()
     repo.record_play(p)
     tid = repo.open_trade(p, fill_price=100.0, fill_qty=10, broker="paper")
@@ -37,7 +38,8 @@ def test_trade_lifecycle_and_pnl(repo):
     assert out["r_multiple"] == 2.0                 # (4 reward) / (2 risk)
     assert out["is_day_trade"] is True
     s = repo.pnl_summary()
-    assert s["n_closed"] >= 1 and s["realized_total"] >= 40.0
+    assert s["n_closed"] == before["n_closed"] + 1
+    assert abs(s["realized_total"] - before["realized_total"] - 40.0) < 1e-6
 
 
 def test_short_trade_pnl(repo):

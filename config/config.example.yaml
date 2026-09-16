@@ -149,6 +149,9 @@ autopilot:
   cooldown_after_loss: true          # skip a ticker for the rest of the session after it stops out
   max_daily_loss_pct: 2.0            # Aziz's daily maximum loss: once today's closed trades have lost this
                                      # % of equity, no more entries until the next session (0 = off)
+  max_giveback_pct: 30.0             # ...or once the day's realized gain has given back this % of its best
+                                     # (Aziz: never lose more than 30% of what the morning made; 0 = off)
+  giveback_floor_pct: 0.25           # the give-back rule only counts a peak gain of at least this % of equity
   require_catalyst: false            # true = only auto-take plays tagged gap / catalyst
   dry_run: false                     # true = log every entry it WOULD take but place nothing
 
