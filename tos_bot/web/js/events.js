@@ -209,6 +209,7 @@ function handle(topic, p) {
     case "autopilot.config":
       S.state.autopilot = p;
       renderAutopilot();
+      emit("autopilot");
       break;
     case "autopilot.entered":
       toast(`🤖 Autopilot entered ${p.side} ${p.symbol} x${p.qty} — ${pretty(p.strategy)} (${p.count_today} today)`, "good");
