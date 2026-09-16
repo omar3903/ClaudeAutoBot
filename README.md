@@ -505,7 +505,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 |---|---|---|
 | master switch | off | `enabled` (UI toggle) |
 | **route real orders** | **off** | `allow_live` — *config-file only*; with it off, Autopilot is armed for **paper only** even in Live mode, and says so |
-| which trade types it may take | day and swing trades follow the **Intraday** / **Swing** filters over the plays, switched live; pairs have their own **Pairs** box in its settings | `trade_types` (`PAIRS`) |
+| which trade types it may take | the **Intraday** / **Swing** / **Pairs** boxes over the plays, switched live | `trade_types` (`PAIRS`) |
 | minimum strategy confidence | 0.62 | `min_confidence` |
 | minimum reward : risk | 2.0 | `min_reward_risk` (Aziz Rule 5) |
 | concurrent open auto positions | 2 | `max_auto_positions` |
@@ -815,7 +815,7 @@ spread with its band, stop and past trades); and the recent pair trades.
 
 **Replay and Autopilot** - **Strategies → Run replay** also chooses pairs on the sessions *before*
 the replayed ones and trades them only on those, paying costs on both legs; their record is
-`pairs_reversion`. Autopilot takes pairs only with **Pairs** among its trade types, once that
+`pairs_reversion`. Autopilot takes pairs only with the **Pairs** box over the plays ticked, once that
 record is proven (held-out sessions included), and at most `pairs.max_new_per_day` a day.
 
 ---

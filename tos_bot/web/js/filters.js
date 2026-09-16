@@ -31,6 +31,19 @@ async function changeFilter(box) {
   toast(r.note + (r.rescanning ? " Rescanning for the new plays…" : ""), "good");
 }
 
+/* ---------- Pairs: whether Autopilot may enter pair trades (its PAIRS trade type) ---------- */
+function syncPairs() {
+  $("#f-pairs").checked = ((S.state.autopilot || {}).trade_types || []).includes("PAIRS");
+}
+
+async function changePairs(box) {
+  const r = await post("/api/autopilot", { trade_types: ["INTRADAY", "SWING", ...(box.checked ? ["PAIRS"] : [])] });
+  if (!r.ok || !r.autopilot) { toast("Pairs not changed: " + (r.reason || "update failed"), "bad"); syncPairs(); return; }
+  S.state.autopilot = r.autopilot;
+  emit("autopilot");
+  toast(box.checked ? "Autopilot may enter pair trades once the replay has proven them." : "Autopilot won't enter pair trades.", "good");
+}
+
 /* ---------- the day/swing split of the trading capital: only while both kinds are on ---------- */
 let splitDragging = false;
 
@@ -103,6 +116,9 @@ export function initFilters() {
   on("state", syncControls);
   on("filters", syncControls);
   on("state", renderSplit);
+  on("state", syncPairs);
+  on("autopilot", syncPairs);
+  $("#f-pairs").onchange = e => changePairs(e.target);
   on("filters", renderSplit);
   on("capital", renderSplit);
   $("#split-range").oninput = e => { splitDragging = true; labelSplit(parseFloat(e.target.value)); };

@@ -1,6 +1,6 @@
 /* Autopilot: hands-off entry. Exits are automatic either way. */
 import { $, $$, escapeHtml, post } from "./util.js";
-import { S, on } from "./state.js";
+import { S, emit, on } from "./state.js";
 import { openModal, toast } from "./ui.js";
 
 const typeName = t => ({ INTRADAY: "day", SWING: "swing", PAIRS: "pairs" })[t] || String(t).toLowerCase();
@@ -27,7 +27,7 @@ export function renderAutopilot() {
 
 async function postAutopilot(body) {
   const r = await post("/api/autopilot", body);
-  if (r.autopilot) { S.state.autopilot = r.autopilot; renderAutopilot(); }
+  if (r.autopilot) { S.state.autopilot = r.autopilot; renderAutopilot(); emit("autopilot"); }
   if (r.note) toast(r.note, r.autopilot && r.autopilot.effective ? "good" : "warn");
   else if (!r.ok) toast("Autopilot: " + (r.reason || "update failed"), "bad");
   return r;
@@ -54,16 +54,12 @@ function toggle() {
 
 function configure() {
   const ap = S.state.autopilot || {};
-  const has = t => (ap.trade_types || []).includes(t) ? "checked" : "";
   openModal({
     title: "Autopilot settings",
     bodyHTML: `<div class="ap-form">
       <label>Auto-take these trade types</label>
-      <p class="muted small">Day trades and swing trades follow the <b>Intraday</b> and <b>Swing</b> filters above the plays -
-        now: <b>${(ap.trade_types || []).filter(t => t !== "PAIRS").map(typeName).join(", ") || "none"}</b>.</p>
-      <div class="ap-row">
-        <label title="Only once the replay has proven the pair rules, at most pairs.max_new_per_day a day"><input type="checkbox" id="ap-pairs" ${has("PAIRS")}> Pairs</label>
-      </div>
+      <p class="muted small">Autopilot takes what the <b>Intraday</b>, <b>Swing</b> and <b>Pairs</b> boxes above the plays switch on -
+        now: <b>${(ap.trade_types || []).map(typeName).join(", ") || "none"}</b>.</p>
       <label>Minimum confidence <b id="ap-conf-v">${ap.min_confidence ?? 0.62}</b></label>
       <input type="range" id="ap-conf" min="0.4" max="0.9" step="0.01" value="${ap.min_confidence ?? 0.62}">
       <label>Minimum reward : risk</label>
@@ -95,7 +91,7 @@ function configure() {
     okText: "Save", okClass: "long",
     onOk: async () => {
       const types = ["INTRADAY", "SWING"];                      // day and swing follow the filters
-      if ($("#ap-pairs").checked) types.push("PAIRS");
+      if ((ap.trade_types || []).includes("PAIRS")) types.push("PAIRS");     // pairs: the box next to them
       const int = sel => parseInt($(sel).value, 10);
       await postAutopilot({
         trade_types: types.length ? types : ["INTRADAY"],
