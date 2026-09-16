@@ -948,7 +948,13 @@ tos_bot/
   config.py                .env + config.yaml loader
   secrets_store.py         the Connections panel's validated, allow-listed .env writer
   engine/                  the conductor
-    engine.py                loops, scans on schedule, operator actions, quitting, snapshot
+    engine.py                the loops, scans on schedule, orders and positions, operator actions, snapshot
+    research_ops.py          the strategy replay and the evidence: records, weights, calibrated odds, half-Kelly
+    journal_ops.py           the daily journal, the movers report and the Reports page
+    pairs_ops.py             pairs trading from the engine's side
+    capital_ops.py           trading capital and its day / swing split
+    quit_ops.py              quitting without stranding a position
+    support.py               small helpers the engine and its mixins share
     connections.py           the one IB Gateway connection + the simulator
     board.py                 the plays on the dashboard
     capital.py               trading capital
