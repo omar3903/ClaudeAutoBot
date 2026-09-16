@@ -373,6 +373,67 @@ tr.clickable-row{cursor:pointer}
 .journal .ev-table th{text-align:left; font-size:11px; color:var(--muted); padding:3px 6px}
 @media (max-width:800px){ .journal{grid-template-columns:1fr} }
 
+/* ---- pages over the dashboard: Reports, Signals (sheet.js) ---- */
+.reports-btn{position:relative}
+.reports-btn .dot{position:absolute; top:4px; right:4px; width:8px; height:8px; border-radius:50%; background:var(--accent)}
+.sheet{position:fixed; inset:0; background:var(--overlay); z-index:9998; display:flex; justify-content:center; padding:2vh 2vw}
+.sheet-card{background:var(--bg2); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); width:100%;
+  max-width:1280px; display:flex; flex-direction:column; min-height:0}
+.sheet-head{display:flex; align-items:baseline; gap:12px; padding:12px 16px; border-bottom:1px solid var(--line)}
+.sheet-tools{margin-left:auto; display:flex; gap:8px}
+.sheet-main{display:grid; grid-template-columns:1fr; min-height:0; flex:1}
+.sheet-main.with-side{grid-template-columns:180px 1fr}
+.sheet-side{display:flex; flex-direction:column; gap:6px; overflow:auto; padding:12px; border-right:1px solid var(--line)}
+.sheet-body{overflow:auto; padding:4px 18px 18px; min-width:0}
+.sheet-body.journal{display:block}
+.report-title{font-size:16px; margin:14px 0 6px}
+.movers{margin-bottom:10px}
+.movers-head{display:flex; align-items:baseline; flex-wrap:wrap; gap:10px; margin-top:14px}
+.movers-head h4{margin:0}
+.seg-group{display:inline-flex; margin-left:auto; border:1px solid var(--line); border-radius:8px; overflow:hidden}
+.seg-group .seg{background:var(--bg3); color:var(--muted); border:none; border-radius:0}
+.seg-group .seg.active{background:var(--accent); color:var(--on-accent)}
+.movers-score div span{display:block}
+.table-scroll{overflow-x:auto}
+.movers-table{min-width:620px}
+.movers-table .nowrap{white-space:nowrap}
+.movers-table td{vertical-align:top; padding:6px}
+.movers-table tr.mover{cursor:pointer}
+.movers-table tr.mover:hover, .movers-table tr.mover.open{background:var(--sel)}
+.movers-table .why{max-width:340px}
+.movers-table .why .small{margin-top:3px}
+.mover-detail > td{background:var(--bg); padding:10px 12px}
+.mover-story{display:grid; grid-template-columns:1fr 1.4fr; gap:8px 22px}
+.mover-story .wide{grid-column:1 / -1}
+.mover-story h5{margin:4px 0; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em}
+.mover-story ul{margin:4px 0; padding-left:18px}
+.mover-story p{margin:4px 0}
+.stories{list-style:none; padding-left:0 !important}
+.stories li{margin:5px 0}
+.stories a{color:var(--accent)}
+.badge.accent{color:var(--accent)}
+button.link{background:none; border:none; padding:0; color:var(--accent); font:inherit; cursor:pointer}
+button.link:hover{text-decoration:underline; filter:none}
+.signal-sources div span{display:block}
+.signals-table td{vertical-align:top; padding:6px}
+.signals-table tr.mover{cursor:pointer}
+.signals-table tr.mover:hover, .signals-table tr.mover.open{background:var(--sel)}
+.sig-mark{font-size:10px; margin-left:4px; cursor:pointer}
+.badge.faint{color:var(--muted); font-weight:600}
+.play-chart .band{fill:var(--sel)}
+.play-chart .vline{stroke-width:1.5; stroke-dasharray:3 3}
+.play-chart .vl-news, .chart-key .vl-news{stroke:var(--accent2); background:var(--accent2)}
+.play-chart .lv-prev, .chart-key .lv-prev{stroke:var(--muted); fill:var(--muted); background:var(--muted)}
+.play-chart .mark{stroke:var(--bg); stroke-width:1}
+.play-chart .mk-entry, .chart-key .mk-entry{fill:var(--accent); background:var(--accent)}
+.play-chart .mk-win, .chart-key .mk-win{fill:var(--long); background:var(--long)}
+.play-chart .mk-loss, .chart-key .mk-loss{fill:var(--short); background:var(--short)}
+.play-chart .mk-play, .chart-key .mk-play{fill:var(--warn); background:var(--warn)}
+.chart-key{list-style:none; padding:0; margin:4px 0 10px; display:flex; flex-wrap:wrap; gap:4px 16px; color:var(--muted)}
+.chart-key i{display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:middle}
+@media (max-width:900px){ .sheet-main.with-side{grid-template-columns:1fr} .sheet-side{flex-direction:row; overflow-x:auto; border-right:none}
+  .mover-story{grid-template-columns:1fr} }
+
 /* ---- pairs ---- */
 .pairs{padding:10px 12px}
 .pairs h4{margin:14px 0 6px}

@@ -26,19 +26,22 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
+from ..core.enums import Side
 from ..core.eventbus import BUS
 from ..data.sec_edgar import sec_ticker
 from ..data.sec_http import SEC, SecHttp
 from ..util import clock
-from .book import SignalBook
+from .book import SignalBook, nudge
+from .calendar import EarningsCalendarFile, next_report, sessions_until
 from .edgar import (LATEST_URL, SUBMISSIONS_URL, TICKERS_URL, FilingRef, company_filings, company_tickers,
                     daily_index, daily_index_url, latest_filings)
 from .finnhub import FinnhubNews
 from .form4 import InsiderTrade, parse_form4
-from .insiders import InsiderSettings, insider_signals
+from .insiders import InsiderSettings, filing_delays, insider_signals
 from .news import NewsItem, eight_k_news, ibkr_headline, is_material
 from .sentiment import HeadlineSentiment, symbol_sentiment
 from .store import SignalStore
@@ -52,6 +55,10 @@ HISTORY_PER_PASS = 25            # companies whose past filings are read in one 
 HISTORY_REFRESH_DAYS = 7
 MAX_WATCHED = 40                 # stocks whose news is followed
 READERS = 6                      # filings downloaded at once; the shared pacer keeps SEC under 10 a second
+MOVER_HEADLINES = 50             # IBKR headlines per stock for a session's movers
+PAGE_DAYS = 30                   # the insider filings and headline counts the Signals page shows
+PAGE_HEADLINES = 80
+CALENDAR_DAYS_BACK = 7           # earlier reports re-read, so their actual numbers are filled in
 
 
 def ibkr_symbol(ticker: str) -> str:
@@ -78,21 +85,48 @@ class SignalService:
         self._ciks: Dict[str, int] = {}
         self._ciks_on: Optional[dt.date] = None
         self._stop: Optional[threading.Event] = None
-        self.report: Dict[str, Any] = {"insiders": {}, "news": {}, "errors": {}}
+        self._checking = threading.Lock()
+        self._insiders_at = self._news_at = self._calendar_at = float("-inf")
+        #: every earnings report seen (signals/calendar.py), kept next to the signals' own state
+        self.calendar = EarningsCalendarFile(state_path.parent / "earnings_calendar.json")
+        self.book.set_earnings(self.calendar.by_symbol())
+        self.report: Dict[str, Any] = {"insiders": {}, "news": {}, "calendar": {}, "errors": {}}
 
     # ---- the loop ------------------------------------------------------------ #
     def run(self, stop: threading.Event) -> None:
         self._stop = stop
         stop.wait(20.0)                                  # let the app connect first
-        insiders_at = news_at = float("-inf")
         while not stop.is_set():
-            if time.monotonic() - insiders_at >= self.cfg.insider_poll_minutes * 60:
-                self._safely("insider filings", self.poll_insiders)
-                insiders_at = time.monotonic()
-            if time.monotonic() - news_at >= self.cfg.news_poll_minutes * 60:
-                self._safely("news", self.poll_news)
-                news_at = time.monotonic()
+            with self._checking:
+                if time.monotonic() - self._insiders_at >= self.cfg.insider_poll_minutes * 60:
+                    self._safely("insider filings", self.poll_insiders)
+                    self._insiders_at = time.monotonic()
+                if time.monotonic() - self._news_at >= self.cfg.news_poll_minutes * 60:
+                    self._safely("news", self.poll_news)
+                    self._news_at = time.monotonic()
+                if self._finnhub_key() and time.monotonic() - self._calendar_at >= self.cfg.calendar_hours * 3600:
+                    self._safely("earnings calendar", self.poll_calendar)
+                    self._calendar_at = time.monotonic()
             stop.wait(15.0)
+
+    def check_now(self) -> Dict[str, Any]:
+        """Read the filings and the news straight away, in the background - after adding a Finnhub key,
+        say. The loop's own passes wait for it."""
+        if not self.cfg.enabled:
+            return {"ok": False, "reason": "The signals are off (signals.enabled in config.yaml)."}
+        if self._checking.locked():
+            return {"ok": True, "note": "A check is already running."}
+
+        def check() -> None:
+            with self._checking:
+                self._safely("insider filings", self.poll_insiders)
+                self._safely("news", self.poll_news)
+                self._insiders_at = self._news_at = time.monotonic()
+                if self._finnhub_key():
+                    self._safely("earnings calendar", self.poll_calendar)
+                    self._calendar_at = time.monotonic()
+        threading.Thread(target=check, name="signals-check", daemon=True).start()
+        return {"ok": True, "note": "Checking the insider filings and the news now - the page updates when it's done."}
 
     def _safely(self, what: str, step: Callable[[], Any]) -> None:
         try:
@@ -238,26 +272,63 @@ class SignalService:
         now = dt.datetime.now(dt.timezone.utc)
         since = now - dt.timedelta(days=self.cfg.news_lookback_days)
         symbols = list(dict.fromkeys([*self._watched(), *self.book.unusual_buying_symbols()]))[:MAX_WATCHED]
-        items = self._ibkr_news(symbols) + self._filings(symbols, since) + self._finnhub(symbols, since)
+        items = self._ibkr_news(symbols, since) + self._filings(symbols, since) + self._finnhub(symbols, since)
         new = self.store.save_news(items)
         scored = self._score_headlines()
         for signals in self.book.all():
             if signals.symbol not in symbols and (signals.news or signals.filings):
                 self.book.set_news(signals.symbol, None, [])
+        stories: Dict[str, List[Dict[str, Any]]] = {}
         for symbol in symbols:
             rows = self.store.news([symbol], since)
             filings = [r for r in rows if r["kind"] == "filing" and is_material(r["items"])]
             self.book.set_news(symbol, symbol_sentiment(rows, now), filings[:5])
+            stories[symbol] = [{"at": r["published_at"], "kind": r["kind"], "headline": r["headline"],
+                                "source": r["provider"] or r["source"]}
+                               for r in rows if r["kind"] != "filing" or is_material(r["items"])]
+        self.book.set_stories(stories, now)
         self.report["news"] = {"checked_at": _now_iso(), "watched": len(symbols), "new_stories": new,
                                "scored": scored, "finnhub": bool(self._finnhub_key())}
         self.bus.publish("signals.updated", report=self.report["news"])
 
-    def _ibkr_news(self, symbols: List[str]) -> List[NewsItem]:
+    def stories_between(self, symbols: Sequence[str], start: dt.datetime,
+                        end: dt.datetime) -> Dict[str, List[Dict[str, Any]]]:
+        """Every source's stories about ``symbols`` published from ``start`` to ``end`` (UTC), oldest first
+        per stock - fetched, kept with the rest of the news and scored. For the report on a session's movers."""
+        symbols = list(dict.fromkeys(symbols))
+        if symbols:
+            self.store.save_news(self._ibkr_news(symbols, start, end, MOVER_HEADLINES) + self._filings(symbols, start)
+                                 + self._finnhub(symbols, start))
+            self._score_headlines()
+        out: Dict[str, List[Dict[str, Any]]] = {s: [] for s in symbols}
+        for row in reversed(self.store.news(symbols, start) if symbols else []):
+            if dt.datetime.fromisoformat(row["published_at"]) <= end:
+                out[row["symbol"]].append(row)
+        return out
+
+    def poll_calendar(self) -> None:
+        """Every company's earnings reports from a week back to ``calendar_days_ahead`` ahead - one Finnhub request."""
+        feed = FinnhubNews(self._finnhub_key())
+        if not feed.configured:
+            return
+        today = self._today()
+        events = feed.earnings_calendar(today - dt.timedelta(days=CALENDAR_DAYS_BACK),
+                                        today + dt.timedelta(days=self.cfg.calendar_days_ahead))
+        kept = self.calendar.merge(events, today)
+        self.calendar.save()
+        self.book.set_earnings(self.calendar.by_symbol())
+        self.report["calendar"] = {"checked_at": _now_iso(), "read": len(events), "kept": kept,
+                                   "upcoming": sum(1 for e in events if e.date >= today.isoformat())}
+        self.bus.publish("signals.updated", report=self.report["calendar"])
+
+    def _ibkr_news(self, symbols: List[str], since: dt.datetime, until: Optional[dt.datetime] = None,
+                   per_symbol: int = 10) -> List[NewsItem]:
         source = self._news_source()
         if source is None or not hasattr(source, "news_headlines") or not symbols:
             return []
         items: List[NewsItem] = []
-        for symbol, rows in source.news_headlines(self._con_ids(symbols), days=self.cfg.news_lookback_days).items():
+        found = source.news_headlines(self._con_ids(symbols), since=since, until=until, per_symbol=per_symbol)
+        for symbol, rows in found.items():
             for when, provider, article, raw in rows:
                 headline, kind = ibkr_headline(raw)
                 if headline:
@@ -313,10 +384,43 @@ class SignalService:
 
     # ---- for the dashboard ----------------------------------------------------- #
     def state(self) -> Dict[str, Any]:
-        signals = sorted(self.book.all(), key=lambda s: -max(s.buying.score if s.buying else 0.0,
-                                                            s.selling.score if s.selling else 0.0))
-        return {"enabled": bool(self.cfg.enabled), "report": self.report, "sentiment": self.sentiment.status(),
-                "finnhub": bool(self._finnhub_key()), "signals": [s.as_dict() for s in signals[:100]]}
+        signals = sorted(self.book.all(), key=lambda s: (-max(s.buying.score if s.buying else 0.0,
+                                                             s.selling.score if s.selling else 0.0),
+                                                         -abs(float((s.news or {}).get("score") or 0.0))))
+        now, today = dt.datetime.now(dt.timezone.utc), self._today()
+        filings = self.store.insider_filings(today - dt.timedelta(days=PAGE_DAYS))
+        return {
+            "enabled": bool(self.cfg.enabled), "report": self.report, "checking": self._checking.locked(),
+            "sentiment": {**self.sentiment.status(), "wanted": bool(self.cfg.sentiment),
+                          **self.store.sentiment_counts(now - dt.timedelta(days=PAGE_DAYS))},
+            "finnhub": bool(self._finnhub_key()), "boosts": asdict(self.book.boosts),
+            "settings": {"insider_poll_minutes": self.cfg.insider_poll_minutes,
+                         "news_poll_minutes": self.cfg.news_poll_minutes, "news_lookback_days": self.cfg.news_lookback_days},
+            "signals": [self._signal_row(s) for s in signals[:100]],
+            "filings": filings[:150], "filing_delays": filing_delays(filings), "days": PAGE_DAYS,
+            "headlines": self.store.news(None, now - dt.timedelta(days=self.cfg.news_lookback_days), PAGE_HEADLINES),
+            "calendar": {"fetched_at": self.calendar.fetched_at, "reports": len(self.calendar),
+                         "hours": self.cfg.calendar_hours},
+        }
+
+    def symbol_state(self, symbol: str) -> Dict[str, Any]:
+        """One stock's signals, its insiders' filings over the past year and its recent news."""
+        signals = self.book.get(symbol)
+        filings = self.store.insider_filings(self._today() - dt.timedelta(days=self.cfg.insider_history_days), [symbol])
+        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=PAGE_DAYS)
+        reports = self.book.earnings_for(symbol)
+        upcoming = next_report(reports, clock.now_ny())
+        return {"symbol": symbol, "signals": self._signal_row(signals) if signals else None, "filings": filings,
+                "filing_delays": filing_delays(filings), "headlines": self.store.news([symbol], since, PAGE_HEADLINES),
+                "earnings": reports[-6:],
+                "next_earnings": {**upcoming, "sessions": sessions_until(upcoming, clock.now_ny())} if upcoming else None}
+
+    def _signal_row(self, signals) -> Dict[str, Any]:
+        effect = {}
+        for side in (Side.LONG, Side.SHORT):
+            delta, why = nudge(side, signals, self.book.boosts)
+            effect[side.value] = {"delta": delta, "why": why}
+        return {**signals.as_dict(), "effect": effect}
 
 
 def _utc(when: dt.datetime) -> dt.datetime:

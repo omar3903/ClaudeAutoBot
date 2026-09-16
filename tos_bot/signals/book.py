@@ -10,6 +10,7 @@ written into the play's evidence, so it can be seen and measured.
 
 from __future__ import annotations
 
+import datetime as dt
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -78,6 +79,8 @@ class SignalBook:
     def __init__(self, boosts: BoostSettings = BoostSettings()) -> None:
         self.boosts = boosts
         self._by_symbol: Dict[str, SymbolSignals] = {}
+        self._stories: Dict[str, Tuple[dt.datetime, List[Dict[str, Any]]]] = {}
+        self._earnings: Dict[str, List[Dict[str, Any]]] = {}
         self._lock = threading.Lock()
 
     def set_insiders(self, found: Mapping[str, Tuple[Optional[InsiderSignal], Optional[InsiderSignal]]]) -> None:
@@ -96,6 +99,26 @@ class SignalBook:
             sig = self._by_symbol.setdefault(symbol, SymbolSignals(symbol))
             sig.news, sig.filings = news, list(filings)
             self._drop_empty()
+
+    def set_stories(self, stories: Mapping[str, List[Dict[str, Any]]], checked_at: dt.datetime) -> None:
+        """Each followed stock's recent stories, as read at ``checked_at``; stocks left out aren't followed any more."""
+        with self._lock:
+            self._stories = {symbol: (checked_at, list(rows)) for symbol, rows in stories.items()}
+
+    def news_reading(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """When the stock's news was last read and the stories found - None when it isn't followed."""
+        with self._lock:
+            found = self._stories.get(symbol)
+        return {"checked_at": found[0], "stories": found[1]} if found else None
+
+    def set_earnings(self, by_symbol: Mapping[str, List[Dict[str, Any]]]) -> None:
+        """Every stock's earnings reports from the calendar (signals/calendar.py)."""
+        with self._lock:
+            self._earnings = dict(by_symbol)
+
+    def earnings_for(self, symbol: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._earnings.get(symbol, []))
 
     def get(self, symbol: str) -> Optional[SymbolSignals]:
         with self._lock:

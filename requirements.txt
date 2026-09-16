@@ -25,7 +25,8 @@ ib_async>=1.0.3          # Interactive Brokers, via a running IB Gateway / TWS
 requests>=2.31           # US listings (Nasdaq Trader), SEC EDGAR financials and insider filings, ECB rates
 
 # --- optional: headline sentiment for the signals (FinBERT, runs on this computer) ---
-# pip install transformers torch   # several hundred MB; without them headlines carry no sentiment
+# pip install "transformers>=5.17" "torch>=2.14"   # ~140 MB, plus the 438 MB model on first use;
+#                                                  # without them headlines carry no sentiment
 
 # --- dev ---
 pytest>=8.0

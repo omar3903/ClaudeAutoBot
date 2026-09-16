@@ -51,6 +51,8 @@
     <div class="actions">
       <button id="btn-refresh" class="ghost" title="Re-pull account, positions and fills now">&#8635; Refresh</button>
       <button id="btn-reset-paper" class="ghost lockable hidden" title="Reset the simulator balance">Reset paper</button>
+      <button id="btn-reports" class="ghost reports-btn" title="Each session's report: the market's biggest movers and why, what the bot made of them, its trades and mistakes">Reports<span id="reports-dot" class="dot hidden" aria-label="new report"></span></button>
+      <button id="btn-signals" class="ghost" title="Insider trades and company news: where they come from, what they say, what they do to plays">Signals</button>
       <button id="btn-connections" class="ghost" title="IB Gateway and where orders go">Connections</button>
       <button id="btn-strategies" class="ghost" title="Switch setups on or off and set their weight">Strategies</button>
       <button id="btn-settings" class="ghost" title="When the scans run and how big the hot list and buffers are">Settings</button>
@@ -116,7 +118,6 @@
         <button class="tab" data-tab="stats">P/L summary</button>
         <button class="tab" data-tab="watchlist">Watchlist</button>
         <button class="tab" data-tab="pairs" title="Pairs trading: two cointegrated stocks, one long and one short">Pairs</button>
-        <button class="tab" data-tab="journal" title="Each session's review: trades, mistakes, the plays not taken, lessons">Journal</button>
       </div>
       <button id="btn-exit-all" class="danger mini hidden" title="Exit every open position at the market">Exit all</button>
     </div>
@@ -126,7 +127,6 @@
     <div class="tab-body hidden" id="tab-stats"></div>
     <div class="tab-body hidden" id="tab-watchlist"></div>
     <div class="tab-body hidden" id="tab-pairs"></div>
-    <div class="tab-body hidden" id="tab-journal"></div>
   </section>
 
   <div id="tooltip" class="tooltip hidden" role="tooltip"></div>

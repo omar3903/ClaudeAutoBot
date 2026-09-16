@@ -155,6 +155,14 @@ class DayWatchlist:
         for old in sorted(directory.glob("watchlist_*.json"))[:-5]:
             old.unlink(missing_ok=True)
 
+    @staticmethod
+    def saved(directory: Path, session: dt.date) -> Optional[dict]:
+        """A session's watchlist as it stood when last saved, while its file is still kept."""
+        try:
+            return json.loads((directory / f"watchlist_{session.isoformat()}.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
     @classmethod
     def load_latest(cls, directory: Path) -> Optional["DayWatchlist"]:
         for path in sorted(directory.glob("watchlist_*.json"), reverse=True):

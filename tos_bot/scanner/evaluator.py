@@ -23,6 +23,7 @@ from ..data.market_data import quote_from_price
 from ..strategies.base import Strategy, StrategyContext
 from ..signals.book import SignalBook
 from .filters import expected_r, rank_score
+from ..signals.calendar import next_report, sessions_until
 from .noise import NoiseSettings, context_flags
 
 log = logging.getLogger(__name__)
@@ -54,8 +55,10 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
              activity: Any = None, fundamentals: Optional[Financials] = None,
              peers: Optional[List[Financials]] = None, noise: Optional[NoiseSettings] = None,
              signals: Optional[SignalBook] = None, market: Optional[Mapping[str, Any]] = None,
-             evidence_weights: Optional[Mapping[str, float]] = None) -> List[Play]:
-    """``evidence_weights``: each strategy's evidence multiplier (see research/weights.py)."""
+             evidence_weights: Optional[Mapping[str, float]] = None,
+             benchmark: Optional[pd.Series] = None) -> List[Play]:
+    """``evidence_weights``: each strategy's evidence multiplier (see research/weights.py). ``benchmark``:
+    the S&P 500 ETF's closes, for the market model."""
     noise = noise or NoiseSettings()
     full_daily = with_today(daily, intraday)
     latest = intraday if intraday is not None and len(intraday) else full_daily
@@ -65,6 +68,8 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
         fundamentals=fundamentals, peers=peers, params=params, account_equity=equity,
         activity=asdict(activity) if is_dataclass(activity) else {},
         signals=signals.get(symbol) if signals is not None else None, market=dict(market or {}),
+        benchmark=benchmark, news=signals.news_reading(symbol) if signals is not None else None,
+        earnings=signals.earnings_for(symbol) if signals is not None else None,
     )
     plays: List[Play] = []
     for strategy in strategies:
@@ -75,7 +80,7 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
                 p.noise = context_flags(p, ctx, strategy.style, noise)
                 if p.evidence["expected_r"] < noise.min_expected_r:
                     p.noise.append("low_expected_value")
-                add_readings(p, ctx, strategy.style)
+                add_readings(p, ctx, strategy.style, noise)
                 multiplier = float((evidence_weights or {}).get(strategy.key, 1.0))
                 if abs(multiplier - 1.0) > 1e-9:
                     p.evidence["evidence_weight"] = round(multiplier, 3)
@@ -89,7 +94,7 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
     return plays
 
 
-def add_readings(p: Play, ctx: StrategyContext, style: str) -> None:
+def add_readings(p: Play, ctx: StrategyContext, style: str, noise: Optional[NoiseSettings] = None) -> None:
     """Write the quantitative readings into the play's evidence, where the dashboard shows
     them and the journal keeps them. A reversal setup is expected to take about as long as
     its price takes to halve a deviation from the mean (Chan, *Algorithmic Trading* ch. 2)."""
@@ -102,6 +107,13 @@ def add_readings(p: Play, ctx: StrategyContext, style: str) -> None:
         p.evidence["vol_forecast"] = vol
     if ctx.market:
         p.evidence["market_regime"] = dict(ctx.market)
+    noise = noise or NoiseSettings()
+    move = ctx.abnormal_move(noise.market_model_sessions)
+    if move is not None:
+        p.evidence["market_move"] = {**move, "news": ctx.news_since_move(noise.news_fresh_minutes)}
+    upcoming = next_report(ctx.earnings, ctx.now)
+    if upcoming is not None:
+        p.evidence["next_earnings"] = {**upcoming, "sessions": sessions_until(upcoming, ctx.now)}
     life = (character or {}).get("half_life_bars")
     if style != "reversal" or not life or character["character"] != "mean reverting":
         return                          # a random walk's half-life is only noise in the estimate

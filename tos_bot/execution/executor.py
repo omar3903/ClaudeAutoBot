@@ -16,6 +16,7 @@ exit is never sent twice.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -46,6 +47,8 @@ class _Pending:
 class Executor:
     #: polls in a row (the sync loop runs every 4 s) a connected broker may not know an order before it's given up
     LOST_AFTER_POLLS = 5
+    #: after the broker (re)connects - IB Gateway's nightly restart - its order list takes a while to reload
+    RESYNC_GRACE_S = 60.0
 
     def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS,
                  venue: Optional[str] = None) -> None:
@@ -365,6 +368,8 @@ class Executor:
         if p is None:
             return
         if res.status == "UNKNOWN":
+            if self._broker_resyncing():
+                return                                  # it has only just reconnected and is still reloading orders
             p.unseen += 1
             if p.unseen < self.LOST_AFTER_POLLS:
                 return
@@ -408,6 +413,10 @@ class Executor:
         self.bus.publish("order.failed", kind=p.kind, order_id=res.order_id, status=res.status,
                          symbol=p.play.symbol, trade_id=p.trade_id, filled_qty=filled,
                          reason=reason, msg=msg)
+
+    def _broker_resyncing(self) -> bool:
+        since = float(getattr(self.broker, "connected_since", 0.0) or 0.0)
+        return since > 0 and time.monotonic() - since < self.RESYNC_GRACE_S
 
     def _cancel_quietly(self, order_id: str) -> None:
         try:

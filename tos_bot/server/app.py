@@ -222,7 +222,15 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
 
     @app.get("/api/signals")
     def signals_state():
-        return eng().signals.state()
+        return eng().signals_state()
+
+    @app.get("/api/signals/stock/{symbol}")
+    def signal_detail(symbol: str):
+        return eng().signal_detail(symbol.upper())
+
+    @app.post("/api/signals/check")
+    def signals_check():
+        return _result(eng().check_signals())
 
     @app.get("/api/replay")
     def replay():
@@ -252,6 +260,14 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
         if review is None:
             raise HTTPException(404, "no review for that session")
         return review
+
+    @app.get("/api/journal/{session}/movers/{symbol}/chart")
+    def mover_chart(session: str, symbol: str):
+        try:
+            day = dt.date.fromisoformat(session)
+        except ValueError:
+            raise HTTPException(400, "the session must be a date like 2026-09-15")
+        return eng().mover_chart(day, symbol.upper())
 
     @app.post("/api/journal/review")
     def journal_build(body: dict):

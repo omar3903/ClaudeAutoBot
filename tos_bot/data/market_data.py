@@ -27,6 +27,8 @@ INTRADAY_DURATION = "5 D"            # today plus four sessions, for relative vo
 _INTRADAY_TTL_S = 60.0
 REFRESH_DURATION = "1800 S"           # the quick re-check fetches the last half hour only
 _QUOTE_TTL_S = 20.0
+#: candles and quotes nothing has asked for in this long are let go - the app runs for days
+_CACHE_KEEP_S = 1800.0
 _DAILY_CHUNK = 200
 
 
@@ -63,6 +65,9 @@ class MarketData:
         self._lock = threading.Lock()
         self._intraday: Dict[str, Tuple[float, pd.DataFrame]] = {}
         self._quotes: Dict[str, Tuple[float, Quote]] = {}
+        self._pruned_at = 0.0
+        #: the morning scan and the movers report can want the same download; the second then finds it done
+        self._daily_lock = threading.Lock()
 
     # ---- the source --------------------------------------------------- #
     def attach(self, source: PriceSource) -> None:
@@ -100,18 +105,19 @@ class MarketData:
                      progress: Optional[Callable[[int, int], None]] = None) -> int:
         """Bring each symbol's stored daily bars up to ``through``. Returns how
         many symbols needed a request."""
-        plan = {s: d for s in symbols if (d := self.bars.duration_needed(s, through))}
-        done = 0
-        items = list(plan.items())
-        for i in range(0, len(items), _DAILY_CHUNK):
-            chunk = dict(items[i:i + _DAILY_CHUNK])
-            got = self.source.history_many({s: ("1 day", d) for s, d in chunk.items()}, con_ids)
-            for symbol, frame in got.items():
-                self.bars.merge(symbol, frame, through)
-            done += len(chunk)
-            if progress:
-                progress(done, len(items))
-        return len(plan)
+        with self._daily_lock:
+            plan = {s: d for s in symbols if (d := self.bars.duration_needed(s, through))}
+            done = 0
+            items = list(plan.items())
+            for i in range(0, len(items), _DAILY_CHUNK):
+                chunk = dict(items[i:i + _DAILY_CHUNK])
+                got = self.source.history_many({s: ("1 day", d) for s, d in chunk.items()}, con_ids)
+                for symbol, frame in got.items():
+                    self.bars.merge(symbol, frame, through)
+                done += len(chunk)
+                if progress:
+                    progress(done, len(items))
+            return len(plan)
 
     def daily(self, symbols: Iterable[str]) -> Dict[str, pd.DataFrame]:
         return self.bars.frames(symbols)
@@ -123,6 +129,7 @@ class MarketData:
     def intraday(self, symbols: Sequence[str],
                  con_ids: Optional[Mapping[str, int]] = None) -> Dict[str, pd.DataFrame]:
         now = time.monotonic()
+        self._prune(now)
         out, todo = {}, []
         for s in dict.fromkeys(symbols):
             hit = self._intraday.get(s)
@@ -137,6 +144,16 @@ class MarketData:
                     self._intraday[s] = (now, frame)
             out.update(got)
         return out
+
+    def _prune(self, now: float) -> None:
+        """Forget the candles and quotes nothing has asked for in a while - otherwise every stock the
+        cycles ever looked at would stay in memory for as long as the app runs."""
+        if now - self._pruned_at < 300:
+            return
+        with self._lock:
+            self._pruned_at = now
+            self._intraday = {s: hit for s, hit in self._intraday.items() if now - hit[0] < _CACHE_KEEP_S}
+            self._quotes = {s: hit for s, hit in self._quotes.items() if now - hit[0] < _CACHE_KEEP_S}
 
     def refresh_intraday(self, symbols: Sequence[str],
                          con_ids: Optional[Mapping[str, int]] = None) -> Dict[str, pd.DataFrame]:

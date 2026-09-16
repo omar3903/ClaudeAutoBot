@@ -14,8 +14,8 @@ from __future__ import annotations
 import datetime as dt
 import re
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from dataclasses import asdict, dataclass
+from typing import Dict, List, Optional, Tuple
 
 BUY, SELL = "P", "S"
 #: best role first - a filing with several reporting owners takes the most senior
@@ -54,6 +54,11 @@ class InsiderTrade:
     @property
     def value(self) -> float:
         return self.shares * self.price
+
+    def as_row(self) -> Dict[str, object]:
+        row = asdict(self)
+        row.update(trade_date=self.trade_date.isoformat(), value=round(self.value, 2))
+        return row
 
     @property
     def new_holding(self) -> bool:

@@ -54,8 +54,10 @@ turbulent market regimes), and **Vidyamurthy, *Pairs Trading***, **Johansen** an
   about it. An open-trade record whose position no longer exists at the broker
   is deleted automatically.
 - **Trading capital** — tell the bot to use only part of the account.
-- **A journal that learns from every session** — after the close the bot reviews
-  the day: each trade with what it was taken on, the mistakes, how the plays it
+- **A report on every session** — after the close: the market's biggest movers,
+  why each one moved (earnings, filings, analyst actions, news, its sector) and
+  whether the bot traded it, offered it, watched it or missed it, with charts; then
+  each of the bot's trades with what it was taken on, the mistakes, how the plays it
   didn't take would have done, and each strategy's real record against its replay.
 - **Proof before Autopilot trades** — every strategy is replayed on past candles
   with costs, and has to make money on the held-out latest third of them too.
@@ -314,6 +316,47 @@ the defaults), and are pushed over the WebSocket so every open tab updates.
 
 ---
 
+## A day in the bot's life
+
+Times are New York time, with the default settings.
+
+| when | what the bot does |
+|---|---|
+| overnight – 8:30 AM | Holds its connection to IB Gateway and watches open positions. Reads SEC's live feed of insider filings every 3 minutes and the news on the stocks it holds and on yesterday's hot list every 15. If the last session has no report yet, it writes one. No scanning — the market is closed. |
+| **8:30 AM** (`premarket_time`, 4:00–9:00) | **The full scan.** Every listed stock's daily candles, through yesterday's close, are brought up to date (after a report the evening before, there's almost nothing left to download). Every liquid stock is ranked by *yesterday's* heat: relative volume, the move in average daily ranges, closeness to a 20-day high or low, daily range and dollar volume. The hottest become today's **hot list** (at most a third per sector) and the next ones each sector's **buffer**. Swing and valuation setups are looked for, and pairs are fitted. |
+| 8:30 – 9:30 AM | News follows the new hot list. Nothing is scanned intraday yet — the scan reads regular-session candles, so pre-market moves aren't in it. |
+| **9:30 AM – 4:00 PM** | **Cycles** every 15 minutes rescan the hot list on 5-minute candles and try the next names from each sector's buffer — adopting a hotter one into the hot list, keeping or dropping the rest. With Autopilot day-trading, a fast cycle over the hot list every minute. Plays are offered, taken by you or Autopilot, and exits are managed. Pairs are decided in the last 30 minutes. |
+| **4:15 PM** (`journal.review_at`) | **The report**: the session's daily candles for every stock, the market's biggest movers and what the bot made of them, then the bot's own trades, mistakes and missed plays. |
+| 9:00 PM | IB Gateway's daily restart — the app rides through it (see below). |
+
+So yesterday's top movers *are* what the morning works from: the heat ranking is mostly
+yesterday's relative volume and move. What it can't see is a stock that starts moving
+overnight; the report counts those every day.
+
+## Running 24/7
+
+The app is built to be left running:
+
+* **IB Gateway's daily restart** (set it to *Auto restart* at 9:00 PM ET - see *Connecting IB Gateway*).
+  The dashboard says the Gateway disconnected; the app keeps trying (5 s, 10 s, 15 s, 30 s, then every
+  minute or two) and reconnects once the Gateway has logged back in. A Gateway that takes connections
+  before it has loaded the account isn't trusted - the app tries again - and for a minute after any
+  reconnect, positions aren't compared with the trade records and working orders aren't given up on,
+  so nothing is deleted because an answer came back half-loaded.
+* **IBKR's nightly maintenance** (about 11:45 PM-12:45 AM ET). When the Gateway stays up but loses
+  IBKR's servers, the app waits on the same connection for IBKR's all-clear; if that hasn't come after
+  10 minutes it starts the connection afresh.
+* **The weekly login.** About once a week IBKR wants a full login (with two-factor). If the Gateway
+  has been gone for 10 minutes, the dashboard says so - log in and the app picks up by itself.
+* **A replay running at 9 PM** waits up to 15 minutes for the Gateway instead of failing.
+* **Days on end** - candles and quotes nothing has asked for in half an hour are let go, the log
+  rotates at 5 MB, and the scans, the reports, Autopilot's daily counts and the pairs roll over by date.
+* **Sleep.** While the app runs it asks Windows not to go to sleep (the screen can still turn off);
+  set `app.keep_awake: false` to stop that.
+* **Crashes.** `scripts\run_24_7.bat` starts the app and starts it again 30 seconds after it stops
+  unexpectedly; quitting from the dashboard ends it. A shortcut to it in the Startup folder
+  (`Win+R`, `shell:startup`) brings the app back after a reboot - Windows Update's included.
+
 ## Quitting
 
 **Quit** (header) or **Ctrl+C** in the terminal never walks away from open
@@ -498,8 +541,10 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 - Every 15 minutes, for the stocks held, the hot list and those with unusual insider buying (up to 40): IBKR
   headlines (on a paper account mostly Briefing.com columns and analyst actions), SEC 8-K filings (material items
   such as earnings or an officer leaving), and Finnhub stories with a free key (Connections → Company news).
-- Headlines are scored by FinBERT on this computer when it is installed - `pip install transformers torch`, a
-  download of several hundred MB. Without it they simply carry no sentiment.
+- Headlines are scored from -1 (negative) to +1 (positive) by FinBERT on this computer when it is installed:
+  `pip install transformers torch` (about 140 MB of packages); the model itself (ProsusAI/finbert, 438 MB) is
+  downloaded from Hugging Face the first time a headline is scored and cached under `~/.cache/huggingface`.
+  Without it headlines carry no sentiment and the news nudge does nothing.
 
 **What the signals do**
 - **Insider buying** (`insider_buying`, a swing setup): unusual buying in the last 10 days, while the stock is no
@@ -510,8 +555,40 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 - **Score nudges** on every other play: unusual insider buying adds up to 0.10 to a long (and takes it from a
   short), unusual selling takes up to 0.08 from a long (and adds half that to a short), and the news moves a play
   by up to 0.06 once two or more headlines are scored. The play's evidence shows each nudge and why.
-- `GET /api/signals` lists the current signals; they are kept in the `insider_trades`, `filings_read` and
-  `news_items` tables.
+- **The earnings calendar** (Finnhub, with the key; read every 6 hours, one request for every company):
+  - *Post-earnings drift* counts a report from the calendar as well as from SEC's 8-K - the 8-K often comes
+    later than the press release. When the calendar has the reported EPS, a gap the other way from the
+    surprise, `(actual - estimate) / |estimate|`, isn't taken (Chan, *Quantitative Trading*: buy the beats,
+    short the misses).
+  - A momentum or reversal **swing** play with a report due within its hold is flagged `earnings_ahead` - a
+    report can gap the price through the stop. A swing position already held into a report due by the next
+    session gets a warning on the dashboard, once.
+- **Moves with and without news** (`quant/market_model.py`): the market model from Tsay (ch. 9),
+  `r_stock = alpha + beta * r_SPY + e`, fitted on the last 60 sessions, says how far today's move goes beyond
+  what the market explains: `z = (r_stock - alpha - beta * r_SPY) / sd(e)`. From `|z| >= 2` the news decides:
+  Chan finds moves on news keep going and moves without news tend to be taken back. A reversal setup fading a
+  big move that came with news is flagged `news_driven_move`; a momentum setup chasing a big move with no news
+  `move_without_news`. Neither is claimed for a stock whose news isn't being read. The play's Statistics show
+  the move, the market's part, z and the stories found.
+- These three flags start as information: Autopilot doesn't skip them unless you add them to
+  `autopilot.skip_noise`, and each day's journal compares how the flagged plays not taken would have done.
+  The replay can't test them yet - it has no news history.
+- They are kept in the `insider_trades`, `filings_read` and `news_items` tables, and the calendar in
+  `data/signals/earnings_calendar.json`.
+
+**The Signals page** (header → **Signals**)
+- **Sources**: when SEC's filings and the news were last read, whether IBKR's news feeds are connected, whether a
+  Finnhub key is saved, FinBERT's state and how many headlines it has scored, and any check that failed.
+  **Check now** reads the filings and the news straight away (after adding a Finnhub key, say).
+- **Stocks with signals**: insider buying and selling (score, dollars, insiders, who), the news tone, recent
+  material 8-Ks, and exactly what each does to a long and a short play's score. Click a stock for its insiders'
+  filings over the past year, why the wave counts as unusual, and its news of the last 30 days.
+- **Insider filings**: every Form 4 trade of the last 30 days with the day traded, the day filed and how many
+  business days late - with the median delay and the share that met SEC's two-business-day deadline. The app
+  reads SEC's feed every 3 minutes, so the delay shown is the insiders'.
+- **Headlines**: the latest stories with their source and FinBERT's tone.
+- Plays whose score a signal moved carry a **signal** badge; click it for that stock on the page.
+- API: `GET /api/signals`, `GET /api/signals/stock/{symbol}`, `POST /api/signals/check`.
 
 ## Dashboard controls
 
@@ -525,6 +602,9 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
   live**, **Reconnect**.
 * **Settings** — the scan schedule and list sizes, the scan status, **Run full
   scan now** and **Rescan hot list now**.
+* **Signals** — insider trades and company news, their sources and what they do to plays (see [Signals](#signals--insider-trades-and-company-news)).
+* **Reports** — each session's report (see [Reports](#reports--every-session-the-market-and-the-bot));
+  a dot marks one you haven't opened.
 * **Scan now** — rescan the hot list and the next buffer names. The plays header
   shows the last scan, a progress bar while one runs, and when the next full
   scan is due.
@@ -537,7 +617,7 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 * **Reset paper** (simulator only) — reset the balance.
 * **Exit** / **Exit all** — close one position, or all of them, at the market.
 * **Quit** — close out, then shut down.
-* Bottom tabs: **Open positions**, **Active orders**, **Trade history**, **P/L summary**, **Watchlist**, **Pairs**, **Journal**.
+* Bottom tabs: **Open positions**, **Active orders**, **Trade history**, **P/L summary**, **Watchlist**, **Pairs**.
 
 ---
 
@@ -610,10 +690,42 @@ follows every play the way the automatic exits would. Its settings are in
 * Every run is summarised in `data/research/replay_runs.jsonl`, so the records
   can be followed from one run to the next.
 
-## Journal — learning from every session
+## Reports — every session, the market and the bot
 
-At `journal.review_at` (16:15 ET) the bot writes a review of the session, kept in
-the database (`daily_reviews`) and in `data/journal/`. The **Journal** tab shows:
+At `journal.review_at` (16:15 ET) the bot writes a report on the session, kept in
+the database (`daily_reviews`) and in `data/journal/`. **Reports** in the header opens
+it — the newest first, every earlier one a click away.
+
+### The market's movers
+
+`research/movers.py`. The biggest gainers and losers of the session among every stock the
+scanner could trade that day (`journal.movers`, 10 of each). To rank them the bot downloads
+the session's daily candle for every stock after the close — the same download the next
+morning's scan would make, made the evening before, so IBKR is asked nothing extra and the
+morning scan is quicker. If IB Gateway isn't connected, the report is written without them
+and they're added once it is. For each mover:
+
+* **why it moved** — the session's stories from IBKR's news feeds, SEC 8-K filings and
+  Finnhub (with a key), read from the previous close to this close, the likeliest cause
+  first: earnings (an item 2.02 filing or an earnings headline), another material filing,
+  an analyst action, a news story — or, with no story, its whole sector moving with it;
+* **how it moved** — gapped at the open or built during the session, volume against its
+  20-day average, the move in average daily ranges, a close at a 20-day high or low;
+* **what the bot made of it** — *traded* (with the move or against it, R and P/L),
+  *offered, not taken* (and what the setup would have made, followed on the candles),
+  *watched, no setup* (on the hot list, adopted into it, or scanned from a sector buffer),
+  or *not watched* — and why: the morning's ranking put it #412 of 2,950, it was too thin
+  for the scanner's filters the day before, or its sector is switched off;
+* **charts** (📈) — the session's 5-minute candles with the bot's entries and exits, the
+  setups it offered and the news as it came out, and the daily candles around the day.
+
+Above the table, the score: how many of the movers were traded, offered, on the morning
+watchlist and moved at the open — and over the last 20 sessions, the share of the market's
+biggest movers the watchlist held. That share is the scanner's report card: if most movers
+make their move at the open on overnight news, a ranking of the previous day's candles
+can't see them, and the report says so.
+
+### The bot's own trading
 
 * **the trades** that closed, each with what it was taken on — noise flags, scans
   in a row, price character, the market's regime, who took it;
@@ -626,7 +738,8 @@ the database (`daily_reviews`) and in `data/journal/`. The **Journal** tab shows
   it, so every check is tested on live plays every day;
 * **each strategy's real record** over the last 20 sessions against its replay,
   flagged when it falls more than 0.3R a trade short;
-* **lessons**, in plain sentences. **Review the last session** rebuilds it on demand.
+* **lessons**, in plain sentences. **Rebuild the last session** writes it again on demand
+  (the movers are kept, and rebuilt once the session's candles are in).
 
 ---
 
@@ -792,7 +905,7 @@ tos_bot/
   strategies/              base (shared indicators, Douglas-framed explanations) + registry + technical + fundamental
                            + insider + statistical (Chan's gap and earnings setups)
   quant/                   the books' models in numpy: stationarity, cointegration, volatility, regime, sizing, bands, readings
-  research/                the replay (replay, runner, history), the evidence weights and the daily journal
+  research/                the replay (replay, runner, history), the evidence weights, the daily journal and the movers report
   signals/                 SEC Form 4 insider trades, company news, 8-K earnings dates, the signal book
   pairs/                   pairs trading: the model, the finder, the backtest and the desk that trades both legs
   scanner/                 schedule, heat, watchlist, evaluator, filters, the scans

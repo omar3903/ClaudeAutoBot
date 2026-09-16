@@ -12,7 +12,8 @@ import { renderWatchlist } from "./watchlist.js";
 import { indexStrategies, onReplayEvent } from "./strategies.js";
 import { loadOrders, ordersChanged } from "./orders.js";
 import { addNotes } from "./notes.js";
-import { loadJournal } from "./journal.js";
+import { reportsUpdated } from "./reports.js";
+import { signalsUpdated } from "./signals.js";
 import { loadPairs, showPairs } from "./pairs.js";
 
 export function connect() {
@@ -122,6 +123,18 @@ function handle(topic, p) {
       S.state.capital = p.capital;
       renderCapital(p.capital);
       break;
+    case "broker.disconnected":
+      toast(p.note || "IB Gateway disconnected - reconnecting", "warn");
+      refreshState();
+      break;
+    case "broker.reconnected":
+      toast(p.note || "IB Gateway is back", "good");
+      if (p.state) setState(p.state);
+      loadOpen();
+      break;
+    case "broker.down":
+      toast(p.note || "IB Gateway is still unreachable", "bad");
+      break;
     case "broker.connected":
       toast(p.note || "Connected", "good");
       if (p.state) setState(p.state);
@@ -157,9 +170,16 @@ function handle(topic, p) {
       break;
     }
 
+    case "signals.updated":
+      signalsUpdated();
+      break;
+    case "position.earnings_ahead":
+      toast(p.note, "warn");
+      break;
+
     case "journal.updated":
-      if (tabVisible("journal")) loadJournal();
-      toast(`The review of ${p.session} is in the Journal tab${p.mistakes ? ` — ${p.mistakes} thing${p.mistakes === 1 ? "" : "s"} to learn from` : ""}.`);
+      reportsUpdated();
+      toast(`The report on ${p.session} is in Reports${p.mistakes ? ` — ${p.mistakes} thing${p.mistakes === 1 ? "" : "s"} to learn from` : ""}.`);
       break;
 
     case "strategies.updated":

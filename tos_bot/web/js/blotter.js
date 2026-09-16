@@ -9,12 +9,11 @@ import { closeDrawer, drawerOpen, openDrawer, openModal, toast, toastResult } fr
 import { stratLabel } from "./strategies.js";
 import { loadWatchlist } from "./watchlist.js";
 import { loadOrders } from "./orders.js";
-import { loadJournal } from "./journal.js";
 import { loadPairs } from "./pairs.js";
 
 const LOADERS = {
   open: loadOpen, orders: () => loadOrders(true), history: loadHistory, stats: loadStats, watchlist: loadWatchlist,
-  journal: loadJournal, pairs: loadPairs,
+  pairs: loadPairs,
 };
 
 export const tabVisible = name => !$("#tab-" + name).classList.contains("hidden");

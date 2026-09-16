@@ -18,7 +18,10 @@ from __future__ import annotations
 import datetime as dt
 import math
 from dataclasses import asdict, dataclass
-from typing import Dict, List, Sequence
+from statistics import median
+from typing import Any, Dict, List, Mapping, Optional, Sequence
+
+import numpy as np
 
 from .form4 import BUY, ROLE_LABELS, ROLES, SELL, InsiderTrade
 
@@ -64,6 +67,22 @@ class InsiderSignal:
         row.update(first_date=self.first_date.isoformat(), last_date=self.last_date.isoformat(),
                    avg_price=round(self.avg_price, 4))
         return row
+
+
+#: SEC's deadline for a Form 4: two business days after the trade
+FORM4_DEADLINE_DAYS = 2
+
+
+def filing_delays(rows: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """How long after their trades insiders filed, in business days: rows as the store's
+    ``insider_filings`` returns them. None without any."""
+    lags = [int(np.busday_count(r["trade_date"], r["filed"])) for r in rows
+            if r.get("filed") and r.get("trade_date") and r["filed"] >= r["trade_date"]]
+    if not lags:
+        return None
+    on_time = sum(1 for d in lags if d <= FORM4_DEADLINE_DAYS)
+    return {"trades": len(lags), "median_days": median(lags), "on_time": round(on_time / len(lags), 3),
+            "late": len(lags) - on_time, "max_days": max(lags)}
 
 
 def insider_signals(symbol: str, trades: Sequence[InsiderTrade], today: dt.date,

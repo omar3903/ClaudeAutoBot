@@ -40,6 +40,10 @@ log = logging.getLogger(__name__)
 _MARKET_DATA_TYPES = {"live": 1, "frozen": 2, "delayed": 3, "delayed-frozen": 4}
 # error codes meaning "no real-time subscription" (354 / 10168: not subscribed)
 _DELAYED_ERRS = {10167, 10168, 10197, 10089, 354}
+# IB Gateway reached IBKR's servers again (1101: subscriptions lost, 1102: kept)
+_SERVERS_BACK = {1101, 1102}
+# a data farm reporting OK - after a 2110 outage, that's the all-clear
+_FARMS_OK = {2104, 2106, 2158}
 # connection chatter, not failures
 _INFO_ERRS = {2104, 2106, 2107, 2108, 2158, 2100, 2150, 202}
 
@@ -126,6 +130,10 @@ class IbkrBroker(BrokerAdapter):
     #: IBKR paces historical requests; about six at a time runs ~10 symbols a second
     HISTORY_CONCURRENCY = 6
     DETAILS_CONCURRENCY = 16
+    #: waits between reconnect attempts: quick at first - a Gateway restart takes a minute or two - then every 2 min
+    RECONNECT_DELAYS_S = (5, 10, 15, 30, 30, 60, 60, 120)
+    #: how long IB Gateway may stay up without IBKR's servers before its socket is dropped and made again
+    SERVER_OUTAGE_RECONNECT_S = 600.0
 
     def __init__(
         self,
@@ -158,6 +166,12 @@ class IbkrBroker(BrokerAdapter):
         self._connected = False
         self._want_connected = False
         self._reconnecting = False
+        #: when the connection last came up (time.monotonic) - positions and orders reload after each time
+        self.connected_since = 0.0
+        #: when it went down, and when IB Gateway lost IBKR's servers while staying up itself (and the code it gave)
+        self.down_since: Optional[float] = None
+        self._servers_lost_at: Optional[float] = None
+        self._servers_lost_code = 0
         self._contracts: Dict[str, Any] = {}              # symbol -> qualified Contract
         self._last_error = ""
         self._lock = threading.RLock()
@@ -181,13 +195,23 @@ class IbkrBroker(BrokerAdapter):
         if self._session is None:
             self._session = self._session_factory()
             self._session.start()
-        self._do_connect(first=True)
+        try:
+            self._do_connect(first=True)
+        except Exception:
+            self.close()                     # no event loop left running for a connection that never came up
+            self._session = None
+            raise
 
     def _do_connect(self, first: bool = False) -> None:
         async def _connect(ib):
             await ib.connectAsync(self.host, self.port, clientId=self.client_id, timeout=8,
                                   readonly=self.readonly)
         self._session.run_coro(_connect, timeout=15)
+        if not self._account_loaded():
+            # a restarting Gateway takes connections a little before it has loaded the account; trusting it
+            # then would make the open positions look closed
+            self._drop_socket()
+            raise AuthError("IB Gateway answered but hasn't finished loading the account - trying again shortly")
         if first:
             try:
                 self._ib.disconnectedEvent += self._on_disconnect
@@ -205,6 +229,8 @@ class IbkrBroker(BrokerAdapter):
         except Exception:  # noqa: BLE001
             pass
         self._connected = True
+        self.connected_since, self.down_since = time.monotonic(), None
+        self._servers_lost_at, self._servers_lost_code = None, 0
         if not self.account_id:
             try:
                 accounts = list(self._session.call(lambda ib: ib.managedAccounts(), timeout=5) or [])
@@ -247,8 +273,29 @@ class IbkrBroker(BrokerAdapter):
             self._session.stop()
         self._connected = False
 
+    def _account_loaded(self) -> bool:
+        """The account's values have arrived - a Gateway that is still starting up connects before they do."""
+        try:
+            values = self._session.call(lambda ib: ib.accountValues(self.account_id or ""), timeout=5) or []
+        except Exception:  # noqa: BLE001
+            return False
+        return any(getattr(v, "tag", "") == "NetLiquidation" for v in values)
+
+    def _socket_up(self) -> bool:
+        try:
+            return bool(self._ib is not None and self._ib.isConnected())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _drop_socket(self) -> None:
+        try:
+            self._session.call(lambda ib: ib.disconnect(), timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _on_disconnect(self) -> None:
         self._connected = False
+        self.down_since = self.down_since or time.monotonic()
         if self._want_connected:
             log.warning("IBKR session dropped - reconnecting")
             self._start_reconnect()
@@ -261,9 +308,20 @@ class IbkrBroker(BrokerAdapter):
         threading.Thread(target=self._reconnect_loop, name="ibkr-reconnect", daemon=True).start()
 
     def _reconnect_loop(self) -> None:
-        delay = 5
+        """Until the session is usable again: while IB Gateway is up but has lost IBKR's servers, wait for
+        it to reach them by itself (IBKR's nightly maintenance); otherwise - the Gateway restarting, or an
+        outage that drags on - connect afresh once its port answers."""
+        attempt = 0
         try:
             while self._want_connected and not self.is_connected:
+                if self._socket_up():
+                    lost = self._servers_lost_at
+                    if lost is not None and time.monotonic() - lost < self.SERVER_OUTAGE_RECONNECT_S:
+                        time.sleep(5)
+                        continue
+                    log.warning("IBKR: the Gateway session isn't usable - dropping it and connecting again")
+                    self._servers_lost_at, self._servers_lost_code = None, 0
+                    self._drop_socket()
                 if port_is_open(self.host, self.port, timeout=2):
                     try:
                         self._do_connect()
@@ -271,8 +329,8 @@ class IbkrBroker(BrokerAdapter):
                         return
                     except Exception as e:  # noqa: BLE001
                         self._last_error = f"reconnect: {e}"
-                time.sleep(delay)
-                delay = min(120, delay * 2)
+                time.sleep(self.RECONNECT_DELAYS_S[min(attempt, len(self.RECONNECT_DELAYS_S) - 1)])
+                attempt += 1
         finally:
             self._reconnecting = False
 
@@ -283,20 +341,28 @@ class IbkrBroker(BrokerAdapter):
         return self.is_connected
 
     def session_status(self) -> Dict[str, Any]:
+        connected = self.is_connected
+        servers_lost = self._servers_lost_at is not None and self._socket_up()
         return {
-            "connected": self.is_connected,
+            "connected": connected,
             "reconnecting": self._reconnecting,
             "host": self.host, "port": self.port, "mode": self.mode,
             "account": self.account_id or None,
             "market_data": "delayed" if self._data_is_delayed else "live",
             "readonly": self.readonly,
-            "message": ("connected" if self.is_connected
+            "servers_lost": servers_lost,
+            "down_for_s": round(time.monotonic() - self.down_since) if self.down_since and not connected else 0,
+            "message": ("connected" if connected
+                        else "IB Gateway is up but has lost IBKR's servers - waiting for them" if servers_lost
                         else "reconnecting - Gateway restarting?" if self._reconnecting
                         else f"IB Gateway not reachable on {self.host}:{self.port}"),
             "last_error": self._last_error,
         }
 
     def _on_error(self, reqId, errorCode, errorString, contract=None) -> None:  # noqa: ANN001
+        if errorCode in _SERVERS_BACK or (errorCode in _FARMS_OK and self._servers_lost_code == 2110):
+            self._servers_back(errorCode)
+            return
         if errorCode in _INFO_ERRS:
             return
         if errorCode in _DELAYED_ERRS:
@@ -311,11 +377,36 @@ class IbkrBroker(BrokerAdapter):
             except Exception:  # noqa: BLE001
                 pass
             return
-        if errorCode in (1100, 1300, 2110):
+        if errorCode in (1100, 2110):
+            if self._servers_lost_at is None:
+                log.warning("IBKR: IB Gateway lost its connection to IBKR's servers (%s) - waiting for it", errorCode)
+                self._servers_lost_at, self._servers_lost_code = time.monotonic(), errorCode
+            self.down_since = self.down_since or time.monotonic()
+            self._connected = False
+            if self._want_connected:
+                self._start_reconnect()          # watches for the servers, and starts afresh if they stay away
+        elif errorCode == 1300:
             self._connected = False
         self._last_error = f"{errorCode}: {errorString}"
         if errorCode not in (162, 200):        # historical-data / unknown-contract noise
             log.debug("IBKR error %s: %s", errorCode, errorString)
+
+    def _servers_back(self, code: int) -> None:
+        """IB Gateway reached IBKR's servers again. Runs on the loop thread, so it calls ib_async directly."""
+        was_lost, self._servers_lost_at, self._servers_lost_code = self._servers_lost_at, None, 0
+        if not self._socket_up() or (self._connected and was_lost is None):
+            return
+        if code == 1101:
+            # the subscriptions were lost with the connection - ask for the account and positions again
+            try:
+                self._ib.reqMarketDataType(self._data_type)
+                self._ib.client.reqAccountUpdates(True, self.account_id or "")
+                self._ib.client.reqPositions()
+            except Exception:  # noqa: BLE001
+                pass
+        self._connected = True
+        self.connected_since, self.down_since = time.monotonic(), None
+        log.warning("IBKR: IB Gateway reached IBKR's servers again (%s)", code)
 
     # ---- contracts ------------------------------------------------------ #
     def _contract(self, symbol: str):
@@ -542,13 +633,16 @@ class IbkrBroker(BrokerAdapter):
         results = [self._result(t) for t in trades]
         return [r for r in results if not status or status.upper() in (r.status, "OPEN", "WORKING")]
 
-    def news_headlines(self, con_ids: Mapping[str, int], days: int = 3,
-                       per_symbol: int = 10) -> Dict[str, List[Tuple[dt.datetime, str, str, str]]]:
-        """Recent headlines per stock from every news feed this account can read, as
-        (time in UTC, provider code, article id, raw headline). Empty when not connected."""
+    def news_headlines(self, con_ids: Mapping[str, int], days: int = 3, per_symbol: int = 10,
+                       since: Optional[dt.datetime] = None,
+                       until: Optional[dt.datetime] = None) -> Dict[str, List[Tuple[dt.datetime, str, str, str]]]:
+        """Headlines per stock from every news feed this account can read - the last ``days``, or from
+        ``since`` to ``until`` (UTC) - as (time in UTC, provider code, article id, raw headline). Empty when
+        not connected."""
         if not self.is_connected or not con_ids:
             return {}
-        since = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - dt.timedelta(days=days)
+        # ib_async reads a naive time as the computer's local time, so the times carry their zone
+        since = since or dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
 
         async def run(ib):
             # reqNewsProvidersAsync hands back a future, not a coroutine, so it is awaited in one
@@ -556,7 +650,7 @@ class IbkrBroker(BrokerAdapter):
             out: Dict[str, List[Tuple[dt.datetime, str, str, str]]] = {}
             for symbol, con_id in (con_ids.items() if codes else ()):
                 try:
-                    found = await asyncio.wait_for(ib.reqHistoricalNewsAsync(con_id, codes, since, "", per_symbol), 10)
+                    found = await asyncio.wait_for(ib.reqHistoricalNewsAsync(con_id, codes, since, until or "", per_symbol), 10)
                 except Exception:  # noqa: BLE001
                     continue
                 out[symbol] = [(h.time, h.providerCode, h.articleId, h.headline) for h in (found or [])]

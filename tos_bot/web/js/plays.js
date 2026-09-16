@@ -8,6 +8,7 @@ import { hideExecuted, hideNoisy } from "./filters.js";
 import { loadOpen, openRecord, showTab } from "./blotter.js";
 import { orderMark } from "./orders.js";
 import { openChart } from "./chart.js";
+import { openSignals } from "./signals.js";
 
 const DONE = new Set(["ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED", "ERROR"]);
 const isDone = p => DONE.has(p.status);
@@ -45,6 +46,13 @@ export function renderPlays() {
   for (const p of rows) body.appendChild(playRow(p));
 }
 
+/** A play whose score the insider or news signals moved: click for its stock on the Signals page. */
+function signalMark(p) {
+  const ev = p.evidence || {}, delta = Number(ev.signal_nudge || 0);
+  if (!ev.signal_reasons) return "";
+  return `<span class="badge sig-mark ${delta > 0 ? "good" : delta < 0 ? "bad" : ""}" title="Signals ${delta > 0 ? "+" : ""}${delta.toFixed(3)}: ${escapeHtml(ev.signal_reasons)}">signal</span>`;
+}
+
 function playRow(p) {
   const tr = document.createElement("tr");
   const done = isDone(p), ap = p.autopilot || {};
@@ -59,7 +67,7 @@ function playRow(p) {
     ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
     : `<span class="info-dot">i</span>`;
   tr.innerHTML = `
-    <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${orderMark(p.symbol)}${apMark}${p.extended_hours_ok ? '<span class="ext" data-term="ext">ext</span>' : ""}${isNoisy(p) && !done ? `<span class="badge warn" data-term="noise" title="${escapeHtml(p.noise.map(noiseLabel).join(", "))}">noisy</span>` : ""}</td>
+    <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${orderMark(p.symbol)}${signalMark(p)}${apMark}${p.extended_hours_ok ? '<span class="ext" data-term="ext">ext</span>' : ""}${isNoisy(p) && !done ? `<span class="badge warn" data-term="noise" title="${escapeHtml(p.noise.map(noiseLabel).join(", "))}">noisy</span>` : ""}</td>
     <td>${sideBadge(p.side)}</td>
     <td>${stratLabel(p.strategy)}</td>
     <td class="tf">${tfLabel(p.timeframe)}</td>
@@ -74,6 +82,7 @@ function playRow(p) {
   tr.addEventListener("click", e => {
     if (e.target.closest(".chart-btn")) openChart(p);
     else if (e.target.closest(".order-mark")) showTab("orders");
+    else if (e.target.closest(".sig-mark")) openSignals(p.symbol);
     else selectPlay(p.id);
   });
   tr.addEventListener("mousemove", e => {
@@ -187,17 +196,20 @@ function evidenceHTML(ev) {
       f.rows.map(r => `<tr><td>${r.method}</td><td class="num">${r.low}</td><td class="num">${r.high}</td></tr>`).join("") +
       `</table><div class="muted">band ${f.band_low}–${f.band_high}, fair value ${f.fair_value}</div>`);
   }
-  const qc = ev.price_character, vf = ev.vol_forecast, mr = ev.market_regime;
-  if (qc || vf || (mr && mr.p_turbulent != null) || ev.evidence_weight) {
+  const qc = ev.price_character, vf = ev.vol_forecast, mr = ev.market_regime, mm = ev.market_move, ne = ev.next_earnings;
+  if (qc || vf || (mr && mr.p_turbulent != null) || ev.evidence_weight || mm || ne) {
     blocks.push(`<h4>Statistics</h4><div class="kv">` +
       (qc ? `<span>Price character</span><span>${escapeHtml(qc.character)} — Hurst ${num(qc.hurst, 2)}, variance ratio z ${num(qc.variance_ratio_z, 1)}${qc.half_life_bars ? `, half-life ${num(qc.half_life_bars, 0)} bars` : ""}</span>` : "") +
       (vf ? `<span>Tomorrow's volatility</span><span>${num(vf.vol * 100, 2)}% (${escapeHtml(vf.model)}, ${num(vf.ratio, 2)}× the last 60 days)</span>` : "") +
       (mr && mr.p_turbulent != null ? `<span>Market regime</span><span>${escapeHtml(mr.regime)} — P(turbulent) ${num(mr.p_turbulent, 2)}</span>` : "") +
       (ev.evidence_weight ? `<span>Evidence weight</span><span>×${num(ev.evidence_weight, 2)} from its replayed and real record</span>` : "") +
+      (mm ? `<span>Move vs the market</span><span>${pct(mm.move_pct)} against ${pct(mm.expected_pct)} the market explains (β ${num(mm.beta, 2)}) - ${num(mm.z, 1)} usual moves of ${num(mm.usual_pct, 1)}%; news: ${mm.news == null ? "not being read" : mm.news ? `${mm.news} stor${mm.news === 1 ? "y" : "ies"}` : "none found"}</span>` : "") +
+      (ne ? `<span>Next earnings</span><span>${escapeHtml(ne.date)} ${escapeHtml({ bmo: "before the open", amc: "after the close", dmh: "during the session" }[ne.hour] || "")} - ${ne.sessions === 0 ? "today" : ne.sessions === 1 ? "next session" : `in ${ne.sessions} sessions`}</span>` : "") +
       `</div>`);
   }
   const skip = new Set(["signal", "dcf", "football_field", "spark", "verdict", "peer_median", "target_multiples", "peers",
-    "price_character", "vol_forecast", "market_regime", "evidence_weight", "at_entry", "hold_from_half_life"]);
+    "price_character", "vol_forecast", "market_regime", "evidence_weight", "at_entry", "hold_from_half_life",
+    "market_move", "next_earnings"]);
   const rest = Object.entries(ev).filter(([k]) => !skip.has(k));
   if (rest.length) {
     blocks.push(`<h4>Signal detail</h4><div class="kv">` +

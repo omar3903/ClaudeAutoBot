@@ -1,67 +1,20 @@
-/* The Journal tab: each session's review - the trades and what they were taken on, the mistakes,
-   the plays not taken and how they would have gone, the strategies' records, and the lessons. */
-import { $, $$, api, escapeHtml, num, post, usd } from "./util.js";
-import { toastResult } from "./ui.js";
+/* The journal half of a session's report (see reports.js): the trades and what they were taken on, the
+   mistakes, the plays not taken and how they would have gone, the strategies' records, and the lessons. */
+import { escapeHtml, fmtClock, num, usd } from "./util.js";
 import { stratLabel } from "./strategies.js";
 
-let selected = null;
-
-const inR = v => v == null ? "–" : `${v >= 0 ? "+" : ""}${num(v, 2)}R`;
-const tone = v => v == null ? "" : v > 0 ? "gain" : v < 0 ? "loss" : "";
-const pctOf = v => v == null ? "–" : `${Math.round(v * 100)}%`;
-const time = iso => iso ? escapeHtml(new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })) : "–";
+export const inR = v => v == null ? "–" : `${v >= 0 ? "+" : ""}${num(v, 2)}R`;
+export const tone = v => v == null ? "" : v > 0 ? "gain" : v < 0 ? "loss" : "";
+export const pctOf = v => v == null ? "–" : `${Math.round(v * 100)}%`;
 const SEVERITY = { high: "bad", medium: "warn", info: "" };
 
-export async function loadJournal() {
-  const box = $("#tab-journal");
-  let state;
-  try { state = await api("/api/journal"); } catch { box.innerHTML = `<div class="empty">Couldn't load the journal.</div>`; return; }
-  const days = state.days || [];
-  if (!days.some(d => d.session === selected)) selected = days.length ? days[0].session : null;
-  box.innerHTML = `<div class="journal">
-    <div class="journal-days">
-      <button class="mini lockable" id="journal-build" title="Build the review of the last session now (it's rebuilt if it exists)">Review the last session</button>
-      <div class="muted">${state.enabled ? `Written after every session at ${escapeHtml(state.review_at)} ET.` : "The automatic review is off (journal.enabled in config.yaml)."}</div>
-      ${days.length ? days.map(d => `<button class="journal-day ${d.session === selected ? "active" : ""}" data-day="${escapeHtml(d.session)}">
-          <b>${escapeHtml(d.session)}</b>
-          <span class="${tone(d.total_r)}">${d.trades} trade${d.trades === 1 ? "" : "s"} · ${inR(d.total_r)} · ${usd(d.realized_pl)}</span>
-          ${d.mistakes ? `<span class="badge warn">${d.mistakes} to learn from</span>` : ""}
-        </button>`).join("") : `<div class="empty">No reviews yet.</div>`}
-    </div>
-    <div class="journal-review" id="journal-review">${selected ? `<p class="muted">Loading…</p>` : ""}</div>
-  </div>`;
-  $$("#tab-journal [data-day]").forEach(b => { b.onclick = () => { selected = b.dataset.day; loadJournal(); }; });
-  $("#journal-build").onclick = async () => {
-    const r = await post("/api/journal/review", {});
-    toastResult(r);
-    if (r.ok && r.review) { selected = r.review.session; loadJournal(); }
-  };
-  if (selected) showReview(selected);
-}
-
-async function showReview(day) {
-  const box = $("#journal-review");
-  let r;
-  try { r = await api(`/api/journal/${encodeURIComponent(day)}`); } catch { r = null; }
-  if (selected !== day || !$("#journal-review")) return;
-  if (!r || !r.session) { box.innerHTML = `<div class="empty">Couldn't load the review.</div>`; return; }
-  const d = r.day || {}, sh = r.shadows || {}, reg = r.regime;
-  box.innerHTML = `
-    <h4>${escapeHtml(r.session)}${reg ? ` <span class="badge ${reg.regime === "turbulent" ? "warn" : "good"}">market ${escapeHtml(reg.regime)}</span>` : ""}</h4>
-    <div class="journal-cards">
-      <div><label>Closed trades</label><b>${d.trades || 0}</b></div>
-      <div><label>Winners</label><b>${pctOf(d.win_rate)}</b></div>
-      <div><label>In all</label><b class="${tone(d.total_r)}">${inR(d.total_r)}</b></div>
-      <div><label>A trade</label><b class="${tone(d.expectancy_r)}">${inR(d.expectancy_r)}</b></div>
-      <div><label>Realized</label><b class="${tone(d.realized_pl)}">${usd(d.realized_pl)}</b></div>
-      <div><label>Plays offered</label><b>${r.plays_offered || 0}</b></div>
-    </div>
-    <h4>Lessons</h4>
+export function journalHTML(r) {
+  return `<h4>What the bot learned</h4>
     <ul class="journal-lessons">${(r.lessons || []).map(l => `<li>${escapeHtml(l)}</li>`).join("")}</ul>
     ${mistakesHTML(r.mistakes || [])}
     ${tradesHTML(r.trades || [])}
     ${pairsHTML(r.pairs || [])}
-    ${shadowsHTML(sh)}
+    ${shadowsHTML(r.shadows || {})}
     ${strategiesHTML(r.strategies || [])}`;
 }
 
@@ -88,7 +41,7 @@ function tradesHTML(rows) {
         reg.regime ? `market ${escapeHtml(reg.regime)}` : "",
       ].filter(Boolean).join(" · ");
       return `<tr><td>${escapeHtml(t.symbol)} <span class="muted">${escapeHtml(t.side)}</span></td><td>${stratLabel(t.strategy)}</td>
-        <td>${time(t.entry_time)} → ${time(t.exit_time)}</td><td class="num ${tone(t.r)}">${inR(t.r)}</td><td class="num">${inR(t.mfe_r)}</td>
+        <td>${escapeHtml(fmtClock(t.entry_time))} → ${escapeHtml(fmtClock(t.exit_time))}</td><td class="num ${tone(t.r)}">${inR(t.r)}</td><td class="num">${inR(t.mfe_r)}</td>
         <td class="num ${tone(t.pl)}">${usd(t.pl)}</td><td>${escapeHtml(t.exit_reason || "")}</td><td class="muted">${taken}</td></tr>`;
     }).join("")}</table>`;
 }

@@ -187,6 +187,10 @@ class NoiseCfg(_Model):
     trending_hurst: float = 0.55          # a Hurst exponent from here up reads as trending...
     reverting_hurst: float = 0.45         # ...and from here down as mean reverting
     turbulent_probability: float = 0.7    # the market counts as turbulent from this regime probability
+    abnormal_z: float = 2.0               # a move this many usual moves beyond what the market explains is the stock's own
+    market_model_sessions: int = 60       # the sessions the market model is fitted on
+    news_fresh_minutes: float = 60.0      # a stock's news read longer ago than this doesn't count as "no news"
+    earnings_ahead_days: int = 5          # a swing play with a report due this many sessions ahead is flagged
 
 
 class ReplayCfg(_Model):
@@ -231,6 +235,7 @@ class JournalCfg(_Model):
     enabled: bool = True
     review_at: str = "16:15"              # ET, after the close
     keep_days: int = 0                    # 0 = keep every review
+    movers: int = 10                      # the session's biggest gainers and losers in the report, each; 0 = none
 
 
 class SignalsCfg(_Model):
@@ -253,6 +258,8 @@ class SignalsCfg(_Model):
     boost_insider_buying: float = 0.10         # added to a long play's score at an insider score of 1
     boost_insider_selling: float = 0.08        # taken off a long play's score at an insider score of 1
     boost_news: float = 0.06                   # at a news sentiment of +1 or -1
+    calendar_hours: float = 6.0                # how often Finnhub's earnings calendar is read (with a key)
+    calendar_days_ahead: int = 30              # how far ahead it's read
 
 
 class DatabaseCfg(_Model):
@@ -263,6 +270,7 @@ class DatabaseCfg(_Model):
 
 class AppCfg(_Model):
     log_level: str = "INFO"
+    keep_awake: bool = True               # keep Windows from sleeping while the app runs (24/7)
 
 
 class AppConfig(_Model):

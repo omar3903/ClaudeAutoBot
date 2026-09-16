@@ -60,6 +60,7 @@ from ..research.history import IntradayHistory, replay_symbols
 from ..research.replay import ReplaySettings
 from ..research.runner import ReplayRunner
 from ..research.journal import ROLLING_SESSIONS, Journal, build_review, first_sightings, live_records, review_day
+from ..research.movers import build_movers, read_session, rolling_capture, session_bounds
 from ..research.weights import evidence_multiplier
 from ..quant.sizing import MIN_TRADES as KELLY_MIN_TRADES, half_kelly_risk_pct
 from ..signals.earnings import EarningsCalendar
@@ -67,15 +68,17 @@ from ..pairs.desk import PairDesk, decision_window
 from ..pairs.finder import FinderSettings
 from ..pairs.model import KEY as PAIRS_KEY, PairRules
 from ..signals.book import BoostSettings, SignalBook
+from ..signals.calendar import describe as describe_report, next_report, sessions_until
 from ..signals.service import SignalService
 from ..signals.store import SignalStore
-from .chart import chart_payload
+from .chart import candles, chart_payload
 from .market_regime import BENCHMARK, MarketRegime
 from ..scanner.noise import LABELS as NOISE_LABELS, NoiseSettings
 from ..scanner import schedule
 from ..scanner.filters import TradeFilters
 from ..scanner.scanner import Scanner
 from ..scanner.schedule import ScanSettings
+from ..scanner.watchlist import DayWatchlist
 from ..strategies.registry import REGISTRY, build_strategies, strategy_catalog
 from ..util import clock
 from ..util.logging_setup import setup_logging
@@ -174,6 +177,8 @@ class TradingEngine:
         #: the daily review (research/journal.py)
         self.journal = Journal(data_dir / "journal", self.repo)
         self._journal_checked: Optional[dt.date] = None
+        self._movers_retry_at = 0.0
+        self._earnings_warned: set = set()
         self._live_stats: Dict[str, Dict[str, Any]] = {}
         self._live_stats_at = float("-inf")
         self._risk_pct: Dict[str, Optional[float]] = {}
@@ -194,6 +199,11 @@ class TradingEngine:
         self._broker_since = 0.0
         self._live_blockers: List[str] = []
         self._connect_retry_at = 0.0
+        #: IB Gateway as last seen by the snapshot loop (see _watch_gateway)
+        self._gateway_up: Optional[bool] = None
+        self._gateway_seen_up = False
+        self._gateway_down_at: Optional[float] = None
+        self._gateway_alerted = False
         self._account: Optional[Account] = None
         self._account_at = 0.0
         self._armed = False
@@ -347,6 +357,45 @@ class TradingEngine:
                     note=f"Connected to {where} - " + ("orders now go there." if plan.trade
                                                        else "the simulator and the scans use them."))
         return True
+
+    #: after this long without IB Gateway, the dashboard is told what to check
+    GATEWAY_DOWN_ALERT_S = 600.0
+
+    def _watch_gateway(self) -> None:
+        """Say when IB Gateway drops and when it's back - its nightly restart, IBKR's maintenance - and,
+        once it has been gone a while, what to check. Positions are only trusted again once the account
+        has settled (see _reconcile_open_trades)."""
+        up, now = self.connections.connected, time.monotonic()
+        if self._gateway_up is None or up == self._gateway_up:
+            if self._gateway_up is None:
+                self._gateway_up, self._gateway_seen_up = up, up
+                self._gateway_down_at = None if up else now
+            elif (not up and self._gateway_down_at is not None and not self._gateway_alerted
+                  and now - self._gateway_down_at >= self.GATEWAY_DOWN_ALERT_S):
+                self._gateway_alerted = True
+                note = (f"IB Gateway has been unreachable for {_duration(now - self._gateway_down_at)}. If it's asking "
+                        "you to log in - IBKR wants a full login about once a week - log in again; the app reconnects "
+                        "by itself. Until then there are no prices, and no automatic exits.")
+                log.warning(note)
+                BUS.publish("broker.down", note=note)
+            return
+        self._gateway_up = up
+        if not up:
+            self._gateway_down_at, self._gateway_alerted = now, False
+            if self._gateway_seen_up:
+                log.warning("IB Gateway disconnected - reconnecting by itself")
+                BUS.publish("broker.disconnected", note=("IB Gateway disconnected - its nightly restart or IBKR's "
+                                                         "maintenance. The app reconnects by itself."))
+            return
+        down_for, self._gateway_down_at = now - (self._gateway_down_at or now), None
+        if not self._gateway_seen_up:
+            self._gateway_seen_up = True                  # the first connection is announced by _retry_connection
+            return
+        self.position_check.reset()                       # misses counted before the drop don't carry over
+        self._refresh_account()
+        log.warning("IB Gateway is back after %s", _duration(down_for))
+        BUS.publish("broker.reconnected", state=self.snapshot(),
+                    note=f"IB Gateway is back after {_duration(down_for)}.")
 
     def _open_trades(self) -> List[Dict[str, Any]]:
         try:
@@ -527,10 +576,18 @@ class TradingEngine:
     JOURNAL_POLL_S = 60.0
     #: how long after starting the review waits for IB Gateway, to follow the plays not taken
     JOURNAL_GATEWAY_WAIT_S = 600.0
+    #: how soon a session's movers are tried again when they couldn't be built (IB Gateway away)
+    MOVERS_RETRY_S = 900.0
+    #: a mover's chart: daily candles before the session, and after it once they exist
+    MOVER_CHART_BEFORE, MOVER_CHART_AFTER = 60, 10
 
     def _journal_loop(self) -> None:
         self._stop.wait(20.0)
         while not self._stop.is_set():
+            try:
+                self._warn_earnings_ahead()
+            except Exception:  # noqa: BLE001
+                log.exception("the earnings check on open positions failed")
             try:
                 self._review_if_due()
             except Exception:  # noqa: BLE001
@@ -542,24 +599,53 @@ class TradingEngine:
         if not cfg.enabled:
             return
         day = review_day(clock.now_ny(), cfg.review_at)
-        if self._journal_checked == day:
+        if self._journal_checked == day or time.monotonic() < self._movers_retry_at:
             return
-        if self.journal.has(day):
+        review = self.journal.get(day)
+        wants_movers = cfg.movers > 0 and not _movers_built(review)
+        if review is not None and not wants_movers:
             self._journal_checked = day
             return
         if not self.md.attached and time.monotonic() - self._started_at < self.JOURNAL_GATEWAY_WAIT_S:
             return
-        self.review_session(day)
-        self._journal_checked = day
+        if wants_movers and self.md.attached:
+            try:
+                self.scanner.update_market_daily(day)
+            except Exception:  # noqa: BLE001
+                log.warning("could not download the session's daily candles for the movers", exc_info=True)
+        out = self.review_session(day) if review is None else self.add_movers(day)
+        if wants_movers and not _movers_built(out.get("review")):
+            self._movers_retry_at = time.monotonic() + self.MOVERS_RETRY_S
+        else:
+            self._journal_checked = day
+
+    def _warn_earnings_ahead(self) -> None:
+        """Say once when a swing position is held into an earnings report due by the next session:
+        the report can gap the price straight through its stop (signals/calendar.py)."""
+        if not self.settings.config.signals.enabled:
+            return
+        now = clock.now_ny()
+        for t in self._open_trades():
+            if t.get("timeframe") != "SWING" or t.get("pair_id"):
+                continue
+            upcoming = next_report(self.signal_book.earnings_for(t["symbol"]), now)
+            if upcoming is None or sessions_until(upcoming, now) > 1 or (t["id"], upcoming["date"]) in self._earnings_warned:
+                continue
+            self._earnings_warned.add((t["id"], upcoming["date"]))
+            note = (f"{t['symbol']} reports earnings {describe_report(upcoming)} and a swing position is open - "
+                    "a report can gap the price straight through its stop.")
+            log.warning(note)
+            BUS.publish("position.earnings_ahead", symbol=t["symbol"], trade_id=t["id"], report=dict(upcoming), note=note)
 
     def review_session(self, day: Optional[dt.date] = None) -> Dict[str, Any]:
-        """Build one session's review (again, if it exists) and keep it."""
+        """Build one session's review (again, if it exists) and keep it. Its movers are rebuilt once every
+        stock's candles for the session are on disk; until then the ones built before are kept."""
         cfg = self.settings.config
         day = day or review_day(clock.now_ny(), cfg.journal.review_at)
         trades = [t for t in self.repo.closed_trades_between(day, day) if not t.get("pair_id")]
         plays = self.repo.plays_on(day)
         pair_trades = self.repo.pair_trades_closed_between(day, day)
-        if not trades and not plays and not pair_trades:
+        if not trades and not plays and not pair_trades and not self._movers_ready(day):
             return {"ok": False, "reason": f"Nothing was offered or traded on {day.isoformat()}."}
         first = min(clock.last_n_sessions(day, ROLLING_SESSIONS))
         ap = self.autopilot
@@ -579,6 +665,14 @@ class TradingEngine:
             total = sum(float(r.get("r_multiple") or 0.0) for r in pair_trades)
             review["lessons"].append(f"{len(pair_trades)} pair trade{'s' if len(pair_trades) != 1 else ''} "
                                      f"closed: {total:+.2f}R in all.")
+        if cfg.journal.movers > 0:
+            earlier = (self.journal.get(day) or {}).get("movers")
+            review["movers"] = self._movers(day, review, plays) or (earlier if _movers_built({"movers": earlier})
+                                                                    else self._movers_pending())
+            if not trades and not plays and not pair_trades and not _movers_built(review):
+                return {"ok": False, "reason": f"Nothing was offered or traded on {day.isoformat()}."}
+            if not _movers_built(review):
+                self._journal_checked, self._movers_retry_at = None, 0.0     # the journal loop adds them
         self.journal.save(review)
         self._live_stats_at = float("-inf")
         BUS.publish("journal.updated", session=review["session"], mistakes=len(review["mistakes"]),
@@ -588,6 +682,95 @@ class TradingEngine:
                 "note": (f"Reviewed {review['session']}: {review['day'].get('trades', 0)} closed trades, "
                          f"{len(review['mistakes'])} things to learn from, {shadows.get('filled', 0)} plays not taken "
                          "followed to their outcome.")}
+
+    def add_movers(self, day: dt.date) -> Dict[str, Any]:
+        """Add the movers to a session's review written without them."""
+        review = self.journal.get(day)
+        if review is None:
+            return self.review_session(day)
+        movers = self._movers(day, review, self.repo.plays_on(day))
+        if movers is None:
+            return {"ok": False, "reason": "The session's movers can't be built yet."}
+        review["movers"] = movers
+        self.journal.save(review)
+        BUS.publish("journal.updated", session=review["session"], mistakes=len(review["mistakes"]),
+                    lessons=len(review["lessons"]))
+        return {"ok": True, "review": review}
+
+    def _movers_ready(self, day: dt.date) -> bool:
+        have = self.scanner.market_daily
+        return self.settings.config.journal.movers > 0 and have is not None and have[0] >= day
+
+    def _movers_pending(self) -> Dict[str, Any]:
+        return {"ok": False, "note": "The market's biggest movers are added once every stock's candles for the session "
+                                     "are in - a few minutes after the close with IB Gateway connected."
+                                     if self.md.attached else
+                                     "IB Gateway isn't connected - the market's biggest movers are added once it is."}
+
+    def _movers(self, day: dt.date, review: Mapping[str, Any], plays: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The session's biggest movers across the market (research/movers.py) - None until every stock's
+        candles for the session are on disk."""
+        if not self._movers_ready(day):
+            return None
+        cfg = self.settings.config
+        _, tradable = self.scanner.market_daily
+        try:
+            universe = read_session(((s, self.md.daily_frame(s)) for s in tradable + [BENCHMARK]), day,
+                                    sector_of=self.scanner.symbols.sector, prefilter=cfg.scanner.prefilter,
+                                    sectors_allowed=self.filters.sectors, benchmark=BENCHMARK)
+            ranked = sorted(universe.moves, key=lambda m: -abs(m.change_pct))
+            symbols = [m.symbol for m in ranked if m.change_pct > 0][:cfg.journal.movers] + \
+                      [m.symbol for m in ranked if m.change_pct < 0][:cfg.journal.movers]
+            news, note = self._mover_news(day, symbols)
+            if symbols and self.md.attached:                    # the session's 5-minute candles, for the charts
+                try:
+                    self.replay.history.load(self.md.source, symbols, 1, self.scanner.con_ids(symbols),
+                                             today=clock.next_trading_day(day))
+                except Exception:  # noqa: BLE001
+                    log.debug("could not download the movers' 5-minute candles", exc_info=True)
+            return build_movers(universe, per_side=cfg.journal.movers, sector_of=self.scanner.symbols.sector, news=news,
+                                trades=self.repo.trades_on(day), plays=plays,
+                                shadows=(review.get("shadows") or {}).get("plays") or [],
+                                saved_watchlist=DayWatchlist.saved(self.scanner.watchlist_dir, day),
+                                hot_size=self.scan_settings.hot_list_size, queue_size=self.scan_settings.sector_queue_size,
+                                prefilter=cfg.scanner.prefilter, news_note=note)
+        except Exception:  # noqa: BLE001
+            log.exception("could not build the movers for %s", day)
+            return None
+
+    def _mover_news(self, day: dt.date, symbols: List[str]):
+        if not self.settings.config.signals.enabled:
+            return None, "News isn't read while the signals are off (signals.enabled in config.yaml)."
+        start, _, end = session_bounds(day)
+        try:
+            news = self.signals.stories_between(symbols, start, end)
+        except Exception:  # noqa: BLE001
+            log.warning("could not read the movers' news", exc_info=True)
+            return None, "The news couldn't be read."
+        return news, "" if self.md.attached else "IB Gateway wasn't connected, so IBKR's news feeds weren't read."
+
+    def mover_chart(self, day: dt.date, symbol: str) -> Dict[str, Any]:
+        """A mover's daily candles around the session and the session's 5-minute candles, with what the bot
+        did and the news - drawn by the Reports page."""
+        movers = (self.journal.get(day) or {}).get("movers") or {}
+        row = next((r for r in movers.get("gainers", []) + movers.get("losers", []) if r["symbol"] == symbol), None)
+        if row is None:
+            return {"ok": False, "reason": f"{symbol} isn't among that session's movers."}
+        daily = self.md.daily_frame(symbol)
+        if daily is not None and len(daily):
+            at = int((daily.index.date <= day).sum())
+            daily = daily.iloc[max(0, at - self.MOVER_CHART_BEFORE):at + self.MOVER_CHART_AFTER]
+        frame = self.replay.history.stored(symbol)
+        if (frame is None or not (frame.index.date == day).any()) and self.md.attached:
+            try:
+                frame = self.replay.history.load(self.md.source, [symbol], 1, self.scanner.con_ids([symbol]),
+                                                 today=clock.next_trading_day(day)).get(symbol)
+            except Exception:  # noqa: BLE001
+                log.debug("chart candles for %s on %s failed", symbol, day, exc_info=True)
+        session = frame[frame.index.date == day] if frame is not None else None
+        return {"ok": True, "symbol": symbol, "session": day.isoformat(), "row": row,
+                "daily": candles(daily, self.MOVER_CHART_BEFORE + self.MOVER_CHART_AFTER),
+                "intraday": candles(session, 200)}
 
     def _session_bars(self, day: dt.date, plays: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """The session's 5-minute candles for the plays not taken (kept with the replay's candles)."""
@@ -822,6 +1005,7 @@ class TradingEngine:
         for row in sorted(rows, key=lambda r: abs(r["z"] or 0.0) - r["entry_z"], reverse=True):
             if ap.dry_run:
                 noted = (clock.session_date().isoformat(), row["id"])
+                self._pairs_dry_noted = {n for n in self._pairs_dry_noted if n[0] == noted[0]}
                 if noted not in self._pairs_dry_noted:
                     self._pairs_dry_noted.add(noted)
                     log.info("autopilot DRY-RUN would enter pair %s (%s)", row["id"], row["side"])
@@ -836,7 +1020,11 @@ class TradingEngine:
         return {"enabled": cfg.enabled, "review_at": cfg.review_at, "days": self.journal.days(limit)}
 
     def journal_review(self, day: dt.date) -> Optional[Dict[str, Any]]:
-        return self.journal.get(day)
+        review = self.journal.get(day)
+        if _movers_built(review):
+            sessions = [d["session"] for d in self.journal.days(3 * ROLLING_SESSIONS) if d["session"] <= day.isoformat()]
+            review["capture"] = rolling_capture(r for s in sessions if (r := self.journal.get(dt.date.fromisoformat(s))))
+        return review
 
     def _switch_blocked(self, target_venue: str) -> Optional[str]:
         """Refuse to move orders to another venue while positions are open on the
@@ -988,6 +1176,20 @@ class TradingEngine:
         if self.settings.config.signals.enabled:
             self.signals.run(self._stop)
 
+    def signals_state(self) -> Dict[str, Any]:
+        """The Signals page: the signal service's state, where its news comes from, and whether the
+        strategies built on it are switched on."""
+        on = {r["key"]: r["enabled"] for r in self.strategy_state()}
+        return {**self.signals.state(), "ibkr_news": self.md.attached, "followed": self._signal_watchlist(),
+                "strategies": {k: {"enabled": bool(on.get(k)), "title": REGISTRY[k].title}
+                               for k in ("insider_buying", "earnings_drift") if k in REGISTRY}}
+
+    def signal_detail(self, symbol: str) -> Dict[str, Any]:
+        return self.signals.symbol_state(symbol)
+
+    def check_signals(self) -> Dict[str, Any]:
+        return self.signals.check_now()
+
     def _signal_watchlist(self) -> List[str]:
         """The stocks whose news the signals follow: those held, then the day's hot list."""
         wl = self.scanner.watchlist
@@ -1027,6 +1229,7 @@ class TradingEngine:
             try:
                 self.connections.refresh()
                 self._retry_connection()
+                self._watch_gateway()
                 if self._refresh_account():
                     self._reconcile_open_trades()
                 state = self.snapshot()
@@ -1309,7 +1512,9 @@ class TradingEngine:
         if broker is None or not broker.is_connected or acc is None or self.executor is None:
             return []
         now = time.monotonic()
-        account_age_s, connection_age_s = now - self._account_at, now - self._broker_since
+        # the adapter reconnects by itself (the Gateway's nightly restart): count from whichever came last
+        since = max(self._broker_since, float(getattr(broker, "connected_since", 0.0) or 0.0))
+        account_age_s, connection_age_s = now - self._account_at, now - since
         mine = [t for t in self._open_trades() if (t.get("broker") or "paper") == venue]
         held = {p.symbol: float(p.quantity) for p in acc.positions if abs(p.quantity) > 1e-9}
         gone = self.position_check.gone(
@@ -1881,3 +2086,17 @@ def _attempt(action: Callable[..., Dict[str, Any]], *args: Any, **kwargs: Any) -
     except Exception as e:  # noqa: BLE001
         log.exception("%s failed", getattr(action, "__name__", "action"))
         return {"ok": False, "reason": f"It didn't go through: {e}"}
+
+
+def _movers_built(review: Optional[Mapping[str, Any]]) -> bool:
+    return bool(((review or {}).get("movers") or {}).get("ok"))
+
+
+def _duration(seconds: float) -> str:
+    """A span of time in words: "45 s", "3 min", "1 h 5 min"."""
+    s = int(max(0.0, seconds))
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        return f"{s // 60} min"
+    return f"{s // 3600} h {(s % 3600) // 60} min"
