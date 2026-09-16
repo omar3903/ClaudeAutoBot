@@ -12,6 +12,8 @@ app:
 account:
   # Day-trading guard rails. See tos_bot/risk/pdt_guard.py
   min_start_equity: 2000.0              # LIVE only: refuse to arm below this. Ignored in paper mode.
+  day_trade_pct: 75                   # of the trading capital, day trades may hold this % at once and swing
+                                      # trades the rest - the dashboard's Trading capital dialog changes it
   paper_start_cash: 100000.0           # opening balance of the built-in simulator
   pdt_equity_threshold: 25000.0        # FINRA pattern-day-trader equity line
   max_day_trades_under_threshold: 3    # rolling 5 business days when equity < pdt_equity_threshold

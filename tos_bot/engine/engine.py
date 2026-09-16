@@ -30,7 +30,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 from .. import secrets_store
 from ..brokers import get_broker
@@ -87,7 +87,7 @@ from . import capital, views
 from .board import PlayBoard
 from .connections import Connections
 from .reconcile import PositionCheck
-from .runtime import RuntimeFile, load_capital, load_filters, load_strategy_overrides
+from .runtime import RuntimeFile, load_capital, load_day_trade_pct, load_filters, load_strategy_overrides
 
 log = logging.getLogger(__name__)
 
@@ -140,6 +140,8 @@ class TradingEngine:
         self.strategy_overrides = load_strategy_overrides(saved.get("strategies"))
         #: how much of the account the bot may use, per venue, in the account's currency
         self.capital = load_capital(saved.get("capital"))
+        #: the part of the trading capital day trades may hold; swing trades get the rest (engine/capital.py)
+        self.day_trade_pct = load_day_trade_pct(saved.get("capital_split"), cfg.account.day_trade_pct)
         sc = cfg.scanner
         self.scan_settings = ScanSettings.load(saved.get("scan"), ScanSettings(
             premarket_time=sc.premarket_time, cycle_minutes=sc.cycle_minutes,
@@ -269,7 +271,7 @@ class TradingEngine:
         payload: Dict[str, Any] = {
             "mode": self.mode, "paper_platform": self.paper_platform, "filters": self.filters.as_dict(),
             "strategies": self.strategy_overrides, "capital": self.capital,
-            "scan": self.scan_settings.as_dict(), "autopilot": self.autopilot.to_runtime(),
+            "capital_split": {"day_pct": self.day_trade_pct}, "scan": self.scan_settings.as_dict(), "autopilot": self.autopilot.to_runtime(),
         }
         if self.quit_state:
             payload["quit"] = self.quit_state
@@ -952,7 +954,7 @@ class TradingEngine:
             model = self.pairs.model(pair_id)
             if model is None:
                 return {"ok": False, "reason": f"{pair_id} isn't on the pairs watch list."}
-            sizing = self.sizing_account() or acc
+            sizing = self.sizing_account(capital.SWING) or acc
             holding = ({t["symbol"] for t in self._open_trades()} | {w["symbol"] for w in self.working_entries()}
                        | {p.symbol for p in acc.positions if abs(p.quantity) > 1e-9})
             cap = float(cfg.risk.max_risk_per_trade_pct)
@@ -998,7 +1000,7 @@ class TradingEngine:
             return
         if self.repo.pair_trades_opened_on(clock.session_date()) >= int(cfg.max_new_per_day):
             return
-        acc = self.sizing_account()
+        acc = self.sizing_account(capital.SWING)
         if acc is None or (acc.equity and self.gross_exposure() > acc.equity * ap.max_gross_exposure_pct / 100.0):
             return
         rows = [r for r in self.pairs.watch(self.md.daily_frame, prices) if r["signal"] and r["live"]]
@@ -1335,12 +1337,7 @@ class TradingEngine:
                 self._last_fast_at = mono
                 if kind == "cycle":
                     self._last_cycle_at = mono
-        sizing = self.sizing_account()
-        if sizing is not None:
-            exposure = self.exposure_by_symbol()
-            for p in result.plays:
-                size_play(p, sizing, self.settings.config.risk, symbol_notional=exposure.get(p.symbol, 0.0),
-                          risk_pct=self.strategy_risk_pct(p.strategy))
+        self._size_plays(result.plays)
         # the cycles don't re-check valuation setups, so those stay; a quick re-check isn't a confirmation
         changes = self.board.replace(result.plays, None if kind == "full" else result.symbols,
                                      keep=lambda p: p.kind.value == "FUNDAMENTAL", confirm=not quick)
@@ -1563,7 +1560,7 @@ class TradingEngine:
             return {"ok": False, "reason": "no account data"}
         cfg = self.settings.config
         # sized against the trading capital; the PDT rule and the floor see the real account
-        sizing = size_play(p, self.sizing_account() or acc, cfg.risk,
+        sizing = size_play(p, self.sizing_account(p.timeframe) or acc, cfg.risk,
                            symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0),
                            risk_pct=self.strategy_risk_pct(p.strategy))
         decision = self.pdt.assess(acc, p)
@@ -1863,18 +1860,41 @@ class TradingEngine:
     def _invested_usd(self) -> float:
         return capital.invested_usd(self._account, self._positions_here())
 
-    def sizing_account(self) -> Optional[Account]:
-        """The account as position sizing sees it - see capital.py."""
+    def sizing_account(self, timeframe: Any = None) -> Optional[Account]:
+        """The account as position sizing sees it - see capital.py. With a ``timeframe`` (a day trade or a
+        swing trade), only that kind's share of the trading capital is open to it."""
         acc, limit = self._account, self.capital.get(self._venue)
-        if acc is None or not limit:
+        share = 1.0 if timeframe is None else capital.share_of(capital.kind_of(timeframe), self.day_trade_pct)
+        if acc is None or (not limit and share >= 1.0):
             return acc
-        return capital.sizing_account(acc, limit, self._invested_usd())
+        trades = self._positions_here()
+        held = capital.invested_by_kind(acc, trades)
+        return capital.sizing_account(acc, limit, sum(held.values()), share=share,
+                                      invested_in_kind=held[capital.kind_of(timeframe)] if timeframe is not None else 0.0)
 
     def capital_state(self) -> Optional[Dict[str, Any]]:
         if self._account is None:
             return None
-        return capital.state(self._account, self._venue, venue_label(self._venue),
-                             self.capital.get(self._venue), self._invested_usd())
+        return capital.state(self._account, self._venue, venue_label(self._venue), self.capital.get(self._venue),
+                             self._invested_usd(), self.day_trade_pct,
+                             capital.invested_by_kind(self._account, self._positions_here()))
+
+    def set_capital_split(self, day_pct: Any) -> Dict[str, Any]:
+        """The part of the trading capital day trades may hold at once, in percent; swing trades get the rest."""
+        locked = self._locked()
+        if locked:
+            return {"ok": False, "reason": locked}
+        try:
+            value = capital.parse_day_pct(day_pct)
+        except ValueError as e:
+            return {"ok": False, "reason": str(e)}
+        self.day_trade_pct = value
+        self._save_runtime()
+        self._resize_plays()
+        state = self.capital_state()
+        BUS.publish("capital.updated", capital=state)
+        return {"ok": True, "capital": state,
+                "note": f"Day trades may now hold up to {value:g}% of the trading capital at once, swing trades {100 - value:g}%."}
 
     def set_capital(self, amount: Any = None) -> Dict[str, Any]:
         """How much of the account on the current platform the bot may use, in the
@@ -1909,14 +1929,18 @@ class TradingEngine:
         return {"ok": True, "capital": state, "note": note}
 
     def _resize_plays(self) -> None:
-        sizing = self.sizing_account()
-        if sizing is not None:
-            exposure = self.exposure_by_symbol()
-            for p in self.board.plays.values():
-                if p.status not in _ACTED_ON:
-                    size_play(p, sizing, self.settings.config.risk, symbol_notional=exposure.get(p.symbol, 0.0),
-                              risk_pct=self.strategy_risk_pct(p.strategy))
+        self._size_plays([p for p in self.board.plays.values() if p.status not in _ACTED_ON])
         self._publish_plays()
+
+    def _size_plays(self, plays: Iterable[Play]) -> None:
+        """Suggested sizes for plays on the board, each against its own share of the trading capital."""
+        accounts = {kind: self.sizing_account(kind) for kind in (capital.DAY, capital.SWING)}
+        if accounts[capital.DAY] is None:
+            return
+        exposure = self.exposure_by_symbol()
+        for p in plays:
+            size_play(p, accounts[capital.kind_of(p.timeframe)], self.settings.config.risk,
+                      symbol_notional=exposure.get(p.symbol, 0.0), risk_pct=self.strategy_risk_pct(p.strategy))
 
     # ------------------------------------------------------------------ #
     #  Quitting                                                          #

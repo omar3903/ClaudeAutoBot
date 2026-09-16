@@ -19,7 +19,7 @@ def exit_rules(cfg: Any) -> Dict[str, Any]:
 
 
 def data_feed(md: MarketData) -> Dict[str, Any]:
-    return {"source": md.source_name, "connected": md.attached, "delayed": md.delayed}
+    return {"source": md.source_name, "connected": md.attached, "delayed": md.delayed, "reason": md.data_problem}
 
 
 def account(acc: Account, cfg: Any, paper: bool) -> Dict[str, Any]:

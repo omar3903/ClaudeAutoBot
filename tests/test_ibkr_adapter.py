@@ -418,6 +418,44 @@ def test_a_quote_with_no_price_raises_so_the_next_feed_answers(broker):
         broker.get_quote("AAPL")
 
 
+def test_real_time_data_comes_back_once_the_competing_session_logs_out(broker, monkeypatch):
+    broker._on_error(4, 10197, "No market data during competing live session", None)
+    status = broker.session_status()
+    assert status["market_data"] == "delayed" and "logged in somewhere else" in status["market_data_reason"]
+
+    ib = broker._session.ib
+    real = ib.reqTickersAsync
+
+    async def refused(contract):
+        broker._on_error(9, 10197, "No market data during competing live session", None)
+        return await real(contract)
+    ib.reqTickersAsync = refused                                           # still logged in on the phone
+    broker.refresh_if_needed()                                             # too soon to ask again
+    assert broker._data_is_delayed and ib.market_data_type == 3
+    broker._live_checked_at -= broker.LIVE_RECHECK_S
+    broker.refresh_if_needed()
+    assert broker._data_is_delayed and ib.market_data_type == 3
+
+    ib.reqTickersAsync = real                                              # logged out there
+    broker._live_checked_at -= broker.LIVE_RECHECK_S
+    broker._competing_at -= 2 * broker.LIVE_RECHECK_S
+    broker.refresh_if_needed()
+    assert not broker._data_is_delayed and ib.market_data_type == 1 and broker.session_status()["market_data_reason"] == ""
+
+
+def test_every_connection_tries_real_time_data_again(broker):
+    broker._on_error(5, 354, "Requested market data is not subscribed.", None)
+    assert "no real-time subscription" in broker.market_data_reason
+    broker._do_connect()                                                  # IB Gateway logged out and in
+    assert not broker._data_is_delayed and broker._session.ib.market_data_type == 1
+
+
+def test_candles_refused_for_a_competing_session_are_explained(broker):
+    broker._on_error(7, 162, "Historical Market Data Service error message:Trading TWS session is connected from a "
+                             "different IP address", None)
+    assert not broker._data_is_delayed and "logged in somewhere else" in broker.market_data_reason
+
+
 def test_not_subscribed_switches_to_delayed_data(broker):
     broker._on_error(5, 354, "Requested market data is not subscribed. Delayed market data is available.", None)
     assert broker._data_is_delayed and broker.quotes_from_bars

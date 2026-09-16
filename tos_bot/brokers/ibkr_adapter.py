@@ -38,8 +38,18 @@ from .base import AuthError, BrokerAdapter, OrderRejected
 log = logging.getLogger(__name__)
 
 _MARKET_DATA_TYPES = {"live": 1, "frozen": 2, "delayed": 3, "delayed-frozen": 4}
-# error codes meaning "no real-time subscription" (354 / 10168: not subscribed)
+# error codes meaning "no real-time data for this login" (354 / 10168: not subscribed; 10197: a competing session)
 _DELAYED_ERRS = {10167, 10168, 10197, 10089, 354}
+COMPETING_SESSION = 10197
+_COMPETING_WORDS = "different ip address"          # error 162: historical data refused for the same reason
+#: what the dashboard says about delayed or refused data
+COMPETING_REASON = ("IBKR sends no market data to this login while your live account is logged in somewhere else "
+                    "(IBKR Mobile, Client Portal, TWS or the web trader) - with market data shared to the paper "
+                    "account, only one session gets it. Log out there; the app switches back to real-time data by "
+                    "itself within a few minutes.")
+NOT_SUBSCRIBED_REASON = ("IBKR says this login has no real-time subscription for US stocks (error {code}). After "
+                         "subscribing, or turning on sharing with the paper account, log IB Gateway out and back in; "
+                         "the app checks again every few minutes.")
 # IB Gateway reached IBKR's servers again (1101: subscriptions lost, 1102: kept)
 _SERVERS_BACK = {1101, 1102}
 # a data farm reporting OK - after a 2110 outage, that's the all-clear
@@ -174,6 +184,12 @@ class IbkrBroker(BrokerAdapter):
         self._servers_lost_code = 0
         self._contracts: Dict[str, Any] = {}              # symbol -> qualified Contract
         self._last_error = ""
+        #: the last refusal of real-time data (IBKR's code), how many there have been, and when live data was last
+        #: tried again; and when IBKR last refused data because the live account was logged in elsewhere
+        self._data_refused_code = 0
+        self._data_refusals = 0
+        self._live_checked_at = 0.0
+        self._competing_at: Optional[float] = None
         self._lock = threading.RLock()
 
     # ---- connection --------------------------------------------------- #
@@ -218,6 +234,10 @@ class IbkrBroker(BrokerAdapter):
                 self._ib.errorEvent += self._on_error
             except Exception:  # noqa: BLE001
                 pass
+        if self._md_pref == "auto":
+            # every connection tries real-time data again: a subscription may have been added, or a competing
+            # live session logged out, since the last one
+            self._data_type, self._data_is_delayed = 1, False
         try:
             self._session.call(lambda ib: ib.reqMarketDataType(self._data_type), timeout=5)
         except Exception:  # noqa: BLE001
@@ -247,12 +267,53 @@ class IbkrBroker(BrokerAdapter):
         dashboard's data label is right from the start."""
         if self._md_pref != "auto" or self._data_is_delayed:
             return
+        self._live_checked_at = time.monotonic()
         try:
             probe = self._contract("SPY")             # IBKR only refuses a qualified contract
             self._session.run_coro(lambda ib: ib.reqTickersAsync(probe), timeout=4)
             self._session.run_coro(lambda ib: _sleep(0.3), timeout=2)    # let the refusal land
         except Exception:  # noqa: BLE001
             pass
+
+    #: how often a login that fell back to delayed data asks for real-time data again
+    LIVE_RECHECK_S = 300.0
+
+    def recheck_live_data(self) -> bool:
+        """Ask for real-time data again after a refusal; returns whether it's live now. Without this a
+        subscription added, or a competing live session logged out, would only count after a restart."""
+        self._live_checked_at = time.monotonic()
+        if self._md_pref != "auto" or not self._data_is_delayed or not self.is_connected:
+            return not self._data_is_delayed
+        refused = self._data_refusals
+        try:
+            probe = self._contract("SPY")
+            self._session.call(lambda ib: ib.reqMarketDataType(1), timeout=5)
+            self._session.run_coro(lambda ib: ib.reqTickersAsync(probe), timeout=6)
+            self._session.run_coro(lambda ib: _sleep(0.5), timeout=3)
+        except Exception:  # noqa: BLE001
+            refused = -1                                  # couldn't tell: stay on delayed data
+        if refused == self._data_refusals:
+            self._data_type, self._data_is_delayed, self._data_refused_code = 1, False, 0
+            log.warning("IBKR: real-time market data is available again")
+            return True
+        try:
+            self._session.call(lambda ib: ib.reqMarketDataType(3), timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    @property
+    def market_data_reason(self) -> str:
+        """Why IBKR isn't sending real-time data (or any), in words - empty when it is."""
+        if self._competing_at is not None and time.monotonic() - self._competing_at < self.LIVE_RECHECK_S * 2:
+            return COMPETING_REASON
+        if not self._data_is_delayed:
+            return ""
+        if self._data_refused_code == COMPETING_SESSION:
+            return COMPETING_REASON
+        if self._data_refused_code:
+            return NOT_SUBSCRIBED_REASON.format(code=self._data_refused_code)
+        return "Delayed data was chosen in the IBKR settings (IBKR_MARKET_DATA)." if self._md_pref != "auto" else ""
 
     @property
     def quotes_from_bars(self) -> bool:
@@ -338,6 +399,8 @@ class IbkrBroker(BrokerAdapter):
         """Nudge a reconnect when the socket has dropped (the daily Gateway restart)."""
         if not self.is_connected and self._want_connected:
             self._start_reconnect()
+        elif self._data_is_delayed and time.monotonic() - self._live_checked_at >= self.LIVE_RECHECK_S:
+            self.recheck_live_data()
         return self.is_connected
 
     def session_status(self) -> Dict[str, Any]:
@@ -349,6 +412,7 @@ class IbkrBroker(BrokerAdapter):
             "host": self.host, "port": self.port, "mode": self.mode,
             "account": self.account_id or None,
             "market_data": "delayed" if self._data_is_delayed else "live",
+            "market_data_reason": self.market_data_reason,
             "readonly": self.readonly,
             "servers_lost": servers_lost,
             "down_for_s": round(time.monotonic() - self.down_since) if self.down_since and not connected else 0,
@@ -366,8 +430,13 @@ class IbkrBroker(BrokerAdapter):
         if errorCode in _INFO_ERRS:
             return
         if errorCode in _DELAYED_ERRS:
+            self._data_refusals += 1
+            self._data_refused_code = errorCode
+            if errorCode == COMPETING_SESSION:
+                self._competing_at = time.monotonic()
             if not self._data_is_delayed:
-                log.warning("IBKR: no real-time market-data subscription - using delayed data")
+                log.warning("IBKR: no real-time market data for this login (%s: %s) - using delayed data",
+                            errorCode, errorString)
             self._data_is_delayed = True
             self._data_type = 3
             try:
@@ -387,6 +456,10 @@ class IbkrBroker(BrokerAdapter):
                 self._start_reconnect()          # watches for the servers, and starts afresh if they stay away
         elif errorCode == 1300:
             self._connected = False
+        elif errorCode == 162 and _COMPETING_WORDS in str(errorString).lower():
+            if self._competing_at is None or time.monotonic() - self._competing_at > self.LIVE_RECHECK_S:
+                log.warning("IBKR: candles refused - the live account is logged in from another place")
+            self._competing_at = time.monotonic()
         self._last_error = f"{errorCode}: {errorString}"
         if errorCode not in (162, 200):        # historical-data / unknown-contract noise
             log.debug("IBKR error %s: %s", errorCode, errorString)

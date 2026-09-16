@@ -99,6 +99,11 @@ class MarketData:
     def delayed(self) -> bool:
         return bool(self._source is not None and self._source.quotes_from_bars)
 
+    @property
+    def data_problem(self) -> str:
+        """Why the price source isn't sending real-time data, in words (see IbkrBroker.market_data_reason)."""
+        return str(getattr(self._source, "market_data_reason", "") or "") if self._source is not None else ""
+
     # ---- daily candles -------------------------------------------------- #
     def update_daily(self, symbols: Iterable[str], through: dt.date,
                      con_ids: Optional[Mapping[str, int]] = None,
