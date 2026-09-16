@@ -247,6 +247,29 @@ def test_connected_and_account(broker):
     assert acc.positions[0].market_price == 400.0
 
 
+def test_a_slow_answer_raises_instead_of_reading_as_an_empty_account(broker):
+    from tos_bot.brokers.base import BrokerError
+
+    real = broker._session.call
+
+    def all_slow(fn, timeout=15.0):
+        raise TimeoutError("the loop is busy")
+
+    def positions_slow(fn, timeout=15.0):
+        if "portfolio" in fn.__code__.co_names:
+            raise TimeoutError("the loop is busy")
+        return real(fn, timeout)
+
+    broker._session.call = all_slow
+    with pytest.raises(BrokerError, match="account values"):
+        broker.get_account()
+    broker._session.call = positions_slow
+    with pytest.raises(BrokerError, match="positions"):
+        broker.get_account()
+    broker._session.call = real
+    assert [p.symbol for p in broker.get_account().positions] == ["MSFT"]
+
+
 def test_quote_falls_back_to_close_when_last_is_nan(broker):
     q = broker.get_quote("AAPL")
     assert q.last == pytest.approx(99.9)              # last was NaN -> close

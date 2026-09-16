@@ -199,6 +199,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         self._gateway_alerted = False
         self._account: Optional[Account] = None
         self._account_at = 0.0
+        self._account_warned_at = float("-inf")     # the last time a failing account read was logged
         self._armed = False
 
         # hands-off entry (exits are always automatic)
@@ -925,14 +926,25 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
     # ------------------------------------------------------------------ #
     #  Account, arming, broker vs database                              #
     # ------------------------------------------------------------------ #
+    #: how often a failing account read is worth a warning in the log
+    ACCOUNT_WARN_S = 300.0
+
     def _refresh_account(self) -> bool:
+        """Read the account; when the broker can't answer, keep the last snapshot - it then reads as
+        stale, so nothing is deleted or closed on its say-so until a fresh one arrives."""
         try:
             if self._broker:
                 self._account = self._broker.get_account()
                 self._account_at = time.monotonic()
                 return True
         except Exception as e:  # noqa: BLE001
-            log.debug("get_account failed: %s", e)
+            now = time.monotonic()
+            if now - self._account_warned_at >= self.ACCOUNT_WARN_S:
+                self._account_warned_at = now
+                log.warning("the account couldn't be read - keeping the last snapshot (%.0f s old): %s",
+                            now - self._account_at if self._account_at > 0 else 0.0, e)
+            else:
+                log.debug("get_account failed: %s", e)
         return False
 
     def _check_arm(self) -> None:
