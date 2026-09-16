@@ -156,6 +156,8 @@ class ExitManagerCfg(_Model):
     trail_lock_ratio: float = 0.5
     flatten_intraday_before_close_min: int = 10
     max_swing_hold_days: int = 10
+    scale_out_pct: float = 50.0           # at the first target of a play with two, take this % off (0 = exit all there)
+    scale_out_lock_r: float = 0.0         # ...and move the stop to the entry plus this R (Aziz: break-even)
 
 
 class AutopilotCfg(_Model):

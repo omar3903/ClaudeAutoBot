@@ -503,6 +503,7 @@ held on the active platform — **entries need your click, exits never do**:
 |---|---|---|
 | cut losses at the working stop | on | — |
 | take profit at the target | on | — |
+| **take half off at the first target**, stop to break-even, the rest runs to the second target (Aziz) | 50 % | `scale_out_pct`, `scale_out_lock_r` (plays with one target exit whole) |
 | tighten the stop to **lock a small profit** once green | at +1.3 R, lock +0.3 R | `breakeven_at_r`, `breakeven_lock_r` |
 | **trail** the stop, keeping a fraction of the open R | from +2.0 R, lock 50% | `trail_start_r`, `trail_lock_ratio` |
 | **flatten day trades** before the (holiday-aware) close | 10 min before | `flatten_intraday_before_close_min` |

@@ -89,6 +89,9 @@ def trade_to_dict(t: Trade) -> Dict[str, Any]:
         "sector": getattr(t, "sector", "") or "", "side": t.side,
         "strategy": t.strategy, "kind": t.kind, "timeframe": t.timeframe, "broker": t.broker,
         "status": t.status, "quantity": _f(t.quantity),
+        "initial_quantity": _f(getattr(t, "initial_quantity", None)),
+        "banked_pl": _f(getattr(t, "banked_pl", 0.0)) or 0.0,
+        "target2_price": _f(getattr(t, "target2_price", None)),
         "entry_price": _f(t.entry_price),
         "entry_time": t.entry_time.isoformat() if t.entry_time else None,
         "order_type": getattr(t, "order_type", None),
@@ -191,10 +194,12 @@ class Repository:
                 id=tid, play_id=play.id, symbol=play.symbol,
                 sector=getattr(play, "sector", "") or "", side=play.side.value,
                 strategy=play.strategy, kind=play.kind.value, timeframe=play.timeframe.value,
-                broker=broker, status="OPEN", quantity=fill_qty, entry_price=fill_price,
+                broker=broker, status="OPEN", quantity=fill_qty, initial_quantity=fill_qty,
+                entry_price=fill_price,
                 entry_time=now, order_type=order_type, order_session=order_session,
                 stop_price=None if pair_id else play.stop,
                 target_price=None if pair_id else play.primary_target,
+                target2_price=None if (pair_id or len(play.targets) < 2) else float(play.targets[1]),
                 initial_stop_price=None if pair_id else play.stop,
                 initial_target_price=None if pair_id else play.primary_target,
                 hwm_price=fill_price, managed_exit=not pair_id, pair_id=pair_id, fees=commission,
@@ -260,18 +265,21 @@ class Repository:
             sign = 1.0 if t.side == "LONG" else -1.0
             gross = (exit_price - float(t.entry_price)) * qty * sign
             fees = float(t.fees or 0.0) + commission
-            pl = gross - commission
+            # what the part taken off earlier made joins the final P/L; R and % are on the shares entered with
+            banked = float(getattr(t, "banked_pl", 0.0) or 0.0)
+            pl = gross - commission + banked
+            basis_qty = float(getattr(t, "initial_quantity", None) or qty) if exit_qty is None else qty
             t.exit_price = exit_price
             t.exit_time = now
             t.exit_reason = exit_reason
             t.fees = fees
             t.realized_pl = pl
-            basis = float(t.entry_price) * qty
+            basis = float(t.entry_price) * basis_qty
             t.realized_pl_pct = (pl / basis * 100.0) if basis else None
             # R is measured against the ORIGINAL stop, not a trailed one
             ref_stop = getattr(t, "initial_stop_price", None) or t.stop_price
             risk_ps = abs(float(t.entry_price) - float(ref_stop)) if ref_stop else 0.0
-            t.r_multiple = (pl / (risk_ps * qty)) if risk_ps and qty else None
+            t.r_multiple = (pl / (risk_ps * basis_qty)) if risk_ps and basis_qty else None
             # day-trade if entry and exit fall on the same NY session
             if t.entry_time:
                 t.is_day_trade = clock.session_date(_as_utc(t.entry_time)) == clock.session_date(_as_utc(now))
@@ -280,6 +288,48 @@ class Repository:
                        leg="EXIT", quantity=qty, price=exit_price, commission=commission))
             out = trade_to_dict(t)
         log.info("trade closed %s: P/L %.2f (%s)", trade_id, out["realized_pl"], exit_reason)
+        return out
+
+    def reduce_trade(self, trade_id: str, exit_qty: float, exit_price: float, exit_reason: str = "target-1",
+                     commission: float = 0.0, stop_price: Optional[float] = None,
+                     target_price: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """Book part of a position taken off - the scale-out at the first target: those shares
+        leave the record, what they made is banked toward the trade's final P/L, and the stop and
+        target move on to what the rest of the position now has to do (the stop only ever in the
+        trade's favour). A part covering the whole position closes the trade instead."""
+        with session_scope() as s:
+            t = s.get(Trade, trade_id)
+            if t is None or t.status == "CLOSED":
+                return trade_to_dict(t) if t else None
+            qty, held = float(exit_qty), float(t.quantity)
+            if qty <= 0:
+                return trade_to_dict(t)
+            whole = qty >= held - 1e-9
+        if whole:
+            return self.close_trade(trade_id, exit_price, exit_reason=exit_reason, commission=commission)
+        now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+        with session_scope() as s:
+            t = s.get(Trade, trade_id)
+            sign = 1.0 if t.side == "LONG" else -1.0
+            gross = (exit_price - float(t.entry_price)) * qty * sign - commission
+            if t.initial_quantity is None:
+                t.initial_quantity = t.quantity
+            t.banked_pl = float(t.banked_pl or 0.0) + gross
+            t.fees = float(t.fees or 0.0) + commission
+            t.quantity = float(t.quantity) - qty
+            if stop_price is not None:
+                current = t.stop_price
+                better = current is None or (stop_price > float(current) if sign > 0 else stop_price < float(current))
+                if better:
+                    t.stop_price = stop_price
+            if target_price is not None:
+                t.target_price = target_price
+            note = f"took {qty:g} off at {exit_price:.2f} ({exit_reason}), {gross:+.2f} banked"
+            t.notes = ((t.notes + " | ") if t.notes else "") + note
+            s.add(Fill(trade_id=trade_id, ts=now, side=("SHORT" if t.side == "LONG" else "LONG"),
+                       leg="EXIT", quantity=qty, price=exit_price, commission=commission))
+            out = trade_to_dict(t)
+        log.info("trade reduced %s: %s, %s left", trade_id, note, out["quantity"])
         return out
 
     def open_trades(self) -> List[Dict[str, Any]]:

@@ -122,6 +122,8 @@ exit_manager:
   trail_lock_ratio: 0.5               # keep the stop at this fraction of the open R
   flatten_intraday_before_close_min: 10   # force-close day trades this many min before the bell
   max_swing_hold_days: 10             # force-close swing trades held longer than this (0 = off)
+  scale_out_pct: 50                   # at the first target of a play with two, take this % off - Aziz: sell half,
+  scale_out_lock_r: 0.0               # ...move the stop to the entry (+ this R), let the rest run to the second (0 = off)
 
 autopilot:
   # Hands-off ENTRY. Exits are already automatic (exit_manager above); this

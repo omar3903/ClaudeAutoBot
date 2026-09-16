@@ -133,10 +133,12 @@ function openRow(t, here) {
       ? ' <span class="badge" title="One leg of a pair trade - the pair desk closes both legs together (Pairs tab)">pair</span>' : ""}</td><td>${sideBadge(t.side)}</td>
     <td>${stratLabel(t.strategy)}</td>
     <td class="muted">${t.order_type || "—"}${t.order_session === "EXTENDED" ? " · ext" : ""}</td>
-    <td class="num">${num(t.quantity, 0)}</td>
+    <td class="num">${num(t.quantity, 0)}${t.initial_quantity && Math.abs(t.initial_quantity - t.quantity) > 1e-9
+      ? ` <span class="muted" title="part of the position was taken off at the first target">of ${num(t.initial_quantity, 0)}</span>` : ""}</td>
     <td class="num">${num(t.entry_price)}</td>
     <td class="num">${parked ? "–" : num(pos.market_price)}</td>
-    <td class="num ${upl >= 0 ? "pl-pos" : "pl-neg"}">${usd(upl)}</td>
+    <td class="num ${upl >= 0 ? "pl-pos" : "pl-neg"}">${usd(upl)}${t.banked_pl
+      ? ` <span class="muted" title="realized on the part already taken off">+${usd(t.banked_pl)} banked</span>` : ""}</td>
     <td class="num">${stopCell}</td>
     <td class="num">${num(t.target_price)}</td>
     <td>${timeCell}</td>

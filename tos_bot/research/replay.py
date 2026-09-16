@@ -74,6 +74,8 @@ class ReplaySettings:
     trail_lock_ratio: float = 0.5
     flatten_before_close_min: int = 10
     max_swing_hold_days: int = 10
+    scale_out_pct: float = 50.0           # at the first target of a play with two, this much comes off...
+    scale_out_lock_r: float = 0.0         # ...and the stop goes to the entry plus this R; the rest runs to the second
 
     @classmethod
     def from_exit_rules(cls, cfg, costs=None) -> "ReplaySettings":
@@ -83,7 +85,9 @@ class ReplaySettings:
         return cls(breakeven_at_r=float(cfg.breakeven_at_r), breakeven_lock_r=float(cfg.breakeven_lock_r),
                    trail_start_r=float(cfg.trail_start_r), trail_lock_ratio=float(cfg.trail_lock_ratio),
                    flatten_before_close_min=int(cfg.flatten_intraday_before_close_min),
-                   max_swing_hold_days=int(cfg.max_swing_hold_days) or 10, **extra)
+                   max_swing_hold_days=int(cfg.max_swing_hold_days) or 10,
+                   scale_out_pct=float(getattr(cfg, "scale_out_pct", 0.0) or 0.0),
+                   scale_out_lock_r=float(getattr(cfg, "scale_out_lock_r", 0.0) or 0.0), **extra)
 
 
 @dataclass
@@ -101,6 +105,7 @@ class SimTrade:
     noise: List[str] = field(default_factory=list)
     confirmed: bool = True                # the setup had also shown up on the bar before
     mfe_r: float = 0.0                    # the best it got, in R, before it closed
+    scaled: bool = False                  # part of it was taken off at the first target
 
 
 @dataclass
@@ -115,6 +120,9 @@ class _Position:
     confirmed: bool
     best: float
     bars_held: int = 0
+    fraction: float = 1.0                 # of the position still on
+    banked_r: float = 0.0                 # in R of the whole position, from the part taken off
+    scaled: bool = False
 
     @property
     def sign(self) -> int:
@@ -297,10 +305,21 @@ def _step(position: _Position, bar: pd.Series, bar_end: pd.Timestamp, settings: 
         price = min(o, position.stop) if long else max(o, position.stop)
         reason = "stop" if position.stop == position.play.stop else "trailing-stop"
         return _close(position, price, bar_end, reason, settings)
-    target = position.play.targets[0]
+    targets = position.play.targets
+    target = targets[1] if position.scaled else targets[0]
     if (h >= target) if long else (low <= target):
-        position.best = max(position.best, target) if long else min(position.best, target)
-        return _close(position, max(o, target) if long else min(o, target), bar_end, "target", settings, limit=True)
+        price = max(o, target) if long else min(o, target)
+        if not position.scaled and len(targets) > 1 and 0.0 < settings.scale_out_pct < 100.0:
+            # Aziz: part off at the first target, stop to break-even, the rest runs to the second
+            part = settings.scale_out_pct / 100.0
+            fill = price * (1 - position.sign * settings.commission_bps / 1e4)          # a limit fill
+            position.banked_r += part * (fill - position.entry) * position.sign / position.risk
+            position.fraction -= part
+            position.scaled = True
+            _tighten(position, position.entry + position.sign * settings.scale_out_lock_r * position.risk)
+        else:
+            position.best = max(position.best, target) if long else min(position.best, target)
+            return _close(position, price, bar_end, "target", settings, limit=True)
 
     position.best = max(position.best, h) if long else min(position.best, low)
     best_r = (position.best - position.entry) * position.sign / position.risk
@@ -320,12 +339,14 @@ def _close(position: _Position, price: float, at: pd.Timestamp, reason: str, set
     cost_bps = settings.commission_bps + (0.0 if limit else settings.slippage_bps)
     price *= 1 - position.sign * cost_bps / 1e4
     play = position.play
+    rest = position.fraction * (price - position.entry) * position.sign / position.risk
     return SimTrade(strategy=position.strategy, symbol=play.symbol, side=play.side.value,
                     timeframe=play.timeframe.value, entered_at=position.entered_at.isoformat(),
                     exited_at=at.isoformat(), entry=round(position.entry, 4), exit=round(price, 4),
-                    r=round((price - position.entry) * position.sign / position.risk, 3), exit_reason=reason,
+                    r=round(position.banked_r + rest, 3), exit_reason=reason,
                     noise=list(position.noise), confirmed=position.confirmed,
-                    mfe_r=round(max(0.0, (position.best - position.entry) * position.sign / position.risk), 3))
+                    mfe_r=round(max(0.0, (position.best - position.entry) * position.sign / position.risk), 3),
+                    scaled=position.scaled)
 
 
 def _at(day: dt.date, time: dt.time) -> pd.Timestamp:

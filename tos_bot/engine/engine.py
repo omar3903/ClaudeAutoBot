@@ -308,6 +308,7 @@ class TradingEngine:
         self.pdt = PdtGuard(cfg.account, trade_repo=self.repo, paper=self.mode == "paper")
         if self.executor is None:
             self.executor = Executor(broker, self.repo, cfg.execution, bus=BUS, venue=venue)
+            self.executor.scale_out = 0.0 < float(getattr(cfg.exit_manager, "scale_out_pct", 0.0) or 0.0) < 100.0
         else:
             self.executor.rebind(broker, venue=venue)
         self.executor.adopt_working_orders()          # before any exit can be sent twice

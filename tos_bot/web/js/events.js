@@ -76,6 +76,15 @@ function handle(topic, p) {
       loadOpen(); loadHistory(); loadStats(); refreshState();
       break;
     }
+    case "trade.reduced":
+    case "exit.scaled": {
+      const t = p.trade || {};
+      toast(`${t.symbol}: ${num(p.qty, 0)} of the position off at ${num(p.price || t.exit_price)} · ${usd(t.banked_pl)} banked · `
+        + `stop → ${num(t.stop_price)}, target → ${num(t.target_price)}`, "good");
+      if (t.id && t.id === S.recordId && drawerOpen("record")) openRecord(t.id);
+      loadOpen(); refreshState();
+      break;
+    }
     case "trades.removed": {
       const gone = p.trades || [];
       toast(`Removed ${plural(gone.length, "open-trade record")} no longer held at ${p.venue_label || "the broker"}: ` +

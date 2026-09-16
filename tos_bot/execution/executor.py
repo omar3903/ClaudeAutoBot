@@ -42,6 +42,8 @@ class _Pending:
     order_session: str = "REGULAR"
     reason: str = ""                # why an exit was sent: stop, target, manual...
     unseen: int = 0                 # polls in a row the broker didn't know the order
+    partial: bool = False           # an exit for part of the position (the scale-out) - the record stays open
+    after_fill: Optional[Dict[str, float]] = None   # the stop and target the rest gets once the part is off
 
 
 class Executor:
@@ -59,6 +61,9 @@ class Executor:
         self.bus = bus
         self._pending: Dict[str, _Pending] = {}
         self._open_by_symbol: Dict[str, str] = {}   # symbol -> trade_id
+        #: the exit manager takes part of a position off at the first target, so a native bracket
+        #: (the simulator's) carries the stop only - a take-profit child would close all of it there
+        self.scale_out: bool = False
 
     def rebind(self, broker: BrokerAdapter, venue: Optional[str] = None) -> None:
         """Point at a different broker (paper <-> live / platform switch).
@@ -202,8 +207,10 @@ class Executor:
             return []
 
     def _track_exit(self, t: Dict[str, Any], order: OrderResult, reason: str) -> None:
+        left = _remaining(order)
         self._pending[order.order_id] = _Pending(order.order_id, Play(**_min_play(t)), "exit",
-                                                 trade_id=t["id"], qty=_remaining(order), reason=reason)
+                                                 trade_id=t["id"], qty=left, reason=reason,
+                                                 partial=left < abs(float(t["quantity"])) - 1e-9)
 
     def _play_for(self, order: OrderResult) -> Optional[Play]:
         """The play an entry order left working was sent for, from the play log."""
@@ -247,7 +254,7 @@ class Executor:
         )
         try:
             if native_bracket:
-                res = self.broker.place_bracket(entry, play.primary_target, play.stop)
+                res = self.broker.place_bracket(entry, None if self.scale_out else play.primary_target, play.stop)
             else:
                 res = self.broker.place_order(entry)      # exit manager will protect it
         except BrokerError as e:
@@ -278,8 +285,11 @@ class Executor:
                 "note": "order working - will confirm on fill"}
 
     # ------------------------------------------------------------------ #
-    def close_trade(self, trade_id: str, reason: str = "manual",
-                    limit_price: Optional[float] = None) -> Dict[str, Any]:
+    def close_trade(self, trade_id: str, reason: str = "manual", limit_price: Optional[float] = None,
+                    qty: Optional[float] = None, after_fill: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        """Send the order that closes a position - or, with ``qty`` short of the whole position, the
+        part of it the exit manager takes off at the first target; ``after_fill`` is the stop and
+        target the rest gets once that part has gone (see Repository.reduce_trade)."""
         t = self.repo.get_trade(trade_id)
         if not t or t["status"] == "CLOSED":
             return {"ok": False, "reason": "trade not open"}
@@ -298,7 +308,9 @@ class Executor:
             log.warning("exit for %s is already working at the broker (order %s) - following it", trade_id,
                         order.order_id)
             return {"ok": True, "status": order.status, "order_id": order.order_id, "adopted": True}
-        qty = abs(float(t["quantity"]))
+        wanted = abs(float(t["quantity"]))
+        partial = qty is not None and 0 < float(qty) < wanted - 1e-9
+        qty = min(float(qty), wanted) if partial else wanted
         held = self._held_quantity(t["symbol"])
         if held is not None:
             if abs(held) < 1e-9 or (held > 0) != (t["side"] == "LONG"):
@@ -325,14 +337,30 @@ class Executor:
 
         if res.status == "FILLED" or res.filled_qty > 0:
             px = res.avg_fill_price or (res.fills[-1].price if res.fills else limit_price)
-            out = self.repo.close_trade(trade_id, float(px), exit_reason=reason)
-            self._open_by_symbol.pop(t["symbol"], None)
-            self.bus.publish("trade.closed", trade=out)
-            return {"ok": True, "status": "FILLED", "trade": out}
+            out, closed = self._book_exit(t["symbol"], trade_id, float(px), res.filled_qty or qty, reason,
+                                          partial, after_fill)
+            return {"ok": True, "status": "FILLED", "trade": out, "reduced": not closed}
 
         self._pending[res.order_id] = _Pending(res.order_id, Play(**_min_play(t)), "exit",
-                                               trade_id=trade_id, qty=qty, reason=reason)
+                                               trade_id=trade_id, qty=qty, reason=reason,
+                                               partial=partial, after_fill=after_fill)
         return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id}
+
+    def _book_exit(self, symbol: str, trade_id: str, price: float, qty: float, reason: str,
+                   partial: bool = False, after_fill: Optional[Dict[str, float]] = None):
+        """Book an exit fill: the whole position closes the record, part of it (the scale-out)
+        reduces it. Returns (the record, whether it is now closed)."""
+        if partial:
+            out = self.repo.reduce_trade(trade_id, float(qty), float(price), exit_reason=reason,
+                                         **(after_fill or {}))
+            if out and out.get("status") == "OPEN":
+                self.bus.publish("trade.reduced", trade=out, reason=reason, qty=qty, price=round(price, 4))
+                return out, False
+        else:
+            out = self.repo.close_trade(trade_id, float(price), exit_reason=reason)
+        self._open_by_symbol.pop(symbol, None)
+        self.bus.publish("trade.closed", trade=out, reason=reason)
+        return out, True
 
     def _held_quantity(self, symbol: str) -> Optional[float]:
         """Signed quantity the broker reports for ``symbol`` (0.0 if none), or
@@ -398,9 +426,8 @@ class Executor:
             self._open_trade(p.play, px, res.filled_qty or p.qty, res.order_id,
                              p.order_type, p.order_session)
         else:
-            out = self.repo.close_trade(p.trade_id, float(px), exit_reason=p.reason or "order")
-            self._open_by_symbol.pop(res.symbol, None)
-            self.bus.publish("trade.closed", trade=out)
+            self._book_exit(res.symbol, p.trade_id, float(px), res.filled_qty or p.qty, p.reason or "order",
+                            p.partial, p.after_fill)
 
     def _on_unfilled(self, p: _Pending, res) -> None:
         """The broker finished an order without filling all of it - rejected,

@@ -51,6 +51,14 @@ class _Repo:
         self.t[tid].update(status="CLOSED", exit_price=exit_price, exit_reason=exit_reason)
         return dict(self.t[tid])
 
+    def reduce_trade(self, tid, exit_qty, exit_price, exit_reason="", commission=0.0, stop_price=None,
+                     target_price=None):
+        t = self.t[tid]
+        t["quantity"] -= exit_qty
+        t["banked_pl"] = t.get("banked_pl", 0.0) + (exit_price - t["entry_price"]) * exit_qty
+        t.update({k: v for k, v in (("stop_price", stop_price), ("target_price", target_price)) if v is not None})
+        return dict(t)
+
     def get_play(self, play_id):
         return {"id": play_id, "symbol": "AAA", "side": "LONG", "strategy": "vwap_reclaim", "kind": "TECHNICAL",
                 "timeframe": "INTRADAY", "entry": 100.0, "stop": 98.0, "targets": [104.0], "confidence": 0.7,
@@ -262,3 +270,19 @@ def test_a_broker_that_cant_be_asked_never_reads_as_having_no_orders():
     broker.list_orders = unreachable
     with pytest.raises(ConnectionError):
         _executor(broker, _Repo([])).active_orders()
+
+
+def test_a_partial_exit_reduces_the_record_when_it_fills():
+    repo = _Repo([_trade(quantity=10, initial_quantity=10, target2_price=120.0)])
+    broker = _Broker(positions={"AAA": 10})
+    ex = _executor(broker, repo)
+    r = ex.close_trade("t1", reason="target-1", qty=4, after_fill={"stop_price": 100.05, "target_price": 120.0})
+    assert r["ok"] and r["status"] != "FILLED" and "t1" in ex.pending_exit_trade_ids()
+    [oid] = list(ex._pending)
+    assert broker.orders[-1].quantity == 4 and ex._pending[oid].partial
+    broker.reports[oid] = OrderResult(order_id=oid, status="FILLED", symbol="AAA", submitted_qty=4, filled_qty=4,
+                                      avg_fill_price=110.0)
+    ex.sync_open_orders()
+    t = repo.get_trade("t1")
+    assert t["status"] == "OPEN" and t["quantity"] == 6 and t["banked_pl"] == 40.0
+    assert (t["stop_price"], t["target_price"]) == (100.05, 120.0) and not ex.pending_exit_trade_ids()
