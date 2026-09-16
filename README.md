@@ -412,11 +412,12 @@ use — click it to set an amount, or **Use the whole account** to clear it.
 - It's remembered per platform, so a paper amount never carries over to a live
   account. The broker balance isn't touched, and the PDT rule and the live
   $2,000 floor still look at the real account.
-- **Day trades and swing trades share it** - 75% / 25% by default (`account.day_trade_pct`,
-  or the slider in the Trading capital dialog). Each kind may hold up to its share at once
-  (pair trades count as swing trades); a trade that doesn't fit what's left of its share is
-  made smaller. Risk per trade is still measured against the whole trading capital. With
-  no trading capital set, the whole account is split the same way.
+- **Day trades and swing trades share it** while the **Intraday** and **Swing** filters are both
+  on - 75% / 25% by default (`account.day_trade_pct`, or the slider that appears next to those
+  filters). Each kind may hold up to its share at once (pair trades count as swing trades); a
+  trade that doesn't fit what's left of its share is made smaller. With only one of the two
+  filters on, that kind gets all of it. Risk per trade is still measured against the whole
+  trading capital, and with no trading capital set the whole account is split the same way.
 
 ---
 

@@ -1,6 +1,6 @@
 /* Filters: what the bot scans for and may trade (saved on the server), plus the
    per-browser "hide executed" view option. */
-import { $, $$, SECTOR_SHORT, api, escapeHtml, post, store } from "./util.js";
+import { $, $$, SECTOR_SHORT, api, escapeHtml, money, post, store } from "./util.js";
 import { S, emit, on } from "./state.js";
 import { openModal, toast } from "./ui.js";
 
@@ -29,6 +29,34 @@ async function changeFilter(box) {
   S.state.filters = r.filters;
   emit("filters");
   toast(r.note + (r.rescanning ? " Rescanning for the new plays…" : ""), "good");
+}
+
+/* ---------- the day/swing split of the trading capital: only while both kinds are on ---------- */
+let splitDragging = false;
+
+function renderSplit() {
+  const kinds = (S.state.filters || {}).timeframes || [], sp = (S.state.capital || {}).split;
+  const both = kinds.includes("INTRADAY") && kinds.includes("SWING");
+  $("#split-ctl").classList.toggle("hidden", !both || !sp);
+  if (!both || !sp || splitDragging) return;
+  const pct = sp.set_pct ?? sp.day_pct;
+  $("#split-range").value = pct;
+  labelSplit(pct);
+}
+
+function labelSplit(pct) {
+  const c = S.state.capital || {};
+  $("#split-label").textContent = `${pct}% / ${100 - pct}%`;
+  $("#split-range").title = `Day trades up to ${money(c.effective * pct / 100, c.currency)}, swing trades up to ${money(c.effective * (100 - pct) / 100, c.currency)}`;
+}
+
+async function saveSplit() {
+  splitDragging = false;
+  const r = await post("/api/capital/split", { day_pct: parseFloat($("#split-range").value) });
+  if (!r.ok) { toast("Split not changed: " + (r.reason || ""), "bad"); renderSplit(); return; }
+  S.state.capital = r.capital;
+  emit("capital", r.capital);
+  toast(r.note, "good");
 }
 
 function renderSectorsButton() {
@@ -74,6 +102,11 @@ const VIEW_OPTIONS = { "f-hide-done": ["atb-hide-done", false], "f-hide-noisy": 
 export function initFilters() {
   on("state", syncControls);
   on("filters", syncControls);
+  on("state", renderSplit);
+  on("filters", renderSplit);
+  on("capital", renderSplit);
+  $("#split-range").oninput = e => { splitDragging = true; labelSplit(parseFloat(e.target.value)); };
+  $("#split-range").onchange = saveSplit;
   Object.keys(BOXES).forEach(id => { $("#" + id).onchange = e => changeFilter(e.target); });
   $("#btn-sectors").onclick = pickSectors;
   for (const [id, [key, byDefault]] of Object.entries(VIEW_OPTIONS)) {

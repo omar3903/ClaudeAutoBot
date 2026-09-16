@@ -124,6 +124,9 @@ main{display:flex; flex:1; min-height:0}
 }
 .filters{display:flex; gap:12px; align-items:center; flex-wrap:wrap; font-size:12px}
 .filters label{display:flex; gap:4px; align-items:center; cursor:pointer}
+.split-ctl{display:flex; gap:6px; align-items:center; padding:2px 8px; border:1px solid var(--line); border-radius:8px; background:var(--bg3)}
+.split-ctl input[type=range]{width:90px; accent-color:var(--accent)}
+.split-ctl b{font-size:11px; white-space:nowrap}
 
 /* ---- plays table ---- */
 .table-wrap{flex:1; overflow:auto; position:relative}

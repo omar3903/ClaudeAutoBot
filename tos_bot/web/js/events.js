@@ -122,6 +122,7 @@ function handle(topic, p) {
     case "capital.updated":
       S.state.capital = p.capital;
       renderCapital(p.capital);
+      emit("capital", p.capital);
       break;
     case "broker.disconnected":
       toast(p.note || "IB Gateway disconnected - reconnecting", "warn");

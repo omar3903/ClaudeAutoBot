@@ -71,6 +71,11 @@
           <label class="lockable" data-term="short"><input type="checkbox" id="f-short" checked /> Short</label>
           <label class="lockable" data-term="intraday"><input type="checkbox" id="f-intraday" checked /> Intraday</label>
           <label class="lockable" data-term="swing"><input type="checkbox" id="f-swing" checked /> Swing</label>
+          <span class="split-ctl lockable hidden" id="split-ctl" data-term="split">
+            <span class="muted">Day</span>
+            <input type="range" id="split-range" min="0" max="100" step="5" value="75" aria-label="Share of trading capital for day trades" />
+            <b id="split-label">75% / 25%</b><span class="muted">Swing</span>
+          </span>
           <label data-term="hide_done"><input type="checkbox" id="f-hide-done" /> Hide executed</label>
           <label data-term="hide_noisy"><input type="checkbox" id="f-hide-noisy" checked /> Hide noise</label>
           <button id="btn-sectors" class="ghost mini lockable">Sectors: all</button>
