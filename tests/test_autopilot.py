@@ -162,6 +162,22 @@ def test_confidence_and_rr_floors():
     assert eng.approved == []
 
 
+def test_swing_plays_have_a_confidence_floor_of_their_own():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(trade_types=["INTRADAY", "SWING"], min_confidence=0.62, min_swing_confidence=0.5),
+                   bus=SILENT)
+    swing = mkplay(sym="SWG", tf=Timeframe.SWING, conf=0.55)      # a Bollinger fade's flat confidence
+    day = mkplay(sym="DAY", conf=0.55)
+    _run(ap, swing, day)
+    assert eng.approved_ids() == [swing.id]                        # the day trade misses 0.62, the swing clears 0.5
+    assert "swing floor" not in ap.verdict(day) and "0.62" in ap.verdict(day)
+    strict = AutoPilot(FakeEngine(), _cfg(trade_types=["SWING"], min_swing_confidence=0.6), bus=SILENT)
+    p = mkplay(sym="SWG", tf=Timeframe.SWING, conf=0.55)
+    assert _run(strict, p) == [] and "swing floor" in strict.verdict(p)
+    strict.configure(min_swing_confidence=0.5)
+    assert strict.to_runtime()["min_swing_confidence"] == 0.5 and strict.status()["min_swing_confidence"] == 0.5
+
+
 def test_fundamental_plays_are_never_auto_traded():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(trade_types=["INTRADAY", "SWING"]), bus=SILENT)

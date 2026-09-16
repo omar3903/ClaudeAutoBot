@@ -535,7 +535,8 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | master switch | off | `enabled` (UI toggle) |
 | **route real orders** | **off** | `allow_live` — *config-file only*; with it off, Autopilot is armed for **paper only** even in Live mode, and says so |
 | which trade types it may take | the **Intraday** / **Swing** / **Pairs** boxes over the plays, switched live | `trade_types` (`PAIRS`) |
-| minimum strategy confidence | 0.62 | `min_confidence` |
+| minimum strategy confidence, day trades | 0.62 | `min_confidence` |
+| minimum strategy confidence, swing trades | 0.5 | `min_swing_confidence` (the swing setups state flat 0.55–0.58 confidences; the replay's proof is their real gate) |
 | minimum reward : risk | 2.0 | `min_reward_risk` (Aziz Rule 5) |
 | concurrent open auto positions | 2 | `max_auto_positions` |
 | auto trades per session | 3 | `max_auto_trades_per_day` |
