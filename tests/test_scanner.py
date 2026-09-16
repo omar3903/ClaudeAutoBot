@@ -77,6 +77,46 @@ def test_a_cycle_scans_the_hot_list_and_the_next_buffer_names(scanner, monkeypat
     assert set(fast.symbols) == set(wl.hot_symbols()) and not fast.decisions
 
 
+def test_the_gap_check_adopts_the_gappers_into_the_hot_list(scanner, monkeypatch):
+    from tos_bot.analysis.levels import find_levels
+    from tos_bot.scanner.heat import GapperMetrics, rank_gappers
+
+    scanner.run_full(ScanSettings(hot_list_size=6, sector_queue_size=10))
+    wl = scanner.watchlist
+    queued = [c.symbol for q in wl.queues.values() for c in q]
+    gapper, small, hot_gapper = queued[0], queued[1], wl.hot_symbols()[0]
+    monkeypatch.setitem(fakes.GAPS, gapper, 7.5)                  # +7.5% pre-market on heavy volume
+    monkeypatch.setitem(fakes.GAPS, small, 0.4)                   # a wiggle, not a gap
+    monkeypatch.setitem(fakes.GAPS, hot_gapper, -3.0)             # a hot-list name gapping down keeps its slot
+    hot_before = wl.hot_symbols()
+
+    result = scanner.run_gappers()
+    assert result.kind == "gappers" and set(result.symbols) >= set(hot_before) | set(queued)
+    assert [g["symbol"] for g in result.gappers] == [gapper, hot_gapper] and result.gappers[0]["heat"] == 1.0
+    assert gapper in wl.hot_symbols() and hot_gapper in wl.hot_symbols() and small not in wl.hot_symbols()
+    assert gapper not in [c.symbol for q in wl.queues.values() for c in q]
+    [d] = result.decisions
+    assert (d.symbol, d.action) == (gapper, "adopted") and d.replaced in hot_before and "gapped +7.5%" in d.note
+    assert next(c for c in wl.hot if c.symbol == gapper).gap_pct == pytest.approx(7.5, abs=0.1)
+    assert next(c for c in wl.hot if c.symbol == hot_gapper).gap_pct == pytest.approx(-3.0, abs=0.1)
+    seen = scanner.premarket[gapper]
+    assert seen["gap_pct"] == pytest.approx(7.5, abs=0.1) and seen["high"] >= seen["last"] >= seen["low"]
+    assert result.summary()["gappers"][0]["symbol"] == gapper
+
+    # the pre-market high and low are levels for the day's setups
+    daily = fakes.daily_bars(gapper)
+    price = float(daily["close"].iloc[-1])
+    extra = [(seen["high"], "pre-market high"), (seen["low"], "pre-market low")]
+    with_pre = find_levels(daily, price, None, max_levels=50, extra_levels=extra)
+    assert {"pre-market high", "pre-market low"} <= {s for lvl in with_pre.levels for s in lvl.sources}
+    assert not {"pre-market high", "pre-market low"} & {s for lvl in find_levels(daily, price, None, max_levels=50).levels
+                                                          for s in lvl.sources}
+
+    # thin or small moves never count as gappers
+    quiet = GapperMetrics("Q", 10.0, 10.5, 5.0, 1.0, 100.0, 1050.0, 10.6, 10.0)
+    assert rank_gappers([quiet], 2.0, 50_000) == [] and rank_gappers([], 2.0, 50_000) == []
+
+
 def test_todays_candle_is_built_from_the_intraday_bars():
     daily = fakes.daily_bars("AAA").iloc[:-1]
     intraday = fakes.intraday_bars("AAA")

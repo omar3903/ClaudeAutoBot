@@ -23,6 +23,9 @@ from tos_bot.util import clock
 
 NY = "America/New_York"
 SYMBOLS = [f"T{i:02d}" for i in range(40)]
+#: pre-market gaps the fake Gateway shows, symbol -> %; a gapping stock trades heavy pre-market volume
+GAPS: Dict[str, float] = {}
+GAP_VOLUME = 1e5
 
 _SESSIONS = 300
 _BARS_PER_SESSION = 78                    # 09:30-16:00 in 5-minute bars
@@ -76,6 +79,20 @@ def intraday_bars(symbol: str) -> pd.DataFrame:
     return _intraday(symbol, clock.session_date(clock.now_ny())).copy()
 
 
+def premarket_bars(symbol: str) -> pd.DataFrame:
+    """Today's pre-market 5-minute candles, 08:00-09:25: flat at yesterday's close on a trickle of
+    volume, or drifting to the gap in GAPS on heavy volume."""
+    today = clock.session_date(clock.now_ny())
+    prev = float(daily_bars(symbol)["close"].iloc[-1])
+    gap = GAPS.get(symbol, 0.0)
+    n = 18
+    path = prev * (1 + gap / 100.0 * np.linspace(0.2, 1.0, n))
+    open_ = np.concatenate([[prev], path[:-1]])
+    index = pd.date_range(pd.Timestamp(f"{today} 08:00", tz=NY), periods=n, freq="5min")
+    return pd.DataFrame({"open": open_, "high": np.maximum(open_, path) * 1.001, "low": np.minimum(open_, path) * 0.999,
+                         "close": path, "volume": np.full(n, GAP_VOLUME if gap else 2e3)}, index=index)
+
+
 def fixed_quote(price: float = 100.0) -> Callable[[str], Quote]:
     return lambda symbol: quote_from_price(symbol, price)
 
@@ -106,6 +123,7 @@ class FakeGateway:
         self.connected = False
         self.kw: Dict[str, object] = {}                     # how the app asked for the connection
         self.requests: List[Tuple[str, str, str]] = []      # (symbol, bar size, duration)
+        self.fills: list = []                               # what get_fills reports
 
     def knows(self, symbol: str) -> bool:
         return not self.symbols or symbol in self.symbols
@@ -138,12 +156,16 @@ class FakeGateway:
         return quote_from_price(symbol, float(intraday_bars(symbol)["close"].iloc[-1]))
 
     def history_many(self, requests: Mapping[str, Tuple[str, str]],
-                     con_ids: Optional[Mapping[str, int]] = None, end=None) -> Dict[str, pd.DataFrame]:
+                     con_ids: Optional[Mapping[str, int]] = None, end=None, rth: bool = True) -> Dict[str, pd.DataFrame]:
         out = {}
         for symbol, (bar, duration) in requests.items():
             self.requests.append((symbol, bar, duration))
-            if self.knows(symbol):
-                out[symbol] = daily_bars(symbol, _sessions(duration)) if bar == "1 day" else intraday_bars(symbol)
+            if not self.knows(symbol):
+                continue
+            if bar == "1 day":
+                out[symbol] = daily_bars(symbol, _sessions(duration))
+            else:
+                out[symbol] = intraday_bars(symbol) if rth else premarket_bars(symbol)
         return out
 
     def contract_details_many(self, symbols: Sequence[str]) -> Dict[str, Optional[dict]]:
@@ -151,6 +173,9 @@ class FakeGateway:
 
     def list_orders(self, status: Optional[str] = None) -> list:
         return []
+
+    def get_fills(self, symbol: Optional[str] = None) -> list:
+        return [f for f in self.fills if not symbol or f.symbol == symbol]
 
 
 def broker_factory(gateway: FakeGateway) -> Callable[..., object]:

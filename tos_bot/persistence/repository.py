@@ -246,8 +246,12 @@ class Repository:
     def close_trade(
         self, trade_id: str, exit_price: float, exit_reason: str = "manual",
         commission: float = 0.0, exit_qty: Optional[float] = None,
+        exit_time: Optional[dt.datetime] = None,
     ) -> Optional[Dict[str, Any]]:
-        now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+        """``exit_time``: when the position actually closed, for a fill learned after the fact
+        (default: now)."""
+        now = (exit_time.astimezone(dt.timezone.utc).replace(tzinfo=None) if exit_time and exit_time.tzinfo
+               else exit_time) or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
             t = s.get(Trade, trade_id)
             if t is None or t.status == "CLOSED":

@@ -25,7 +25,7 @@ import json
 import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .heat import DailyMetrics
 
@@ -40,6 +40,7 @@ class Candidate:
     sector: str
     daily_heat: float
     heat: Optional[float] = None          # latest intraday heat
+    gap_pct: Optional[float] = None       # the pre-market gap the gap check saw, %
 
 
 @dataclass
@@ -50,6 +51,7 @@ class Decision:
     action: str                           # adopted | kept | dropped
     heat: float
     replaced: str = ""
+    note: str = ""                        # why, in words (the gap check says what it saw)
 
 
 @dataclass
@@ -128,10 +130,46 @@ class DayWatchlist:
         self.decisions = (self.decisions + decisions)[-_DECISIONS_KEPT:]
         return decisions
 
+    def apply_gappers(self, gappers: Sequence[Any], hot_size: int) -> List[Decision]:
+        """Before the open (Aziz's gappers watchlist): a stock gapping on pre-market volume is in
+        play whatever yesterday's ranking said, so each one, hottest first, takes the hot-list
+        slot of the coolest name that isn't gapping itself - within the cap of a third per
+        sector - and leaves its sector's queue. A hot-list name already gapping keeps its slot;
+        every hot-list name's gap is noted."""
+        per_sector_cap = max(1, math.ceil(hot_size / 3))
+        known = {c.symbol: c for cs in [self.hot, *self.queues.values(), *self.kept.values()] for c in cs}
+        gapping = {g.symbol: g for g in gappers}
+        for c in self.hot:
+            c.gap_pct = gapping[c.symbol].gap_pct if c.symbol in gapping else None
+        decisions: List[Decision] = []
+        for g in gappers:
+            if any(c.symbol == g.symbol for c in self.hot) or g.symbol not in known:
+                continue
+            note = f"gapped {g.gap_pct:+.1f}% pre-market on {g.volume:,.0f} shares"
+            seen = known[g.symbol]
+            candidate = Candidate(g.symbol, seen.sector, seen.daily_heat, gap_pct=g.gap_pct)
+            settled = [h for h in self.hot if h.symbol not in gapping]
+            same = [h for h in settled if h.sector == seen.sector]
+            pool = same if sum(h.sector == seen.sector for h in self.hot) >= per_sector_cap else settled
+            if not pool:
+                decisions.append(self._decide(candidate, "dropped", g.heat, note=note + " - no hot-list slot free"))
+                continue
+            coolest = min(pool, key=lambda h: h.daily_heat)
+            self.hot[self.hot.index(coolest)] = candidate
+            self._forget(g.symbol)
+            decisions.append(self._decide(candidate, "adopted", g.heat, replaced=coolest.symbol, note=note))
+        self.decisions = (self.decisions + decisions)[-_DECISIONS_KEPT:]
+        return decisions
+
+    def _forget(self, symbol: str) -> None:
+        """Take a stock out of the queues and the kept lists - it has a hot-list slot now."""
+        self.queues = {s: [c for c in q if c.symbol != symbol] for s, q in self.queues.items()}
+        self.kept = {s: [c for c in q if c.symbol != symbol] for s, q in self.kept.items()}
+
     @staticmethod
-    def _decide(c: Candidate, action: str, heat: float, replaced: str = "") -> Decision:
+    def _decide(c: Candidate, action: str, heat: float, replaced: str = "", note: str = "") -> Decision:
         return Decision(at=_now_iso(), symbol=c.symbol, sector=c.sector, action=action,
-                        heat=round(heat, 4), replaced=replaced)
+                        heat=round(heat, 4), replaced=replaced, note=note)
 
     # ---- persistence and the dashboard ----------------------------------- #
     def state(self) -> dict:

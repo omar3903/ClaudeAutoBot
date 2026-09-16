@@ -45,6 +45,11 @@ scanner:
   fast_cycle_seconds: 60               # hot list only, while Autopilot day-trades an open session
   plays_refresh_seconds: 15            # re-check the stocks with plays on the board this often (0 = off)
   fundamentals_leaders: 8              # valuation setups (SEC EDGAR financials) on this many top names
+  gapper_time: "09:15"                # ET, 08:00-09:25 - the pre-open gap check reads the hot list and buffer
+                                       # names' pre-market candles once; the gappers join the hot list
+  gapper_symbols: 400                  # at most this many names get a pre-market request
+  gapper_min_gap_pct: 2.0              # a pre-market move this big, either way, counts as a gap...
+  gapper_min_volume: 50000             # ...on at least this many pre-market shares (Aziz's gappers scan)
   max_universe: 0                      # 0 = every listing; a smaller number caps it (for testing)
   sectors: []                          # only scan + trade these, e.g. ["Technology", "Energy"]; [] = all.
                                        # The dashboard's Sectors button overrides this.

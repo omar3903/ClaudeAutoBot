@@ -3,6 +3,9 @@
 * The **full scan** looks at every US stock once a day, before the open, at the
   time set in Settings (between 04:00 and 09:00 ET, so it's done at least half
   an hour before the bell). Its hot list and buffer are for one trading session.
+* The **gap check** reads the hot list and buffer names' pre-market candles once,
+  shortly before the open, and moves the stocks gapping on volume into the hot
+  list (Aziz's gappers watchlist).
 * The **cycle** rescans the hot list and the next buffer names every few
   minutes during the regular session.
 
@@ -21,11 +24,16 @@ from ..util import clock
 
 EARLIEST_FULL_SCAN = dt.time(4, 0)
 LATEST_FULL_SCAN = dt.time(9, 0)          # half an hour before the open
+EARLIEST_GAP_CHECK = dt.time(8, 0)
+LATEST_GAP_CHECK = dt.time(9, 25)         # once, before the bell
+OPEN = dt.time(9, 30)
+_TIMES = ("premarket_time", "gapper_time")
 
 
 @dataclass(frozen=True)
 class ScanSettings:
     premarket_time: str = "08:30"
+    gapper_time: str = "09:15"
     cycle_minutes: int = 5
     hot_list_size: int = 20
     sector_queue_size: int = 25
@@ -36,20 +44,30 @@ class ScanSettings:
     def full_scan_time(self) -> dt.time:
         return dt.time.fromisoformat(self.premarket_time)
 
+    @property
+    def gap_check_time(self) -> dt.time:
+        return dt.time.fromisoformat(self.gapper_time)
+
     def changed(self, **changes: Any) -> "ScanSettings":
         """A validated copy; raises ValueError with a message for the dashboard."""
         clean = {k: v for k, v in changes.items() if v is not None and k in asdict(self)}
-        new = replace(self, **{k: (str(v) if k == "premarket_time" else int(v)) for k, v in clean.items()})
+        new = replace(self, **{k: (str(v) if k in _TIMES else int(v)) for k, v in clean.items()})
         try:
             t = new.full_scan_time
         except ValueError:
             raise ValueError("Full-scan time must look like 08:30.") from None
         if not EARLIEST_FULL_SCAN <= t <= LATEST_FULL_SCAN:
             raise ValueError("The full scan runs before the open: pick a time from 04:00 to 09:00 ET.")
+        try:
+            g = new.gap_check_time
+        except ValueError:
+            raise ValueError("Gap-check time must look like 09:15.") from None
+        if not EARLIEST_GAP_CHECK <= g <= LATEST_GAP_CHECK:
+            raise ValueError("The gap check runs just before the open: pick a time from 08:00 to 09:25 ET.")
         for key, (lo, hi) in self.LIMITS.items():
             if not lo <= getattr(new, key) <= hi:
                 raise ValueError(f"{key.replace('_', ' ').capitalize()} must be between {lo} and {hi}.")
-        return replace(new, premarket_time=t.strftime("%H:%M"))
+        return replace(new, premarket_time=t.strftime("%H:%M"), gapper_time=g.strftime("%H:%M"))
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -113,3 +131,13 @@ def full_scan_due(now: dt.datetime, settings: ScanSettings, have_session: Option
     in_window = (session == now.date() and settings.full_scan_time <= now.time()
                  < clock.regular_close_time(session))
     return in_window or not have_any
+
+
+def gap_check_due(now: dt.datetime, settings: ScanSettings, have_session: Optional[dt.date],
+                  done_session: Optional[dt.date]) -> bool:
+    """The gap check runs once a session, from its time until the open, on the watchlist
+    built for today's session. ``done_session`` is the session it last ran for."""
+    today = now.date()
+    if have_session != today or done_session == today or not clock.is_trading_day(today):
+        return False
+    return settings.gap_check_time <= now.time() < OPEN

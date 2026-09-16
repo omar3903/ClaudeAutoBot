@@ -83,16 +83,26 @@ class Executor:
     def flatten_untracked(self, symbol: str, position_side: str, qty: float) -> bool:
         """Close shares the broker holds that have no trade record - what's left when an order filled
         but booking it failed. A market order, audited like any other."""
+        return bool(self.close_untracked(symbol, position_side, qty).get("ok"))
+
+    def close_untracked(self, symbol: str, position_side: str, qty: float) -> Dict[str, Any]:
+        """Send the market order that closes ``qty`` shares held without a record, and say how it went."""
         req = build_exit_order(symbol, position_side, qty, cfg=self.cfg, tag=f"unwind:{symbol}")
         try:
             res = self.broker.place_order(req)
         except BrokerError as e:
             self._audit("PLACE", req, {"error": str(e)}, ok=False, msg=str(e))
             log.error("could not close %s %s shares that have no trade record: %s", qty, symbol, e)
-            return False
-        self._audit("PLACE", req, res.raw or {"status": res.status}, ok=True, msg="closing shares without a trade record")
-        log.warning("closed %s %s shares left without a trade record", qty, symbol)
-        return True
+            return {"ok": False, "reason": str(e)}
+        self._audit("PLACE", req, res.raw or {"status": res.status}, ok=True,
+                    msg="closing shares without a trade record")
+        log.warning("closing %s %s shares held without a trade record (order %s, %s)", qty, symbol, res.order_id,
+                    res.status)
+        return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id}
+
+    def forget_open(self, symbol: str) -> None:
+        """Drop the note that ``symbol`` is held - its record was closed without an exit going through here."""
+        self._open_by_symbol.pop(symbol, None)
 
     def cancel_entries_for(self, play_id: str) -> int:
         """Call off the entry orders still working for one play - a pair leg whose other leg failed."""

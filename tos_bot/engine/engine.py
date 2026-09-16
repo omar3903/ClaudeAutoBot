@@ -30,7 +30,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from .. import secrets_store
 from ..brokers import get_broker
@@ -39,7 +39,7 @@ from ..brokers.venues import (
     IBKR_STEPS, PAPER_PLATFORMS, ROUTE_LABELS, normalize_platform, plan_venue, venue_id, venue_label,
 )
 from ..config import DATA_DIR, RUNTIME_PATH, Secrets, Settings, get_settings
-from ..core.enums import PlayStatus, Timeframe
+from ..core.enums import PlayStatus, Side, Timeframe
 from ..core.eventbus import BUS
 from ..core.models import Account, Play
 from ..data.bars import DailyBarStore
@@ -144,7 +144,7 @@ class TradingEngine:
         self.day_trade_pct = load_day_trade_pct(saved.get("capital_split"), cfg.account.day_trade_pct)
         sc = cfg.scanner
         self.scan_settings = ScanSettings.load(saved.get("scan"), ScanSettings(
-            premarket_time=sc.premarket_time, cycle_minutes=sc.cycle_minutes,
+            premarket_time=sc.premarket_time, gapper_time=sc.gapper_time, cycle_minutes=sc.cycle_minutes,
             hot_list_size=sc.hot_list_size, sector_queue_size=sc.sector_queue_size))
 
         self.scanner = Scanner(
@@ -219,6 +219,7 @@ class TradingEngine:
         self._scan_wake = threading.Event()
         self._scan_running: Optional[Dict[str, Any]] = None
         self._last_scans: Dict[str, Dict[str, Any]] = {}
+        self._gappers_session: Optional[dt.date] = None      # the session the gap check last ran for
         self._last_cycle_at = float("-inf")
         self._last_fast_at = float("-inf")
         self._last_plays_at = float("-inf")
@@ -1280,6 +1281,8 @@ class TradingEngine:
         wl = self.scanner.watchlist
         if schedule.full_scan_due(now, self.scan_settings, wl.session if wl else None, wl is not None):
             return "full"
+        if wl is not None and schedule.gap_check_due(now, self.scan_settings, wl.session, self._gappers_session):
+            return "gappers"
         if wl is None or not clock.is_market_open(now):
             return None
         if mono - self._last_cycle_at >= self.scan_settings.cycle_minutes * 60:
@@ -1313,6 +1316,8 @@ class TradingEngine:
             self.scanner.strategy_records = self.strategy_odds()
             if kind == "full":
                 result = self.scanner.run_full(self.scan_settings)
+            elif kind == "gappers":
+                result = self.scanner.run_gappers()
             elif quick:
                 result = self.scanner.run_plays(self._board_symbols())
             else:
@@ -1346,6 +1351,12 @@ class TradingEngine:
                 self._last_fast_at = mono
                 if kind == "cycle":
                     self._last_cycle_at = mono
+        if kind == "gappers":                    # it moves names between the lists; the plays are untouched
+            wl = self.scanner.watchlist
+            self._gappers_session = wl.session if wl else None
+            self._last_scans[kind] = result.summary()
+            BUS.publish("watchlist.updated", **self.watchlist_state())
+            return
         self._size_plays(result.plays)
         # the cycles don't re-check valuation setups, so those stay; a quick re-check isn't a confirmation
         changes = self.board.replace(result.plays, None if kind == "full" else result.symbols,
@@ -1375,13 +1386,15 @@ class TradingEngine:
         locked = self._locked()
         if locked:
             return {"ok": False, "reason": locked}
-        if kind not in ("full", "cycle"):
-            return {"ok": False, "reason": "scan must be 'full' or 'cycle'"}
-        if kind == "cycle" and self.scanner.watchlist is None:
+        if kind not in ("full", "cycle", "gappers"):
+            return {"ok": False, "reason": "scan must be 'full', 'cycle' or 'gappers'"}
+        if kind != "full" and self.scanner.watchlist is None:
             kind = "full"
         self._queue_scan(kind)
-        note = ("Full scan queued: every US stock gets ranked and today's hot list and sector buffers are rebuilt."
-                if kind == "full" else "Rescanning the hot list and the next buffer names.")
+        note = {"full": "Full scan queued: every US stock gets ranked and today's hot list and sector buffers are rebuilt.",
+                "cycle": "Rescanning the hot list and the next buffer names.",
+                "gappers": "Reading the hot list and buffer names' pre-market candles: the stocks gapping on volume "
+                           "join the hot list."}[kind]
         running = self._scan_running
         if running:
             note += f" It starts once the {running['kind']} scan that's running finishes."
@@ -1396,8 +1409,11 @@ class TradingEngine:
             "limits": {k: list(v) for k, v in ScanSettings.LIMITS.items()},
             "full_scan_window": [schedule.EARLIEST_FULL_SCAN.strftime("%H:%M"),
                                  schedule.LATEST_FULL_SCAN.strftime("%H:%M")],
+            "gap_check_window": [schedule.EARLIEST_GAP_CHECK.strftime("%H:%M"),
+                                 schedule.LATEST_GAP_CHECK.strftime("%H:%M")],
             "running": self._scan_running,
             "last_full": self._last_scans.get("full"),
+            "last_gappers": self._last_scans.get("gappers"),
             "last_cycle": max(cycles, key=lambda s: s["started_at"]) if cycles else None,
             "watchlist_session": session.isoformat() if session else None,
             "next_full_scan": schedule.next_full_scan_at(clock.now_ny(), self.scan_settings, session).isoformat(),
@@ -1421,6 +1437,8 @@ class TradingEngine:
         notes = []
         if new.premarket_time != old.premarket_time:
             notes.append(f"The full scan now runs at {new.premarket_time} ET.")
+        if new.gapper_time != old.gapper_time:
+            notes.append(f"The pre-open gap check now runs at {new.gapper_time} ET.")
         if new.cycle_minutes != old.cycle_minutes:
             notes.append(f"The hot list and buffers are rescanned every {new.cycle_minutes} minutes.")
         if (new.hot_list_size, new.sector_queue_size) != (old.hot_list_size, old.sector_queue_size):
@@ -1526,14 +1544,16 @@ class TradingEngine:
         gone = self.position_check.gone(
             venue, mine, held=set(held), busy=self.executor.pending_exit_trade_ids(),
             account_age_s=account_age_s, connection_age_s=connection_age_s, force=force)
-        removed = [{"id": t["id"], "symbol": t["symbol"], "side": t["side"], "quantity": t["quantity"]}
-                   for t in gone if self.repo.delete_trade(t["id"])]
+        closed, removed = self._settle_gone(gone)
+        if closed:
+            log.warning("booked %d record(s) closed outside the app from %s's fills: %s", len(closed), venue,
+                        ", ".join(f"{c['symbol']} at {c['exit_price']}" for c in closed))
         if removed:
             log.warning("removed %d trade record(s) no longer held at %s: %s", len(removed), venue,
                         ", ".join(r["symbol"] for r in removed))
             BUS.publish("trades.removed", trades=removed, venue=venue, venue_label=venue_label(venue))
 
-        removed_ids = {r["id"] for r in removed}
+        removed_ids = {r["id"] for r in removed} | {c["id"] for c in closed}
         new = self.position_check.share_counts(
             venue, venue_label(venue), [t for t in mine if t["id"] not in removed_ids], held=held,
             in_flight=self.executor.symbols_in_flight(),
@@ -1542,7 +1562,95 @@ class TradingEngine:
             log.warning("share counts disagree: %s", m["note"])
         if new:
             BUS.publish("positions.mismatch", mismatches=new)
-        return removed
+        return closed + removed
+
+    def _settle_gone(self, gone: List[Mapping[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Each record whose position is gone: closed at the price the broker's fills say it went
+        for, so the journal, the strategy records and the sizing learn its outcome - or, when the
+        broker reports no such fill, deleted as before. Returns (closed, removed)."""
+        closed: List[Dict[str, Any]] = []
+        removed: List[Dict[str, Any]] = []
+        for t in gone:
+            row = {"id": t["id"], "symbol": t["symbol"], "side": t["side"], "quantity": t["quantity"]}
+            fill = self._exit_fill(t)
+            out = None
+            if fill is not None:
+                out = self.repo.close_trade(t["id"], fill["price"], exit_reason="closed-outside",
+                                            commission=fill["commission"], exit_time=fill["at"])
+            if out:
+                if self.executor is not None:
+                    self.executor.forget_open(t["symbol"])
+                closed.append({**row, "exit_price": fill["price"], "fills": fill["fills"],
+                               "realized_pl": out.get("realized_pl")})
+                BUS.publish("trade.closed", trade=out, reason="closed outside the app, booked from the broker's fills")
+            elif self.repo.delete_trade(t["id"]):
+                removed.append(row)
+        return closed, removed
+
+    def _exit_fill(self, t: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """What closed a position outside the app, from the broker's executions: the exit-side fills
+        of the symbol since the trade was entered, averaged by size. None when the broker reports
+        none (IBKR keeps only the current session's)."""
+        get = getattr(self._broker, "get_fills", None)
+        if not callable(get):
+            return None
+        try:
+            fills = get(t["symbol"]) or []
+        except Exception:  # noqa: BLE001
+            log.debug("fills for %s unavailable", t["symbol"], exc_info=True)
+            return None
+        entered = _utc(t.get("entry_time"))
+        exit_side = Side.SHORT if t["side"] == "LONG" else Side.LONG
+        picked = [f for f in fills if f.side == exit_side and float(f.quantity) > 0
+                  and (entered is None or _utc(f.ts) >= entered - dt.timedelta(minutes=1))]
+        if not picked:
+            return None
+        qty = sum(float(f.quantity) for f in picked)
+        price = sum(float(f.price) * float(f.quantity) for f in picked) / qty
+        return {"price": round(price, 4), "quantity": qty, "fills": len(picked),
+                "commission": round(sum(float(f.commission or 0.0) for f in picked), 2),
+                "at": max(_utc(f.ts) for f in picked)}
+
+    def untracked_positions(self) -> List[Dict[str, Any]]:
+        """Shares the current venue's account holds beyond what its open-trade records cover:
+        opened or changed outside the app, or a fill the app couldn't book. Shown so they can be
+        exited - the app doesn't manage their exits. Shares an entry order is still working for
+        aren't counted (their record follows the fill)."""
+        acc = self._account
+        if acc is None or self._broker is None or not self._broker.is_connected:
+            return []
+        recorded: Dict[str, float] = {}
+        for t in self._positions_here():
+            sign = -1.0 if t.get("side") == "SHORT" else 1.0
+            recorded[t["symbol"]] = recorded.get(t["symbol"], 0.0) + sign * abs(float(t.get("quantity") or 0.0))
+        working = {w["symbol"] for w in self.working_entries()}
+        out: List[Dict[str, Any]] = []
+        for p in acc.positions:
+            if abs(p.quantity) < 1e-9 or p.symbol in working:
+                continue
+            extra = p.quantity - recorded.get(p.symbol, 0.0)
+            if abs(extra) < 1e-9 or (recorded.get(p.symbol) and (extra > 0) != (p.quantity > 0)):
+                continue                 # fewer than recorded is a mismatch, reported by the position check
+            mark = p.market_price or None
+            out.append({"symbol": p.symbol, "side": "LONG" if extra > 0 else "SHORT", "qty": abs(extra),
+                        "held": p.quantity, "recorded": recorded.get(p.symbol, 0.0),
+                        "avg_price": round(p.avg_price, 4), "market_price": round(mark, 4) if mark else None,
+                        "unrealized_pl": round((mark - p.avg_price) * extra, 2) if mark else None})
+        return out
+
+    def close_untracked(self, symbol: str) -> Dict[str, Any]:
+        """Exit the shares of ``symbol`` held without a record, at the market - allowed at any time."""
+        row = next((r for r in self.untracked_positions() if r["symbol"] == symbol), None)
+        if row is None:
+            return {"ok": False, "reason": f"{venue_label(self._venue)} shows no {symbol} shares without a record."}
+        out = self.executor.close_untracked(symbol, row["side"], row["qty"])
+        self._refresh_account()
+        BUS.publish("account.snapshot", state=self.snapshot())
+        if out.get("ok"):
+            status = str(out.get("status") or "")
+            tail = "" if status == "FILLED" else f" ({status.lower()})"
+            out["note"] = f"Exit sent for {row['qty']:,.0f} {symbol} shares that had no record{tail}."
+        return out
 
     def refresh_account_now(self) -> Dict[str, Any]:
         self._refresh_account()
@@ -2112,6 +2220,7 @@ class TradingEngine:
             "capital": self.capital_state(),
             "account": views.account(acc, cfg.account, paper=self.mode == "paper") if acc else None,
             "positions": views.positions(acc),
+            "untracked": self.untracked_positions(),
             "mismatches": self.position_check.mismatches,
             "day_trades_5d": self.repo.count_day_trades(5),
             "day_trade_limit": cfg.account.max_day_trades_under_threshold,
@@ -2121,6 +2230,20 @@ class TradingEngine:
 
     def current_plays(self) -> List[Dict[str, Any]]:
         return [self._decorate(p) for p in self.board.ranked()]
+
+
+def _utc(value: Any) -> Optional[dt.datetime]:
+    """An aware UTC datetime from an ISO string or a datetime (naive = UTC); None when there isn't one."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        try:
+            value = dt.datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, dt.datetime):
+        return None
+    return value.replace(tzinfo=dt.timezone.utc) if value.tzinfo is None else value.astimezone(dt.timezone.utc)
 
 
 def _order_signature(orders: List[Dict[str, Any]]) -> tuple:

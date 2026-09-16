@@ -36,15 +36,33 @@ def test_the_next_session_change_is_exact():
 def test_scan_settings_are_validated():
     s = ScanSettings()
     assert s.changed(premarket_time="07:05", cycle_minutes="4").as_dict() == {
-        "premarket_time": "07:05", "cycle_minutes": 4, "hot_list_size": 20, "sector_queue_size": 25}
+        "premarket_time": "07:05", "gapper_time": "09:15", "cycle_minutes": 4, "hot_list_size": 20,
+        "sector_queue_size": 25}
     with pytest.raises(ValueError, match="04:00 to 09:00"):
         s.changed(premarket_time="09:15")
+    assert s.changed(gapper_time="08:05").gapper_time == "08:05"
+    with pytest.raises(ValueError, match="08:00 to 09:25"):
+        s.changed(gapper_time="09:30")
+    with pytest.raises(ValueError, match="look like 09:15"):
+        s.changed(gapper_time="later")
     with pytest.raises(ValueError, match="look like"):
         s.changed(premarket_time="soon")
     with pytest.raises(ValueError, match="between 3 and 5"):
         s.changed(cycle_minutes=2)
     assert ScanSettings.load({"cycle_minutes": 999}, s) == s               # a bad saved value falls back
     assert ScanSettings.load({"hot_list_size": 30, "bogus": 1}, s).hot_list_size == 30
+
+
+def test_the_gap_check_runs_once_before_the_open():
+    s = ScanSettings(gapper_time="09:15")
+    assert not schedule.gap_check_due(at(MONDAY, 9, 10), s, MONDAY, None)          # not yet
+    assert schedule.gap_check_due(at(MONDAY, 9, 15), s, MONDAY, None)
+    assert schedule.gap_check_due(at(MONDAY, 9, 29), s, MONDAY, None)
+    assert not schedule.gap_check_due(at(MONDAY, 9, 30), s, MONDAY, None)          # the open: the cycles take over
+    assert not schedule.gap_check_due(at(MONDAY, 9, 20), s, MONDAY, MONDAY)        # done for this session
+    assert not schedule.gap_check_due(at(MONDAY, 9, 20), s, dt.date(2026, 9, 11), None)   # Friday's watchlist
+    assert not schedule.gap_check_due(at(MONDAY, 9, 20), s, None, None)
+    assert not schedule.gap_check_due(at(dt.date(2026, 9, 12), 9, 20), s, dt.date(2026, 9, 12), None)   # Saturday
 
 
 def test_which_session_a_watchlist_is_for():
@@ -137,5 +155,6 @@ def test_a_cycle_replaces_only_the_plays_for_the_symbols_it_scanned():
 def test_settings_saved_under_the_old_limits_are_pulled_into_range():
     defaults = ScanSettings(cycle_minutes=15)                     # an old config.yaml
     assert ScanSettings.load({"cycle_minutes": 15, "hot_list_size": 30}, defaults).as_dict() == {
-        "premarket_time": "08:30", "cycle_minutes": 5, "hot_list_size": 30, "sector_queue_size": 25}
+        "premarket_time": "08:30", "gapper_time": "09:15", "cycle_minutes": 5, "hot_list_size": 30,
+        "sector_queue_size": 25}
     assert ScanSettings.load(None, defaults).cycle_minutes == 5

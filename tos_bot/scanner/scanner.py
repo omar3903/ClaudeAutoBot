@@ -47,7 +47,8 @@ from ..signals.book import SignalBook
 from .evaluator import evaluate, with_today
 from .noise import NoiseSettings
 from .filters import TradeFilters
-from .heat import DailyMetrics, daily_metrics, intraday_metrics, liquid, rank_by_daily_heat
+from .heat import (DailyMetrics, daily_metrics, intraday_metrics, liquid, premarket_metrics, rank_by_daily_heat,
+                   rank_gappers)
 from .schedule import ScanSettings
 from .watchlist import Decision, DayWatchlist
 
@@ -73,6 +74,7 @@ class ScanResult:
     plays: List[Play] = field(default_factory=list)
     hot: List[str] = field(default_factory=list)
     decisions: List[Decision] = field(default_factory=list)
+    gappers: List[Dict[str, Any]] = field(default_factory=list)      # the gap check's findings, hottest first
     errors: Dict[str, str] = field(default_factory=dict)
     timings: Dict[str, float] = field(default_factory=dict)
     elapsed_s: float = 0.0
@@ -85,6 +87,7 @@ class ScanResult:
             "universe_size": self.universe_size, "scanned": self.scanned, "liquid": self.liquid,
             "n_plays": len(self.plays), "hot": self.hot,
             "decisions": {a: sum(d.action == a for d in self.decisions) for a in ("adopted", "kept", "dropped")},
+            "gappers": [{"symbol": g["symbol"], "gap_pct": g["gap_pct"]} for g in self.gappers[:10]],
             "errors": dict(list(self.errors.items())[:5]), "n_errors": len(self.errors),
             "elapsed_s": round(self.elapsed_s, 1),
             "timings": {k: round(v, 2) for k, v in self.timings.items()},
@@ -121,6 +124,9 @@ class Scanner:
         self.strategy_records: Dict[str, Dict[str, Any]] = {}
         #: (the session every tradable stock's daily candles reach, those stocks) after a full download
         self.market_daily: Optional[Tuple[dt.date, List[str]]] = None
+        #: what the gap check saw per stock today (heat.GapperMetrics.as_dict): the gap, the pre-market
+        #: high and low the setups use as levels
+        self.premarket: Dict[str, Dict[str, Any]] = {}
 
     def set_strategies(self, strategies: Sequence[Strategy]) -> None:
         """Swap the active setups. A scan already running keeps the set it started with."""
@@ -161,6 +167,7 @@ class Scanner:
         with self._watchlist_lock:
             self.watchlist = watchlist
             watchlist.save(self.watchlist_dir)
+            self.premarket = {}
         result.hot = watchlist.hot_symbols()
 
         swing_on = "SWING" in filters.timeframes
@@ -287,7 +294,8 @@ class Scanner:
                                  equity=self._equity, params=self._params, activity=activity, noise=self._noise,
                                  signals=self.signals, market=self.market,
                                  evidence_weights=self.evidence_weights,
-                                 records=self.strategy_records, benchmark=benchmark)
+                                 records=self.strategy_records, benchmark=benchmark,
+                                 premarket=self.premarket.get(symbol))
                 result.plays += plays
                 if activity is not None:
                     heat[symbol] = activity.heat + (_PLAY_BONUS if plays else 0.0)
@@ -300,6 +308,35 @@ class Scanner:
                 result.decisions = wl.apply_cycle(heat, picks, cfg.kept_per_sector)
                 wl.save(self.watchlist_dir)
             result.hot = wl.hot_symbols()
+        return self._finish(result, filters)
+
+    # ---- the gap check, just before the open ----------------------------- #
+    def run_gappers(self, now: Optional[dt.datetime] = None) -> ScanResult:
+        """Aziz's gappers watchlist: the hot list and buffer names' pre-market candles, read once
+        before the open. The stocks gapping on volume take hot-list slots; every stock's pre-market
+        high and low are kept as the day's first levels (see strategies/base.py levels)."""
+        cfg = self.settings.config.scanner
+        filters = self.filters
+        result = ScanResult("gappers")
+        wl = self.watchlist
+        if wl is None:
+            result.errors["watchlist"] = "no watchlist yet - the full scan hasn't run"
+            return self._finish(result, filters, quiet=True)
+        with self._watchlist_lock:
+            queued = [c.symbol for sector, q in wl.queues.items() if sector_allowed(sector, filters.sectors) for c in q]
+            symbols = list(dict.fromkeys(wl.hot_symbols() + wl.kept_symbols() + queued))[:cfg.gapper_symbols]
+        with self._timed(result, "premarket_candles"):
+            pre = self.md.premarket(symbols, self.con_ids(symbols))
+        daily = self.md.daily(symbols)
+        metrics = [m for s in symbols if (m := premarket_metrics(s, pre.get(s), daily.get(s))) is not None]
+        gappers = rank_gappers(metrics, cfg.gapper_min_gap_pct, cfg.gapper_min_volume)
+        self.premarket = {m.symbol: m.as_dict() for m in metrics}
+        with self._watchlist_lock:
+            result.decisions = wl.apply_gappers(gappers, len(wl.hot))
+            wl.save(self.watchlist_dir)
+            result.hot = wl.hot_symbols()
+        result.universe_size, result.scanned, result.symbols = len(symbols), len(pre), symbols
+        result.gappers = [{"symbol": g.symbol, **g.as_dict()} for g in gappers]
         return self._finish(result, filters)
 
     def _signal_plays(self, strategies: Sequence[Strategy], done: Collection[str],
@@ -345,7 +382,8 @@ class Scanner:
                                          equity=self._equity, params=self._params, activity=activity,
                                          noise=self._noise, signals=self.signals, market=self.market,
                                          evidence_weights=self.evidence_weights,
-                                         records=self.strategy_records, benchmark=benchmark)
+                                         records=self.strategy_records, benchmark=benchmark,
+                                         premarket=self.premarket.get(symbol))
         for p in result.plays:
             p.scan_run_id = None               # a quick re-check isn't recorded as a scan
         return self._finish(result, filters, quiet=True)

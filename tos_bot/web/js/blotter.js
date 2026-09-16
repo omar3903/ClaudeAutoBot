@@ -4,7 +4,7 @@ import {
   $, $$, SECTOR_SHORT, VENUE_SHORT, api, escapeHtml, fmtTime, num, pct, plural, positionList, post,
   sectorTag, sideBadge, tfLabel, usd,
 } from "./util.js";
-import { S, refreshState } from "./state.js";
+import { S, on, refreshState } from "./state.js";
 import { closeDrawer, drawerOpen, openDrawer, openModal, toast, toastResult } from "./ui.js";
 import { stratLabel } from "./strategies.js";
 import { loadWatchlist } from "./watchlist.js";
@@ -27,13 +27,15 @@ export async function loadOpen() {
   try { ({ trades } = await api("/api/trades?status=OPEN")); } catch { return; }
   const here = hereVenue(), el = $("#tab-open");
   $("#btn-exit-all").classList.toggle("hidden", !trades.some(t => (t.broker || "paper") === here));
-  if (!trades.length) { el.innerHTML = `<p class="muted pad">No open positions.</p>`; return; }
+  if (!trades.length) { el.innerHTML = `<p class="muted pad">No open positions.</p>` + untrackedHTML(); wireUntracked(el); return; }
   el.innerHTML = exposureHTML(trades) +
     `<table><thead><tr><th data-term="symbol">Symbol</th><th data-term="side">Side</th><th data-term="strategy_col">Strategy</th><th>Order</th>
     <th class="num" data-term="qty">Qty</th><th class="num" data-term="entry">Entry</th><th class="num" data-term="mark">Mark</th>
     <th class="num" data-term="unrealized">Unrealized</th><th class="num" data-term="stop">Stop</th><th class="num" data-term="target">Target</th>
     <th data-term="age">Age / Expected</th><th class="num" data-term="mfe">MFE / MAE</th>
-    <th data-term="auto_exit">Auto&nbsp;exit</th><th></th></tr></thead><tbody>${trades.map(t => openRow(t, here)).join("")}</tbody></table>`;
+    <th data-term="auto_exit">Auto&nbsp;exit</th><th></th></tr></thead><tbody>${trades.map(t => openRow(t, here)).join("")}</tbody></table>` +
+    untrackedHTML();
+  wireUntracked(el);
 
   const byId = Object.fromEntries(trades.map(t => [t.id, t]));
   $$("[data-exit]", el).forEach(b => { b.onclick = () => confirmExit(byId[b.dataset.exit]); });
@@ -47,6 +49,52 @@ export async function loadOpen() {
   $$("tr[data-record]", el).forEach(tr => {
     tr.onclick = e => { if (!e.target.closest(".no-row-click")) openRecord(tr.dataset.record); };
   });
+}
+
+/* ---------- shares held at the broker with no open-trade record behind them ---------- */
+let untrackedKey = "";
+
+function untrackedHTML() {
+  const rows = S.state.untracked || [];
+  if (!rows.length) return "";
+  const venue = (S.state.venue || {}).trading_on_label || "the broker";
+  return `<div class="untracked"><h4 data-term="untracked">Shares without a record (${rows.length})</h4>
+    <p class="muted small">${escapeHtml(venue)} holds these beyond what the open-trade records cover: opened or changed outside
+      the app, or a fill it couldn't book. The app doesn't manage their exits. <b>Exit</b> closes them at the market.</p>
+    <table><thead><tr><th data-term="symbol">Symbol</th><th data-term="side">Side</th><th class="num" data-term="qty">Qty</th>
+      <th class="num">Recorded</th><th class="num">Avg price</th><th class="num" data-term="mark">Mark</th>
+      <th class="num" data-term="unrealized">Unrealized</th><th></th></tr></thead><tbody>${rows.map(r => `<tr>
+      <td class="sym">${escapeHtml(r.symbol)}</td><td>${sideBadge(r.side)}</td><td class="num">${num(r.qty, 0)}</td>
+      <td class="num muted" title="shares the open-trade records cover, of all the shares held">${num(Math.abs(r.recorded), 0)} of ${num(Math.abs(r.held), 0)}</td><td class="num">${num(r.avg_price)}</td>
+      <td class="num">${num(r.market_price)}</td>
+      <td class="num ${(r.unrealized_pl || 0) >= 0 ? "pl-pos" : "pl-neg"}">${usd(r.unrealized_pl)}</td>
+      <td><button class="danger mini" data-untracked="${escapeHtml(r.symbol)}" title="Close these shares at the market">Exit</button></td></tr>`).join("")}
+    </tbody></table></div>`;
+}
+
+function wireUntracked(el) {
+  $$("[data-untracked]", el).forEach(b => { b.onclick = () => confirmUntrackedExit(b.dataset.untracked); });
+}
+
+function confirmUntrackedExit(symbol) {
+  const r = (S.state.untracked || []).find(x => x.symbol === symbol);
+  if (!r) return;
+  const venue = (S.state.venue || {}).trading_on_label || "your broker";
+  openModal({
+    title: `Exit ${symbol} (no record)?`,
+    bodyHTML: `${isLive() ? `<div class="warn-box">This sends a <b>real market order</b> to ${escapeHtml(venue)}.</div>` : ""}
+      <p>${r.side === "SHORT" ? "Buy back" : "Sell"} ${num(r.qty, 0)} ${escapeHtml(symbol)} at the market - the shares the app has no record for.</p>
+      <p class="muted">The open-trade records${r.recorded ? ` (${num(r.recorded, 0)} shares)` : ""} are left alone.</p>`,
+    okText: "Exit shares", okClass: "danger",
+    onOk: async () => { toastResult(await post(`/api/positions/untracked/${encodeURIComponent(symbol)}/close`)); loadOpen(); refreshState(); },
+  });
+}
+
+export function untrackedChanged() {
+  const key = JSON.stringify((S.state.untracked || []).map(r => [r.symbol, r.qty]));
+  if (key === untrackedKey) return;
+  untrackedKey = key;
+  if (tabVisible("open")) loadOpen();
 }
 
 function exposureHTML(trades) {
@@ -256,4 +304,5 @@ export function showTab(name) {
 export function initBlotter() {
   $$(".blotter .tab").forEach(tab => { tab.onclick = () => showTab(tab.dataset.tab); });
   $("#btn-exit-all").onclick = exitAll;
+  on("state", untrackedChanged);
 }

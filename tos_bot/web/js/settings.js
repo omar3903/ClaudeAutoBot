@@ -23,6 +23,7 @@ function numberField(key, label, help, [lo, hi], value) {
 
 function render(scan) {
   const s = scan.settings, limits = scan.limits, [earliest, latest] = scan.full_scan_window;
+  const [gapLo, gapHi] = scan.gap_check_window || ["08:00", "09:25"];
   $("#drawer-body").innerHTML = `
     <section class="conn">
       <h4>Scanning</h4>
@@ -33,6 +34,10 @@ function render(scan) {
         <label for="set-premarket_time">Full scan at (ET)</label>
         <div><input type="time" id="set-premarket_time" data-key="premarket_time" min="${earliest}" max="${latest}" step="300" value="${escapeHtml(s.premarket_time)}">
           <div class="help">Pre-market, ${earliest}–${latest} ET, so it's finished at least half an hour before the open.</div></div>
+        <label for="set-gapper_time" data-term="gap">Gap check at (ET)</label>
+        <div><input type="time" id="set-gapper_time" data-key="gapper_time" min="${gapLo}" max="${gapHi}" step="300" value="${escapeHtml(s.gapper_time || "09:15")}">
+          <div class="help">Just before the open, ${gapLo}–${gapHi} ET: the hot list and buffer names' pre-market candles are read once, and
+            the stocks gapping on volume take hot-list slots - Aziz's gappers watchlist. One request per name.</div></div>
         ${numberField("cycle_minutes", "Rescan every (min)", "How often the hot list and buffers are rescanned in the session", limits.cycle_minutes, s.cycle_minutes)}
         ${numberField("hot_list_size", "Hot list size", "Stocks rescanned every cycle", limits.hot_list_size, s.hot_list_size)}
         ${numberField("sector_queue_size", "Buffer per sector", "Candidates lined up in each sector", limits.sector_queue_size, s.sector_queue_size)}
@@ -46,6 +51,7 @@ function render(scan) {
       <div class="row-gap">
         <button class="mini lockable" id="settings-full">Run full scan now</button>
         <button class="ghost mini lockable" id="settings-cycle">Rescan hot list now</button>
+        <button class="ghost mini lockable" id="settings-gappers" title="Read the pre-market candles now (before the open)">Check gappers now</button>
       </div>
       <p class="muted small">A full scan re-ranks every stock and rebuilds today's hot list and buffers. Candles already downloaded
         are reused, so running it again later in the day is quick.</p>
@@ -53,6 +59,7 @@ function render(scan) {
   $("#settings-save").onclick = e => save(e.currentTarget);
   $("#settings-full").onclick = e => requestScan("full", e.currentTarget);
   $("#settings-cycle").onclick = e => requestScan("cycle", e.currentTarget);
+  $("#settings-gappers").onclick = e => requestScan("gappers", e.currentTarget);
 }
 
 function summary(label, sum) {
@@ -68,6 +75,7 @@ function statusHTML(scan) {
   return `<div class="kv">
     <span>Now</span><span>${run ? progressHTML(run) : "idle"}</span>
     ${summary("Last full scan", scan.last_full)}
+    ${summary("Last gap check", scan.last_gappers)}
     ${summary(`Last ${scan.last_cycle ? kindLabel(scan.last_cycle.kind).toLowerCase() : "cycle"}`, scan.last_cycle)}
     <span>Watchlist for</span><span>${escapeHtml(scan.watchlist_session || "none yet")}</span>
     <span>Next full scan</span><span>${nextFullScanText(scan)}</span>

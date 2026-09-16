@@ -289,6 +289,11 @@ class PaperBroker(BrokerAdapter):
             raise OrderRejected(f"unknown order {order_id}")
         return order.result()
 
+    def get_fills(self, symbol: Optional[str] = None) -> List[Fill]:
+        with self._lock:
+            fills = [f for o in self._orders.values() for f in o.fills if not symbol or f.symbol == symbol]
+        return sorted(fills, key=lambda f: f.ts)
+
     def list_orders(self, status: Optional[str] = None) -> List[OrderResult]:
         with self._lock:
             return [o.result() for o in self._orders.values() if status is None or o.status == status]

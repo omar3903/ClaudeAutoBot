@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -70,9 +70,12 @@ def find_levels(
     lookback_days: int = 90,
     max_levels: int = 8,
     band_pct: float = 0.30,
+    extra_levels: Optional[Iterable[Tuple[float, str]]] = None,
 ) -> SupportResistance:
     """Build the S/R map around ``last_price`` (only levels within ``band_pct``
-    of it - Aziz: levels far from the current range don't matter)."""
+    of it - Aziz: levels far from the current range don't matter). ``extra_levels``
+    are (price, source) pairs known from elsewhere - the pre-market high and low
+    the gap check read, when the intraday candles are regular hours only."""
     if daily is None or len(daily) < 10 or last_price <= 0:
         return SupportResistance([], last_price)
 
@@ -110,6 +113,9 @@ def find_levels(
                 piv.append((float(pre["low"].min()), 1.0, "pre-market low"))
         except Exception:  # noqa: BLE001
             pass
+
+    for price, source in extra_levels or []:
+        piv.append((float(price), 1.0, source))
 
     piv = [(p, wt, s) for (p, wt, s) in piv if lo_band <= p <= hi_band and p > 0]
     if not piv:

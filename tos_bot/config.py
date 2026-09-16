@@ -122,6 +122,10 @@ class ScannerCfg(_Model):
     buffer_picks_per_sector: int = 2      # new buffer names scanned per sector per cycle
     kept_per_sector: int = 2              # buffer names kept waiting for a hot-list slot
     fundamentals_leaders: int = 8         # valuation setups run on this many top names
+    gapper_time: str = "09:15"            # ET, 08:00-09:25 - the pre-open gap check (Aziz's gappers)
+    gapper_symbols: int = 400             # at most this many hot-list and buffer names get a pre-market request
+    gapper_min_gap_pct: float = 2.0       # a pre-market move this big, either way, counts as a gap
+    gapper_min_volume: float = 50_000     # ...on at least this many pre-market shares
     max_universe: int = 0                 # 0 = every listing (smoke tests cap it)
     sectors: list = Field(default_factory=list)
     prefilter: Dict[str, Any] = Field(default_factory=dict)
