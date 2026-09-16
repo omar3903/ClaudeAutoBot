@@ -461,11 +461,36 @@ def test_the_daily_loss_counts_only_the_venue_autopilot_trades_on():
     assert ap.status()["realized_today"] == -50.0
 
 
+def test_the_give_back_rule_stops_the_day_once_a_gain_is_mostly_gone():
+    eng = FakeEngine(equity=10_000.0)                      # floor: a peak of at least 0.25% = $25
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=0.0, max_giveback_pct=30.0, giveback_floor_pct=0.25), bus=SILENT)
+    eng.repo._closed = [_closed("AAA", 200.0)]
+    assert len(_run(ap, mkplay(sym="BBB"))) == 1 and ap.status()["peak_realized"] == 200.0
+    ap._realized = (float("-inf"), 0.0)                    # forget the cached figure
+    eng.repo._closed = [_closed("AAA", 200.0), _closed("BBB", -50.0)]   # 150 left: 25% given back
+    assert len(_run(ap, mkplay(sym="CCC"))) == 1
+    ap._realized = (float("-inf"), 0.0)
+    eng.repo._closed = [_closed("AAA", 200.0), _closed("BBB", -50.0), _closed("CCC", -20.0)]   # 130 left: 35%
+    p = mkplay(sym="DDD")
+    assert _run(ap, p) == [] and "give-back" in ap.verdict(p) and ap.status()["daily_loss_stop"]
+    assert not ap.decorate_play({"id": "x", "timeframe": "INTRADAY", "confidence": 0.9, "reward_risk": 3,
+                                 "kind": "TECHNICAL", "status": "PROPOSED", "noise": [], "confirmations": 5,
+                                 "strategy": "opening_range_breakout"})["autopilot"]["eligible"]
+    # a small gain that fades is noise, not a give-back
+    eng2 = FakeEngine(equity=10_000.0)
+    ap2 = AutoPilot(eng2, _cfg(max_daily_loss_pct=0.0, max_giveback_pct=30.0, giveback_floor_pct=0.25), bus=SILENT)
+    eng2.repo._closed = [_closed("AAA", 20.0)]
+    _run(ap2, mkplay(sym="BBB"))
+    ap2._realized = (float("-inf"), 0.0)
+    eng2.repo._closed = [_closed("AAA", 20.0), _closed("BBB", -15.0)]
+    assert len(_run(ap2, mkplay(sym="CCC"))) == 1
+
+
 def test_the_daily_loss_limit_is_tunable_and_remembered():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
-    ap.configure(max_daily_loss_pct=3.5)
-    assert ap.to_runtime()["max_daily_loss_pct"] == 3.5
+    ap.configure(max_daily_loss_pct=3.5, max_giveback_pct=40)
+    assert ap.to_runtime()["max_daily_loss_pct"] == 3.5 and ap.to_runtime()["max_giveback_pct"] == 40.0
     other = AutoPilot(FakeEngine(), _cfg(), bus=SILENT)
     other.load_runtime(ap.to_runtime())
-    assert other.max_daily_loss_pct == 3.5
+    assert other.max_daily_loss_pct == 3.5 and other.max_giveback_pct == 40.0

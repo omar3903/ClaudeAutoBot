@@ -156,6 +156,8 @@ class ExitManagerCfg(_Model):
     trail_lock_ratio: float = 0.5
     flatten_intraday_before_close_min: int = 10
     max_swing_hold_days: int = 10
+    scale_out_pct: float = 50.0           # at the first target of a play with two, take this % off (0 = exit all there)
+    scale_out_lock_r: float = 0.0         # ...and move the stop to the entry plus this R (Aziz: break-even)
 
 
 class AutopilotCfg(_Model):
@@ -181,6 +183,8 @@ class AutopilotCfg(_Model):
     min_replay_expectancy_r: float = 0.05
     cooldown_after_loss: bool = True
     max_daily_loss_pct: float = 2.0       # no new entries once today's closed trades have lost this % of equity (0 = off)
+    max_giveback_pct: float = 30.0        # ...or once the day's realized gain has given back this % of its peak (0 = off)
+    giveback_floor_pct: float = 0.25      # the give-back rule only counts a peak gain of at least this % of equity
     require_catalyst: bool = False
     dry_run: bool = False
 

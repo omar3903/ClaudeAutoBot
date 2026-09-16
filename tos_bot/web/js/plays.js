@@ -115,7 +115,7 @@ function detailHTML(a) {
   const p = a.play, op = a.order_preview, pdt = a.pdt || {}, em = S.state.exit_manager || {};
   const protection = { native: "broker OCO (TP + SL)", managed: "auto exit manager", none: "none" }[op.bracket_mode] || op.bracket_mode;
   const exitLine = em.enabled
-    ? `stop @ ${num(op.stop_loss)}, target @ ${num(op.take_profit)}, then break-even at ${num(em.breakeven_at_r, 1)}R`
+    ? `stop @ ${num(op.stop_loss)}, target @ ${num(op.take_profit)}, ${em.scale_out_pct && (p.targets || []).length > 1 ? `${num(em.scale_out_pct, 0)}% off at the first target (stop to the entry, the rest to ${num(p.targets[1])}), ` : ""}then break-even at ${num(em.breakeven_at_r, 1)}R`
     + (em.trail_start_r > 0 ? `, trail from ${num(em.trail_start_r, 1)}R (lock ${Math.round(em.trail_lock_ratio * 100)}%)` : "")
     + (p.timeframe === "INTRADAY" && em.flatten_intraday_before_close_min ? `, flatten ${em.flatten_intraday_before_close_min} min before the close` : "")
     : "OFF — you must close this manually";

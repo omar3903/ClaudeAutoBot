@@ -103,6 +103,10 @@ class Trade(Base):
 
     status: Mapped[str] = mapped_column(sa.String(12), default="OPEN", index=True)  # OPEN / CLOSED
     quantity: Mapped[float] = mapped_column(MONEY, default=0)
+    #: the shares entered with - quantity shrinks as part of the position is taken off (the scale-out)
+    initial_quantity: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
+    #: realized so far on the part taken off; joins the final P/L when the rest closes
+    banked_pl: Mapped[float] = mapped_column(MONEY, default=0)
     entry_price: Mapped[float] = mapped_column(MONEY, default=0)
     entry_time: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, index=True)
     order_type: Mapped[str] = mapped_column(sa.String(16), default="LIMIT")
@@ -113,6 +117,8 @@ class Trade(Base):
     #: the levels the play was entered with - never mutated (basis for R math)
     initial_stop_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
     initial_target_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
+    #: the play's second target: where the rest of the position goes after the scale-out at the first
+    target2_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
     hwm_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)  # favourable extreme
     managed_exit: Mapped[bool] = mapped_column(sa.Boolean, default=True)     # auto exit manager on?
     #: expected-exit overwatch (informational only - never drives the stop)

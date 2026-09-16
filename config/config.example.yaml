@@ -122,6 +122,8 @@ exit_manager:
   trail_lock_ratio: 0.5               # keep the stop at this fraction of the open R
   flatten_intraday_before_close_min: 10   # force-close day trades this many min before the bell
   max_swing_hold_days: 10             # force-close swing trades held longer than this (0 = off)
+  scale_out_pct: 50                   # at the first target of a play with two, take this % off - Aziz: sell half,
+  scale_out_lock_r: 0.0               # ...move the stop to the entry (+ this R), let the rest run to the second (0 = off)
 
 autopilot:
   # Hands-off ENTRY. Exits are already automatic (exit_manager above); this
@@ -149,6 +151,9 @@ autopilot:
   cooldown_after_loss: true          # skip a ticker for the rest of the session after it stops out
   max_daily_loss_pct: 2.0            # Aziz's daily maximum loss: once today's closed trades have lost this
                                      # % of equity, no more entries until the next session (0 = off)
+  max_giveback_pct: 30.0             # ...or once the day's realized gain has given back this % of its best
+                                     # (Aziz: never lose more than 30% of what the morning made; 0 = off)
+  giveback_floor_pct: 0.25           # the give-back rule only counts a peak gain of at least this % of equity
   require_catalyst: false            # true = only auto-take plays tagged gap / catalyst
   dry_run: false                     # true = log every entry it WOULD take but place nothing
 

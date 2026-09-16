@@ -27,14 +27,21 @@ class FakeExecutor:
     def __init__(self, repo):
         self.repo = repo
         self.closed = []
+        self.reduced = []
 
     def pending_exit_trade_ids(self):
         return set()
 
-    def close_trade(self, tid, reason="manual", limit_price=None):
+    def close_trade(self, tid, reason="manual", limit_price=None, qty=None, after_fill=None):
         t = self.repo._t.get(tid)
         if not t or t["status"] == "CLOSED":
             return {"ok": False}
+        if qty is not None and qty < t["quantity"]:
+            t["quantity"] -= qty
+            t["banked_pl"] = t.get("banked_pl", 0.0) + qty * 1.0
+            t.update({k: v for k, v in (after_fill or {}).items() if v is not None})
+            self.reduced.append((tid, reason, qty))
+            return {"ok": True, "status": "FILLED", "reduced": True, "trade": dict(t)}
         t["status"] = "CLOSED"
         t["exit_reason"] = reason
         self.closed.append((tid, reason))
@@ -135,3 +142,36 @@ def test_overdue_notifies_once_and_does_not_close():
     em.run_once()
     assert events.count("trade.overdue") == 1     # one-shot
     assert not ex.closed                           # overdue never force-closes
+
+
+def test_half_comes_off_at_the_first_target_and_the_rest_runs_to_the_second():
+    cfg = SimpleNamespace(enabled=True, breakeven_at_r=0.0, breakeven_buffer_bps=0, trail_start_r=0.0,
+                          trail_lock_ratio=0.5, flatten_intraday_before_close_min=10, max_swing_hold_days=0,
+                          scale_out_pct=50.0, scale_out_lock_r=0.0)
+    repo = FakeRepo([_trade(target2_price=120.0, initial_quantity=10)])
+    em, ex = _mk(repo, price=110.5, cfg=cfg)                       # the first target, 110
+    em.run_once()
+    t = repo._t["t1"]
+    assert ex.reduced == [("t1", "target-1", 5.0)] and ex.closed == []
+    assert (t["quantity"], t["stop_price"], t["target_price"]) == (5, 100.0, 120.0)     # break-even, on to target 2
+    em.run_once()                                                   # still above target 1: nothing more comes off
+    assert ex.reduced == [("t1", "target-1", 5.0)] and ex.closed == []
+    em2, ex2 = _mk(repo, price=120.2, cfg=cfg)                      # the second target
+    em2.run_once()
+    assert ex2.closed == [("t1", "target")]
+
+
+def test_the_position_exits_whole_without_a_second_target_or_with_the_scale_out_off():
+    cfg = SimpleNamespace(enabled=True, breakeven_at_r=0.0, breakeven_buffer_bps=0, trail_start_r=0.0,
+                          trail_lock_ratio=0.5, flatten_intraday_before_close_min=10, max_swing_hold_days=0,
+                          scale_out_pct=50.0, scale_out_lock_r=0.0)
+    em, ex = _mk(FakeRepo([_trade(initial_quantity=10)]), price=110.5, cfg=cfg)     # one target only
+    em.run_once()
+    assert ex.closed == [("t1", "target")] and ex.reduced == []
+    off = SimpleNamespace(**{**cfg.__dict__, "scale_out_pct": 0.0})
+    em, ex = _mk(FakeRepo([_trade(target2_price=120.0, initial_quantity=10)]), price=110.5, cfg=off)
+    em.run_once()
+    assert ex.closed == [("t1", "target")] and ex.reduced == []
+    em, ex = _mk(FakeRepo([_trade(target2_price=120.0, initial_quantity=1, quantity=1)]), price=110.5, cfg=cfg)
+    em.run_once()                                                   # a single share can't be halved
+    assert ex.closed == [("t1", "target")] and ex.reduced == []

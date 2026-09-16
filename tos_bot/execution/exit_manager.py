@@ -2,7 +2,10 @@
 
 For each OPEN trade it:
   1. marks the position to the current quote and records MAE / MFE;
-  2. closes it at the working stop (cut losses) or target (take profit);
+  2. closes it at the working stop (cut losses) or target (take profit) - or, at the
+     first target of a play that has a second, takes ``scale_out_pct`` of it off, moves
+     the stop to break-even and lets the rest run to the second target (Aziz: sell
+     half at the target and bring the stop to the entry);
   3. flattens INTRADAY trades a few minutes before the (holiday-aware) close;
   4. closes SWING trades held longer than ``max_swing_hold_days``;
   5. ratchets the protective stop:
@@ -103,12 +106,15 @@ class ExitManager:
         px = getattr(q, "last", 0.0) or getattr(q, "mid", 0.0)
         return float(px) if px else None
 
-    def _close(self, tid: str, reason: str) -> Optional[Dict[str, Any]]:
+    def _close(self, tid: str, reason: str, qty: Optional[float] = None,
+               after_fill: Optional[Dict[str, float]] = None) -> Optional[Dict[str, Any]]:
+        """Send the exit - the whole position, or with ``qty`` the part taken off at the first target."""
         tries, next_at = self._tries.get(tid, (0, 0.0))
         now = time.monotonic()
         if now < next_at:
             return None                     # the last exit didn't take - wait before sending another
-        out = self.executor.close_trade(tid, reason=reason) or {}
+        extra = {"qty": qty, "after_fill": after_fill} if qty is not None else {}
+        out = self.executor.close_trade(tid, reason=reason, **extra) or {}
         if out.get("not_held"):
             # nothing to sell: say it once; the engine's broker check removes the record once confirmed
             if tid not in self._not_held:
@@ -121,6 +127,12 @@ class ExitManager:
         self._tries[tid] = (tries, now + wait)
         if out.get("ok"):
             trade = out.get("trade") or {}
+            if qty is not None:
+                log.info("AUTO-EXIT %s: %s - %s of the position off, %s left, %.2f banked%s", tid, reason, qty,
+                         trade.get("quantity"), trade.get("banked_pl") or 0.0, f"  (try {tries})" if tries > 1 else "")
+                self.bus.publish("exit.scaled", trade_id=tid, reason=reason, qty=qty, trade=trade,
+                                 status=out.get("status"))
+                return {"trade_id": tid, "reason": reason, "trade": trade, "reduced": True}
             log.info("AUTO-EXIT %s: %s  P/L %.2f%s", tid, reason, trade.get("realized_pl") or 0.0,
                      f"  (try {tries})" if tries > 1 else "")
             self.bus.publish("exit.triggered", trade_id=tid, reason=reason, trade=trade)
@@ -131,6 +143,24 @@ class ExitManager:
             self._last_failure[tid] = why
             self.bus.publish("exit.failed", trade_id=tid, reason=why, attempt=tries, retry_in_s=round(wait))
         return None
+
+    def _scale_out(self, t: Dict[str, Any], managed: bool, entry: float, sign: float,
+                   risk_ps: float) -> Optional[Tuple[float, Dict[str, float]]]:
+        """At the first target of a play that has a second: the shares to take off and the stop
+        and target the rest gets - break-even (plus ``scale_out_lock_r`` R and the usual buffer)
+        and the second target. None when the position is exited whole: no second target, the
+        scale-out switched off, exits by hand, too few shares, or already taken."""
+        pct = float(getattr(self.cfg, "scale_out_pct", 0.0) or 0.0)
+        target2 = t.get("target2_price")
+        qty = float(t.get("quantity") or 0.0)
+        initial = float(t.get("initial_quantity") or qty)
+        if not managed or not 0.0 < pct < 100.0 or not target2 or qty < 2 or qty < initial - 1e-9:
+            return None
+        part = float(max(1, min(int(qty) - 1, round(qty * pct / 100.0))))
+        lock_r = float(getattr(self.cfg, "scale_out_lock_r", 0.0) or 0.0)
+        buf = entry * float(getattr(self.cfg, "breakeven_buffer_bps", 5) or 0) / 1e4
+        stop = entry + sign * (lock_r * risk_ps + buf)
+        return part, {"stop_price": round(stop, 4), "target_price": float(target2)}
 
     def _forget_all_but(self, open_ids: set) -> None:
         """Drop what's remembered about trades that are no longer open."""
@@ -190,6 +220,9 @@ class ExitManager:
                 return self._close(t["id"], "trailing-stop" if moved else "stop")
         if target:
             if (side == "LONG" and px >= float(target)) or (side == "SHORT" and px <= float(target)):
+                part = self._scale_out(t, managed, entry, sign, risk_ps)
+                if part is not None:
+                    return self._close(t["id"], "target-1", qty=part[0], after_fill=part[1])
                 return self._close(t["id"], "target")
 
         # --- 2. time / session exits ------------------------------- #

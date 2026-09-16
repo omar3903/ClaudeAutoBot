@@ -39,6 +39,21 @@ class _LongAtBar(Strategy):
         return [play] if play else []
 
 
+class _LongTwoTargets(_LongAtBar):
+    """The same, with a second target 4 above."""
+
+    key = "long_two_targets"
+
+    def generate(self, ctx):
+        today = ctx.today_intraday()
+        if today is None or len(today) != self.at_bar + 1:
+            return []
+        entry = float(today["close"].iloc[-1])
+        play = self._mk_play(ctx, Side.LONG, entry, entry - 1.0, [entry + 2.0, entry + 4.0], 0.7, "r", "d", {},
+                             tags=["intraday"])
+        return [play] if play else []
+
+
 def _session(bars):
     """A full session of (open, high, low, close) bars; after the given ones it goes quiet at the last close."""
     bars = list(bars)
@@ -69,6 +84,21 @@ def test_a_target_hit_books_the_planned_reward():
     assert (t.exit_reason, t.entry, t.exit, t.r) == ("target", 100.0, 102.0, 2.0)
 
 
+def test_half_comes_off_at_the_first_target_and_the_rest_runs_on():
+    bars = _session(FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9), (102.0, 104.2, 101.9, 104.0)])
+    [t] = replay_intraday([_LongTwoTargets()], "RPL", bars, _daily(), EXACT, QUIET)
+    assert (t.exit_reason, t.scaled, t.r) == ("target", True, 3.0)          # half at +2R, half at +4R
+    # after the first target the stop sits at the entry: a fall back costs nothing on the rest
+    bars = _session(FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9), (101.5, 101.6, 99.5, 99.6)])
+    [t] = replay_intraday([_LongTwoTargets()], "RPL", bars, _daily(), EXACT, QUIET)
+    assert (t.exit_reason, t.scaled, t.r) == ("trailing-stop", True, 1.0)
+    # switched off, the position exits whole at the first target
+    whole = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, breakeven_at_r=0.0, trail_start_r=0.0, scale_out_pct=0.0)
+    bars = _session(FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9), (102.0, 104.2, 101.9, 104.0)])
+    [t] = replay_intraday([_LongTwoTargets()], "RPL", bars, _daily(), whole, QUIET)
+    assert (t.exit_reason, t.scaled, t.r) == ("target", False, 2.0)
+
+
 def test_a_stop_hit_books_minus_one_r_and_a_bar_touching_both_counts_as_the_stop():
     [stopped] = _replay([(100.0, 100.1, 99.9, 100.0), (99.8, 99.9, 98.9, 99.0)])
     assert (stopped.exit_reason, stopped.r) == ("stop", -1.0)
@@ -79,6 +109,48 @@ def test_a_stop_hit_books_minus_one_r_and_a_bar_touching_both_counts_as_the_stop
 def test_an_open_day_trade_is_flattened_before_the_close():
     [t] = _replay([(100.0, 100.1, 99.9, 100.0)] + [(100.5, 100.6, 100.4, 100.5)] * 3)
     assert t.exit_reason == "eod-flatten" and t.r == 0.5 and t.exited_at.startswith(f"{DAY}T15:50")
+
+
+def _spy(day_prices):
+    """The S&P 500 ETF: daily closes with a little noise, and a flat session of 5-minute candles."""
+    rng = np.random.default_rng(3)
+    idx = pd.bdate_range(end=pd.Timestamp(DAY - dt.timedelta(days=1)), periods=45, tz=NY)
+    c = 500 * np.exp(np.cumsum(rng.normal(0.0, 0.006, len(idx))))
+    daily = pd.DataFrame({"open": c, "high": c + 1, "low": c - 1, "close": c, "volume": np.full(len(idx), 5e7)}, index=idx)
+    bars = _session([(day_prices, day_prices + 0.1, day_prices - 0.1, day_prices)] * 6)
+    return daily, bars
+
+
+def _noisy_daily():
+    rng = np.random.default_rng(5)
+    idx = pd.bdate_range(end=pd.Timestamp(DAY - dt.timedelta(days=1)), periods=45, tz=NY)
+    c = 100 * np.exp(np.cumsum(rng.normal(0.0, 0.004, len(idx))))
+    return pd.DataFrame({"open": c, "high": c + 0.5, "low": c - 0.5, "close": c, "volume": np.full(len(idx), 3e6)},
+                        index=idx)
+
+
+def test_the_news_checks_see_the_stories_out_by_each_bar_and_the_market_model():
+    daily = _noisy_daily()
+    prev = float(daily["close"].iloc[-1])
+    jump = round(prev * 1.06, 2)                                            # today the stock is up 6% on its own
+    spy_daily, spy_bars = _spy(500.0)
+    session = _session([(jump, jump + 0.05, jump - 0.05, jump)] * 6 + [(jump, jump + 0.1, jump - 0.1, jump),
+                                                                        (jump, jump + 2.5, jump - 0.1, jump + 2.2)])
+    kw = dict(settings=EXACT, noise=NoiseSettings(min_expected_r=-99.0, abnormal_z=2.0), benchmark_bars=spy_bars,
+              benchmark_daily=spy_daily)
+    # no stories out: a momentum long chasing the move is flagged as a move without news
+    [quiet] = replay_intraday([_LongAtBar()], "NWS", session, daily, news=[{"at": f"{DAY}T18:00:00+00:00"}], **kw)
+    assert "move_without_news" in quiet.noise
+    # a story published before the bar: the move came with news, so the flag is off
+    [told] = replay_intraday([_LongAtBar()], "NWS", session, daily, news=[{"at": f"{DAY}T12:00:00+00:00"}], **kw)
+    assert "move_without_news" not in told.noise
+    # no stories given at all: as live, the check stays silent
+    [unknown] = replay_intraday([_LongAtBar()], "NWS", session, daily, **kw)
+    assert "move_without_news" not in unknown.noise
+    # and without the benchmark there is no market model to read the move against
+    [blind] = replay_intraday([_LongAtBar()], "NWS", session, daily, settings=EXACT, noise=QUIET,
+                              news=[{"at": f"{DAY}T18:00:00+00:00"}])
+    assert "move_without_news" not in blind.noise
 
 
 def test_no_fill_when_the_next_open_has_already_run_away():

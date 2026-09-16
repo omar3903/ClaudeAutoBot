@@ -64,6 +64,10 @@ LABELS = {
 CHECKS = tuple(LABELS)
 #: the checks from the books' statistics; Autopilot also skips one once the replay shows it helps
 QUANT_CHECKS = ("not_trending", "not_mean_reverting", "turbulent_market")
+#: the checks from the news, measured by the replay from the headlines the app has stored
+NEWS_CHECKS = ("news_driven_move", "move_without_news")
+#: every check the replay can teach Autopilot to skip
+LEARNABLE_CHECKS = QUANT_CHECKS + NEWS_CHECKS
 
 
 @dataclass(frozen=True)

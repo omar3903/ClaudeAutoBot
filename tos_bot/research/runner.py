@@ -66,9 +66,13 @@ class ReplayRunner:
               market: Optional[Callable[[dt.date], Mapping[dt.date, float]]] = None,
               earnings: Optional[Callable[[Sequence[str]], Mapping[str, Sequence[str]]]] = None,
               pairs: Optional[Mapping[str, Any]] = None,
-              held_out_fraction: float = HELD_OUT_FRACTION) -> Dict[str, Any]:
+              held_out_fraction: float = HELD_OUT_FRACTION,
+              news: Optional[Callable[[Sequence[str], dt.date], Mapping[str, Sequence[Mapping[str, Any]]]]] = None,
+              benchmark: Optional[str] = None) -> Dict[str, Any]:
         """``market``: the turbulent regime's probability per day, from a model fitted before the
-        given first day; ``earnings``: when each stock's earnings filings were accepted. Both are
+        given first day; ``earnings``: when each stock's earnings filings were accepted; ``news``:
+        each stock's stored stories since a first day, for the news checks; ``benchmark``: the
+        S&P 500 ETF's symbol, whose candles the market model behind those checks needs. All are
         asked for on the replay's own thread, and the replay goes on without them if they fail."""
         with self._lock:
             if self.running:
@@ -78,7 +82,7 @@ class ReplayRunner:
                 target=self._run, name="replay", daemon=True,
                 args=(list(strategies), source, daily_frame, list(intraday_symbols), list(swing_symbols),
                       sessions, swing_sessions, settings, noise, con_ids or {}, market, earnings,
-                      held_out_fraction, pairs))
+                      held_out_fraction, pairs, news, benchmark))
             self._thread.start()
         held = f"{held_out_fraction:.0%}"
         return {"ok": True, "note": (f"Replaying the last {sessions} sessions of day-trade setups on "
@@ -91,21 +95,28 @@ class ReplayRunner:
             self._thread.join(timeout)
 
     def _run(self, strategies, source, daily_frame, intraday_symbols, swing_symbols, sessions, swing_sessions,
-             settings, noise, con_ids, market, earnings, fraction, pairs=None) -> None:
+             settings, noise, con_ids, market, earnings, fraction, pairs=None, news=None, benchmark=None) -> None:
         started = time.monotonic()
         try:
-            bars = self.history.load(source, intraday_symbols, sessions, con_ids,
+            wanted = intraday_symbols + ([benchmark] if benchmark and benchmark not in intraday_symbols else [])
+            bars = self.history.load(source, wanted, sessions, con_ids,
                                      progress=lambda done, total: self._report("5-minute candles", done, total))
             last = clock.prev_trading_day(clock.session_date())
             first = min(clock.last_n_sessions(last, max(sessions, swing_sessions)))
-            self._report("market regime and earnings dates", 0, 1)
+            self._report("market regime, earnings dates and news", 0, 1)
             regime = dict(self._optional("the market regime", market, first) or {})
             reports = {s: tuple(v) for s, v in (self._optional("earnings dates", earnings, list(bars)) or {}).items()}
+            everyone = list(dict.fromkeys(list(intraday_symbols) + list(swing_symbols)))
+            stories = {s: list(v) for s, v in (self._optional("the news", news, everyone, first) or {}).items()}
+            bench_bars = bars.get(benchmark) if benchmark else None
+            bench_daily = daily_frame(benchmark) if benchmark else None
             split = {"INTRADAY": held_out_from(last, sessions, fraction),
                      "SWING": held_out_from(last, swing_sessions, fraction)}
-            jobs = [("intraday", strategies, s, bars[s], daily, settings, noise, sessions, regime, reports.get(s, ()))
+            jobs = [("intraday", strategies, s, bars[s], daily, settings, noise, sessions, regime, reports.get(s, ()),
+                     stories.get(s, ()), bench_bars, bench_daily)
                     for s in intraday_symbols if s in bars and (daily := daily_frame(s)) is not None]
-            jobs += [("swing", strategies, s, None, daily, settings, noise, swing_sessions, regime, ())
+            jobs += [("swing", strategies, s, None, daily, settings, noise, swing_sessions, regime, (),
+                      stories.get(s, ()), None, bench_daily)
                      for s in swing_symbols if (daily := daily_frame(s)) is not None]
             if pairs:
                 frames = {s: f for s in pairs["groups"] if (f := daily_frame(s)) is not None}
@@ -117,6 +128,7 @@ class ReplayRunner:
                 "elapsed_s": round(time.monotonic() - started, 1), "held_out_from": split,
                 "costs": {"slippage_bps": settings.slippage_bps, "commission_bps": settings.commission_bps},
                 "market_regime_days": len(regime), "earnings_stocks": sum(1 for v in reports.values() if v),
+                "news_stocks": sum(1 for v in stories.values() if v), "benchmark": benchmark if bench_daily is not None else None,
                 "noise": noise_report(trades, split), "trades": [dataclasses.asdict(t) for t in trades],
             }
             self._save(data, trades)
@@ -233,6 +245,7 @@ class ReplayRunner:
     def _append_history(self, data: Dict[str, Any], trades: List[SimTrade]) -> None:
         summary = {k: data[k] for k in ("ran_at", "sessions", "swing_sessions", "intraday_symbols", "swing_symbols",
                                          "held_out_from", "costs", "market_regime_days", "earnings_stocks")}
+        summary["news_stocks"] = data.get("news_stocks", 0)
         summary["trade_count"] = len(trades)
         summary["records"] = strategy_records(trades, split=data["held_out_from"])
         summary["noise"] = {check: {"removes": row["removes"], "removed_avg_r": row["removed_avg_r"],
@@ -254,7 +267,9 @@ def replay_job(job: tuple) -> List[Dict[str, Any]]:
         _, pairs, frames, sessions = job
         trades = replay_pairs(frames, pairs["groups"], pairs["rules"], pairs["finder"], sessions)
         return [dataclasses.asdict(t) for t in trades]
-    kind, strategies, symbol, bars, daily, settings, noise, sessions, market, earnings = job
-    trades = (replay_intraday(strategies, symbol, bars, daily, settings, noise, sessions, market, earnings)
-              if kind == "intraday" else replay_swing(strategies, symbol, daily, settings, noise, sessions, market))
+    kind, strategies, symbol, bars, daily, settings, noise, sessions, market, earnings, news, bench_bars, bench_daily = job
+    trades = (replay_intraday(strategies, symbol, bars, daily, settings, noise, sessions, market, earnings,
+                              news, bench_bars, bench_daily)
+              if kind == "intraday" else replay_swing(strategies, symbol, daily, settings, noise, sessions, market,
+                                                      news, bench_daily))
     return [dataclasses.asdict(t) for t in trades]

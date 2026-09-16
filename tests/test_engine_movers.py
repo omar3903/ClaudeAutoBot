@@ -6,14 +6,14 @@ from __future__ import annotations
 import time
 
 from test_engine import _connect, engine, gateway, port  # noqa: F401 - pytest fixtures
-from tos_bot.engine import engine as engine_module
+from tos_bot.engine import journal_ops
 from tos_bot.scanner import schedule
 from tos_bot.util import clock
 
 
 def test_after_the_close_the_market_is_downloaded_and_the_movers_join_the_review(engine, port, gateway, monkeypatch):
     day = schedule.last_completed_session(clock.now_ny())
-    monkeypatch.setattr(engine_module, "review_day", lambda now, at: day)
+    monkeypatch.setattr(journal_ops, "review_day", lambda now, at: day)
     engine._started_at -= engine.JOURNAL_GATEWAY_WAIT_S
     engine._review_if_due()                                              # IB Gateway is away: nothing to build yet
     assert engine.journal_review(day) is None and engine._movers_retry_at > time.monotonic()

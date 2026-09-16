@@ -503,6 +503,7 @@ held on the active platform — **entries need your click, exits never do**:
 |---|---|---|
 | cut losses at the working stop | on | — |
 | take profit at the target | on | — |
+| **take half off at the first target**, stop to break-even, the rest runs to the second target (Aziz) | 50 % | `scale_out_pct`, `scale_out_lock_r` (plays with one target exit whole) |
 | tighten the stop to **lock a small profit** once green | at +1.3 R, lock +0.3 R | `breakeven_at_r`, `breakeven_lock_r` |
 | **trail** the stop, keeping a fraction of the open R | from +2.0 R, lock 50% | `trail_start_r`, `trail_lock_ratio` |
 | **flatten day trades** before the (holiday-aware) close | 10 min before | `flatten_intraday_before_close_min` |
@@ -539,6 +540,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | new auto entries **per scan** | 1 | `max_new_per_cycle` |
 | **cool off** a ticker after it stops out today | on | `cooldown_after_loss` |
 | **stop for the day** once today's closed trades have lost this % of equity | 2 % | `max_daily_loss_pct` (Aziz's daily maximum loss; 0 = off) |
+| **stop for the day** once the day's realized gain has given back this % of its best | 30 % | `max_giveback_pct` (Aziz: never lose more than 30 % of what the morning made; `giveback_floor_pct` 0.25 % of equity is the smallest gain that counts; 0 = off) |
 | require a catalyst / dry-run | off | `require_catalyst`, `dry_run` |
 
 The filters and the Strategies panel apply to Autopilot too, and it takes no
@@ -553,7 +555,8 @@ are never auto-traded. Eligible plays get a **🤖** marker.
 taken, averaging at least `min_replay_expectancy_r` (+0.05R) — **and** at least 10
 of them in the held-out latest third of the sessions, averaging more than 0R
 there. The statistical noise checks (`not_trending`, `not_mean_reverting`,
-`turbulent_market`) are skipped by themselves once the replay shows that the
+`turbulent_market`) and the two news checks (`news_driven_move`,
+`move_without_news`) are skipped by themselves once the replay shows that the
 trades they remove did worse on every session and on the held-out ones. Each
 entry risks no more than `risk.max_risk_per_trade_pct`, lowered to **half-Kelly**
 when the strategy's record calls for less.
@@ -616,7 +619,10 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
   the move, the market's part, z and the stories found.
 - These three flags start as information: Autopilot doesn't skip them unless you add them to
   `autopilot.skip_noise`, and each day's journal compares how the flagged plays not taken would have done.
-  The replay can't test them yet - it has no news history.
+  The replay measures the two news flags from the headlines the app has stored (each story counts from
+  the moment it was published, and the S&P 500 ETF's candles feed the market model), so as the store
+  grows, Autopilot learns to skip them the way it learns the statistical checks. The earnings flag
+  needs a calendar history the app doesn't keep.
 - They are kept in the `insider_trades`, `filings_read` and `news_items` tables, and the calendar in
   `data/signals/earnings_calendar.json`.
 
@@ -942,7 +948,13 @@ tos_bot/
   config.py                .env + config.yaml loader
   secrets_store.py         the Connections panel's validated, allow-listed .env writer
   engine/                  the conductor
-    engine.py                loops, scans on schedule, operator actions, quitting, snapshot
+    engine.py                the loops, scans on schedule, orders and positions, operator actions, snapshot
+    research_ops.py          the strategy replay and the evidence: records, weights, calibrated odds, half-Kelly
+    journal_ops.py           the daily journal, the movers report and the Reports page
+    pairs_ops.py             pairs trading from the engine's side
+    capital_ops.py           trading capital and its day / swing split
+    quit_ops.py              quitting without stranding a position
+    support.py               small helpers the engine and its mixins share
     connections.py           the one IB Gateway connection + the simulator
     board.py                 the plays on the dashboard
     capital.py               trading capital
