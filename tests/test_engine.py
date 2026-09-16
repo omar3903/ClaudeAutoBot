@@ -407,6 +407,28 @@ def test_a_position_of_another_size_than_its_records_is_reported_and_left_alone(
     assert engine.snapshot()["mismatches"] == []
 
 
+def test_an_account_that_cant_be_read_keeps_the_last_snapshot_and_touches_nothing(engine, monkeypatch):
+    from tos_bot.brokers.base import BrokerError
+
+    tid = _open(engine, "AAPL")
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAPL", quantity=5, avg_price=100.0),
+                                 Position(symbol="MSFT", quantity=3, avg_price=50.0)]
+    read_at = engine._account_at
+
+    def slow(self):
+        raise BrokerError("IBKR didn't answer for the positions in time (TimeoutError)")
+
+    monkeypatch.setattr(type(engine._broker), "get_account", slow)
+    assert engine._refresh_account() is False
+    assert [p.symbol for p in engine._account.positions] == ["AAPL", "MSFT"] and engine._account_at == read_at
+    engine._account_at -= 10                                                 # the snapshot is stale now...
+    assert all(engine._reconcile_open_trades() == [] for _ in range(3))     # ...so nothing is deleted or closed
+    assert engine.repo.get_trade(tid)["status"] == "OPEN"
+    assert [r["symbol"] for r in engine.untracked_positions()] == ["MSFT"]  # the last known strays still show
+
+
 def test_a_position_closed_outside_the_app_is_booked_from_the_brokers_fills(engine):
     import datetime as dt
 

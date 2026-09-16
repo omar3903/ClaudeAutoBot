@@ -377,6 +377,10 @@ The app is built to be left running:
 * **The weekly login.** About once a week IBKR wants a full login (with two-factor). If the Gateway
   has been gone for 10 minutes, the dashboard says so - log in and the app picks up by itself.
 * **A replay running at 9 PM** waits up to 15 minutes for the Gateway instead of failing.
+* **A slow answer never reads as an empty account.** An account or positions read IBKR doesn't
+  answer in time (the Gateway busy with a big download, say) keeps the last snapshot, which then
+  counts as stale: no record is deleted or closed on its say-so, no exit is refused for a position
+  that "isn't there", and the shares-without-a-record list doesn't blink.
 * **Days on end** - candles and quotes nothing has asked for in half an hour are let go, the log
   rotates at 5 MB, and the scans, the reports, Autopilot's daily counts and the pairs roll over by date.
 * **Sleep.** While the app runs it asks Windows not to go to sleep (the screen can still turn off);

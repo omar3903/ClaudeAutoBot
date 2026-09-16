@@ -33,7 +33,7 @@ from ..config import get_settings
 from ..core.enums import OrderType, Side, TimeInForce
 from ..core.models import Account, Fill, OrderRequest, OrderResult, Position, Quote
 from ..util.net import port_is_open
-from .base import AuthError, BrokerAdapter, OrderRejected
+from .base import AuthError, BrokerAdapter, BrokerError, OrderRejected
 
 log = logging.getLogger(__name__)
 
@@ -514,10 +514,13 @@ class IbkrBroker(BrokerAdapter):
         acct = self.account_id or ""
         # accountValues() is the stream ib_async subscribes to at connect. Not
         # accountSummary(): called on the loop thread it tries to run the loop.
+        # A read the loop doesn't answer in time (it is busy with a big download, say) raises,
+        # so the caller keeps its last snapshot: an answer of "no values, no positions" would
+        # read as an empty account, and positions must never look gone because IBKR was slow.
         try:
             values = list(self._session.call(lambda ib: ib.accountValues(acct), timeout=8) or [])
-        except Exception:  # noqa: BLE001
-            values = []
+        except Exception as e:  # noqa: BLE001
+            raise BrokerError(f"IBKR didn't answer for the account values in time ({type(e).__name__})") from e
         base = next((v.currency for v in values
                      if v.tag == "NetLiquidation" and v.currency not in ("", "BASE")), "USD")
         summary: Dict[str, str] = {}
@@ -548,8 +551,8 @@ class IbkrBroker(BrokerAdapter):
 
         try:
             portfolio = self._session.call(lambda ib: ib.portfolio(acct), timeout=8) or []
-        except Exception:  # noqa: BLE001
-            portfolio = []
+        except Exception as e:  # noqa: BLE001
+            raise BrokerError(f"IBKR didn't answer for the positions in time ({type(e).__name__})") from e
         positions = [Position(symbol=getattr(it.contract, "symbol", "?"), quantity=float(it.position),
                               avg_price=float(it.averageCost or 0.0), market_price=float(it.marketPrice or 0.0))
                      for it in portfolio if abs(float(getattr(it, "position", 0.0) or 0.0)) > 1e-9]
