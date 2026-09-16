@@ -97,6 +97,16 @@ def test_insider_filings_are_read_once_and_unusual_buying_reaches_the_book(tmp_p
     service.poll_insiders()                             # nothing new: no filing or index is fetched again
     assert [u for u in sec.asked if u.endswith(".txt") or u.endswith(".idx")] == []
 
+    page = service.state()                              # the Signals page
+    row = next(r for r in page["signals"] if r["symbol"] == "SVCA")
+    assert row["effect"]["LONG"]["delta"] > 0 > row["effect"]["SHORT"]["delta"]
+    assert row["effect"]["LONG"]["why"][0].startswith("unusual insider buying")
+    assert {"SVCA", "SVCB"} <= {f["symbol"] for f in page["filings"]} and page["filing_delays"]["trades"] >= 3
+    assert not page["finnhub"] and page["boosts"]["insider_buying"] == 0.10
+    detail = service.symbol_state("SVCA")
+    assert len(detail["filings"]) == 3 and detail["signals"]["buying"]["unusual"]
+    assert service.symbol_state("NONE")["signals"] is None
+
 
 def test_a_buyers_history_is_read_on_a_later_pass_when_it_couldnt_be_at_first(tmp_path):
     pages = {
@@ -127,7 +137,7 @@ def test_news_is_gathered_scored_and_summed_up_per_stock(tmp_path):
             "form": ["8-K"], "accessionNumber": ["0000000611-26-000009"], "filingDate": [now.date().isoformat()],
             "acceptanceDateTime": [stamp], "items": ["2.02,9.01"], "primaryDocument": ["svcn-8k.htm"]}}},
     })
-    ibkr = SimpleNamespace(news_headlines=lambda con_ids, days: {"SVCN": [
+    ibkr = SimpleNamespace(news_headlines=lambda con_ids, **kw: {"SVCN": [
         ((now - dt.timedelta(hours=1)).replace(tzinfo=None), "BRFG", "BRFG$1", "{A:800015:L:en}SVCN beats estimates"),
         ((now - dt.timedelta(hours=3)).replace(tzinfo=None), "BRFUPDN", "BRFUPDN$2",
          "{A:800015:L:en}!A broker upgraded SVCN Test (SVCN) to Buy, beats peers")]})
@@ -146,3 +156,12 @@ def test_news_is_gathered_scored_and_summed_up_per_stock(tmp_path):
     [filing] = signals.filings
     assert filing["headline"] == "8-K: results of operations (earnings)"
     assert service.report["news"]["new_stories"] == 3 and service.report["news"]["scored"] == 2
+
+
+def test_a_check_can_be_asked_for_while_the_signals_are_on(tmp_path):
+    service = _service(FakeSec({}), tmp_path, SignalBook())
+    service.cfg.enabled = False
+    assert not service.check_now()["ok"]
+    service.cfg.enabled = True
+    with service._checking:                             # a pass is already running
+        assert service.check_now()["note"] == "A check is already running."

@@ -24,6 +24,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import uvicorn  # noqa: E402
 
 from tos_bot.config import get_settings  # noqa: E402
+from tos_bot.util.keep_awake import keep_awake  # noqa: E402
 from tos_bot.util.logging_setup import setup_logging  # noqa: E402
 
 
@@ -95,6 +96,8 @@ def main() -> None:
         threading.Thread(target=_open, daemon=True).start()
 
     print(f"\n  AutoTradeBot -> {url}\n")
+    if s.config.app.keep_awake and keep_awake():          # this (main) thread lives as long as the app
+        print("  Keeping this computer awake while the app runs (app.keep_awake in config.yaml).\n")
     if args.reload:
         uvicorn.run("tos_bot.server.app:app", host=args.host, port=args.port,
                     reload=True, log_level=log_level)

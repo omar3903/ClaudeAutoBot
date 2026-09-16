@@ -20,7 +20,8 @@ from ..core.enums import AssetClass, Side, StrategyKind, Timeframe
 from ..core.models import Play, Quote
 from ..data.fundamentals import Financials
 from ..indicators import ta
-from ..quant import readings
+from ..quant import market_model, readings
+from ..signals.calendar import DURING, report_before_open
 from ..util import clock
 
 
@@ -41,6 +42,12 @@ class StrategyContext:
     signals: Any = None
     #: the market's regime (engine/market_regime.py): {"p_turbulent": ..., "regime": ...}, when known
     market: Dict[str, Any] = field(default_factory=dict)
+    #: the S&P 500 ETF's closes by session - today's latest price last while trading - for the market model
+    benchmark: Optional[pd.Series] = None
+    #: the stock's news as last read, {"checked_at", "stories"} - None when it isn't followed (signals/book.py)
+    news: Optional[Dict[str, Any]] = None
+    #: its earnings reports from the calendar (signals/calendar.py), when known
+    earnings: Optional[List[Dict[str, Any]]] = None
     _memo: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     def _cached(self, key: str, compute: Callable[[], Any]) -> Any:
@@ -58,6 +65,39 @@ class StrategyContext:
                 return None
             return readings.price_character(frame["close"].to_numpy()[-bars:])
         return self._cached("character_5m" if intraday else "character_1d", compute)
+
+    def abnormal_move(self, sessions: int = market_model.SESSIONS) -> Optional[Dict[str, Any]]:
+        """The latest session's move beyond what the market explains (quant/market_model.py)."""
+        if self.benchmark is None or self.daily is None or not len(self.daily):
+            return None
+        return self._cached(f"abnormal_{sessions}",
+                            lambda: market_model.abnormal_move(self.daily["close"], self.benchmark, sessions))
+
+    def news_since_move(self, fresh_minutes: float = 60.0) -> Optional[int]:
+        """The stories out since the close before the latest session - an earnings report around it
+        counts as one. None when the stock's news isn't being read, or wasn't lately."""
+        reading = self.news or {}
+        checked, now = reading.get("checked_at"), pd.Timestamp(self.now)
+        now = now.tz_localize("America/New_York") if now.tzinfo is None else now
+        if checked is None or self.daily is None or not len(self.daily):
+            return None
+        checked = pd.Timestamp(checked)
+        if (now - (checked.tz_localize("UTC") if checked.tzinfo is None else checked)).total_seconds() > fresh_minutes * 60:
+            return None
+        day = self.daily.index[-1].date()
+        prev = clock.prev_trading_day(day)
+        since = pd.Timestamp(dt.datetime.combine(prev, clock.regular_close_time(prev)), tz="America/New_York")
+        count = 0
+        for story in reading.get("stories") or []:
+            try:
+                at = pd.Timestamp(story["at"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if since <= (at.tz_localize("UTC") if at.tzinfo is None else at) <= now:
+                count += 1
+        reported = report_before_open(self.earnings, day) or next(
+            (e for e in self.earnings or [] if e["date"] == day.isoformat() and e.get("hour") == DURING), None)
+        return count + (1 if reported else 0)
 
     def vol_forecast(self) -> Optional[Dict[str, Any]]:
         """Tomorrow's volatility from the completed daily candles (GARCH, or RiskMetrics)."""

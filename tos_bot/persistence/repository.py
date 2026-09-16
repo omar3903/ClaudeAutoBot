@@ -6,7 +6,7 @@ import datetime as dt
 import logging
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 
 from ..core.models import Account, Play
 from ..util import clock
@@ -420,6 +420,15 @@ class Repository:
                              .where(Trade.status == "CLOSED", Trade.exit_time >= start, Trade.exit_time < end)
                              .order_by(Trade.exit_time)).all()
             return [{**trade_to_dict(t), "play": play_to_dict(p) if p is not None else None} for t, p in rows]
+
+    def trades_on(self, day: dt.date) -> List[Dict[str, Any]]:
+        """Trades opened or closed during the New York session ``day``, oldest first."""
+        start, end = _ny_bounds(day)
+        with session_scope() as s:
+            rows = s.execute(select(Trade).where(or_(and_(Trade.entry_time >= start, Trade.entry_time < end),
+                                                     and_(Trade.exit_time >= start, Trade.exit_time < end)))
+                             .order_by(Trade.entry_time)).scalars().all()
+            return [trade_to_dict(t) for t in rows]
 
     def plays_on(self, day: dt.date, limit: int = 5000) -> List[Dict[str, Any]]:
         """The plays recorded during the New York session ``day``, oldest first."""

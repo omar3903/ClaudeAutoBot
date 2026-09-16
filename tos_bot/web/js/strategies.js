@@ -19,7 +19,7 @@ export async function loadStrategies() {
   indexStrategies(d.strategies);
 }
 
-async function openStrategies() {
+export async function openStrategies() {
   openDrawer("strategies", "Strategies", `<p class="muted">Loading…</p>`);
   try {
     await Promise.all([loadStrategies(), loadReplay()]);

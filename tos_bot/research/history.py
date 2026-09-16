@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import pickle
+import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional
 
@@ -23,6 +24,9 @@ log = logging.getLogger(__name__)
 NY = "America/New_York"
 BAR_SIZE = "5 mins"
 SESSIONS_PER_REQUEST = 5          # IBKR serves 5-minute history up to a week per request
+#: how long a download waits for IB Gateway to come back (its nightly restart takes a minute or two)
+GATEWAY_WAIT_S = 900.0
+GATEWAY_POLL_S = 15.0
 
 
 class IntradayHistory:
@@ -44,8 +48,9 @@ class IntradayHistory:
             missing = [s for s in symbols if not set(chunk) <= _sessions_in(frames[s])]
             if missing:
                 close = dt.datetime.combine(chunk[-1], clock.regular_close_time(chunk[-1]))
-                got = source.history_many({s: (BAR_SIZE, f"{len(chunk)} D") for s in missing}, con_ids,
-                                          end=pd.Timestamp(close, tz=NY).to_pydatetime())
+                got = _through_gateway_drops(source, lambda: source.history_many(
+                    {s: (BAR_SIZE, f"{len(chunk)} D") for s in missing}, con_ids,
+                    end=pd.Timestamp(close, tz=NY).to_pydatetime()))
                 for symbol, frame in got.items():
                     frames[symbol] = _merge(frames[symbol], frame)
                     self._write(symbol, frames[symbol])
@@ -53,6 +58,10 @@ class IntradayHistory:
                 progress(n, len(chunks))
         first = pd.Timestamp(wanted[0], tz=NY)
         return {s: f[f.index >= first] for s, f in frames.items() if f is not None and len(f)}
+
+    def stored(self, symbol: str) -> Optional[pd.DataFrame]:
+        """The candles already on disk, without asking IBKR."""
+        return self._read(symbol)
 
     def _path(self, symbol: str) -> Path:
         return self.directory / f"{symbol.replace(' ', '_')}.pkl"
@@ -68,6 +77,22 @@ class IntradayHistory:
         tmp = self._path(symbol).with_suffix(".tmp")
         frame.to_pickle(tmp)
         tmp.replace(self._path(symbol))
+
+
+def _through_gateway_drops(source, request: Callable[[], Dict[str, pd.DataFrame]]) -> Dict[str, pd.DataFrame]:
+    """Run a download. If IB Gateway drops part way - its nightly restart - wait for it to come back and
+    ask again; an error while it's connected is a real one."""
+    waited = 0.0
+    while True:
+        try:
+            return request()
+        except Exception:
+            if getattr(source, "is_connected", True) or waited >= GATEWAY_WAIT_S:
+                raise
+            if not waited:
+                log.warning("replay: IB Gateway dropped - waiting up to %d minutes for it", GATEWAY_WAIT_S // 60)
+            time.sleep(GATEWAY_POLL_S)
+            waited += GATEWAY_POLL_S
 
 
 def _sessions_in(frame: Optional[pd.DataFrame]) -> set:

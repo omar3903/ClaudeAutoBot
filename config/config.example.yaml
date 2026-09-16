@@ -7,6 +7,7 @@
 
 app:
   log_level: "INFO"
+  keep_awake: true                    # keep Windows from sleeping while the app runs - it has to be awake to run 24/7
 
 account:
   # Day-trading guard rails. See tos_bot/risk/pdt_guard.py
@@ -154,6 +155,11 @@ noise:
   trending_hurst: 0.55                # from here up the price reads as trending (reversal setups get flagged)
   reverting_hurst: 0.45               # from here down as mean reverting (momentum setups get flagged)
   turbulent_probability: 0.7          # momentum setups are flagged from this probability of the turbulent regime
+  # From the news and the earnings calendar (Tsay ch. 9's market model; Chan on moves with and without news):
+  abnormal_z: 2.0                     # a move this many usual moves beyond what the market explains is the stock's own
+  market_model_sessions: 60           # the sessions the market model is fitted on
+  news_fresh_minutes: 60              # news read longer ago than this doesn't count as "no news"
+  earnings_ahead_days: 5              # swing plays with an earnings report due this many sessions ahead are flagged
 
 replay:
   # How the Strategies panel's replay tests the setups (Chan, Quantitative Trading ch. 3). 60 day-trade
@@ -193,10 +199,14 @@ pairs:
   etf_pairs: [[EWA, EWC], [GLD, GDX], [XLE, XOP], [KBE, KRE]]
 
 journal:
-  # The daily review in the Journal tab: every trade with the readings it was taken on, the mistakes,
+  # The daily report (the Reports button): every trade with the readings it was taken on, the mistakes,
   # the plays that weren't taken and how they would have done, and what the strategies' records say.
   enabled: true
   review_at: "16:15"                  # ET, after the close
+  # The market's biggest gainers and losers of the session (this many of each): why each one moved - news,
+  # filings, analyst actions, its sector - and whether the bot traded it, offered it, watched it or missed it.
+  # Their daily candles are the ones the next morning's scan downloads, fetched after the close instead.
+  movers: 10
 
 signals:
   # What a company's insiders buy and sell (SEC Form 4 filings) and what the news says
@@ -220,6 +230,8 @@ signals:
   boost_insider_buying: 0.10          # added to a long play's score at an insider score of 1
   boost_insider_selling: 0.08         # taken off a long play's score at an insider score of 1
   boost_news: 0.06                    # at a news sentiment of +1 or -1
+  calendar_hours: 6                   # Finnhub's earnings calendar (needs the key): how often it's read...
+  calendar_days_ahead: 30             # ...and how far ahead
 
 database:
   echo_sql: false

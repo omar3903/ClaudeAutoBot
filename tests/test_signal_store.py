@@ -6,6 +6,7 @@ import datetime as dt
 
 from tos_bot.signals.edgar import FilingRef
 from tos_bot.signals.form4 import BUY, InsiderTrade
+from tos_bot.signals.insiders import filing_delays
 from tos_bot.signals.news import NewsItem
 from tos_bot.signals.store import SignalStore
 
@@ -53,3 +54,26 @@ def test_news_is_kept_once_and_scored_later():
     assert [(r["headline"], r["sentiment"]) for r in rows] == [
         ("News Test Inc raises its outlook", 0.8), ("8-K: results of operations (earnings)", None)]
     assert rows[0]["published_at"] == "2026-09-15T12:00:00+00:00"
+
+
+def test_the_signals_page_reads_filings_with_their_delays_and_every_stocks_news():
+    store = SignalStore()
+    prompt = FilingRef("0000000911-26-000001", "4", 911, dt.date(2026, 9, 14), "https://example/11.txt")
+    late = FilingRef("0000000911-26-000002", "4", 911, dt.date(2026, 9, 14), "https://example/12.txt")
+    store.save_filing(prompt, [_trade(prompt.accession, symbol="LAGS", day=dt.date(2026, 9, 10))])   # Thu -> Mon
+    store.save_filing(late, [_trade(late.accession, symbol="LAGS", day=dt.date(2026, 9, 1))])
+    rows = store.insider_filings(dt.date(2026, 9, 14), ["LAGS"])
+    assert [(r["trade_date"], r["filed"], r["value"]) for r in rows] == [
+        ("2026-09-10", "2026-09-14", 10_500.0), ("2026-09-01", "2026-09-14", 10_500.0)]
+    assert filing_delays(rows) == {"trades": 2, "median_days": 5.5, "on_time": 0.5, "late": 1, "max_days": 9}
+    assert filing_delays([]) is None
+
+    at = dt.datetime(2031, 1, 6, 15, tzinfo=UTC)
+    scored = NewsItem("PAGA", "finnhub", "Reuters", "Page Test A wins a contract", at, ref="fh1")
+    plain = NewsItem("PAGB", "ibkr", "BRFG", "Page Test B names a new CFO", at + dt.timedelta(hours=1), ref="BRFG$1")
+    store.save_news([scored, plain])
+    store.set_sentiment({scored.key: (0.7, 0.9)})
+    assert [r["symbol"] for r in store.news(None, at)] == ["PAGB", "PAGA"]
+    assert [r["symbol"] for r in store.news(None, at, limit=1)] == ["PAGB"]
+    assert store.sentiment_counts(at) == {"headlines": 2, "scored": 1}
+    store.set_sentiment({plain.key: (0.0, 0.8)})         # left unscored, it would be scored by other tests

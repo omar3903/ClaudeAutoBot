@@ -20,6 +20,17 @@ Three checks come from the books' statistics (see quant/):
 - a momentum setup while the market is in its turbulent regime (Hamilton's Markov
   switching model, ch. 22) is "turbulent_market" - Chan (ch. 8) finds momentum
   suffers in high volatility while short-term reversal does better.
+
+And three read the events around the stock (signals/, quant/market_model.py):
+
+- the market model (Tsay ch. 9) says how far today's move goes beyond what the market
+  explains. When that's a big move, the news decides what it is: Chan finds moves on news
+  keep going and moves without news tend to be taken back (*Quantitative Trading*, on stop
+  losses; *Algorithmic Trading* ch. 4). A reversal setup fading a big move that came with
+  news is "news_driven_move"; a momentum setup chasing a big move with no news is
+  "move_without_news". Neither is claimed while the stock's news isn't being read;
+- a momentum or reversal swing setup with an earnings report due within its hold is
+  "earnings_ahead" - a report can gap the price straight through the stop.
 """
 
 from __future__ import annotations
@@ -33,6 +44,7 @@ import pandas as pd
 from ..core.enums import Side, Timeframe
 from ..core.models import Play
 from ..quant import readings
+from ..signals.calendar import next_report, sessions_until
 from ..strategies.base import StrategyContext
 
 LABELS = {
@@ -45,6 +57,9 @@ LABELS = {
     "not_trending": "the price keeps snapping back - breakouts in it tend to fail",
     "not_mean_reverting": "the price has been trending - fading it fights the trend",
     "turbulent_market": "the market is in its turbulent regime",
+    "news_driven_move": "fading a big move that came with news - news-driven moves tend to keep going",
+    "move_without_news": "chasing a big move with no news behind it - those tend to be taken back",
+    "earnings_ahead": "an earnings report is due within the hold",
 }
 CHECKS = tuple(LABELS)
 #: the checks from the books' statistics; Autopilot also skips one once the replay shows it helps
@@ -60,6 +75,10 @@ class NoiseSettings:
     trending_hurst: float = readings.TRENDING_HURST
     reverting_hurst: float = readings.REVERTING_HURST
     turbulent_probability: float = 0.7
+    abnormal_z: float = 2.0
+    market_model_sessions: int = 60
+    news_fresh_minutes: float = 60.0
+    earnings_ahead_days: int = 5
 
     @classmethod
     def from_config(cls, cfg) -> "NoiseSettings":
@@ -67,12 +86,16 @@ class NoiseSettings:
                    volume_bars=int(cfg.volume_bars), min_expected_r=float(cfg.min_expected_r),
                    trending_hurst=float(getattr(cfg, "trending_hurst", readings.TRENDING_HURST)),
                    reverting_hurst=float(getattr(cfg, "reverting_hurst", readings.REVERTING_HURST)),
-                   turbulent_probability=float(getattr(cfg, "turbulent_probability", 0.7)))
+                   turbulent_probability=float(getattr(cfg, "turbulent_probability", 0.7)),
+                   abnormal_z=float(getattr(cfg, "abnormal_z", 2.0)),
+                   market_model_sessions=int(getattr(cfg, "market_model_sessions", 60)),
+                   news_fresh_minutes=float(getattr(cfg, "news_fresh_minutes", 60.0)),
+                   earnings_ahead_days=int(getattr(cfg, "earnings_ahead_days", 5)))
 
 
 def context_flags(play: Play, ctx: StrategyContext, style: str, settings: NoiseSettings) -> List[str]:
     """The checks that read the market around a play."""
-    flags = quant_flags(play, ctx, style, settings)
+    flags = quant_flags(play, ctx, style, settings) + event_flags(play, ctx, style, settings)
     if style != "momentum":
         return flags
     long = play.side is Side.LONG
@@ -110,6 +133,29 @@ def quant_flags(play: Play, ctx: StrategyContext, style: str, settings: NoiseSet
     turbulent = (ctx.market or {}).get("p_turbulent")
     if style == "momentum" and turbulent is not None and turbulent >= settings.turbulent_probability:
         flags.append("turbulent_market")
+    return flags
+
+
+def event_flags(play: Play, ctx: StrategyContext, style: str, settings: NoiseSettings) -> List[str]:
+    """The checks from the news and the earnings calendar."""
+    if style not in ("momentum", "reversal"):
+        return []
+    flags: List[str] = []
+    upcoming = next_report(ctx.earnings, ctx.now) if play.timeframe is Timeframe.SWING else None
+    if upcoming is not None and sessions_until(upcoming, ctx.now) <= max(settings.earnings_ahead_days,
+                                                                         math.ceil(play.expected_hold_max or 0)):
+        flags.append("earnings_ahead")
+    move = ctx.abnormal_move(settings.market_model_sessions)
+    if move is None or abs(move["z"]) < settings.abnormal_z:
+        return flags
+    news = ctx.news_since_move(settings.news_fresh_minutes)
+    if news is None:
+        return flags
+    with_move = (move["z"] > 0) == (play.side is Side.LONG)
+    if style == "reversal" and not with_move and news:
+        flags.append("news_driven_move")
+    elif style == "momentum" and with_move and not news:
+        flags.append("move_without_news")
     return flags
 
 

@@ -1,12 +1,13 @@
 /* The chart behind a play: its recent candles, the entry, stop and target, and every
-   way the trade can end (see engine/chart.py). Opened from the chart button on a play. */
+   way the trade can end (see engine/chart.py). Opened from the chart button on a play. The
+   same window shows a report's movers (movers.js). */
 import { $, api, escapeHtml, num } from "./util.js";
 import { S } from "./state.js";
 
 const ROUTE_CLASS = { target: "rt-target", stop: "rt-stop", breakeven: "rt-lock", trail: "rt-trail", time: "rt-time" };
 
 export async function openChart(play) {
-  const box = modal();
+  const box = chartModal();
   box.dataset.play = play.id;
   const title = (S.strategies[play.strategy] || {}).title || play.strategy.replace(/_/g, " ");
   $(".chart-title", box).textContent = `${play.symbol} · ${play.side.toLowerCase()} · ${title}`;
@@ -18,7 +19,7 @@ export async function openChart(play) {
   $(".chart-body", box).innerHTML = d.ok ? chartHTML(d) : `<p class="reasons">${escapeHtml(d.reason || "No chart for this play.")}</p>`;
 }
 
-function modal() {
+export function chartModal() {
   let box = $("#chart-modal");
   if (box) return box;
   box = document.createElement("div");

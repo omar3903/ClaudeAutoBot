@@ -46,6 +46,17 @@ class SignalStore:
             return [_trade(r) for i in range(0, len(wanted), _CHUNK)
                     for r in s.scalars(q.where(InsiderTradeLog.symbol.in_(wanted[i:i + _CHUNK])))]
 
+    def insider_filings(self, since: dt.date, symbols: Optional[Iterable[str]] = None,
+                        limit: int = 500) -> List[Dict[str, Any]]:
+        """Insider trades filed since ``since``, the latest filings first, each with the day it was
+        filed - for the dashboard."""
+        q = (select(InsiderTradeLog).where(InsiderTradeLog.filed >= since)
+             .order_by(InsiderTradeLog.filed.desc(), InsiderTradeLog.trade_date.desc()).limit(limit))
+        if symbols is not None:
+            q = q.where(InsiderTradeLog.symbol.in_(list(dict.fromkeys(symbols))[:_CHUNK]))
+        with session_scope() as s:
+            return [{**_trade(r).as_row(), "filed": r.filed.isoformat() if r.filed else None} for r in s.scalars(q)]
+
     def symbols_traded(self, since: dt.date) -> List[str]:
         """Stocks with insider trades on or after ``since``."""
         with session_scope() as s:
@@ -80,13 +91,23 @@ class SignalStore:
                                   published_at=_naive_utc(i.published_at)))
         return len(by_key) - len(have)
 
-    def news(self, symbols: Iterable[str], since: dt.datetime) -> List[Dict[str, Any]]:
-        """Stories about ``symbols`` published since ``since``, newest first."""
+    def news(self, symbols: Optional[Iterable[str]], since: dt.datetime,
+             limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Stories about ``symbols`` (every stock: None) published since ``since``, newest first."""
+        q = select(NewsLog).where(NewsLog.published_at >= _naive_utc(since)).order_by(NewsLog.published_at.desc())
+        if symbols is not None:
+            q = q.where(NewsLog.symbol.in_(list(symbols)))
         with session_scope() as s:
-            rows = s.scalars(select(NewsLog)
-                             .where(NewsLog.symbol.in_(list(symbols)), NewsLog.published_at >= _naive_utc(since))
-                             .order_by(NewsLog.published_at.desc()))
-            return [_news_row(r) for r in rows]
+            return [_news_row(r) for r in s.scalars(q.limit(limit) if limit else q)]
+
+    def sentiment_counts(self, since: dt.datetime) -> Dict[str, int]:
+        """Headlines published since ``since`` and how many of them have a sentiment. Filings aren't
+        scored, so they aren't counted."""
+        q = select(func.count(), func.count(NewsLog.sentiment)).where(
+            NewsLog.published_at >= _naive_utc(since), NewsLog.kind != "filing")
+        with session_scope() as s:
+            total, scored = s.execute(q).one()
+        return {"headlines": int(total or 0), "scored": int(scored or 0)}
 
     def unscored_news(self, limit: int = 200) -> List[Tuple[str, str]]:
         """(key, headline) of the newest headlines without a sentiment yet. Filings are

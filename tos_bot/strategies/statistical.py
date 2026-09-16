@@ -24,6 +24,7 @@ import pandas as pd
 from ..core.enums import Side, StrategyKind, Timeframe
 from ..core.models import Play
 from ..quant.readings import completed_daily
+from ..signals.calendar import report_before_open, surprise
 from ..util import clock
 from .base import Strategy, StrategyContext
 from .registry import register
@@ -139,20 +140,25 @@ class EarningsDrift(Strategy):
               "a standard deviation of its usual overnight moves away from yesterday's close, trade in the "
               "direction of the gap and hold to the close. It is taken in the first half hour while the price still "
               "holds beyond yesterday's close, with the stop beyond the day's extreme so far and a target at twice "
-              "the risk; the exit manager flattens what's left before the bell.")
+              "the risk; the exit manager flattens what's left before the bell. A report counts from SEC's filing "
+              "or Finnhub's earnings calendar, whichever knows first; when the calendar has the reported EPS, a gap "
+              "the other way from the surprise isn't taken (Chan, Quantitative Trading: buy the beats, short the "
+              "misses).")
     default_params = {"sigma_days": 90, "min_gap_sigmas": 0.5, "max_minutes": 30, "target_r": 2.0, "stop_atr": 0.1}
 
     def generate(self, ctx: StrategyContext) -> List[Play]:
         p = self.params
-        if ctx.signals is None:
+        if ctx.signals is None and not ctx.earnings:
             return []
         today, prior = _opening(ctx, p["max_minutes"], 30)
         atr, price = ctx.intraday_atr, ctx.price
         if today is None or math.isnan(atr) or atr <= 0:
             return []
         filing = earnings_filing(ctx.signals, today.index[0].date(), today.index[0])
-        if filing is None:
+        report = report_before_open(ctx.earnings, today.index[0].date())
+        if filing is None and report is None:
             return []
+        eps_surprise = surprise(report) if report else None
         opens, closes = prior["open"].to_numpy(dtype=float), prior["close"].to_numpy(dtype=float)
         sigma = float(np.std(np.log(opens[1:] / closes[:-1])[-int(p["sigma_days"]):]))
         day_open, close = float(today["open"].iloc[0]), float(closes[-1])
@@ -165,17 +171,25 @@ class EarningsDrift(Strategy):
         long = gap > 0
         if (price <= close) if long else (price >= close):
             return []                                   # the gap has already been given back
+        if eps_surprise is not None and eps_surprise != 0 and (eps_surprise > 0) != long:
+            return []                                   # the market and the reported numbers disagree
         stop = (float(today["low"].min()) - p["stop_atr"] * atr) if long else (float(today["high"].max()) + p["stop_atr"] * atr)
         target = price + p["target_r"] * (price - stop)
         side = Side.LONG if long else Side.SHORT
         play = self._mk_play(
             ctx, side, price, stop, [target], confidence=min(0.75, 0.52 + 0.05 * min(3.0, gap_sigmas)),
             rationale=f"earnings overnight, gapped {100 * gap:+.1f}% ({gap_sigmas:.1f} overnight standard deviations)",
-            detail=(f"{ctx.symbol} filed its earnings with SEC before today's open and gapped {100 * gap:+.1f}% - "
+            detail=(f"{ctx.symbol} reported earnings before today's open"
+                    + (f" (EPS {100 * eps_surprise:+.0f}% against the estimate)" if eps_surprise is not None else "")
+                    + f" and gapped {100 * gap:+.1f}% - "
                     f"{gap_sigmas:.1f} times its usual overnight move of {100 * sigma:.1f}%. Prices tend to keep "
                     "drifting the way an earnings surprise pushed them."),
             evidence={"gap_pct": round(100 * gap, 2), "gap_sigmas": round(gap_sigmas, 2),
-                      "overnight_sigma_pct": round(100 * sigma, 2), "earnings_filed_at": str(filing.get("published_at"))},
+                      "overnight_sigma_pct": round(100 * sigma, 2),
+                      "earnings_source": "SEC 8-K" if filing else "Finnhub calendar",
+                      "earnings_filed_at": str(filing.get("published_at")) if filing else f"{report['date']} {report.get('hour') or ''}".strip(),
+                      **({"eps_actual": report.get("eps_actual"), "eps_estimate": report.get("eps_estimate"),
+                          "eps_surprise_pct": round(100 * eps_surprise, 1)} if eps_surprise is not None else {})},
             tags=["intraday", "gap", "catalyst", "earnings"],
             invalidation=f"a 5-minute close back {'below' if long else 'above'} yesterday's close of {close:.2f}")
         return [play] if play else []

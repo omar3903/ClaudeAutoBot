@@ -44,7 +44,7 @@ from ..strategies.base import Strategy
 from ..util import clock
 from . import schedule
 from ..signals.book import SignalBook
-from .evaluator import evaluate
+from .evaluator import evaluate, with_today
 from .noise import NoiseSettings
 from .filters import TradeFilters
 from .heat import DailyMetrics, daily_metrics, intraday_metrics, liquid, rank_by_daily_heat
@@ -117,6 +117,8 @@ class Scanner:
         self.market: Dict[str, Any] = {}
         #: each strategy's evidence multiplier (research/weights.py)
         self.evidence_weights: Dict[str, float] = {}
+        #: (the session every tradable stock's daily candles reach, those stocks) after a full download
+        self.market_daily: Optional[Tuple[dt.date, List[str]]] = None
 
     def set_strategies(self, strategies: Sequence[Strategy]) -> None:
         """Swap the active setups. A scan already running keeps the set it started with."""
@@ -134,9 +136,7 @@ class Scanner:
         result = ScanResult("full")
 
         with self._timed(result, "listings"):
-            symbols = [listing.symbol for listing in self.listings.load(now.date())]
-            if cfg.max_universe:
-                symbols = symbols[:cfg.max_universe]
+            symbols = self._listed(now)
         result.universe_size = len(symbols)
         with self._timed(result, "contracts"):
             self._learn_contracts(symbols + [BENCHMARK], result)
@@ -146,6 +146,7 @@ class Scanner:
             everyone = tradable + [BENCHMARK]
             self.md.update_daily(everyone, through, self.con_ids(everyone),
                                  progress=lambda done, total: self._progress(result, "daily candles", done, total))
+        self.market_daily = (through, tradable)
         with self._timed(result, "ranking"):
             ranked = self._rank(tradable, through, cfg.prefilter, result)
         result.liquid = len(ranked)
@@ -170,7 +171,7 @@ class Scanner:
                     result.plays += evaluate(m.symbol, swing, daily, None, run_id=result.run_id,
                                              equity=self._equity, params=self._params, activity=m, noise=self._noise,
                                              signals=self.signals, market=self.market,
-                                             evidence_weights=self.evidence_weights)
+                                             evidence_weights=self.evidence_weights, benchmark=self._benchmark(False))
             result.plays += self._signal_plays(swing, {m.symbol for m in ranked[:self.SWING_LEADERS]},
                                                result.run_id)[0]
         with self._timed(result, "valuation_setups"):
@@ -179,11 +180,29 @@ class Scanner:
                 result.plays += self._valuation_plays(valuation, ranked, result.run_id)
         return self._finish(result, filters)
 
-    def _learn_contracts(self, symbols: List[str], result: ScanResult) -> None:
+    def update_market_daily(self, through: dt.date) -> List[str]:
+        """Every tradable stock's daily candles up to ``through``: the download the morning's full scan
+        makes, made after the close for the report on the session's movers (research/movers.py).
+        Returns the tradable stocks."""
+        symbols = self._listed(clock.now_ny())
+        self._learn_contracts(symbols + [BENCHMARK])                   # quietly: it isn't a scan
+        tradable = self.symbols.tradable(symbols)
+        everyone = tradable + [BENCHMARK]
+        self.md.update_daily(everyone, through, self.con_ids(everyone))
+        self.market_daily = (through, tradable)
+        return tradable
+
+    def _listed(self, now: dt.datetime) -> List[str]:
+        symbols = [listing.symbol for listing in self.listings.load(now.date())]
+        cap = self.settings.config.scanner.max_universe
+        return symbols[:cap] if cap else symbols
+
+    def _learn_contracts(self, symbols: List[str], result: Optional[ScanResult] = None) -> None:
         unknown = self.symbols.unknown(symbols)
         for i in range(0, len(unknown), _CONTRACT_CHUNK):
             self.symbols.record(self.md.source.contract_details_many(unknown[i:i + _CONTRACT_CHUNK]))
-            self._progress(result, "contract details", min(i + _CONTRACT_CHUNK, len(unknown)), len(unknown))
+            if result is not None:
+                self._progress(result, "contract details", min(i + _CONTRACT_CHUNK, len(unknown)), len(unknown))
 
     def _rank(self, symbols: Iterable[str], through: dt.date, prefilter: Mapping[str, float],
               result: ScanResult) -> List[DailyMetrics]:
@@ -249,6 +268,7 @@ class Scanner:
         with self._timed(result, "intraday_candles"):
             intraday = self.md.intraday(symbols, self.con_ids(symbols))
         daily = self.md.daily(symbols)
+        benchmark = self._benchmark(True)
         result.universe_size, result.scanned, result.symbols = len(symbols), len(intraday), symbols
 
         market_open = clock.is_market_open()
@@ -263,7 +283,7 @@ class Scanner:
                 plays = evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
                                  equity=self._equity, params=self._params, activity=activity, noise=self._noise,
                                  signals=self.signals, market=self.market,
-                                 evidence_weights=self.evidence_weights)
+                                 evidence_weights=self.evidence_weights, benchmark=benchmark)
                 result.plays += plays
                 if activity is not None:
                     heat[symbol] = activity.heat + (_PLAY_BONUS if plays else 0.0)
@@ -313,18 +333,33 @@ class Scanner:
         market_open = clock.is_market_open()
         active = [s for s in strategies if s.kind is StrategyKind.TECHNICAL and s.timeframe.value in filters.timeframes
                   and (s.timeframe is Timeframe.SWING or market_open)]
+        benchmark = self._benchmark(True) if result.symbols else None
         with self._timed(result, "setups"):
             for symbol in result.symbols:
                 activity = intraday_metrics(symbol, intraday[symbol], daily[symbol])
                 result.plays += evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
                                          equity=self._equity, params=self._params, activity=activity,
                                          noise=self._noise, signals=self.signals, market=self.market,
-                                         evidence_weights=self.evidence_weights)
+                                         evidence_weights=self.evidence_weights, benchmark=benchmark)
         for p in result.plays:
             p.scan_run_id = None               # a quick re-check isn't recorded as a scan
         return self._finish(result, filters, quiet=True)
 
     # ---- shared ------------------------------------------------------------- #
+    def _benchmark(self, intraday: bool) -> Optional[pd.Series]:
+        """The S&P 500 ETF's closes for the market model, with today's latest price while the market
+        is open (one small request, shared by the cycle's stocks)."""
+        daily = self.md.daily_frame(BENCHMARK)
+        if daily is None or not len(daily):
+            return None
+        today = None
+        if intraday and clock.is_market_open():
+            try:
+                today = self.md.intraday([BENCHMARK], self.con_ids([BENCHMARK])).get(BENCHMARK)
+            except Exception:  # noqa: BLE001
+                log.debug("the benchmark's intraday candles failed", exc_info=True)
+        return with_today(daily, today)["close"]
+
     @property
     def _equity(self) -> float:
         return self.account.equity if self.account else 0.0
