@@ -117,6 +117,8 @@ class Scanner:
         self.market: Dict[str, Any] = {}
         #: each strategy's evidence multiplier (research/weights.py)
         self.evidence_weights: Dict[str, float] = {}
+        #: each strategy's pooled win rate and trade count, calibrating the odds its plays state
+        self.strategy_records: Dict[str, Dict[str, Any]] = {}
         #: (the session every tradable stock's daily candles reach, those stocks) after a full download
         self.market_daily: Optional[Tuple[dt.date, List[str]]] = None
 
@@ -171,7 +173,8 @@ class Scanner:
                     result.plays += evaluate(m.symbol, swing, daily, None, run_id=result.run_id,
                                              equity=self._equity, params=self._params, activity=m, noise=self._noise,
                                              signals=self.signals, market=self.market,
-                                             evidence_weights=self.evidence_weights, benchmark=self._benchmark(False))
+                                             evidence_weights=self.evidence_weights,
+                                             records=self.strategy_records, benchmark=self._benchmark(False))
             result.plays += self._signal_plays(swing, {m.symbol for m in ranked[:self.SWING_LEADERS]},
                                                result.run_id)[0]
         with self._timed(result, "valuation_setups"):
@@ -238,7 +241,7 @@ class Scanner:
             plays += evaluate(m.symbol, strategies, self.md.daily_frame(m.symbol), None, run_id=run_id,
                               equity=self._equity, params=self._params, activity=m, fundamentals=fin, peers=peers,
                               noise=self._noise, signals=self.signals, market=self.market,
-                              evidence_weights=self.evidence_weights)
+                              evidence_weights=self.evidence_weights, records=self.strategy_records)
         return plays
 
     def _financials(self, symbol: str, benchmark: Optional[pd.DataFrame]) -> Optional[Financials]:
@@ -283,7 +286,8 @@ class Scanner:
                 plays = evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
                                  equity=self._equity, params=self._params, activity=activity, noise=self._noise,
                                  signals=self.signals, market=self.market,
-                                 evidence_weights=self.evidence_weights, benchmark=benchmark)
+                                 evidence_weights=self.evidence_weights,
+                                 records=self.strategy_records, benchmark=benchmark)
                 result.plays += plays
                 if activity is not None:
                     heat[symbol] = activity.heat + (_PLAY_BONUS if plays else 0.0)
@@ -316,7 +320,7 @@ class Scanner:
             looked_at.append(symbol)
             plays += evaluate(symbol, strategies, daily, None, run_id=run_id, equity=self._equity, params=self._params,
                               activity=daily_metrics(symbol, daily), noise=self._noise, signals=self.signals,
-                              market=self.market, evidence_weights=self.evidence_weights)
+                              market=self.market, evidence_weights=self.evidence_weights, records=self.strategy_records)
         return plays, looked_at
 
     def run_plays(self, symbols: Sequence[str]) -> ScanResult:
@@ -340,7 +344,8 @@ class Scanner:
                 result.plays += evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
                                          equity=self._equity, params=self._params, activity=activity,
                                          noise=self._noise, signals=self.signals, market=self.market,
-                                         evidence_weights=self.evidence_weights, benchmark=benchmark)
+                                         evidence_weights=self.evidence_weights,
+                                         records=self.strategy_records, benchmark=benchmark)
         for p in result.plays:
             p.scan_run_id = None               # a quick re-check isn't recorded as a scan
         return self._finish(result, filters, quiet=True)

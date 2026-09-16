@@ -86,3 +86,30 @@ def test_one_stock_never_takes_more_than_its_share_of_equity():
     r = size_play(p, _acct(10000), cfg, symbol_notional=1_000.0)
     assert r.qty == 5 and "max exposure per stock" in r.caps_hit      # $1,500 cap - $1,000 already held
     assert size_play(_play(100, 90), _acct(10000), cfg, symbol_notional=1_600.0).qty == 0
+
+
+# --------------------------------------------------------------------------- #
+#  Aziz: a smaller size at Mid-day
+# --------------------------------------------------------------------------- #
+def test_a_day_trade_sized_at_midday_risks_a_fraction_of_the_usual(monkeypatch):
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    from tos_bot.risk import position_sizing
+    from tos_bot.risk.position_sizing import time_of_day_factor
+
+    ny = ZoneInfo("America/New_York")
+    cfg = SimpleNamespace(**RISK_CFG.__dict__, midday_size_pct=60.0)
+    midday, open_ = dt.datetime(2026, 9, 15, 13, 0, tzinfo=ny), dt.datetime(2026, 9, 15, 9, 45, tzinfo=ny)
+    assert time_of_day_factor(_play(), cfg, now=midday) == 0.6
+    assert time_of_day_factor(_play(), cfg, now=open_) == 1.0
+    assert time_of_day_factor(_play(tf=Timeframe.SWING), cfg, now=midday) == 1.0      # swing trades are untouched
+    assert time_of_day_factor(_play(), RISK_CFG, now=midday) == 1.0                    # no setting = off
+    assert time_of_day_factor(_play(), SimpleNamespace(midday_size_pct=100.0), now=midday) == 1.0
+
+    monkeypatch.setattr(position_sizing.clock, "time_of_day", lambda now=None: "MIDDAY")
+    usual = size_play(_play(stop=90.0), _acct(100_000.0), RISK_CFG)         # $1,000 of risk at $10 a share
+    smaller = size_play(_play(stop=90.0), _acct(100_000.0), cfg)
+    assert usual.qty == 100 and smaller.qty == 60 and "Mid-day: a smaller size (Aziz)" in smaller.caps_hit
+    monkeypatch.setattr(position_sizing.clock, "time_of_day", lambda now=None: "OPEN")
+    assert size_play(_play(stop=90.0), _acct(100_000.0), cfg).qty == 100

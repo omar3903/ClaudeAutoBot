@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from ..core.models import Account, Play
+from ..util import clock
 
 
 @dataclass
@@ -44,6 +45,10 @@ def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
     if risk_pct is not None and risk_pct < pct:
         pct = max(0.0, float(risk_pct))
         caps.append("half-Kelly from the strategy's record")
+    factor = time_of_day_factor(play, cfg)
+    if factor < 1.0:
+        pct *= factor
+        caps.append("Mid-day: a smaller size (Aziz)")
     risk_budget = equity * pct / 100.0
 
     # respect the portfolio-wide open-risk ceiling
@@ -91,6 +96,19 @@ def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
     if qty == 0:
         caps.append("risk budget too small for one share")
     return SizingResult(qty, round(rps, 4), round(dollar_risk, 2), round(notional, 2), caps)
+
+
+def time_of_day_factor(play: Play, cfg, now=None) -> float:
+    """How much of the usual risk a play may take right now. Aziz (ch. 7, "Trading Based on the
+    Time of Day"): Mid-day (12-3 pm ET) is the most dangerous part of the session - thin, choppy,
+    strange moves stop you out - "I lower my share size and keep my stops tight". A day trade
+    sized then risks ``cfg.midday_size_pct`` percent of the usual; a swing trade is untouched."""
+    if not play.is_day_trade:
+        return 1.0
+    pct = float(getattr(cfg, "midday_size_pct", 100.0) or 100.0)
+    if pct >= 100.0 or clock.time_of_day(now) != "MIDDAY":
+        return 1.0
+    return max(0.0, pct) / 100.0
 
 
 def _apply(play: Play, qty: int, rps: float, dollar_risk: float, notional: float) -> None:

@@ -24,6 +24,7 @@ It holds no broker or DB handles of its own; it drives the engine.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from ..core.eventbus import BUS
@@ -54,6 +55,7 @@ class AutoPilot:
         self.max_per_strategy: int = int(getattr(cfg, "max_per_strategy", 2))
         self.max_new_per_cycle: int = int(getattr(cfg, "max_new_per_cycle", 1))
         self.cooldown_after_loss: bool = bool(getattr(cfg, "cooldown_after_loss", True))
+        self.max_daily_loss_pct: float = float(getattr(cfg, "max_daily_loss_pct", 2.0))
         self.max_gross_exposure_pct: float = float(getattr(cfg, "max_gross_exposure_pct", 100.0))
         self.min_confirmations: int = int(getattr(cfg, "min_confirmations", 2))
         self.skip_noise: List[str] = [str(n) for n in getattr(cfg, "skip_noise", list(NOISE_LABELS))]
@@ -69,6 +71,8 @@ class AutoPilot:
         self._count_today: int = 0
         self._last_reason: Dict[str, str] = {}  # play_id -> why skipped (for the UI)
         self._blocked_note: str = ""
+        self._loss_stop_day: str = ""           # the session the daily loss limit was reached on
+        self._realized: tuple = (float("-inf"), 0.0)   # (monotonic time read, realized P/L today)
 
     # ------------------------------------------------------------------ #
     #  Persistable slice (goes into data/runtime.json alongside `mode`)  #
@@ -84,6 +88,7 @@ class AutoPilot:
             "max_per_strategy": self.max_per_strategy,
             "max_new_per_cycle": self.max_new_per_cycle,
             "cooldown_after_loss": self.cooldown_after_loss,
+            "max_daily_loss_pct": self.max_daily_loss_pct,
             "max_gross_exposure_pct": self.max_gross_exposure_pct,
             "min_confirmations": self.min_confirmations,
             "skip_noise": list(self.skip_noise),
@@ -100,7 +105,7 @@ class AutoPilot:
         tt = d.get("trade_types")
         if isinstance(tt, list) and tt:
             self.trade_types = [str(x).upper() for x in tt if str(x).upper() in TRADE_TYPES] or self.trade_types
-        for k in ("min_confidence", "min_reward_risk", "max_gross_exposure_pct"):
+        for k in ("min_confidence", "min_reward_risk", "max_gross_exposure_pct", "max_daily_loss_pct"):
             if isinstance(d.get(k), (int, float)):
                 setattr(self, k, float(d[k]))
         for k in ("max_auto_positions", "max_auto_trades_per_day",
@@ -149,6 +154,8 @@ class AutoPilot:
             self.require_proven = bool(kw["require_proven"])
         if isinstance(kw.get("max_gross_exposure_pct"), (int, float)):
             self.max_gross_exposure_pct = max(10.0, min(400.0, float(kw["max_gross_exposure_pct"])))
+        if isinstance(kw.get("max_daily_loss_pct"), (int, float)):
+            self.max_daily_loss_pct = max(0.0, min(50.0, float(kw["max_daily_loss_pct"])))
         if isinstance(kw.get("min_confirmations"), int):
             self.min_confirmations = max(1, min(10, int(kw["min_confirmations"])))
         if isinstance(kw.get("skip_noise"), list):
@@ -201,6 +208,9 @@ class AutoPilot:
             "max_per_strategy": self.max_per_strategy,
             "max_new_per_cycle": self.max_new_per_cycle,
             "cooldown_after_loss": self.cooldown_after_loss,
+            "max_daily_loss_pct": round(self.max_daily_loss_pct, 2),
+            "realized_today": round(self._realized_today(), 2),
+            "daily_loss_stop": bool(self._loss_stop_day) and self._loss_stop_day == self._day,
             "max_gross_exposure_pct": round(self.max_gross_exposure_pct, 1),
             "min_confirmations": self.min_confirmations,
             "skip_noise": list(self.skip_noise),
@@ -258,6 +268,17 @@ class AutoPilot:
         equity = float(getattr(acct, "equity", 0.0) or 0.0)
         actions: List[Dict[str, Any]] = []
         taken = 0                              # new entries opened this cycle
+
+        stopped = self.daily_loss_reason(equity)
+        if stopped:
+            if self._loss_stop_day != self._day:
+                self._loss_stop_day = self._day
+                log.warning("autopilot stopped for the day: %s", stopped)
+                self.bus.publish("autopilot.daily_loss", reason=stopped, day=self._day)
+            for p in plays.values():
+                if p.id not in self._acted:
+                    self._last_reason[p.id] = stopped
+            return []
 
         # highest-conviction first
         ordered = sorted(plays.values(), key=lambda p: getattr(p, "score", 0.0), reverse=True)
@@ -353,6 +374,38 @@ class AutoPilot:
         return actions
 
     # ------------------------------------------------------------------ #
+    #: how long the realized P/L of the day is kept before it is read again
+    REALIZED_CACHE_S = 20.0
+
+    def _realized_today(self) -> float:
+        """Realized P/L of the trades closed this session on the venue Autopilot trades on, by
+        hand or by Autopilot - they drain the same account."""
+        mono = time.monotonic()
+        if mono - self._realized[0] < self.REALIZED_CACHE_S:
+            return self._realized[1]
+        venue = getattr(self.engine, "_venue", None)
+        total = 0.0
+        try:
+            for t in self.engine.repo.trades_on(clock.session_date()):
+                if t.get("status") == "CLOSED" and (not venue or (t.get("broker") or "paper") == venue):
+                    total += float(t.get("realized_pl") or 0.0)
+        except Exception:  # noqa: BLE001
+            log.debug("could not read today's closed trades", exc_info=True)
+        self._realized = (mono, total)
+        return total
+
+    def daily_loss_reason(self, equity: float) -> Optional[str]:
+        """Why today's losses stop new entries, if they do. Aziz's daily maximum loss - "live to
+        trade another day" - and Chan's rule of cutting exposure after losses, never adding."""
+        if self.max_daily_loss_pct <= 0 or equity <= 0:
+            return None
+        realized = self._realized_today()
+        limit = equity * self.max_daily_loss_pct / 100.0
+        if realized > -limit:
+            return None
+        return (f"today's closed trades have lost {-realized:,.0f}, past the daily limit of "
+                f"{self.max_daily_loss_pct:g}% of equity ({limit:,.0f}) - no more entries this session")
+
     def _pre_gate(self, p: Any, equity: float) -> Optional[str]:
         """Cheap filters before we spend an engine assessment. Returns a reason
         string to skip, or None to proceed."""

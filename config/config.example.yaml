@@ -27,6 +27,8 @@ risk:
   max_symbol_pct_of_equity: 15.0       # cap per stock: shares already held + entries working + the new trade
   min_reward_risk: 1.5                 # discard plays whose target/stop R:R is below this
   round_lot: 1                         # share rounding
+  midday_size_pct: 60                  # a day trade sized at Mid-day (12-3 pm ET) risks this % of the usual
+                                       # (Aziz: lower your size mid-day, the thin choppy hours); 100 = off
 
 scanner:
   # Once a day before the open every US stock and ADR is ranked from its daily
@@ -140,6 +142,8 @@ autopilot:
   min_replay_trades: 30              # ...over at least this many replayed trades
   min_replay_expectancy_r: 0.05      # ...averaging at least this much per trade, in R
   cooldown_after_loss: true          # skip a ticker for the rest of the session after it stops out
+  max_daily_loss_pct: 2.0            # Aziz's daily maximum loss: once today's closed trades have lost this
+                                     # % of equity, no more entries until the next session (0 = off)
   require_catalyst: false            # true = only auto-take plays tagged gap / catalyst
   dry_run: false                     # true = log every entry it WOULD take but place nothing
 

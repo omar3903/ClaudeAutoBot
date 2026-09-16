@@ -72,3 +72,17 @@ def evidence_multiplier(replay: Optional[Mapping[str, Any]], live: Optional[Mapp
     return Evidence(multiplier=round(multiplier, 3), pooled_r=round(pooled, 4), replay_trades=n_replay,
                     replay_r=r_replay, held_out_trades=n_held, held_out_r=r_held, live_trades=n_live, live_r=r_live,
                     note="; ".join(notes))
+
+
+def pooled_odds(replay: Optional[Mapping[str, Any]], live: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The win rate a strategy's plays state their odds against (strategies/base.py
+    calibrated_probability): its replayed and real trades pooled, each real trade counting
+    ``LIVE_WEIGHT`` times, as in the evidence multiplier. None without any record."""
+    n_replay = int((replay or {}).get("trades") or 0)
+    n_live = int((live or {}).get("trades") or 0)
+    weight = n_replay + LIVE_WEIGHT * n_live
+    if weight <= 0:
+        return None
+    wins = (n_replay * float((replay or {}).get("win_rate") or 0.0)
+            + LIVE_WEIGHT * n_live * float((live or {}).get("win_rate") or 0.0))
+    return {"trades": int(round(weight)), "win_rate": round(wins / weight, 4)}

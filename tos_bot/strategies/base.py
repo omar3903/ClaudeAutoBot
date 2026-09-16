@@ -11,7 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import pandas as pd
 
@@ -48,6 +48,9 @@ class StrategyContext:
     news: Optional[Dict[str, Any]] = None
     #: its earnings reports from the calendar (signals/calendar.py), when known
     earnings: Optional[List[Dict[str, Any]]] = None
+    #: each strategy's record, {"trades", "win_rate"} pooled from the replay and real trades
+    #: (research/weights.py pooled_odds) - it calibrates the odds a play states; {} in the replay
+    records: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     _memo: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     def _cached(self, key: str, compute: Callable[[], Any]) -> Any:
@@ -146,6 +149,11 @@ class StrategyContext:
                             if self.enough_daily(20) else math.nan)
 
     @property
+    def daily_adx(self) -> pd.DataFrame:
+        """ADX on the daily candles, shared by the swing setups that read the trend's strength."""
+        return self._cached("daily_adx", lambda: ta.adx(self.daily, 14))
+
+    @property
     def vwap_series(self) -> pd.Series:
         return self._cached("vwap", lambda: ta.session_vwap(self.intraday))
 
@@ -223,10 +231,12 @@ class Strategy:
 
     #: how the setup behaves across Aziz's intraday sessions (Ch. 7). Momentum /
     #: breakout setups fade at midday; reversal setups hold up; trend setups get
-    #: better into the close. Scales confidence only, never the geometry.
+    #: better into the close; an "open" setup (the flag) belongs to the first hour and
+    #: is rarely worth taking later. Scales confidence only, never the geometry.
     tod_profile: str = "momentum"
     _TOD_WEIGHTS = {
         "momentum": {"OPEN": 1.00, "LATE_MORNING": 1.00, "MIDDAY": 0.75, "CLOSE": 0.85, "OFF": 1.0},
+        "open":     {"OPEN": 1.00, "LATE_MORNING": 0.85, "MIDDAY": 0.60, "CLOSE": 0.70, "OFF": 1.0},
         "reversal": {"OPEN": 0.85, "LATE_MORNING": 1.00, "MIDDAY": 1.00, "CLOSE": 0.90, "OFF": 1.0},
         "trend":    {"OPEN": 0.80, "LATE_MORNING": 1.00, "MIDDAY": 1.00, "CLOSE": 0.95, "OFF": 1.0},
         "swing":    {"OPEN": 1.00, "LATE_MORNING": 1.00, "MIDDAY": 1.00, "CLOSE": 1.00, "OFF": 1.0},
@@ -318,9 +328,13 @@ class Strategy:
             evidence = {**evidence, "time_of_day": tod, "tod_weight": round(weight, 2)}
         confidence = max(0.0, min(1.0, confidence))
 
-        # Douglas: state the edge as a probability, never a promise
-        probability = max(0.05, min(0.90, float(probability if probability is not None
-                                                else 0.40 + 0.28 * confidence)))
+        # Douglas: state the edge as a probability, never a promise - and Chan: measure it.
+        # The setup's own read is blended with the win rate of its replayed and real trades
+        # (calibrated_probability), so the odds shown lean on the record as it grows.
+        own = float(probability if probability is not None else 0.40 + 0.28 * confidence)
+        probability, odds = calibrated_probability(own, ctx.records.get(self.key))
+        if odds is not None:
+            evidence = {**evidence, "odds_from_record": odds}
         if not invalidation:
             invalidation = (f"a 5-minute close {'below' if side is Side.LONG else 'above'} {stop:.2f} "
                             "(the protective stop / the technical level the idea rests on)")
@@ -329,7 +343,7 @@ class Strategy:
             entry=round(entry, 4), stop=round(stop, 4), targets=[round(t, 4) for t in targets],
             confidence=confidence, rationale=rationale,
             explanation=self._compose_explanation(side, entry, stop, targets, detail, invalidation,
-                                                  edge_note, probability, tod),
+                                                  edge_note, probability, tod, odds),
             invalidation=invalidation, probability=round(probability, 3), evidence=evidence, tags=tags,
             asset_class=AssetClass.EQUITY, extended_hours_ok=ext_ok,
             expected_hold_typical=hold_typ, expected_hold_max=hold_max,
@@ -338,7 +352,7 @@ class Strategy:
 
     def _compose_explanation(self, side: Side, entry: float, stop: float, targets: List[float],
                              detail: str, invalidation: str, edge_note: str, probability: float,
-                             tod: str) -> str:
+                             tod: str, odds: Optional[Dict[str, Any]] = None) -> str:
         """The hover pop-up, framed the way Douglas (*Trading in the Zone*) says
         a position should be held: one execution of an edge - a higher
         probability of one outcome over another - not a forecast."""
@@ -363,8 +377,7 @@ class Strategy:
             f"   - protective stop {stop:.2f}  ->  you risk {risk_ps:.2f}/share ({risk_pct:.1f}% of price) "
             "to find out whether the edge pays\n"
             f"   - {target_line}\n"
-            f"   - estimated odds the edge pays: ~{probability * 100:.0f}%  "
-            "(a probability over many trades, not a call on this one)",
+            f"   - estimated odds the edge pays: ~{probability * 100:.0f}%  {_odds_note(odds)}",
             f"INVALIDATION: {invalidation}. If price gets there the reason for the trade is gone - "
             "the automatic exit handles it, no decision needed.",
             "HOW TO HOLD IT (Douglas): this is one roll of an edge, not a prediction. Wins and losses "
@@ -373,6 +386,32 @@ class Strategy:
             "leave it alone - don't widen the stop and don't add size to be right.",
         ]
         return "\n\n".join(blocks)
+
+
+#: trades of record that weigh as much as the setup's own read of its odds
+PRIOR_ODDS_TRADES = 30.0
+
+
+def calibrated_probability(own: float, record: Optional[Mapping[str, Any]],
+                           prior_trades: float = PRIOR_ODDS_TRADES) -> Tuple[float, Optional[Dict[str, Any]]]:
+    """The odds a play states: the setup's own read of them, shrunk toward the win rate of the
+    strategy's replayed and real trades as those accumulate - a small sample proves little (Chan),
+    and an edge is a probability over a series of trades (Douglas). Returns the probability,
+    bounded like any play's, and the record it leaned on (None when there is none)."""
+    n = float((record or {}).get("trades") or 0)
+    rate = (record or {}).get("win_rate")
+    if n <= 0 or rate is None:
+        return max(0.05, min(0.90, own)), None
+    blended = (n * float(rate) + prior_trades * own) / (n + prior_trades)
+    return (max(0.05, min(0.90, blended)),
+            {"trades": int(n), "win_rate": round(float(rate), 3), "own": round(own, 3)})
+
+
+def _odds_note(odds: Optional[Dict[str, Any]]) -> str:
+    if not odds:
+        return "(a probability over many trades, not a call on this one)"
+    return (f"(the setup's own read, blended with its record: {odds['trades']} replayed and real trades, "
+            f"{odds['win_rate'] * 100:.0f}% of them winners)")
 
 
 def swing_low(series: pd.Series, lookback: int = 10) -> float:

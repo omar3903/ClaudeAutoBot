@@ -199,3 +199,64 @@ def test_stops_are_floored_at_a_slice_of_the_stocks_daily_range():
     p = _T()._mk_play(ctx, Side.LONG, entry=50.0, stop=49.7, targets=[52.0],
                       confidence=0.7, rationale="r", detail="d", evidence={}, tags=["intraday"])
     assert p is not None and p.entry - p.stop >= 0.25 * 2.0 - 1e-9                 # a quarter of the day's range
+
+
+# --------------------------------------------------------------------------- #
+#  the odds a play states lean on the setup's record (Douglas, Chan)
+# --------------------------------------------------------------------------- #
+def test_calibrated_probability_shrinks_toward_the_record_as_it_grows():
+    from tos_bot.strategies.base import calibrated_probability
+
+    assert calibrated_probability(0.55, None) == (0.55, None)
+    assert calibrated_probability(0.55, {"trades": 0, "win_rate": 0.9}) == (0.55, None)
+    p30, odds = calibrated_probability(0.50, {"trades": 30, "win_rate": 0.70})
+    assert abs(p30 - 0.60) < 1e-9 and odds == {"trades": 30, "win_rate": 0.7, "own": 0.5}
+    p300, _ = calibrated_probability(0.50, {"trades": 300, "win_rate": 0.70})
+    assert 0.60 < p300 < 0.70 and abs(p300 - (300 * 0.7 + 30 * 0.5) / 330) < 1e-9
+    assert calibrated_probability(0.50, {"trades": 3000, "win_rate": 0.99})[0] == 0.90     # bounded like any play
+
+
+def test_a_play_carries_the_record_its_odds_lean_on():
+    from tos_bot.strategies.base import Strategy
+
+    class Fixed(Strategy):
+        key, title, thesis = "fixed", "Fixed", "t"
+
+        def generate(self, ctx):
+            p = self._mk_play(ctx, Side.LONG, 100.0, 97.0, [110.0], 0.5, "r", "d", {}, probability=0.5)
+            return [p] if p else []
+
+    plain = _context("ODDS")
+    informed = _context("ODDS")
+    informed.records["fixed"] = {"trades": 90, "win_rate": 0.8}
+    [before] = Fixed().generate(plain)
+    [after] = Fixed().generate(informed)
+    assert before.probability == 0.5 and "odds_from_record" not in before.evidence
+    assert abs(after.probability - (90 * 0.8 + 30 * 0.5) / 120) < 1e-9
+    assert after.evidence["odds_from_record"] == {"trades": 90, "win_rate": 0.8, "own": 0.5}
+    assert "90 replayed and real trades" in after.explanation and "not a call on this one" in before.explanation
+
+
+def test_a_reversal_after_a_doji_waits_for_the_next_candle_to_turn():
+    from tos_bot.analysis.candles import CandleRead
+    from tos_bot.strategies.technical import _reversal_triggered
+
+    doji, hammer = CandleRead("doji", None, True), CandleRead("hammer", True, False)
+    bars = pd.DataFrame({"open": [10.0, 10.1], "high": [10.5, 10.4], "low": [9.8, 10.0], "close": [10.1, 10.2]})
+    assert not _reversal_triggered(bars, doji, up=True)          # the bar after the doji hasn't made a new high
+    assert _reversal_triggered(bars, hammer, up=True)            # a hammer is its own confirmation
+    bars.loc[1, "high"] = 10.6
+    assert _reversal_triggered(bars, doji, up=True)
+    bars.loc[1, "low"] = 9.7
+    assert _reversal_triggered(bars, doji, up=False)
+    bars.loc[1, "low"] = 9.9
+    assert not _reversal_triggered(bars, doji, up=False)
+
+
+def test_pooled_odds_count_a_real_trade_twice():
+    from tos_bot.research.weights import pooled_odds
+
+    assert pooled_odds(None, None) is None
+    assert pooled_odds({"trades": 40, "win_rate": 0.5}, None) == {"trades": 40, "win_rate": 0.5}
+    pooled = pooled_odds({"trades": 40, "win_rate": 0.5}, {"trades": 10, "win_rate": 0.8})
+    assert pooled == {"trades": 60, "win_rate": round((40 * 0.5 + 20 * 0.8) / 60, 4)}

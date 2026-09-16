@@ -61,7 +61,7 @@ from ..research.replay import ReplaySettings
 from ..research.runner import ReplayRunner
 from ..research.journal import ROLLING_SESSIONS, Journal, build_review, first_sightings, live_records, review_day
 from ..research.movers import build_movers, read_session, rolling_capture, session_bounds
-from ..research.weights import evidence_multiplier
+from ..research.weights import evidence_multiplier, pooled_odds
 from ..quant.sizing import MIN_TRADES as KELLY_MIN_TRADES, half_kelly_risk_pct
 from ..signals.earnings import EarningsCalendar
 from ..pairs.desk import PairDesk, decision_window
@@ -543,6 +543,14 @@ class TradingEngine:
 
     def evidence_weights(self) -> Dict[str, float]:
         return {key: row["multiplier"] for key, row in self.evidence_state().items()}
+
+    def strategy_odds(self) -> Dict[str, Dict[str, Any]]:
+        """Each active strategy's pooled win rate and trade count (research/weights.py pooled_odds),
+        which calibrate the odds its plays state (strategies/base.py calibrated_probability)."""
+        records = self.replay.records(self.autopilot.skipped_noise(), self.autopilot.min_confirmations)
+        live = self.live_stats()
+        odds = ((s.key, pooled_odds(records.get(s.key), live.get(s.key))) for s in self.scanner.strategies)
+        return {key: row for key, row in odds if row is not None}
 
     def strategy_risk_pct(self, key: str) -> Optional[float]:
         """Half-Kelly risk per trade from the strategy's record (quant/sizing.py): its real trades
@@ -1302,6 +1310,7 @@ class TradingEngine:
                 self._refresh_regime()
             self.scanner.market = self.regime.context()
             self.scanner.evidence_weights = self.evidence_weights()
+            self.scanner.strategy_records = self.strategy_odds()
             if kind == "full":
                 result = self.scanner.run_full(self.scan_settings)
             elif quick:

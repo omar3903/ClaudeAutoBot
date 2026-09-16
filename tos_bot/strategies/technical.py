@@ -9,7 +9,7 @@ Pignataro Ch. 12, which uses the 52-week high/low as a valuation anchor.
 from __future__ import annotations
 
 import math
-from typing import List
+from typing import List, Optional, Tuple
 
 import pandas as pd
 
@@ -31,6 +31,26 @@ def _last_closed(today: pd.DataFrame):
     if today is None or len(today) < 2:
         return None
     return today.iloc[-2]
+
+
+def _reversal_triggered(today: pd.DataFrame, cndl, up: bool) -> bool:
+    """Aziz (Strategies 3 and 4): after an indecision candle the entry is the first 5-minute
+    candle to make a new high (bottom reversal) or a new low (top reversal) - never the doji
+    itself, or you are catching the falling knife. A hammer, an engulfing bar or a strong body
+    is its own confirmation: the handover already showed."""
+    if cndl.name != "doji":
+        return True
+    prev, now = today.iloc[-2], today.iloc[-1]
+    return float(now["high"]) > float(prev["high"]) if up else float(now["low"]) < float(prev["low"])
+
+
+def _emas(close: pd.Series, lengths=(9, 20)) -> List[Optional[float]]:
+    """The 9 and 20 EMAs of the 5-minute closes - with VWAP, Aziz's targets for a reversal."""
+    out: List[Optional[float]] = []
+    for length in lengths:
+        v = safe_last(ta.ema(close, length)) if len(close) >= length else math.nan
+        out.append(None if math.isnan(v) else float(v))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -398,7 +418,7 @@ class BollingerFade(Strategy):
             return []
         d = ctx.daily
         bb = ta.bollinger(d["close"], self.params["length"], self.params["mult"])
-        adx = safe_last(ta.adx(d, 14)["adx"])
+        adx = safe_last(ctx.daily_adx["adx"])
         atr = ctx.daily_atr
         price = ctx.price
         mid, lower, upper = safe_last(bb["mid"]), safe_last(bb["lower"]), safe_last(bb["upper"])
@@ -462,7 +482,7 @@ class AtrChannelBreakout(Strategy):
             return []
         d = ctx.daily
         kc = ta.keltner(d, self.params["length"], self.params["mult"])
-        adxdf = ta.adx(d, 14)
+        adxdf = ctx.daily_adx
         adx = safe_last(adxdf["adx"])
         adx_prev = float(adxdf["adx"].iloc[-3]) if len(adxdf) > 3 else adx
         atr = ctx.daily_atr
@@ -735,7 +755,7 @@ class MomentumFlag(Strategy):
     key = "bull_bear_flag"
     kind = StrategyKind.TECHNICAL
     timeframe = Timeframe.INTRADAY
-    tod_profile = "momentum"
+    tod_profile = "open"           # Aziz: a flag belongs to the Open; he rarely trades one later
     expected_hold = (10.0, 35.0)   # minutes
     title = "Bull / Bear Flag"
     thesis = (
@@ -937,13 +957,13 @@ class IntradayReversal(Strategy):
             lvl = sr.nearest_below(price) or sr.at(price, band)
             if lvl is None or (price - lvl.price) / price > band:
                 return []
-            if not (cndl.is_reversal_up or cndl.indecision):
+            if not (cndl.is_reversal_up or cndl.indecision) or not _reversal_triggered(today, cndl, up=True):
                 return []
             lod = float(today["low"].min())
             entry = price
             stop = min(lod, float(today["low"].iloc[-2])) - 0.05 * atr
             up_lvl = sr.nearest_above(price)
-            cands = [x for x in (vwap, up_lvl.price if up_lvl else None)
+            cands = [x for x in (vwap, *_emas(ctx.intraday["close"]), up_lvl.price if up_lvl else None)
                      if x is not None and x > entry]
             t1 = min(cands) if cands else entry + 1.5 * (entry - stop)
             targets = [t1, entry + 2.0 * (entry - stop)]
@@ -954,12 +974,14 @@ class IntradayReversal(Strategy):
             lvl = sr.nearest_above(price) or sr.at(price, band)
             if lvl is None or (lvl.price - price) / price > band:
                 return []
-            if not (cndl.is_reversal_down or cndl.indecision):
+            if not (cndl.is_reversal_down or cndl.indecision) or not _reversal_triggered(today, cndl, up=False):
                 return []
             hod = float(today["high"].max())
             entry = price
             stop = max(hod, float(today["high"].iloc[-2])) + 0.05 * atr
-            cands = [x for x in (vwap, (sr.nearest_below(price).price if sr.nearest_below(price) else vwap)) if x < entry]
+            dn_lvl = sr.nearest_below(price)
+            cands = [x for x in (vwap, *_emas(ctx.intraday["close"]), dn_lvl.price if dn_lvl else None)
+                     if x is not None and x < entry]
             t1 = max(cands) if cands else entry - 1.5 * (stop - entry)
             targets = [t1, entry - 2.0 * (stop - entry)]
             conf = 0.48 + 0.02 * (abs(run) - self.params["min_run"]) + (0.08 if r >= 90 else 0.0)
@@ -973,9 +995,10 @@ class IntradayReversal(Strategy):
             f"({'/'.join(lvl.sources)}), and the last closed bar was a "
             f"{cndl.name.replace('_', ' ')}."
         )
-        note = ("Reversals only work at the extremes and at a real level. Target "
-                "is VWAP / the nearest MA or the next level; exit on a fresh "
-                "5-minute extreme back the original way.")
+        note = ("Reversals only work at the extremes and at a real level, and the entry is the "
+                "first 5-minute candle to turn - never the doji itself. Target is VWAP, the 9 or "
+                "20 EMA or the next level, whichever is nearest; exit on a fresh 5-minute extreme "
+                "back the original way.")
         inval = (f"a new {'low' if side is Side.LONG else 'high'} of day beyond "
                  f"{stop:.2f} (the move never actually reversed)")
         p = self._mk_play(
