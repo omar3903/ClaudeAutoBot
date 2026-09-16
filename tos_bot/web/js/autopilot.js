@@ -11,14 +11,15 @@ export function renderAutopilot() {
   const enabled = !!ap.enabled, eff = !!ap.effective;
   const fast = !!scan.fast, secs = scan.fast_cycle_seconds, mins = (scan.settings || {}).cycle_minutes;
   const types = (ap.trade_types || []).map(typeName).join("+");
-  btn.textContent = enabled ? `Autopilot: ${types || "on"}${ap.dry_run ? " · dry" : ""}${fast ? ` ⚡${secs}s` : ""}` : "Autopilot: off";
+  btn.textContent = enabled ? `Autopilot: ${types || "on"}${ap.dry_run ? " · dry" : ""}${ap.daily_loss_stop ? " · stopped today" : fast ? ` ⚡${secs}s` : ""}` : "Autopilot: off";
   btn.classList.toggle("on", enabled && eff);
   btn.classList.toggle("armed-paper", enabled && !eff);       // wants to run but paper-gated in live
   const caps = `${ap.open_auto_positions ?? 0}/${ap.max_auto_positions ?? 0} open · ${ap.auto_trades_today ?? 0}/${ap.max_auto_trades_per_day ?? 0} today`;
+  const stopped = ap.daily_loss_stop ? ` Stopped for the day: today's closed trades have lost ${Math.abs(ap.realized_today || 0).toFixed(0)}, past the ${ap.max_daily_loss_pct}% daily limit.` : "";
   const cadence = fast ? ` The hot list is rescanned every ~${secs}s while the session is open.`
     : enabled && eff ? ` The hot list and buffers are rescanned every ${mins} min, and the hot list every ~${secs}s once the session opens.` : "";
   btn.title = enabled
-    ? (eff ? `Autopilot is taking entries: ${types || "?"}, ≥ ${ap.min_reward_risk}:1, ≥ conf ${ap.min_confidence}. ${caps}.${cadence} Exits are automatic. Click to turn off.`
+    ? (eff ? `Autopilot is taking entries: ${types || "?"}, ≥ ${ap.min_reward_risk}:1, ≥ conf ${ap.min_confidence}. ${caps}.${stopped}${cadence} Exits are automatic. Click to turn off.`
       : (ap.blocked_note || "Autopilot is on but not routing (paper-only gate). Click to turn off."))
     : "Hands-off entry is OFF — you click every entry. Exits are automatic regardless. Click to turn on.";
   $("#autopilot-ctl").classList.toggle("live-warn", enabled && !eff);
@@ -76,6 +77,9 @@ function configure() {
         <span><label>New per scan</label><input type="number" id="ap-maxcycle" min="1" max="10" step="1" value="${ap.max_new_per_cycle ?? 1}"></span>
       </div>
       <div class="ap-row">
+        <span><label title="Aziz's daily maximum loss: once today's closed trades have lost this share of equity, no more entries until tomorrow. 0 = off">Stop for the day after losing % of equity</label><input type="number" id="ap-dayloss" min="0" max="50" step="0.5" value="${ap.max_daily_loss_pct ?? 2}"></span>
+      </div>
+      <div class="ap-row">
         <span><label>Day trades: seen in scans in a row</label><input type="number" id="ap-confirm" min="1" max="10" step="1" value="${ap.min_confirmations ?? 2}"></span>
         <span><label>Max % of equity in positions</label><input type="number" id="ap-gross" min="10" max="400" step="5" value="${ap.max_gross_exposure_pct ?? 100}"></span>
       </div>
@@ -105,6 +109,7 @@ function configure() {
         max_new_per_cycle: int("#ap-maxcycle"),
         min_confirmations: int("#ap-confirm"),
         max_gross_exposure_pct: parseFloat($("#ap-gross").value),
+        max_daily_loss_pct: parseFloat($("#ap-dayloss").value),
         skip_noise: $$(".ap-noise-check").filter(c => c.checked).map(c => c.value),
         require_proven: $("#ap-proven").checked,
         cooldown_after_loss: $("#ap-cooldown").checked,

@@ -105,6 +105,8 @@ class RiskCfg(_Model):
     max_symbol_pct_of_equity: float = 15.0     # everything in one stock: shares held + entries working + this trade
     min_reward_risk: float = 1.5
     round_lot: int = 1
+    midday_size_pct: float = 60.0              # a day trade sized at Mid-day (12-3 pm ET) risks this % of the usual
+                                               # (Aziz: lower your size mid-day); 100 = off
 
 
 class ScannerCfg(_Model):
@@ -174,6 +176,7 @@ class AutopilotCfg(_Model):
     min_replay_trades: int = 30
     min_replay_expectancy_r: float = 0.05
     cooldown_after_loss: bool = True
+    max_daily_loss_pct: float = 2.0       # no new entries once today's closed trades have lost this % of equity (0 = off)
     require_catalyst: bool = False
     dry_run: bool = False
 

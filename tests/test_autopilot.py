@@ -31,6 +31,9 @@ class FakeRepo:
     def recent_trades(self, limit=100):
         return list(self._closed)[:limit]
 
+    def trades_on(self, day):
+        return list(self._closed)
+
     def get_open_trade_for_symbol(self, sym):
         return {"symbol": sym} if sym in self.held else None
 
@@ -419,3 +422,50 @@ def test_autopilot_can_be_told_to_take_pairs_only():
     assert ap.trade_types == ["PAIRS"]
     _run(ap, mkplay())
     assert eng.approved == []                                                   # plays aren't pairs
+
+
+# --------------------------------------------------------------------------- #
+#  the daily loss stop (Aziz: a daily maximum loss - live to trade another day)
+# --------------------------------------------------------------------------- #
+def _closed(symbol, pl, broker="paper"):
+    return {"id": f"t_{symbol}", "symbol": symbol, "status": "CLOSED", "realized_pl": pl, "broker": broker,
+            "session_date": "2000-01-01"}
+
+
+def test_the_daily_loss_limit_stops_new_entries_for_the_session():
+    eng = FakeEngine(equity=10_000.0)                      # 2% of equity = $200
+    eng.repo._closed = [_closed("AAA", -150.0), _closed("BBB", -60.0)]
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    p = mkplay(sym="CCC")
+    assert _run(ap, p) == [] and eng.approved == []
+    st = ap.status()
+    assert st["daily_loss_stop"] and st["realized_today"] == -210.0
+    assert "daily limit" in ap.verdict(p)
+    # a loss short of the limit, or the limit switched off, changes nothing
+    eng2 = FakeEngine(equity=10_000.0)
+    eng2.repo._closed = [_closed("AAA", -150.0)]
+    ap2 = AutoPilot(eng2, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    assert len(_run(ap2, mkplay(sym="CCC"))) == 1 and not ap2.status()["daily_loss_stop"]
+    eng3 = FakeEngine(equity=10_000.0)
+    eng3.repo._closed = [_closed("AAA", -900.0)]
+    ap3 = AutoPilot(eng3, _cfg(max_daily_loss_pct=0.0), bus=SILENT)
+    assert len(_run(ap3, mkplay(sym="CCC"))) == 1
+
+
+def test_the_daily_loss_counts_only_the_venue_autopilot_trades_on():
+    eng = FakeEngine(equity=10_000.0)
+    eng._venue = "ibkr-paper"
+    eng.repo._closed = [_closed("AAA", -500.0, broker="paper"), _closed("BBB", -50.0, broker="ibkr-paper")]
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    assert len(_run(ap, mkplay(sym="CCC"))) == 1
+    assert ap.status()["realized_today"] == -50.0
+
+
+def test_the_daily_loss_limit_is_tunable_and_remembered():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    ap.configure(max_daily_loss_pct=3.5)
+    assert ap.to_runtime()["max_daily_loss_pct"] == 3.5
+    other = AutoPilot(FakeEngine(), _cfg(), bus=SILENT)
+    other.load_runtime(ap.to_runtime())
+    assert other.max_daily_loss_pct == 3.5

@@ -58,10 +58,19 @@ function recordLine(key) {
   const held = auto && auto.out_of_sample;
   const heldOk = !held || (held.trades >= 10 && held.expectancy_r > 0);
   const proven = !!auto && auto.trades >= (ap.min_replay_trades ?? 30) && auto.expectancy_r >= (ap.min_replay_expectancy_r ?? 0.05) && heldOk;
-  const ev = (rp.evidence || {})[key];
-  const weight = ev && Math.abs(ev.multiplier - 1) > 0.001 ? ` · evidence weight ×${num(ev.multiplier, 2)}` : "";
-  return `<div class="record">Replay: ${recordText(all)}${auto && auto.trades ? ` · the ones Autopilot would take: ${recordText(auto)}` : ""}${held && held.trades ? ` · held-out sessions: ${recordText(held)}` : ""}${weight}
+  return `<div class="record">Replay: ${recordText(all)}${auto && auto.trades ? ` · the ones Autopilot would take: ${recordText(auto)}` : ""}${held && held.trades ? ` · held-out sessions: ${recordText(held)}` : ""}
     <span class="badge ${proven ? "good" : "warn"}">${proven ? "proven" : "not proven"}</span></div>`;
+}
+
+/* your weight × what the record says = the weight the ranking uses */
+function weightLine(s) {
+  const ev = ((S.replay || {}).evidence || {})[s.key];
+  const mult = ev ? Number(ev.multiplier) : 1;
+  const why = !ev || !(ev.replay_trades || ev.live_trades) ? "no record yet, so ×1"
+    : Math.abs(mult - 1) < 0.001 ? `record too thin or mixed to tilt it${ev.note ? ` (${escapeHtml(ev.note)})` : ""}`
+    : mult > 1 ? `the record raises it (${ev.replay_trades} replayed${ev.live_trades ? ` + ${ev.live_trades} real` : ""} trades)`
+    : `the record lowers it (${ev.replay_trades} replayed${ev.live_trades ? ` + ${ev.live_trades} real` : ""} trades)`;
+  return `<div class="record muted">Used in ranking: your ${num(s.weight, 1)} × record ${num(mult, 2)} = <b>${num(s.weight * mult, 2)}</b> — ${why}.</div>`;
 }
 
 function replayHTML() {
@@ -99,11 +108,12 @@ function card(s) {
         <input type="checkbox" data-strat-toggle="${escapeHtml(s.key)}" ${s.enabled ? "checked" : ""}><span></span></label>
       <div><div class="meta">${s.timeframe === "INTRADAY" ? "day trade" : "swing"} · ${escapeHtml(s.kind.toLowerCase())}${s.customized ? " · changed from config" : ""}</div>
         <h4>${escapeHtml(s.title)}</h4></div>
-      <label class="weight lockable" title="Scales this setup's score — 1 is normal">weight
+      <label class="weight lockable" title="Your weight. It only moves this setup's plays up or down the list against other setups' plays — it doesn't change whether a play is found, its odds, its stop or its target. Autopilot takes the top-ranked play first. 1 = normal; switch a setup off rather than weighting it 0.1.">weight
         <input type="number" min="0.1" max="3" step="0.1" value="${s.weight}" data-strat-weight="${escapeHtml(s.key)}"></label>
     </div>
     <div class="thesis">${escapeHtml(s.thesis)}</div>
     ${recordLine(s.key)}
+    ${weightLine(s)}
   </div>`;
 }
 
@@ -117,6 +127,18 @@ function renderStrategies() {
   $("#drawer-body").innerHTML = `
     <p class="muted">${rows.filter(s => s.enabled).length} of ${rows.length} setups on. A change applies to the next scan and to Autopilot
       straight away, shows up in every open tab, and is remembered. Plays from a setup you switch off leave the board.</p>
+    <div class="strat how-box">
+      <h4>What the weight does, in plain words</h4>
+      <div class="thesis">Every play gets a <b>score</b>: what it should make per dollar risked, from the setup's odds of paying
+        and its reward against its risk. The weight multiplies that score, so it only moves a setup's plays <b>up or down the list</b>
+        against other setups' plays. It doesn't change whether a setup fires, its odds, its stop or its target, and Autopilot's gates
+        (confidence, reward:risk, noise flags, proof) never look at it. Autopilot does take the highest-scored play first, so the
+        weight decides which of two plays it takes when both qualify.</div>
+      <div class="thesis"><b>How to set it:</b> leave every weight at 1 unless you have a reason of your own. The bot already tilts each
+        setup by its record: the replay and your real trades give it an <b>evidence weight</b> between ×0.5 and ×1.5, applied on top
+        of yours, and a setup that lost money on the held-out sessions or in real trading is never raised. Each card shows the weight
+        the ranking actually uses. A setup you don't want traded should be switched off, not weighted 0.1.</div>
+    </div>
     ${replayHTML()}
     ${groups.map(([name, test]) => {
       const group = rows.filter(test);

@@ -24,7 +24,7 @@ const GLOSSARY = {
   rr: ["Reward : Risk", "Distance to the target divided by distance to the stop. 2.0 means a win pays twice what a stop-out costs."],
   qty: ["Quantity", "Shares sized so a stop-out loses about your per-trade risk budget, capped by buying power."],
   risk: ["$ Risk", "What you lose if the stop is hit: quantity × |entry − stop|, before slippage."],
-  score: ["Score", "The rank: the setup's confidence and reward:risk, times its strategy weight, plus a bump for unusual volume or a gap."],
+  score: ["Score", "The rank: what the play should make per dollar risked (its odds times the reward, less the odds it fails), times the setup's weight and the evidence weight from its record, plus a small bump for unusual volume, a gap (day trades) and enough range. Weights only reorder plays; they don't change a play."],
   mark: ["Mark", "The broker's current price for the position."],
   unrealized: ["Unrealized", "This record's open profit or loss at the current mark: (mark − entry) × its shares. The broker's figure for all the shares it holds of the stock is in the trade record."],
   order_for: ["For", "entry: opens a position for a play.\nexit: closes an open position.\nbracket stop / target: attached to an entry.\nplaced outside the app: by hand or by another program - listed, but the app never changes or cancels it."],

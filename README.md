@@ -306,9 +306,22 @@ the plays table) are the bot's instructions, not just a view:
   one view-only checkbox (remembered per browser).
 
 The **Strategies** button opens the playbook: an on/off switch and a **weight**
-(0.1–3, multiplies the setup's score) per setup, grouped into day-trade, swing
-and valuation. Switching a setup off removes its plays from the board; switching
-one on or changing a weight rescans. **Reset to config.yaml** drops your changes.
+(0.1–3) per setup, grouped into day-trade, swing and valuation. Switching a setup
+off removes its plays from the board; switching one on or changing a weight
+rescans. **Reset to config.yaml** drops your changes.
+
+**What a weight does, in plain words.** Every play gets a *score*: what it
+should make per dollar risked, from the setup's odds of paying and its reward
+against its risk. The weight multiplies that score, so it only moves a setup's
+plays up or down the list against other setups' plays. It doesn't change whether
+a setup fires, its odds, its stop or its target, and Autopilot's gates
+(confidence, reward:risk, noise flags, proof) never look at it - though Autopilot
+takes the highest-scored play first, so a weight decides which of two qualifying
+plays it takes. Leave every weight at 1 unless you have a reason of your own: the
+bot already tilts each setup by its record (the *evidence weight*, ×0.5 to ×1.5,
+from the replay and your real trades), and each card shows the weight the
+ranking actually uses. A setup you don't want traded should be switched off, not
+weighted 0.1.
 
 Filters, strategy switches, scan settings, Paper/Live and the paper platform are
 saved in `data/runtime.json`, so they survive a restart (`config.yaml` supplies
@@ -501,6 +514,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | concurrent auto trades from **one** strategy | 2 | `max_per_strategy` |
 | new auto entries **per scan** | 1 | `max_new_per_cycle` |
 | **cool off** a ticker after it stops out today | on | `cooldown_after_loss` |
+| **stop for the day** once today's closed trades have lost this % of equity | 2 % | `max_daily_loss_pct` (Aziz's daily maximum loss; 0 = off) |
 | require a catalyst / dry-run | off | `require_catalyst`, `dry_run` |
 
 The filters and the Strategies panel apply to Autopilot too, and it takes no
@@ -667,6 +681,16 @@ is tested on simulated series whose answer is known.
 * **Half-Kelly risk** — half of Kelly's mean ÷ variance of the strategy's R
   multiples (its real trades once there are 30, otherwise the replayed ones),
   capped at `risk.max_risk_per_trade_pct`. It can only lower the risk.
+* **Odds from the record** — the "estimated odds the edge pays" in a play's
+  explanation start as the setup's own read and are blended with the win rate
+  of its replayed and real trades (each real trade counting twice), 30 trades
+  of record weighing as much as the setup's read. Douglas: an edge is a
+  probability over a series of trades; Chan: measure it. Those odds drive the
+  play's expected value, and so its score and the `low_expected_value` flag.
+  The replay never uses them, so it can't flatter itself.
+* **Mid-day size** — a day trade sized between 12 and 3 pm ET risks
+  `risk.midday_size_pct` (60 %) of the usual: Aziz's thin, choppy hours, when
+  he lowers his share size. Swing trades are untouched.
 
 **Two statistical day trades** (`tos_bot/strategies/statistical.py`; on even when
 an older `config.yaml` doesn't list them):

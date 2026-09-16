@@ -56,9 +56,11 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
              peers: Optional[List[Financials]] = None, noise: Optional[NoiseSettings] = None,
              signals: Optional[SignalBook] = None, market: Optional[Mapping[str, Any]] = None,
              evidence_weights: Optional[Mapping[str, float]] = None,
-             benchmark: Optional[pd.Series] = None) -> List[Play]:
+             benchmark: Optional[pd.Series] = None,
+             records: Optional[Mapping[str, Mapping[str, Any]]] = None) -> List[Play]:
     """``evidence_weights``: each strategy's evidence multiplier (see research/weights.py). ``benchmark``:
-    the S&P 500 ETF's closes, for the market model."""
+    the S&P 500 ETF's closes, for the market model. ``records``: each strategy's pooled win rate and
+    trade count (research/weights.py pooled_odds), which calibrate the odds its plays state."""
     noise = noise or NoiseSettings()
     full_daily = with_today(daily, intraday)
     latest = intraday if intraday is not None and len(intraday) else full_daily
@@ -70,6 +72,7 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
         signals=signals.get(symbol) if signals is not None else None, market=dict(market or {}),
         benchmark=benchmark, news=signals.news_reading(symbol) if signals is not None else None,
         earnings=signals.earnings_for(symbol) if signals is not None else None,
+        records={k: dict(v) for k, v in (records or {}).items()},
     )
     plays: List[Play] = []
     for strategy in strategies:
