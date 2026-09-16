@@ -505,7 +505,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 |---|---|---|
 | master switch | off | `enabled` (UI toggle) |
 | **route real orders** | **off** | `allow_live` — *config-file only*; with it off, Autopilot is armed for **paper only** even in Live mode, and says so |
-| which trade types it may take | `["INTRADAY"]` (or `SWING`, `PAIRS`) | `trade_types` |
+| which trade types it may take | day and swing trades follow the **Intraday** / **Swing** filters over the plays, switched live; pairs have their own **Pairs** box in its settings | `trade_types` (`PAIRS`) |
 | minimum strategy confidence | 0.62 | `min_confidence` |
 | minimum reward : risk | 2.0 | `min_reward_risk` (Aziz Rule 5) |
 | concurrent open auto positions | 2 | `max_auto_positions` |
@@ -534,7 +534,7 @@ trades they remove did worse on every session and on the held-out ones. Each
 entry risks no more than `risk.max_risk_per_trade_pct`, lowered to **half-Kelly**
 when the strategy's record calls for less.
 
-**Faster loop while day-trading.** When Autopilot is armed with `INTRADAY` and
+**Faster loop while day-trading.** When Autopilot is armed with the **Intraday** filter on and
 the regular session is open, the hot list is rescanned every
 `scanner.fast_cycle_seconds` (60) between the regular cycles. The header button
 shows it (`Autopilot: day ⚡60s`).
