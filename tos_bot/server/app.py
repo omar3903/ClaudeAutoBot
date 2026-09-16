@@ -160,6 +160,10 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     def set_capital(body: dict):
         return _result(eng().set_capital((body or {}).get("amount")))
 
+    @app.post("/api/capital/split")
+    def set_capital_split(body: dict):
+        return _result(eng().set_capital_split((body or {}).get("day_pct")))
+
     # ---- quitting (same machine only) ----------------------------------- #
     @app.get("/api/quit", dependencies=LOCAL_ONLY)
     def quit_preview():

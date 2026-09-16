@@ -66,6 +66,13 @@ def load_strategy_overrides(saved: Any) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def load_day_trade_pct(saved: Any, default: float) -> float:
+    """The part of the trading capital day trades may hold, in percent (see engine/capital.py)."""
+    value = saved.get("day_pct") if isinstance(saved, dict) else None
+    ok = isinstance(value, (int, float)) and math.isfinite(value) and 0 <= value <= 100
+    return float(value) if ok else float(default)
+
+
 def load_capital(saved: Any) -> Dict[str, float]:
     """Trading capital per venue - positive, finite amounts only."""
     return {str(venue): float(amount)

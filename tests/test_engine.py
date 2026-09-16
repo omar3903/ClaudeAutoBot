@@ -100,7 +100,7 @@ def test_the_chosen_account_connects_once_the_gateway_answers(engine, port, gate
     _connect(engine, port)
     snap = engine.snapshot()
     assert engine._venue == "ibkr-paper" and engine.broker is gateway and gateway.kw["readonly"] is False
-    assert snap["data"] == {"source": "ibkr", "connected": True, "delayed": False}
+    assert snap["data"] == {"source": "ibkr", "connected": True, "delayed": False, "reason": ""}
     assert snap["account"]["equity"] == 50_000 and snap["connection"]["cls"] == "good"
     assert not engine._retry_connection(force=True)                   # already connected
     assert engine.exit_manager.quote_fn("T01").last > 0               # exits are priced off the Gateway
@@ -441,6 +441,32 @@ def test_trading_capital_shrinks_what_the_bot_uses_not_the_account(engine):
 
     assert engine.set_capital(None)["ok"] and engine.sizing_account() is engine._account
     assert engine.runtime.read()["capital"] == {}
+
+
+def test_trading_capital_is_split_between_day_trades_and_swing_trades(engine):
+    engine._refresh_account()
+    risk = engine.settings.config.risk
+    assert engine.day_trade_pct == 75.0                                    # the default: 75% day, 25% swing
+    assert not engine.set_capital_split(120)["ok"] and not engine.set_capital_split("half")["ok"]
+    assert engine.set_capital(40_000)["ok"]
+    assert engine.sizing_account(Timeframe.INTRADAY).raw["capital_room"] == 30_000
+    assert engine.sizing_account("SWING").raw["capital_room"] == 10_000
+    assert engine.sizing_account().raw["capital_room"] == 40_000           # the whole trading capital, as before
+
+    _open(engine, "MSFT", qty=90)                                          # a 9,000 swing position
+    assert engine.sizing_account("SWING").raw["capital_room"] == 1_000
+    assert engine.sizing_account("INTRADAY").raw["capital_room"] == 30_000
+    capped = size_play(_tight_play(), engine.sizing_account("SWING"), risk)
+    assert capped.notional <= 1_000 and "trading capital" in capped.caps_hit
+    split = engine.capital_state()["split"]
+    assert (split["day"]["limit"], split["swing"]["invested"], split["swing"]["available"]) == (30_000, 9_000, 1_000)
+
+    r = engine.set_capital_split(50)
+    assert r["ok"] and engine.runtime.read()["capital_split"] == {"day_pct": 50.0}
+    assert engine.sizing_account("SWING").raw["capital_room"] == 11_000
+    assert engine.set_capital(None)["ok"]                                  # the whole account, still split
+    whole = engine._account.equity
+    assert engine.sizing_account("INTRADAY").raw["capital_room"] == pytest.approx(min(whole - 9_000, whole / 2))
 
 
 def test_capital_is_checked_and_shown_in_the_accounts_own_currency(engine, monkeypatch):

@@ -5,6 +5,11 @@ holds. Position sizing then sees an account of that size, with only what's left
 of it available for new positions. The PDT rule and the live equity floor keep
 looking at the real account.
 
+It is split between day trades and swing trades: day trades may hold up to
+``day_pct`` of it at once and swing trades (pair trades among them) the rest. A
+trade that doesn't fit what's left of its share is made smaller; risk per trade
+is still measured against the whole trading capital.
+
 Account amounts are in US dollars (US stocks are sized in dollars); an account
 kept in another currency converts with ``Account.usd_per_base``.
 """
@@ -13,9 +18,12 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 from ..core.models import Account
+
+DAY, SWING = "INTRADAY", "SWING"
+DEFAULT_DAY_PCT = 75.0
 
 _CURRENCY_SIGN = {"USD": "$", "CAD": "CA$", "EUR": "€", "GBP": "£", "AUD": "A$", "HKD": "HK$"}
 
@@ -48,24 +56,59 @@ def invested_usd(acc: Optional[Account], trades: Iterable[Mapping[str, Any]]) ->
                for t in trades)
 
 
-def sizing_account(acc: Account, limit: float, invested: float) -> Account:
-    """The account shrunk to ``limit`` (account currency) for position sizing."""
-    cap = min(limit * float(acc.usd_per_base or 0.0), acc.equity)
+def kind_of(timeframe: Any) -> str:
+    """Day trade or swing trade: anything not closed the same day is a swing trade."""
+    return DAY if str(getattr(timeframe, "value", timeframe) or "").upper() == DAY else SWING
+
+
+def share_of(kind: str, day_pct: float) -> float:
+    return max(0.0, min(1.0, (day_pct if kind == DAY else 100.0 - day_pct) / 100.0))
+
+
+def invested_by_kind(acc: Optional[Account], trades: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+    return {kind: invested_usd(acc, [t for t in trades if kind_of(t.get("timeframe")) == kind]) for kind in (DAY, SWING)}
+
+
+def sizing_account(acc: Account, limit: Optional[float], invested: float, *, share: float = 1.0,
+                   invested_in_kind: float = 0.0) -> Account:
+    """The account shrunk to ``limit`` (account currency; None: the whole account) for position sizing.
+    With ``share`` under 1, only that part of it is open to this kind of trade, less what that kind holds."""
+    cap = min(limit * float(acc.usd_per_base or 0.0), acc.equity) if limit else acc.equity
     room = max(0.0, cap - invested)
+    if share < 1.0:
+        room = min(room, max(0.0, cap * share - invested_in_kind))
     return dataclasses.replace(acc, equity=round(cap, 2), cash=round(min(acc.cash, cap), 2),
                                buying_power=round(min(acc.buying_power, cap), 2),
-                               raw={**(acc.raw or {}), "capital_room": round(room, 2)})
+                               raw={**(acc.raw or {}), "capital_room": round(room, 2), "capital_share": share})
 
 
-def state(acc: Account, venue: str, label: str, limit: Optional[float], invested: float) -> Dict[str, Any]:
+def state(acc: Account, venue: str, label: str, limit: Optional[float], invested: float,
+          day_pct: float = DEFAULT_DAY_PCT, by_kind: Optional[Mapping[str, float]] = None) -> Dict[str, Any]:
     worth = in_account_currency(acc)
     rate, value = worth["usd_per_base"], worth["equity"]
     effective = min(limit, value) if limit else value
     held = invested / rate if rate else 0.0
+
+    def part(kind: str) -> Dict[str, float]:
+        size = effective * share_of(kind, day_pct)
+        used = float((by_kind or {}).get(kind, 0.0)) / rate if rate else 0.0
+        return {"pct": round(100 * share_of(kind, day_pct), 1), "limit": round(size, 2), "invested": round(used, 2),
+                "available": round(max(0.0, min(size - used, effective - held)), 2)}
     return {"venue": venue, "venue_label": label, "currency": worth["currency"], "usd_per_base": rate,
             "limit": limit, "account_value": value, "effective": round(effective, 2),
             "invested": round(held, 2), "available": round(max(0.0, effective - held), 2),
-            "clipped": bool(limit and limit > value), "fx_missing": not rate}
+            "clipped": bool(limit and limit > value), "fx_missing": not rate,
+            "split": {"day_pct": day_pct, "day": part(DAY), "swing": part(SWING)}}
+
+
+def parse_day_pct(value: Any) -> float:
+    try:
+        pct = round(float(value), 1)
+    except (TypeError, ValueError):
+        raise ValueError("Enter the day-trade share as a percentage, like 75.") from None
+    if not math.isfinite(pct) or not 0.0 <= pct <= 100.0:
+        raise ValueError("The day-trade share has to be between 0% and 100%.")
+    return pct
 
 
 def parse_amount(amount: Any) -> float:

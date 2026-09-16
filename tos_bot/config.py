@@ -95,6 +95,7 @@ class AccountCfg(_Model):
     max_day_trades_under_threshold: int = 3
     day_trade_warn_at: int = 2
     cash_account: bool = False
+    day_trade_pct: float = 75.0               # of the trading capital day trades may hold at once; swing trades get the rest
 
 
 class RiskCfg(_Model):
