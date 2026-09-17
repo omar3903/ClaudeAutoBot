@@ -134,6 +134,12 @@ class JournalOps:
             if not movers_built(review):
                 self._journal_checked, self._movers_retry_at = None, 0.0     # the journal loop adds them
         self.journal.save(review)
+        try:
+            kept = self.repo.save_shadow_trades(day, review["shadows"].get("plays") or [])
+            if kept:
+                log.info("%d plays not taken on %s followed and kept for learning", kept, day.isoformat())
+        except Exception:  # noqa: BLE001
+            log.warning("the shadow trades couldn't be kept", exc_info=True)
         self._live_stats_at = float("-inf")
         self._publish("journal.updated", session=review["session"], mistakes=len(review["mistakes"]),
                     lessons=len(review["lessons"]))

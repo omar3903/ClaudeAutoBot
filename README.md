@@ -438,6 +438,37 @@ positions** with their own **Exit** button. The app doesn't manage their exits.
 
 ---
 
+## Learning from what happened - the training set
+
+Every play the app acts on is kept with **what it looked like at the decision**, so a model can
+later learn which plays pay. `tos_bot/research/features.py` turns a play into one flat row of
+features - the setup's confidence, odds, reward:risk and geometry, its noise flags and
+confirmations, the time of day, the market regime, the stock's relative volume, gap and range,
+the volatility forecast, the price character, the abnormal-move reading, the sessions to
+earnings - always the same keys, in the same order, with `None` where a reading wasn't
+available. `FEATURE_SCHEMA` goes up when a key is added or changes meaning, so rows written
+by different versions can be told apart; changing the app elsewhere never disturbs them.
+
+Three populations are kept, because training on the trades taken alone would learn the gates'
+choices rather than the market:
+
+| rows | where | written when |
+|---|---|---|
+| **live** - the trades the app took | `trades.entry_context` (+ `submitted_at`, `mfe_at`) | at the fill, whether Autopilot or you approved the play |
+| **shadow** - the plays shown and not taken | `shadow_trades` | by the 16:15 review, which follows each day-trade play on the session's candles as if it had been taken |
+| **replay** - the simulated trades | `sim_trades` (one set of rows per run) | when a replay finishes; `held_out` marks its out-of-sample sessions |
+
+Export them as one CSV, with a `source` column, while the app keeps running:
+
+```
+python scripts/export_training_set.py            # -> data/research/training_set.csv
+```
+
+The data collection is passive: the app trades as usual and the rows accumulate. See
+`docs/AutoTradeBot-learning.pdf` for how they are meant to be used.
+
+---
+
 ## Trading capital
 
 The header shows the account's **equity, cash and buying power as the broker

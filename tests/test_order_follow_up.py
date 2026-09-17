@@ -42,9 +42,11 @@ class _Repo:
     def update_trade_risk(self, tid, **kw):
         self.t[tid].update({k: v for k, v in kw.items() if v is not None})
 
-    def open_trade(self, play, price, qty, venue, order_id, order_type="LIMIT", order_session="REGULAR"):
+    def open_trade(self, play, price, qty, venue, order_id, order_type="LIMIT", order_session="REGULAR",
+                   entry_context=None, submitted_at=None):
         tid = f"t{len(self.t) + 1}"
         self.t[tid] = _trade(id=tid, symbol=play.symbol, entry_price=price, quantity=qty, broker=venue)
+        self.t[tid]["entry_context"], self.t[tid]["submitted_at"] = entry_context, submitted_at
         return tid
 
     def close_trade(self, tid, exit_price, exit_reason=""):
@@ -174,7 +176,7 @@ def test_an_entry_cancelled_after_a_partial_fill_books_the_shares_bought():
     play = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
                 timeframe=Timeframe.INTRADAY, entry=100.0, stop=98.0, targets=[104.0])
     play.suggested_qty = 10
-    assert ex.execute_play(play, Account(account_id="DU"), plan=PLAN)["status"] == "SUBMITTED"
+    assert ex.execute_play(play, Account(account_id="DU"), plan=PLAN, context={"schema": 1})["status"] == "SUBMITTED"
     assert [(w["symbol"], w["risk"]) for w in ex.working_entries()] == [("AAA", 20.0)]
 
     broker.reports["1"] = OrderResult(order_id="1", status="CANCELED", symbol="AAA", submitted_qty=10,
@@ -182,6 +184,8 @@ def test_an_entry_cancelled_after_a_partial_fill_books_the_shares_bought():
     ex.sync_open_orders()
     assert ex.working_entries() == []
     assert [(t["symbol"], t["quantity"], t["entry_price"]) for t in repo.open_trades()] == [("AAA", 4.0, 100.02)]
+    booked = repo.open_trades()[0]
+    assert booked["entry_context"] == {"schema": 1} and booked["submitted_at"]      # the context waited for the fill
 
 
 # ---------------------------------------------------------------- after a restart

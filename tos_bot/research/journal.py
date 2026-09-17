@@ -36,6 +36,7 @@ from ..core.enums import Side, StrategyKind, Timeframe
 from ..core.models import Play
 from ..scanner.noise import LABELS as NOISE_LABELS
 from ..util import clock
+from .features import play_features
 from .replay import ReplaySettings, shadow_trade
 
 log = logging.getLogger(__name__)
@@ -218,14 +219,19 @@ def shadow_outcomes(plays: Sequence[Mapping[str, Any]], bars: Mapping[str, pd.Da
         if frame is None or play is None or seen_at is None:
             continue
         session = frame[frame.index.date == day]
-        trade = shadow_trade(play, session, seen_at, settings) if len(session) else None
+        features = play_features(row, now=seen_at)
+        trade = shadow_trade(play, session, seen_at, settings, features=features) if len(session) else None
         rows.append({"play_id": row.get("id"), "symbol": play.symbol, "side": play.side.value, "strategy": play.strategy,
-                     "seen_at": seen_at.isoformat(), "noise": play.noise, "confirmations": play.confirmations,
+                     "timeframe": play.timeframe.value, "seen_at": seen_at.isoformat(), "noise": play.noise,
+                     "confirmations": play.confirmations,
                      "score": row.get("score"), "confidence": row.get("confidence"),
                      "reward_risk": row.get("reward_risk"), "passed_checks": bool(passes(row)),
                      "filled": trade is not None, "r": trade.r if trade else None,
                      "mfe_r": trade.mfe_r if trade else None,
-                     "exit_reason": trade.exit_reason if trade else "no fill - the price had already moved away"})
+                     "entered_at": trade.entered_at if trade else None, "exited_at": trade.exited_at if trade else None,
+                     "entry": trade.entry if trade else None, "exit": trade.exit if trade else None,
+                     "exit_reason": trade.exit_reason if trade else "no fill - the price had already moved away",
+                     "features": features})
     filled = [r for r in rows if r["filled"]]
     flags = sorted({f for r in filled for f in r["noise"]})
     by_noise = {f: _compare([r for r in filled if f in r["noise"]], [r for r in filled if f not in r["noise"]])

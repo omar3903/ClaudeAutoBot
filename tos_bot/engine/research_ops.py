@@ -51,6 +51,12 @@ class ResearchOps:
             held_out_fraction=float(cfg.replay.held_out_fraction),
             news=self._news_history if cfg.signals.enabled else None, benchmark=BENCHMARK)
 
+    def _keep_sim_trades(self, data: Dict[str, Any], trades: Sequence[Any]) -> None:
+        """The replay's sink: its simulated trades go to the database, next to the real ones and
+        the shadows, so a model can learn from all three (research/dataset.py)."""
+        run_id = self.repo.save_sim_trades(str(data.get("ran_at") or ""), trades, data.get("held_out_from"))
+        log.info("replay run %s: %d simulated trades kept", run_id, len(trades))
+
     def _news_history(self, symbols: Sequence[str], first_day: dt.date) -> Dict[str, List[Dict[str, Any]]]:
         """Each stock's stored stories since ``first_day`` - as far back as the app has been reading
         the news - shaped like the signal book's, for the replay's news checks."""
