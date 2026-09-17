@@ -42,6 +42,8 @@ function render(scan) {
         ${numberField("hot_list_size", "Hot list size", "Stocks rescanned every cycle", limits.hot_list_size, s.hot_list_size)}
         ${numberField("sector_queue_size", "Buffer per sector", "Candidates lined up in each sector", limits.sector_queue_size, s.sector_queue_size)}
         ${numberField("wide_minutes", "Wide scan every (min)", `Every liquid stock's 5-minute candles, one request each, and the setups on all of them - so a stock that heats up mid-session is seen. 0 = off, else at least ${scan.wide_minimum_minutes || 15}`, limits.wide_minutes || [0, 120], s.wide_minutes ?? 30)}
+        ${numberField("movers", "Today's movers on the hot list", "After each wide scan the biggest movers of the day on volume hold hot-list slots, whatever their sector; 0 = off", limits.movers || [0, 20], s.movers ?? 10)}
+        ${numberField("yesterday_movers", "Yesterday's movers on the hot list", "The full scan gives the last session's biggest movers slots, in case they move for a second day; 0 = off", limits.yesterday_movers || [0, 20], s.yesterday_movers ?? 10)}
         ${numberField("wide_stocks", "Wide scan covers", "The hottest N of the full scan's liquid stocks; 0 = all of them (a few minutes per scan)", limits.wide_stocks || [0, 6000], s.wide_stocks ?? 0)}
       </form>
       <div class="row-gap"><button class="mini lockable" id="settings-save">Save</button></div>

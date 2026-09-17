@@ -37,7 +37,7 @@ def test_scan_settings_are_validated():
     s = ScanSettings()
     assert s.changed(premarket_time="07:05", cycle_minutes="4").as_dict() == {
         "premarket_time": "07:05", "gapper_time": "09:15", "cycle_minutes": 4, "hot_list_size": 20,
-        "sector_queue_size": 25, "wide_minutes": 30, "wide_stocks": 0}
+        "sector_queue_size": 25, "wide_minutes": 30, "wide_stocks": 0, "movers": 10, "yesterday_movers": 10}
     with pytest.raises(ValueError, match="04:00 to 09:00"):
         s.changed(premarket_time="09:15")
     assert s.changed(gapper_time="08:05").gapper_time == "08:05"
@@ -157,7 +157,7 @@ def test_settings_saved_under_the_old_limits_are_pulled_into_range():
     defaults = ScanSettings(cycle_minutes=15)                     # an old config.yaml
     assert ScanSettings.load({"cycle_minutes": 15, "hot_list_size": 30}, defaults).as_dict() == {
         "premarket_time": "08:30", "gapper_time": "09:15", "cycle_minutes": 5, "hot_list_size": 30,
-        "sector_queue_size": 25, "wide_minutes": 30, "wide_stocks": 0}
+        "sector_queue_size": 25, "wide_minutes": 30, "wide_stocks": 0, "movers": 10, "yesterday_movers": 10}
     assert ScanSettings.load({"wide_minutes": 5}, defaults).wide_minutes == 15      # too often: pulled into range
     assert ScanSettings.load(None, defaults).cycle_minutes == 5
 
@@ -197,4 +197,25 @@ def test_a_wide_look_refreshes_the_hot_list_and_keeps_the_best_of_the_rest(watch
     assert set(watchlist.hot_symbols()) == {"T7", "T8", "E4", "E1"} and set(watchlist.kept_symbols()) == {"T1", "E0"}
     assert all(c.heat is not None for c in watchlist.hot)
     assert "T7" not in [c.symbol for q in watchlist.queues.values() for c in q]   # left its queue
+
+
+def test_the_movers_hold_slots_whatever_their_sector(watchlist):
+    assert watchlist.hot_symbols() == ["T0", "T1", "E0", "E1"]
+    movers = [("T7", "Technology", 0.9, "moved +8.0% today on 3.0x volume"),
+              ("T1", "Technology", 0.8, "moved +6.0% today on 2.5x volume"),          # already hot: keeps its slot
+              ("T8", "Technology", 0.7, "moved -5.5% today on 2.0x volume"),
+              ("U1", "", 0.95, "no sector"),                                           # unknown sector: skipped
+              ("E4", "Energy", 0.6, "moved +4.0% today on 1.6x volume")]
+    decisions = watchlist.apply_movers(movers, limit=4)                                # the top four only
+    by = {d.symbol: (d.action, d.replaced) for d in decisions}
+    # no cycle has run, so the coolest names are judged by daily heat: the Energy ones go, whatever the sector cap says
+    assert by == {"T7": ("adopted", "E1"), "T8": ("adopted", "E0")} and "E4" not in by
+    assert set(watchlist.hot_symbols()) == {"T7", "T1", "T8", "T0"}
+    hot = {c.symbol: c for c in watchlist.hot}
+    assert hot["T1"].why.startswith("moved +6.0%") and hot["T7"].heat == 0.9
+    assert "T7" not in [c.symbol for q in watchlist.queues.values() for c in q]
+    assert watchlist.apply_movers([("T9", "Technology", 0.5, "late")], limit=0) == []   # off
+    all_movers = [(s, "Technology", 0.5, "m") for s in ("T7", "T1", "T8", "E1", "T9")]
+    actions = [d.action for d in watchlist.apply_movers(all_movers, limit=5)]
+    assert actions == ["adopted", "dropped"]                     # E1 takes T0's slot; then no non-mover slot is left for T9
 

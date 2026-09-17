@@ -43,9 +43,11 @@ class ScanSettings:
     sector_queue_size: int = 25
     wide_minutes: int = 30                # the wide scan's spacing; 0 = off, else 15-120
     wide_stocks: int = 0                  # the hottest N of the full scan's liquid stocks; 0 = all of them
+    movers: int = 10                      # today's biggest movers hold hot-list slots after each wide scan (0 = off)
+    yesterday_movers: int = 10            # ...and the last session's biggest movers, from the full scan (0 = off)
 
     LIMITS = {"cycle_minutes": (3, 5), "hot_list_size": (5, 50), "sector_queue_size": (10, 50),
-              "wide_minutes": (0, 120), "wide_stocks": (0, 6000)}
+              "wide_minutes": (0, 120), "wide_stocks": (0, 6000), "movers": (0, 20), "yesterday_movers": (0, 20)}
     WIDE_MIN_MINUTES = 15
 
     @property
