@@ -203,13 +203,16 @@ class AutoPilot:
         )
 
     def play_types(self) -> List[str]:
-        """The plays Autopilot takes: day trades and swing trades as the Intraday / Swing filters over the
-        plays switch them on, so ticking Swing there is all it takes. (Pairs keep their own switch in
-        Autopilot's settings.) Without the engine's filters, its own trade types."""
+        """The plays Autopilot takes: day trades and swing trades only where both the Intraday / Swing
+        filters over the plays and its own day / swing boxes allow them. So the filters can put day-trade
+        plays on the board - for the review to follow, say - while Autopilot's own box keeps it from
+        taking any. (Pairs keep their own switch in Autopilot's settings.) Without the engine's
+        filters, its own trade types."""
+        own = [t for t in self.trade_types if t != "PAIRS"]
         kinds = getattr(getattr(self.engine, "filters", None), "timeframes", None)
         if kinds:
-            return [t for t in ("INTRADAY", "SWING") if t in kinds]
-        return [t for t in self.trade_types if t != "PAIRS"]
+            return [t for t in ("INTRADAY", "SWING") if t in kinds and t in own]
+        return own
 
     def effective_trade_types(self) -> List[str]:
         return self.play_types() + (["PAIRS"] if "PAIRS" in self.trade_types else [])
@@ -227,6 +230,7 @@ class AutoPilot:
             "effective": self.enabled and self._live_ok(),
             "dry_run": self.dry_run,
             "trade_types": self.effective_trade_types(),
+            "own_trade_types": list(self.trade_types),
             "min_confidence": round(self.min_confidence, 2),
             "min_swing_confidence": round(self.min_swing_confidence, 2),
             "min_reward_risk": round(self.min_reward_risk, 2),
@@ -455,7 +459,7 @@ class AutoPilot:
             return "not a fresh proposed play"
         tf = p.timeframe.value
         if tf not in self.play_types():
-            return f"{'day' if tf == 'INTRADAY' else tf.lower()} trades are switched off in the Intraday / Swing filters"
+            return f"{'day' if tf == 'INTRADAY' else tf.lower()} trades are switched off - in the Intraday / Swing filters or in Autopilot's own boxes"
         floor = self.confidence_floor(tf)
         if p.confidence < floor:
             return f"confidence {p.confidence:.2f} < {floor:.2f}{'' if tf == 'INTRADAY' else ' (the swing floor)'}"

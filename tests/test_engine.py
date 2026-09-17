@@ -613,15 +613,18 @@ def test_the_session_review_keeps_each_trade_with_what_it_was_taken_on(engine):
     assert engine.journal_state()["days"][0]["session"] == today.isoformat()
 
 
-def test_autopilot_takes_the_trade_types_the_filters_switch_on(engine):
+def test_autopilot_takes_only_what_the_filters_and_its_own_boxes_both_allow(engine):
     ap = engine.autopilot
-    ap.enabled, ap.trade_types = True, ["INTRADAY"]                        # its own setting said day trades only
-    assert engine.set_filters(timeframes=["SWING"])["ok"]                  # the filters say swing trades only
+    ap.enabled, ap.trade_types = True, ["INTRADAY", "SWING"]              # its own boxes: day and swing
+    assert engine.set_filters(timeframes=["SWING"])["ok"]                  # the filters: swing plays only
     day = Play(symbol="MSFT", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
                timeframe=Timeframe.INTRADAY, entry=100.0, stop=95.0, targets=[110.0])
     assert ap.play_types() == ["SWING"] and ap.status()["trade_types"] == ["SWING"]
     assert "switched off" not in (ap._pre_gate(_play("AAPL"), 50_000) or "")
     assert "day trades are switched off" in ap._pre_gate(day, 50_000)
     assert not ap.day_mode_active(market_open=True)
-    assert engine.set_filters(timeframes=["INTRADAY", "SWING"])["ok"]
+    assert engine.set_filters(timeframes=["INTRADAY", "SWING"])["ok"]      # day plays on the board too...
     assert ap.play_types() == ["INTRADAY", "SWING"] and ap.day_mode_active(market_open=True)
+    ap.trade_types = ["SWING"]                                             # ...but its own box says no day trades
+    assert ap.play_types() == ["SWING"] and not ap.day_mode_active(market_open=True)
+    assert "day trades are switched off" in ap._pre_gate(day, 50_000) and ap.status()["own_trade_types"] == ["SWING"]
