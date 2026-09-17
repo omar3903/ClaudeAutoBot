@@ -697,7 +697,9 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 * **Long / Short / Intraday / Swing** and **Sectors** — what the bot scans for
   and may trade.
 * **Strategies** — switch setups on or off and weight them.
-* **◐** — light / dark theme.  **↻ Refresh** — re-pull account, positions and fills.
+* **◐** — light / dark theme.  **↻ Refresh** — re-pull account, positions and fills; when IB Gateway
+  came up after the app, it connects at once instead of waiting for the background retry. The button spins
+  until the answer is in and then says what happened, so there is no need to press it again.
 * **Trading capital** — how much of the account the bot may use.
 * **Autopilot** + **⚙** — hands-off entry and its caps.
 * **Reset paper** (simulator only) — reset the balance.

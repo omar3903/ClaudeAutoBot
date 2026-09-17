@@ -1087,7 +1087,15 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         return out
 
     def refresh_account_now(self) -> Dict[str, Any]:
-        self._refresh_account()
+        """The dashboard's Refresh. When IB Gateway came up after the app it connects right away
+        (the background retry would get there within a minute or two; this doesn't wait), then
+        reads the account, positions and orders again and says what happened - a read that
+        didn't come back is reported, not passed off as a refresh."""
+        connected_now = False
+        if not self.connections.connected:
+            self.connections.refresh()
+            connected_now = self._retry_connection(force=True)
+        read = self._refresh_account()
         self._check_arm()
         if self.executor:
             try:
@@ -1096,7 +1104,22 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
                 log.debug("order sync failed", exc_info=True)
         state = self.snapshot()
         self._publish("account.snapshot", state=state)
-        return {"ok": True, "state": state}
+        if read and connected_now:
+            return {"ok": True, "state": state, "connected": True,
+                    "note": f"Connected to {venue_label(self._venue)} and read the account."}
+        if read and not self.connections.connected:                 # the simulator answered; IBKR is still away
+            why = " ".join(self.connections.blockers) or "the app keeps trying by itself."
+            return {"ok": True, "state": state, "connected": False, "warn": True,
+                    "note": f"Re-read {venue_label(self._venue)}. IB Gateway isn't reachable yet: {why}"}
+        if read:
+            return {"ok": True, "state": state, "connected": True, "note": "Account, positions and orders re-read."}
+        if self.connections.connected:
+            reason = "IBKR didn't answer in time - keeping the last snapshot; the app tries again by itself."
+        elif self.connections.blockers:
+            reason = "IB Gateway isn't reachable yet: " + " ".join(self.connections.blockers)
+        else:
+            reason = "Not connected yet - the app keeps trying by itself."
+        return {"ok": False, "state": state, "reason": reason, "connected": self.connections.connected}
 
     # ------------------------------------------------------------------ #
     #  Plays and positions                                               #

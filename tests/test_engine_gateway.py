@@ -50,3 +50,32 @@ def test_positions_arent_trusted_right_after_the_broker_reconnects(engine):
     engine.broker.connected_since = time.monotonic()                     # it has only just come back
     engine._refresh_account()
     assert all(engine._reconcile_open_trades() == [] for _ in range(3)) and engine.repo.get_trade(tid)
+
+
+def test_refresh_connects_at_once_when_the_gateway_came_up_after_the_app(engine, port, gateway, monkeypatch):
+    heard = []
+    monkeypatch.setattr(engine_module, "BUS", SimpleNamespace(publish=lambda topic, **p: heard.append(topic)))
+    out = engine.refresh_account_now()                        # the simulator answers, and IBKR's absence is said
+    assert out["ok"] and out["warn"] and not out["connected"] and "isn't reachable yet" in out["note"]
+
+    port["open"] = True                                                   # the user starts IB Gateway...
+    engine._connect_retry_at = time.monotonic() + 60.0                    # ...and the background retry is a minute away
+    out = engine.refresh_account_now()
+    assert out["ok"] and out["connected"] and out["note"].startswith("Connected to")
+    assert "broker.connected" in heard and engine.connections.connected
+    assert engine.refresh_account_now()["note"] == "Account, positions and orders re-read."
+
+
+def test_refresh_says_when_ibkr_doesnt_answer(engine, port, gateway, monkeypatch):
+    from tos_bot.brokers.base import BrokerError
+
+    _connect(engine, port)
+    assert engine.refresh_account_now()["ok"]
+
+    def slow():
+        raise BrokerError("IBKR didn't answer for the account values in time (TimeoutError)")
+
+    monkeypatch.setattr(gateway, "get_account", slow)
+    out = engine.refresh_account_now()
+    assert not out["ok"] and out["connected"] and "didn't answer" in out["reason"]
+    assert out["state"]["account"] is not None                            # the last snapshot is kept

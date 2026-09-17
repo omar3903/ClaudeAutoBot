@@ -194,12 +194,36 @@ function resetPaper() {
   });
 }
 
+/* The Refresh button spins and stays disabled until the server answers (connecting to a Gateway that
+   just came up can take a few seconds), then says what happened - so pressing it again does nothing
+   and there is no need to. */
+let refreshing = false;
 async function refreshAccount(btn) {
-  busy(btn, "↻ …");
-  const r = await post("/api/account/refresh");
+  if (refreshing) return;
+  refreshing = true;
+  const started = Date.now();
+  const label = btn.innerHTML;
+  btn.disabled = true;
+  btn.classList.add("spinning");
+  btn.innerHTML = `<span class="spin">&#8635;</span> ${S.state.connected ? "Refreshing…" : "Connecting…"}`;
+  let r;
+  try {
+    r = await post("/api/account/refresh");
+  } catch (e) {
+    r = { ok: false, reason: "The app didn't answer - is it still running?" };
+  }
   if (r.state) setState(r.state);
   loadOpen();
-  setTimeout(() => unbusy(btn), 800);
+  const verdict = r.ok ? (r.warn ? "warn" : "good") : "bad";
+  setTimeout(() => {                                  // long enough to be seen, even on a fast answer
+    btn.innerHTML = label;
+    btn.disabled = false;
+    btn.classList.remove("spinning");
+    btn.classList.add(`flash-${verdict}`);
+    setTimeout(() => btn.classList.remove("flash-good", "flash-warn", "flash-bad"), 1500);
+    refreshing = false;
+  }, Math.max(0, 700 - (Date.now() - started)));
+  toast(r.ok ? (r.note || "Refreshed") : (r.reason || r.detail || "Refresh failed"), verdict);
 }
 
 /* ---------- theme ---------- */
