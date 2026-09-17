@@ -15,6 +15,7 @@ exit is never sent twice.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import time
 from dataclasses import dataclass
@@ -44,6 +45,8 @@ class _Pending:
     unseen: int = 0                 # polls in a row the broker didn't know the order
     partial: bool = False           # an exit for part of the position (the scale-out) - the record stays open
     after_fill: Optional[Dict[str, float]] = None   # the stop and target the rest gets once the part is off
+    context: Optional[Dict[str, Any]] = None        # an entry's features at the decision (research/features.py)
+    submitted_at: Optional[dt.datetime] = None
 
 
 class Executor:
@@ -238,7 +241,10 @@ class Executor:
 
     # ------------------------------------------------------------------ #
     def execute_play(self, play: Play, account: Account,
-                     plan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                     plan: Optional[Dict[str, Any]] = None,
+                     context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """``context``: what the play looked like at the decision (research/features.py), kept on
+        the trade record for learning."""
         qty = int(play.suggested_qty or 0)
         if qty <= 0:
             return {"ok": False, "reason": "position size is zero (risk budget / buying power)"}
@@ -252,6 +258,7 @@ class Executor:
         native_bracket = plan.get("bracket_mode") == "native" and (
             self.broker.supports_bracket_native or self.broker.paper
         )
+        submitted_at = dt.datetime.now(dt.timezone.utc)
         try:
             if native_bracket:
                 res = self.broker.place_bracket(entry, None if self.scale_out else play.primary_target, play.stop)
@@ -270,7 +277,8 @@ class Executor:
         # immediate fill (paper / marketable) -> open the trade now
         if res.status in ("FILLED",) or res.filled_qty >= qty > 0:
             fill_price = res.avg_fill_price or (res.fills[-1].price if res.fills else play.entry)
-            tid = self._open_trade(play, fill_price, res.filled_qty or qty, res.order_id, ot, osess)
+            tid = self._open_trade(play, fill_price, res.filled_qty or qty, res.order_id, ot, osess,
+                                   context=context, submitted_at=submitted_at)
             return {"ok": True, "status": "FILLED", "trade_id": tid,
                     "fill_price": round(fill_price, 4), "qty": res.filled_qty or qty,
                     "order_id": res.order_id, "order_type": ot, "order_session": osess,
@@ -279,6 +287,7 @@ class Executor:
         # otherwise track it; sync_open_orders() will pick up the fill
         p = _Pending(res.order_id, play, "entry", qty=qty)
         p.order_type, p.order_session = ot, osess
+        p.context, p.submitted_at = context, submitted_at
         self._pending[res.order_id] = p
         return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id,
                 "order_type": ot, "order_session": osess,
@@ -424,7 +433,7 @@ class Executor:
         px = res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0)
         if p.kind == "entry":
             self._open_trade(p.play, px, res.filled_qty or p.qty, res.order_id,
-                             p.order_type, p.order_session)
+                             p.order_type, p.order_session, context=p.context, submitted_at=p.submitted_at)
         else:
             self._book_exit(res.symbol, p.trade_id, float(px), res.filled_qty or p.qty, p.reason or "order",
                             p.partial, p.after_fill)
@@ -437,7 +446,8 @@ class Executor:
         if p.kind == "entry":
             if filled > 0:
                 px = res.avg_fill_price or (res.fills[-1].price if res.fills else p.play.entry)
-                self._open_trade(p.play, px, filled, res.order_id, p.order_type, p.order_session)
+                self._open_trade(p.play, px, filled, res.order_id, p.order_type, p.order_session,
+                                 context=p.context, submitted_at=p.submitted_at)
             else:
                 p.play.status = PlayStatus.CANCELED if res.status in ("CANCELED", "EXPIRED") else PlayStatus.ERROR
         if res.status == "REJECTED":
@@ -477,9 +487,12 @@ class Executor:
 
     # ------------------------------------------------------------------ #
     def _open_trade(self, play: Play, price: float, qty: float, order_id: str,
-                    order_type: str = "LIMIT", order_session: str = "REGULAR") -> str:
+                    order_type: str = "LIMIT", order_session: str = "REGULAR",
+                    context: Optional[Dict[str, Any]] = None,
+                    submitted_at: Optional[dt.datetime] = None) -> str:
         tid = self.repo.open_trade(play, float(price), float(qty), self.venue, order_id,
-                                   order_type=order_type, order_session=order_session)
+                                   order_type=order_type, order_session=order_session,
+                                   entry_context=context, submitted_at=submitted_at)
         self._open_by_symbol[play.symbol] = tid
         play.status = PlayStatus.FILLED
         play.trade_id = tid

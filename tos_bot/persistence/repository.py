@@ -6,12 +6,13 @@ import datetime as dt
 import logging
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, delete, func, insert, or_, select
 
 from ..core.models import Account, Play
 from ..util import clock
 from .db import session_scope
-from .models_orm import AccountSnapshot, DailyReviewLog, Fill, OrderAudit, PairTradeLog, PlayLog, ScanRun, Trade
+from .models_orm import (AccountSnapshot, DailyReviewLog, Fill, OrderAudit, PairTradeLog, PlayLog, ScanRun,
+                         ShadowTradeLog, SimTradeLog, Trade)
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +97,9 @@ def trade_to_dict(t: Trade) -> Dict[str, Any]:
         "entry_time": t.entry_time.isoformat() if t.entry_time else None,
         "order_type": getattr(t, "order_type", None),
         "order_session": getattr(t, "order_session", None),
+        "submitted_at": t.submitted_at.isoformat() if getattr(t, "submitted_at", None) else None,
+        "entry_context": getattr(t, "entry_context", None),
+        "mfe_at": t.mfe_at.isoformat() if getattr(t, "mfe_at", None) else None,
         "stop_price": _f(t.stop_price), "target_price": _f(t.target_price),
         "initial_stop_price": _f(getattr(t, "initial_stop_price", None)),
         "initial_target_price": _f(getattr(t, "initial_target_price", None)),
@@ -127,6 +131,7 @@ def play_to_dict(p: PlayLog) -> Dict[str, Any]:
         "notional": _f(p.notional), "rationale": p.rationale,
         "explanation": p.explanation, "evidence": p.evidence, "tags": p.tags,
         "noise": list(getattr(p, "noise", None) or []), "confirmations": int(getattr(p, "confirmations", None) or 1),
+        "probability": _f(getattr(p, "probability", None)),
         "status": p.status,
     }
 
@@ -173,7 +178,10 @@ class Repository:
         self, play: Play, fill_price: float, fill_qty: float, broker: str,
         broker_order_id: str = "", commission: float = 0.0,
         order_type: str = "LIMIT", order_session: str = "REGULAR",
+        entry_context: Optional[Dict[str, Any]] = None, submitted_at: Optional[dt.datetime] = None,
     ) -> str:
+        """``entry_context``: the play's features at the fill (research/features.py), the row a
+        model learns from; ``submitted_at``: when the entry order went out."""
         tid = f"trd_{play.id.split('_', 1)[-1]}"
         now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
@@ -197,6 +205,7 @@ class Repository:
                 broker=broker, status="OPEN", quantity=fill_qty, initial_quantity=fill_qty,
                 entry_price=fill_price,
                 entry_time=now, order_type=order_type, order_session=order_session,
+                submitted_at=_naive(submitted_at), entry_context=entry_context,
                 stop_price=None if pair_id else play.stop,
                 target_price=None if pair_id else play.primary_target,
                 target2_price=None if (pair_id or len(play.targets) < 2) else float(play.targets[1]),
@@ -236,6 +245,8 @@ class Repository:
             if mae is not None:
                 t.mae = mae
             if mfe is not None:
+                if t.mfe is None or float(mfe) > float(t.mfe):
+                    t.mfe_at = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
                 t.mfe = mfe
             if managed_exit is not None:
                 t.managed_exit = managed_exit
@@ -492,6 +503,77 @@ class Repository:
                              .order_by(PlayLog.created_at).limit(limit)).scalars().all()
             return [play_to_dict(r) for r in rows]
 
+    # -------------------------------------------------------------- #
+    #  What a model learns from (research/dataset.py)               #
+    # -------------------------------------------------------------- #
+    def save_sim_trades(self, ran_at: str, trades, split: Optional[Dict[str, Optional[str]]] = None) -> str:
+        """Keep one replay run's simulated trades, replacing the same run's rows if it is saved
+        again. ``trades``: research/replay.py SimTrades. Returns the run id."""
+        from ..research.replay import held_out
+
+        run_id = "rpl_" + "".join(ch for ch in ran_at[:19] if ch.isdigit())
+        stamp = _naive(dt.datetime.fromisoformat(ran_at)) if ran_at else None
+        rows = [{
+            "run_id": run_id, "ran_at": stamp, "strategy": t.strategy, "symbol": t.symbol, "side": t.side,
+            "timeframe": t.timeframe, "entered_at": _naive_iso(t.entered_at), "exited_at": _naive_iso(t.exited_at),
+            "entry_price": t.entry, "exit_price": t.exit, "r": t.r, "exit_reason": t.exit_reason, "noise": list(t.noise),
+            "confirmed": bool(t.confirmed), "mfe_r": t.mfe_r, "scaled": bool(t.scaled),
+            "held_out": held_out(t, split), "features": dict(t.features or {}),
+            "feature_schema": int((t.features or {}).get("schema", 0) or 0),
+        } for t in trades]
+        with session_scope() as s:
+            s.execute(delete(SimTradeLog).where(SimTradeLog.run_id == run_id))
+            for start in range(0, len(rows), 500):
+                s.execute(insert(SimTradeLog), rows[start:start + 500])
+        return run_id
+
+    def sim_runs(self) -> List[Dict[str, Any]]:
+        """Each replay run kept, newest first, with its row count."""
+        with session_scope() as s:
+            rows = s.execute(select(SimTradeLog.run_id, func.max(SimTradeLog.ran_at), func.count())
+                             .group_by(SimTradeLog.run_id).order_by(func.max(SimTradeLog.ran_at).desc())).all()
+            return [{"run_id": r[0], "ran_at": r[1].isoformat() if r[1] else None, "trades": int(r[2])} for r in rows]
+
+    def latest_sim_run(self) -> Optional[str]:
+        runs = self.sim_runs()
+        return runs[0]["run_id"] if runs else None
+
+    def sim_trades(self, run_id: Optional[str] = None, limit: int = 200000) -> List[Dict[str, Any]]:
+        with session_scope() as s:
+            q = select(SimTradeLog)
+            if run_id:
+                q = q.where(SimTradeLog.run_id == run_id)
+            rows = s.execute(q.order_by(SimTradeLog.exited_at).limit(limit)).scalars().all()
+            return [sim_to_dict(r) for r in rows]
+
+    def save_shadow_trades(self, day: dt.date, shadows: List[Dict[str, Any]]) -> int:
+        """Keep the review's shadow trades (research/journal.py shadow_outcomes rows) for ``day``."""
+        n = 0
+        with session_scope() as s:
+            for row in shadows:
+                if not row.get("play_id"):
+                    continue
+                feats = dict(row.get("features") or {})
+                s.merge(ShadowTradeLog(
+                    play_id=row["play_id"], session_date=day, symbol=row["symbol"], strategy=row["strategy"],
+                    side=row["side"], timeframe=row.get("timeframe") or "INTRADAY",
+                    seen_at=_naive_iso(row.get("seen_at")), passed_checks=bool(row.get("passed_checks")),
+                    filled=bool(row.get("filled")), entered_at=_naive_iso(row.get("entered_at")),
+                    exited_at=_naive_iso(row.get("exited_at")), entry_price=row.get("entry"), exit_price=row.get("exit"),
+                    r=row.get("r"), mfe_r=row.get("mfe_r"), exit_reason=str(row.get("exit_reason") or "")[:64],
+                    noise=list(row.get("noise") or []), confirmations=int(row.get("confirmations") or 1),
+                    features=feats, feature_schema=int(feats.get("schema", 0) or 0)))
+                n += 1
+        return n
+
+    def shadow_trades(self, day: Optional[dt.date] = None, limit: int = 200000) -> List[Dict[str, Any]]:
+        with session_scope() as s:
+            q = select(ShadowTradeLog)
+            if day is not None:
+                q = q.where(ShadowTradeLog.session_date == day)
+            rows = s.execute(q.order_by(ShadowTradeLog.seen_at).limit(limit)).scalars().all()
+            return [shadow_to_dict(r) for r in rows]
+
     def save_review(self, day: dt.date, review: Dict[str, Any]) -> None:
         stats = review.get("day") or {}
         with session_scope() as s:
@@ -618,8 +700,41 @@ def _play_row(p: Play) -> PlayLog:
         suggested_qty=p.suggested_qty, dollar_risk=p.dollar_risk, notional=p.notional,
         rationale=p.rationale[:400], explanation=p.explanation, evidence=p.evidence,
         tags=p.tags, noise=list(p.noise), confirmations=int(p.confirmations),
+        probability=float(getattr(p, "probability", 0.5) or 0.0),
         status=p.status.value if hasattr(p.status, "value") else str(p.status),
     )
+
+
+def sim_to_dict(t: SimTradeLog) -> Dict[str, Any]:
+    return {"id": t.id, "run_id": t.run_id, "ran_at": t.ran_at.isoformat() if t.ran_at else None,
+            "strategy": t.strategy, "symbol": t.symbol, "side": t.side, "timeframe": t.timeframe,
+            "entered_at": t.entered_at.isoformat() if t.entered_at else None,
+            "exited_at": t.exited_at.isoformat() if t.exited_at else None,
+            "entry": _f(t.entry_price), "exit": _f(t.exit_price), "r": _f(t.r), "exit_reason": t.exit_reason,
+            "noise": list(t.noise or []), "confirmed": bool(t.confirmed), "mfe_r": _f(t.mfe_r),
+            "scaled": bool(t.scaled), "held_out": bool(t.held_out), "features": t.features or {},
+            "schema": int(t.feature_schema or 0)}
+
+
+def shadow_to_dict(t: ShadowTradeLog) -> Dict[str, Any]:
+    return {"play_id": t.play_id, "session_date": t.session_date.isoformat() if t.session_date else None,
+            "symbol": t.symbol, "strategy": t.strategy, "side": t.side, "timeframe": t.timeframe,
+            "seen_at": t.seen_at.isoformat() if t.seen_at else None, "passed_checks": bool(t.passed_checks),
+            "filled": bool(t.filled), "entered_at": t.entered_at.isoformat() if t.entered_at else None,
+            "exited_at": t.exited_at.isoformat() if t.exited_at else None, "entry": _f(t.entry_price), "exit": _f(t.exit_price),
+            "r": _f(t.r), "mfe_r": _f(t.mfe_r), "exit_reason": t.exit_reason, "noise": list(t.noise or []),
+            "confirmations": int(t.confirmations or 1), "features": t.features or {}, "schema": int(t.feature_schema or 0)}
+
+
+def _naive_iso(stamp: Any) -> Optional[dt.datetime]:
+    """An ISO string (any zone) as the naive UTC the database keeps."""
+    if not stamp:
+        return None
+    try:
+        d = dt.datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return None
+    return _naive(d)
 
 
 def _naive(d: Optional[dt.datetime]) -> Optional[dt.datetime]:

@@ -22,6 +22,7 @@ from ..data.fundamentals import Financials
 from ..data.market_data import quote_from_price
 from ..strategies.base import Strategy, StrategyContext
 from ..signals.book import SignalBook
+from ..research.features import activity_summary
 from .filters import expected_r, rank_score
 from ..signals.calendar import next_report, sessions_until
 from .noise import NoiseSettings, context_flags
@@ -93,6 +94,8 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
                 if signals is not None:
                     signals.apply(p)
                 p.evidence.setdefault("spark", ctx.spark())
+                if activity is not None:
+                    p.evidence.setdefault("activity", activity_summary(activity))
                 plays.append(p)
         except Exception as e:  # noqa: BLE001
             log.debug("%s %s failed: %s", symbol, strategy.key, e)

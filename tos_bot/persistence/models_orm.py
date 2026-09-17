@@ -11,6 +11,10 @@ order_audit        raw order request + broker response
 insider_trades     open-market insider purchases and sales, from SEC Form 4 filings
 filings_read       the SEC filings already read, so none is fetched twice
 news_items         company headlines and 8-K filings, with their sentiment
+daily_reviews      the 16:15 review of each session
+pair_trades        a pair trade's two legs and its z-score model
+sim_trades         the replay's simulated trades, with the features at the signal (research/dataset.py)
+shadow_trades      the plays shown and not taken, followed to their outcome by the review
 """
 
 from __future__ import annotations
@@ -79,6 +83,7 @@ class PlayLog(Base):
     #: the noise flags and the scans in a row that found it, when it was recorded (see scanner/noise.py)
     noise: Mapped[Optional[list]] = mapped_column(sa.JSON, nullable=True)
     confirmations: Mapped[Optional[int]] = mapped_column(sa.Integer, nullable=True, default=1)
+    probability: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)   # the odds the play stated
     status: Mapped[str] = mapped_column(sa.String(16), default="PROPOSED", index=True)
     decided_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
     decided_by: Mapped[str] = mapped_column(sa.String(32), default="")
@@ -111,6 +116,10 @@ class Trade(Base):
     entry_time: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, index=True)
     order_type: Mapped[str] = mapped_column(sa.String(16), default="LIMIT")
     order_session: Mapped[str] = mapped_column(sa.String(12), default="REGULAR")  # REGULAR / EXTENDED
+    #: when the entry order was sent (the fill is entry_time); what the play looked like at the fill
+    #: (research/features.py) - the row a model learns from, next to the outcome below
+    submitted_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
+    entry_context: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     #: working protective levels - the exit manager moves these
     stop_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
     target_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
@@ -136,6 +145,7 @@ class Trade(Base):
     r_multiple: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
     mae: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)   # max adverse excursion
     mfe: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)   # max favourable excursion
+    mfe_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)   # when the MFE was set
     is_day_trade: Mapped[bool] = mapped_column(sa.Boolean, default=False, index=True)
     session_date: Mapped[Optional[dt.date]] = mapped_column(sa.Date, nullable=True, index=True)
     #: the pair trade this is one leg of (see pairs/desk.py); its exits belong to the pair desk
@@ -302,3 +312,61 @@ class PairTradeLog(Base):
     model: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     notes: Mapped[str] = mapped_column(sa.Text, default="")
     created_at: Mapped[dt.datetime] = mapped_column(sa.DateTime, default=_utcnow, index=True)
+
+
+class SimTradeLog(Base):
+    """A simulated trade of one replay run (research/runner.py), kept so a model can learn from
+    it: the outcome next to the features the play had at the signal."""
+
+    __tablename__ = "sim_trades"
+
+    id: Mapped[int] = mapped_column(sa.Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(sa.String(32), index=True)
+    ran_at: Mapped[dt.datetime] = mapped_column(sa.DateTime, index=True)
+    strategy: Mapped[str] = mapped_column(sa.String(48), index=True)
+    symbol: Mapped[str] = mapped_column(sa.String(16), index=True)
+    side: Mapped[str] = mapped_column(sa.String(8))
+    timeframe: Mapped[str] = mapped_column(sa.String(16))
+    entered_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
+    exited_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
+    entry_price: Mapped[float] = mapped_column(MONEY, default=0)
+    exit_price: Mapped[float] = mapped_column(MONEY, default=0)
+    r: Mapped[float] = mapped_column(sa.Float, default=0.0)
+    exit_reason: Mapped[str] = mapped_column(sa.String(24), default="")
+    noise: Mapped[Optional[list]] = mapped_column(sa.JSON, nullable=True)
+    confirmed: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    mfe_r: Mapped[float] = mapped_column(sa.Float, default=0.0)
+    scaled: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    held_out: Mapped[bool] = mapped_column(sa.Boolean, default=False)      # in the out-of-sample sessions
+    features: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
+    feature_schema: Mapped[int] = mapped_column(sa.Integer, default=0)   # research/features.py FEATURE_SCHEMA
+
+
+class ShadowTradeLog(Base):
+    """A play the app showed and didn't take, followed on the session's candles as if it had been
+    (research/journal.py shadow_outcomes) - the rows that keep a model honest about what the
+    gates turned away."""
+
+    __tablename__ = "shadow_trades"
+
+    play_id: Mapped[str] = mapped_column(sa.String(32), primary_key=True)
+    session_date: Mapped[dt.date] = mapped_column(sa.Date, index=True)
+    symbol: Mapped[str] = mapped_column(sa.String(16), index=True)
+    strategy: Mapped[str] = mapped_column(sa.String(48), index=True)
+    side: Mapped[str] = mapped_column(sa.String(8))
+    timeframe: Mapped[str] = mapped_column(sa.String(16), default="INTRADAY")
+    seen_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
+    passed_checks: Mapped[bool] = mapped_column(sa.Boolean, default=False)   # Autopilot's checks, that is
+    filled: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    entered_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
+    exited_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
+    entry_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
+    exit_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
+    r: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
+    mfe_r: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
+    exit_reason: Mapped[str] = mapped_column(sa.String(64), default="")
+    noise: Mapped[Optional[list]] = mapped_column(sa.JSON, nullable=True)
+    confirmations: Mapped[int] = mapped_column(sa.Integer, default=1)
+    features: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
+    feature_schema: Mapped[int] = mapped_column(sa.Integer, default=0)
+    created_at: Mapped[dt.datetime] = mapped_column(sa.DateTime, default=_utcnow)

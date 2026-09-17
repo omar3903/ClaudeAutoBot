@@ -52,6 +52,7 @@ from ..persistence.db import init_db
 from ..persistence.repository import Repository
 from ..risk.pdt_guard import PdtGuard
 from ..risk.position_sizing import size_play
+from ..research.features import play_features
 from ..research.history import IntradayHistory
 from ..research.runner import ReplayRunner
 from ..research.journal import Journal
@@ -162,7 +163,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         self.position_check = PositionCheck()
         self.replay = ReplayRunner(data_dir / "research" / "replay.json",
                                    IntradayHistory(data_dir / "research" / "intraday"),
-                                   workers=self.settings.config.replay.workers or None)
+                                   workers=self.settings.config.replay.workers or None,
+                                   sink=self._keep_sim_trades)
         #: calm or turbulent, from SPY's daily returns (Hamilton's Markov switching model)
         self.regime = MarketRegime(data_dir / "research" / "benchmark_spy.pkl")
         #: when companies reported earnings (SEC 8-K item 2.02), for the replay
@@ -1178,11 +1180,13 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
                 return {"ok": False, "reason": "; ".join(pre["reasons"]) or "not executable"}
 
             p.status = PlayStatus.ACCEPTED
-            p.evidence["at_entry"] = self._entry_context(p, operator)
+            p.evidence["at_entry"] = at_entry = self._entry_context(p, operator)
+            context = play_features(p, now=clock.now_ny(), market=self.regime.context(), at_entry=at_entry,
+                                    by=operator)
             self.repo.record_play(p)
             self.repo.set_play_status(p.id, p.status.value, operator)
             try:
-                out = self.executor.execute_play(p, self._account, plan=pre["order_plan"])
+                out = self.executor.execute_play(p, self._account, plan=pre["order_plan"], context=context)
             except Exception as e:  # noqa: BLE001
                 p.status = PlayStatus.ERROR
                 self.repo.set_play_status(p.id, p.status.value, operator)

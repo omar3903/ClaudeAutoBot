@@ -50,6 +50,8 @@ from ..core.models import Play
 from ..data.market_data import quote_from_price
 from ..scanner.evaluator import with_today
 from ..scanner.filters import expected_r
+from ..scanner.heat import daily_metrics, intraday_metrics
+from .features import play_features
 from ..scanner.noise import CHECKS, LEARNABLE_CHECKS, NoiseSettings, context_flags
 from ..strategies.base import Strategy, StrategyContext
 from ..util import clock
@@ -108,6 +110,7 @@ class SimTrade:
     confirmed: bool = True                # the setup had also shown up on the bar before
     mfe_r: float = 0.0                    # the best it got, in R, before it closed
     scaled: bool = False                  # part of it was taken off at the first target
+    features: Dict[str, Any] = field(default_factory=dict)   # the play at the signal (research/features.py)
 
 
 @dataclass
@@ -125,6 +128,7 @@ class _Position:
     fraction: float = 1.0                 # of the position still on
     banked_r: float = 0.0                 # in R of the whole position, from the part taken off
     scaled: bool = False
+    features: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def sign(self) -> int:
@@ -182,10 +186,14 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
                               benchmark=benchmark.closes_at(closed_at) if benchmark is not None else None,
                               shared=shared)
         signals_now = _signals(strategies, ctx, noise)
+        activity = intraday_metrics(symbol, window, prior_daily) if signals_now else None
         for strategy, play, flags in signals_now:
             if strategy.key not in open_positions:
-                position = _enter(strategy.key, play, flags, (strategy.key, play.side) in seen_before, next_at,
-                                  float(next_bar["open"]), settings.max_entry_drift_atr * ctx.intraday_atr, settings)
+                confirmed = (strategy.key, play.side) in seen_before
+                position = _enter(strategy.key, play, flags, confirmed, next_at,
+                                  float(next_bar["open"]), settings.max_entry_drift_atr * ctx.intraday_atr, settings,
+                                  features=play_features(play, now=ctx.now, market=ctx.market, noise=flags,
+                                                         confirmations=2 if confirmed else 1, activity=activity))
                 if position is not None:
                     open_positions[strategy.key] = position
         seen_before = {(s.key, p.side) for s, p, _ in signals_now}
@@ -222,10 +230,14 @@ def replay_swing(strategies: Sequence[Strategy], symbol: str, daily: pd.DataFram
                               quote=quote_from_price(symbol, float(history["close"].iloc[-1])),
                               now=close_at.to_pydatetime(), market=regime(market, next_at.date()),
                               news=news_at(stories, close_at), benchmark=benchmark.closes_at(close_at, whole_day=True))
-        for strategy, play, flags in _signals(swing, ctx, noise) if swing else []:
+        signals_now = _signals(swing, ctx, noise) if swing else []
+        activity = daily_metrics(symbol, history) if signals_now else None
+        for strategy, play, flags in signals_now:
             if strategy.key not in open_positions:
                 position = _enter(strategy.key, play, flags, True, next_at, float(next_bar["open"]),
-                                  settings.max_entry_drift_daily_atr * ctx.daily_atr, settings)
+                                  settings.max_entry_drift_daily_atr * ctx.daily_atr, settings,
+                                  features=play_features(play, now=ctx.now, market=ctx.market, noise=flags,
+                                                         confirmations=1, activity=activity))
                 if position is not None:
                     open_positions[strategy.key] = position
         for key, position in list(open_positions.items()):
@@ -239,7 +251,8 @@ def replay_swing(strategies: Sequence[Strategy], symbol: str, daily: pd.DataFram
 
 # ---------------------------------------------------------------- plays that weren't taken
 def shadow_trade(play: Play, session: pd.DataFrame, seen_at: pd.Timestamp,
-                 settings: ReplaySettings = ReplaySettings()) -> Optional[SimTrade]:
+                 settings: ReplaySettings = ReplaySettings(),
+                 features: Optional[Mapping[str, Any]] = None) -> Optional[SimTrade]:
     """How a day-trade play seen at ``seen_at`` would have gone if it had been taken: filled
     at the open of the next 5-minute bar, then managed like any other trade on the rest of
     ``session``. None when the price had already run away from the entry, or no bars follow."""
@@ -251,7 +264,7 @@ def shadow_trade(play: Play, session: pd.DataFrame, seen_at: pd.Timestamp,
     if len(after) < 2:
         return None
     position = _enter(play.strategy, play, list(play.noise), play.confirmations > 1, after.index[0],
-                      float(after["open"].iloc[0]), 0.0, settings)
+                      float(after["open"].iloc[0]), 0.0, settings, features=features)
     if position is None:
         return None
     for at, bar in after.iterrows():
@@ -354,7 +367,8 @@ def _signals(strategies: Sequence[Strategy], ctx: StrategyContext,
             continue
         for play in plays[:1]:
             flags = context_flags(play, ctx, strategy.style, noise)
-            if expected_r(play, ctx.daily_atr) < noise.min_expected_r:
+            play.evidence["expected_r"] = round(expected_r(play, ctx.daily_atr), 3)
+            if play.evidence["expected_r"] < noise.min_expected_r:
                 flags.append("low_expected_value")
             out.append((strategy, play, flags))
     if len({play.side for _, play, _ in out}) > 1:
@@ -364,7 +378,8 @@ def _signals(strategies: Sequence[Strategy], ctx: StrategyContext,
 
 
 def _enter(key: str, play: Play, flags: List[str], confirmed: bool, at: pd.Timestamp, open_price: float,
-           max_drift: float, settings: ReplaySettings) -> Optional[_Position]:
+           max_drift: float, settings: ReplaySettings,
+           features: Optional[Mapping[str, Any]] = None) -> Optional[_Position]:
     limit = max_drift if max_drift > 0 else 0.5 * abs(play.entry - play.stop)   # no ATR yet: half the stop distance
     if abs(open_price - play.entry) > limit:
         return None                                  # ran away before it could be filled
@@ -373,7 +388,8 @@ def _enter(key: str, play: Play, flags: List[str], confirmed: bool, at: pd.Times
     risk = (fill - play.stop) * sign
     if risk <= 0:
         return None                                  # opened through the stop
-    return _Position(key, play, fill, play.stop, risk, at, list(flags), confirmed, best=fill)
+    return _Position(key, play, fill, play.stop, risk, at, list(flags), confirmed, best=fill,
+                     features=dict(features or {}))
 
 
 def _step(position: _Position, bar: pd.Series, bar_end: pd.Timestamp, settings: ReplaySettings,
@@ -428,7 +444,7 @@ def _close(position: _Position, price: float, at: pd.Timestamp, reason: str, set
                     r=round(position.banked_r + rest, 3), exit_reason=reason,
                     noise=list(position.noise), confirmed=position.confirmed,
                     mfe_r=round(max(0.0, (position.best - position.entry) * position.sign / position.risk), 3),
-                    scaled=position.scaled)
+                    scaled=position.scaled, features=dict(position.features))
 
 
 def _at(day: dt.date, time: dt.time) -> pd.Timestamp:

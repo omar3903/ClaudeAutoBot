@@ -48,10 +48,14 @@ LOOKBACK_SESSIONS = 5
 
 
 class ReplayRunner:
-    def __init__(self, results_path: Path, history: IntradayHistory, bus=BUS, workers: Optional[int] = None) -> None:
+    def __init__(self, results_path: Path, history: IntradayHistory, bus=BUS, workers: Optional[int] = None,
+                 sink: Optional[Callable[[Dict[str, Any], List[SimTrade]], Any]] = None) -> None:
+        """``sink``: called with the results and the trades once a run is saved - the engine keeps
+        them in the database (research/dataset.py); a sink that fails never fails the replay."""
         self.results_path = results_path
         self.history = history
         self.bus = bus
+        self.sink = sink
         #: worker processes; 1 replays on the runner's own thread
         self.workers = workers if workers else max(1, (os.cpu_count() or 2) - 2)
         #: sessions per day-trade job (see the module docstring)
@@ -144,6 +148,11 @@ class ReplayRunner:
             }
             self._save(data, trades)
             self._append_history(data, trades)
+            if self.sink is not None:
+                try:
+                    self.sink(data, trades)
+                except Exception:  # noqa: BLE001
+                    log.warning("the replayed trades couldn't be kept in the database", exc_info=True)
             log.info("replay finished: %d simulated trades in %.0fs", len(trades), time.monotonic() - started)
             self.bus.publish("replay.completed", trades=len(trades))
         except Exception as e:  # noqa: BLE001 - reported to the dashboard, never kills the app

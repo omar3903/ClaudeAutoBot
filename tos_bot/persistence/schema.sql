@@ -265,3 +265,71 @@ CREATE INDEX ix_pair_trades_status ON pair_trades (status);
 CREATE INDEX ix_pair_trades_opened_at ON pair_trades (opened_at);
 CREATE INDEX ix_pair_trades_closed_at ON pair_trades (closed_at);
 CREATE INDEX ix_pair_trades_created_at ON pair_trades (created_at);
+
+-- what a model learns from (research/dataset.py): the replay's trades and the plays not taken
+
+CREATE TABLE IF NOT EXISTS sim_trades (
+	id INTEGER NOT NULL AUTO_INCREMENT, 
+	run_id VARCHAR(32) NOT NULL, 
+	ran_at DATETIME NOT NULL, 
+	strategy VARCHAR(48) NOT NULL, 
+	symbol VARCHAR(16) NOT NULL, 
+	side VARCHAR(8) NOT NULL, 
+	timeframe VARCHAR(16) NOT NULL, 
+	entered_at DATETIME, 
+	exited_at DATETIME, 
+	entry_price NUMERIC(20, 6) NOT NULL, 
+	exit_price NUMERIC(20, 6) NOT NULL, 
+	r FLOAT NOT NULL, 
+	exit_reason VARCHAR(24) NOT NULL, 
+	noise JSON, 
+	confirmed BOOL NOT NULL, 
+	mfe_r FLOAT NOT NULL, 
+	scaled BOOL NOT NULL, 
+	held_out BOOL NOT NULL, 
+	features JSON, 
+	feature_schema INTEGER NOT NULL, 
+	PRIMARY KEY (id)
+);
+
+CREATE INDEX ix_sim_trades_ran_at ON sim_trades (ran_at);
+
+CREATE INDEX ix_sim_trades_run_id ON sim_trades (run_id);
+
+CREATE INDEX ix_sim_trades_strategy ON sim_trades (strategy);
+
+CREATE INDEX ix_sim_trades_symbol ON sim_trades (symbol);
+
+CREATE TABLE IF NOT EXISTS shadow_trades (
+	play_id VARCHAR(32) NOT NULL, 
+	session_date DATE NOT NULL, 
+	symbol VARCHAR(16) NOT NULL, 
+	strategy VARCHAR(48) NOT NULL, 
+	side VARCHAR(8) NOT NULL, 
+	timeframe VARCHAR(16) NOT NULL, 
+	seen_at DATETIME, 
+	passed_checks BOOL NOT NULL, 
+	filled BOOL NOT NULL, 
+	entered_at DATETIME, 
+	exited_at DATETIME, 
+	entry_price NUMERIC(20, 6), 
+	exit_price NUMERIC(20, 6), 
+	r FLOAT, 
+	mfe_r FLOAT, 
+	exit_reason VARCHAR(64) NOT NULL, 
+	noise JSON, 
+	confirmations INTEGER NOT NULL, 
+	features JSON, 
+	feature_schema INTEGER NOT NULL, 
+	created_at DATETIME NOT NULL, 
+	PRIMARY KEY (play_id)
+);
+
+CREATE INDEX ix_shadow_trades_session_date ON shadow_trades (session_date);
+
+CREATE INDEX ix_shadow_trades_strategy ON shadow_trades (strategy);
+
+CREATE INDEX ix_shadow_trades_symbol ON shadow_trades (symbol);
+
+-- trades also gained submitted_at DATETIME, entry_context JSON and mfe_at DATETIME; play_logs gained
+-- probability FLOAT - the app adds them to an existing database on start (persistence/db.py).
