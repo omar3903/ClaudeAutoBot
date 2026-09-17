@@ -49,6 +49,7 @@ class AutoPilot:
         self.enabled: bool = bool(cfg.enabled)
         self.trade_types: List[str] = [t.upper() for t in (cfg.trade_types or ["INTRADAY"])]
         self.min_confidence: float = float(cfg.min_confidence)
+        self.min_swing_confidence: float = float(getattr(cfg, "min_swing_confidence", 0.5))
         self.min_reward_risk: float = float(cfg.min_reward_risk)
         self.max_auto_positions: int = int(cfg.max_auto_positions)
         self.max_auto_trades_per_day: int = int(cfg.max_auto_trades_per_day)
@@ -85,6 +86,7 @@ class AutoPilot:
             "enabled": self.enabled,
             "trade_types": self.trade_types,
             "min_confidence": self.min_confidence,
+            "min_swing_confidence": self.min_swing_confidence,
             "min_reward_risk": self.min_reward_risk,
             "max_auto_positions": self.max_auto_positions,
             "max_auto_trades_per_day": self.max_auto_trades_per_day,
@@ -110,8 +112,8 @@ class AutoPilot:
         tt = d.get("trade_types")
         if isinstance(tt, list) and tt:
             self.trade_types = [str(x).upper() for x in tt if str(x).upper() in TRADE_TYPES] or self.trade_types
-        for k in ("min_confidence", "min_reward_risk", "max_gross_exposure_pct", "max_daily_loss_pct",
-                  "max_giveback_pct"):
+        for k in ("min_confidence", "min_swing_confidence", "min_reward_risk", "max_gross_exposure_pct",
+                  "max_daily_loss_pct", "max_giveback_pct"):
             if isinstance(d.get(k), (int, float)):
                 setattr(self, k, float(d[k]))
         for k in ("max_auto_positions", "max_auto_trades_per_day",
@@ -145,6 +147,8 @@ class AutoPilot:
                 self.trade_types = clean
         if isinstance(kw.get("min_confidence"), (int, float)):
             self.min_confidence = max(0.0, min(1.0, float(kw["min_confidence"])))
+        if isinstance(kw.get("min_swing_confidence"), (int, float)):
+            self.min_swing_confidence = max(0.0, min(1.0, float(kw["min_swing_confidence"])))
         if isinstance(kw.get("min_reward_risk"), (int, float)):
             self.min_reward_risk = max(1.0, float(kw["min_reward_risk"]))
         if isinstance(kw.get("max_auto_positions"), int):
@@ -224,6 +228,7 @@ class AutoPilot:
             "dry_run": self.dry_run,
             "trade_types": self.effective_trade_types(),
             "min_confidence": round(self.min_confidence, 2),
+            "min_swing_confidence": round(self.min_swing_confidence, 2),
             "min_reward_risk": round(self.min_reward_risk, 2),
             "max_auto_positions": self.max_auto_positions,
             "max_auto_trades_per_day": self.max_auto_trades_per_day,
@@ -451,8 +456,9 @@ class AutoPilot:
         tf = p.timeframe.value
         if tf not in self.play_types():
             return f"{'day' if tf == 'INTRADAY' else tf.lower()} trades are switched off in the Intraday / Swing filters"
-        if p.confidence < self.min_confidence:
-            return f"confidence {p.confidence:.2f} < {self.min_confidence:.2f}"
+        floor = self.confidence_floor(tf)
+        if p.confidence < floor:
+            return f"confidence {p.confidence:.2f} < {floor:.2f}{'' if tf == 'INTRADAY' else ' (the swing floor)'}"
         if p.reward_risk < self.min_reward_risk:
             return f"reward:risk {p.reward_risk:.1f} < {self.min_reward_risk:.1f}"
         if p.kind.value == "FUNDAMENTAL":
@@ -492,6 +498,12 @@ class AutoPilot:
             except Exception:  # noqa: BLE001
                 pass
         return None
+
+    def confidence_floor(self, timeframe: str) -> float:
+        """The conviction a play must state: day trades use min_confidence; swing plays their own,
+        lower floor - the swing setups state flat, modest confidences, and the replay's proof is
+        what really vets them."""
+        return self.min_confidence if timeframe == "INTRADAY" else self.min_swing_confidence
 
     def verdict(self, p: Any) -> str:
         """What Autopilot makes of a play, in words, for the dashboard's notes."""
@@ -551,7 +563,7 @@ class AutoPilot:
         will = (
             self.enabled and self._live_ok()
             and row.get("timeframe") in self.play_types()
-            and float(row.get("confidence", 0)) >= self.min_confidence
+            and float(row.get("confidence", 0)) >= self.confidence_floor(str(row.get("timeframe") or "INTRADAY"))
             and float(row.get("reward_risk", 0)) >= self.min_reward_risk
             and row.get("kind") != "FUNDAMENTAL"
             and row.get("status") == "PROPOSED"

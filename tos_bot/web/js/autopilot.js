@@ -62,8 +62,10 @@ function configure() {
       <label>Auto-take these trade types</label>
       <p class="muted small">Autopilot takes what the <b>Intraday</b>, <b>Swing</b> and <b>Pairs</b> boxes above the plays switch on -
         now: <b>${(ap.trade_types || []).map(typeName).join(", ") || "none"}</b>.</p>
-      <label>Minimum confidence <b id="ap-conf-v">${ap.min_confidence ?? 0.62}</b></label>
+      <label>Minimum confidence, day trades <b id="ap-conf-v">${ap.min_confidence ?? 0.62}</b></label>
       <input type="range" id="ap-conf" min="0.4" max="0.9" step="0.01" value="${ap.min_confidence ?? 0.62}">
+      <label title="Swing setups state flat, modest confidences (0.55-0.58); the replay's proof is their real gate, so this only keeps out the weakest">Minimum confidence, swing trades <b id="ap-sconf-v">${ap.min_swing_confidence ?? 0.5}</b></label>
+      <input type="range" id="ap-sconf" min="0.3" max="0.9" step="0.01" value="${ap.min_swing_confidence ?? 0.5}">
       <label>Minimum reward : risk</label>
       <input type="number" id="ap-rr" min="1" max="10" step="0.5" value="${ap.min_reward_risk ?? 2}">
       <div class="ap-row">
@@ -99,6 +101,7 @@ function configure() {
       await postAutopilot({
         trade_types: types.length ? types : ["INTRADAY"],
         min_confidence: parseFloat($("#ap-conf").value),
+        min_swing_confidence: parseFloat($("#ap-sconf").value),
         min_reward_risk: parseFloat($("#ap-rr").value),
         max_auto_positions: int("#ap-maxpos"),
         max_auto_trades_per_day: int("#ap-maxday"),
@@ -117,6 +120,8 @@ function configure() {
   });
   const slider = $("#ap-conf");
   slider.oninput = () => { $("#ap-conf-v").textContent = slider.value; };
+  const swing = $("#ap-sconf");
+  swing.oninput = () => { $("#ap-sconf-v").textContent = swing.value; };
 }
 
 export function initAutopilot() {
