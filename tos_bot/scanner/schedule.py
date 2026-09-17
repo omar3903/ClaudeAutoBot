@@ -8,6 +8,10 @@
   list (Aziz's gappers watchlist).
 * The **cycle** rescans the hot list and the next buffer names every few
   minutes during the regular session.
+* The **wide scan** reads every liquid stock's 5-minute candles every half hour
+  or so (settable; 0 switches it off) and runs the setups on all of them, so a
+  stock that heats up mid-session is seen even if the morning's ranking had it
+  cold. It costs one request per stock, so it runs no more than every 15 minutes.
 
 If the app starts after the full-scan time (or on a day off) with no watchlist
 for the coming session, the full scan runs as soon as prices are available, so
@@ -37,8 +41,12 @@ class ScanSettings:
     cycle_minutes: int = 5
     hot_list_size: int = 20
     sector_queue_size: int = 25
+    wide_minutes: int = 30                # the wide scan's spacing; 0 = off, else 15-120
+    wide_stocks: int = 0                  # the hottest N of the full scan's liquid stocks; 0 = all of them
 
-    LIMITS = {"cycle_minutes": (3, 5), "hot_list_size": (5, 50), "sector_queue_size": (10, 50)}
+    LIMITS = {"cycle_minutes": (3, 5), "hot_list_size": (5, 50), "sector_queue_size": (10, 50),
+              "wide_minutes": (0, 120), "wide_stocks": (0, 6000)}
+    WIDE_MIN_MINUTES = 15
 
     @property
     def full_scan_time(self) -> dt.time:
@@ -67,7 +75,14 @@ class ScanSettings:
         for key, (lo, hi) in self.LIMITS.items():
             if not lo <= getattr(new, key) <= hi:
                 raise ValueError(f"{key.replace('_', ' ').capitalize()} must be between {lo} and {hi}.")
+        if 0 < new.wide_minutes < self.WIDE_MIN_MINUTES:
+            raise ValueError(f"The wide scan runs every {self.WIDE_MIN_MINUTES} to {self.LIMITS['wide_minutes'][1]} "
+                             "minutes - one request per stock - or 0 switches it off.")
         return replace(new, premarket_time=t.strftime("%H:%M"), gapper_time=g.strftime("%H:%M"))
+
+    @property
+    def wide_on(self) -> bool:
+        return self.wide_minutes > 0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -85,6 +100,8 @@ class ScanSettings:
                     out[key] = min(hi, max(lo, int(out[key])))
             except (TypeError, ValueError):
                 out.pop(key)
+        if 0 < out.get("wide_minutes", 0) < cls.WIDE_MIN_MINUTES:
+            out["wide_minutes"] = cls.WIDE_MIN_MINUTES
         return out
 
     @classmethod

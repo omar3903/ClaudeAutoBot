@@ -119,6 +119,9 @@ class ScannerCfg(_Model):
     plays_refresh_seconds: int = 15       # re-check the stocks with plays on the board (0 = off)
     hot_list_size: int = 20
     sector_queue_size: int = 25           # buffer candidates lined up per sector
+    wide_minutes: int = 30                # the wide scan - every liquid stock's 5-minute candles - this often
+                                          # in the session (15-120; 0 = off); one request per stock
+    wide_stocks: int = 0                  # the hottest N of the full scan's liquid stocks; 0 = all of them
     buffer_picks_per_sector: int = 2      # new buffer names scanned per sector per cycle
     kept_per_sector: int = 2              # buffer names kept waiting for a hot-list slot
     fundamentals_leaders: int = 8         # valuation setups run on this many top names

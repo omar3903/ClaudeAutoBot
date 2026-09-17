@@ -37,7 +37,7 @@ def test_scan_settings_are_validated():
     s = ScanSettings()
     assert s.changed(premarket_time="07:05", cycle_minutes="4").as_dict() == {
         "premarket_time": "07:05", "gapper_time": "09:15", "cycle_minutes": 4, "hot_list_size": 20,
-        "sector_queue_size": 25}
+        "sector_queue_size": 25, "wide_minutes": 30, "wide_stocks": 0}
     with pytest.raises(ValueError, match="04:00 to 09:00"):
         s.changed(premarket_time="09:15")
     assert s.changed(gapper_time="08:05").gapper_time == "08:05"
@@ -157,7 +157,8 @@ def test_settings_saved_under_the_old_limits_are_pulled_into_range():
     defaults = ScanSettings(cycle_minutes=15)                     # an old config.yaml
     assert ScanSettings.load({"cycle_minutes": 15, "hot_list_size": 30}, defaults).as_dict() == {
         "premarket_time": "08:30", "gapper_time": "09:15", "cycle_minutes": 5, "hot_list_size": 30,
-        "sector_queue_size": 25}
+        "sector_queue_size": 25, "wide_minutes": 30, "wide_stocks": 0}
+    assert ScanSettings.load({"wide_minutes": 5}, defaults).wide_minutes == 15      # too often: pulled into range
     assert ScanSettings.load(None, defaults).cycle_minutes == 5
 
 
@@ -173,4 +174,27 @@ def test_the_replay_takes_the_full_scans_leaders_as_well_as_the_watchlist(watchl
     assert set(wide["swing"]) == set(day["swing"]) | set(watchlist.leaders(12)) and "U1" in wide["swing"]
     assert set(replay_symbols(watchlist, swing_stocks=0)["swing"]) == set(day["swing"])
     assert replay_symbols(None, 400) == {"intraday": [], "swing": []}
+
+
+def test_the_wide_scan_runs_every_quarter_hour_at_most_or_not_at_all():
+    assert ScanSettings().wide_on and ScanSettings().changed(wide_minutes=0).wide_on is False
+    assert ScanSettings().changed(wide_minutes=120, wide_stocks=500).as_dict()["wide_stocks"] == 500
+    with pytest.raises(ValueError, match="15 to 120"):
+        ScanSettings().changed(wide_minutes=10)
+    with pytest.raises(ValueError, match="between 0 and 6000"):
+        ScanSettings().changed(wide_stocks=7000)
+
+
+def test_a_wide_look_refreshes_the_hot_list_and_keeps_the_best_of_the_rest(watchlist):
+    heat = {"T0": 0.2, "T1": 0.5, "E0": 0.6, "E1": 0.7,          # the hot list
+            "T7": 0.95, "T8": 0.9, "T9": 0.3, "E4": 0.8, "E3": 0.1, "U1": 0.99}
+    decisions = watchlist.apply_wide(heat, _sector, kept_per_sector=1)
+    by = {d.symbol: (d.action, d.replaced) for d in decisions}
+    assert by["T7"] == ("adopted", "T0") and by["T8"] == ("adopted", "T1")      # Technology is full: its own coolest go
+    assert by["E4"] == ("adopted", "E0")                                        # Energy is full too: its coolest goes
+    assert by["T1"] == ("kept", "") and by["E0"] == ("kept", "")               # the displaced, still the best of the rest
+    assert "T9" not in by and "E3" not in by and "U1" not in by                  # no slot left, no sector; no drops recorded
+    assert set(watchlist.hot_symbols()) == {"T7", "T8", "E4", "E1"} and set(watchlist.kept_symbols()) == {"T1", "E0"}
+    assert all(c.heat is not None for c in watchlist.hot)
+    assert "T7" not in [c.symbol for q in watchlist.queues.values() for c in q]   # left its queue
 

@@ -36,7 +36,7 @@ from ..core.eventbus import BUS
 from ..core.models import Account, Play
 from ..data.fundamentals import Financials, FundamentalsProvider
 from ..data.listings import UsListings
-from ..data.market_data import MarketData
+from ..data.market_data import MarketData, NoDataSource
 from ..data.sectors import sector_allowed
 from ..data.symbols import SymbolMaster
 from ..indicators import ta
@@ -97,6 +97,8 @@ class ScanResult:
 class Scanner:
     SWING_LEADERS = 400
     PEERS = 6
+    #: the wide scan reads candles this many stocks at a time, so a chunk that fails is skipped, not the sweep
+    WIDE_CHUNK = 250
 
     def __init__(self, settings: Settings, market_data: MarketData, symbols: SymbolMaster,
                  listings: UsListings, fundamentals: FundamentalsProvider, watchlist_dir: Path,
@@ -307,6 +309,64 @@ class Scanner:
             if not fast:
                 result.decisions = wl.apply_cycle(heat, picks, cfg.kept_per_sector)
                 wl.save(self.watchlist_dir)
+            result.hot = wl.hot_symbols()
+        return self._finish(result, filters)
+
+    # ---- the wide scan: every liquid stock ------------------------------- #
+    def run_wide(self, stocks: int = 0) -> ScanResult:
+        """Every liquid stock the full scan ranked - or the hottest ``stocks`` of them - on its
+        5-minute candles: the day-trade and swing setups the filters allow run on all of them, with
+        today's partial candle, and the hot list is refreshed from what has heated up since the
+        morning. One request per stock, in chunks; a chunk that fails is noted and skipped."""
+        cfg = self.settings.config.scanner
+        filters, strategies = self.filters, list(self.strategies)
+        result = ScanResult("wide")
+        wl = self.watchlist
+        if wl is None:
+            result.errors["watchlist"] = "no watchlist yet - the full scan hasn't run"
+            return self._finish(result, filters)
+        with self._watchlist_lock:
+            symbols = [s for s in wl.leaders(stocks) if sector_allowed(self.symbols.sector(s), filters.sectors)]
+            if not symbols:                                  # a watchlist saved before the ranking was kept
+                symbols = wl.hot_symbols() + wl.kept_symbols()
+        result.universe_size = len(symbols)
+        market_open = clock.is_market_open()
+        active = [s for s in strategies if s.kind is StrategyKind.TECHNICAL and s.timeframe.value in filters.timeframes
+                  and (s.timeframe is Timeframe.SWING or market_open)]
+        benchmark = self._benchmark(True)
+        heat: Dict[str, float] = {}
+        scanned: List[str] = []
+        with self._timed(result, "setups"):
+            for start in range(0, len(symbols), self.WIDE_CHUNK):
+                chunk = symbols[start:start + self.WIDE_CHUNK]
+                self._progress(result, "wide scan", start, len(symbols))
+                try:
+                    intraday = self.md.intraday(chunk, self.con_ids(chunk))
+                except NoDataSource:
+                    raise
+                except Exception as e:  # noqa: BLE001 - one chunk's candles, not the sweep
+                    result.errors[f"stocks {start + 1}-{start + len(chunk)}"] = str(e)
+                    log.warning("wide scan: candles for stocks %d-%d failed: %s", start + 1, start + len(chunk), e)
+                    continue
+                daily = self.md.daily(chunk)
+                for symbol in chunk:
+                    if symbol not in intraday or symbol not in daily:
+                        continue
+                    scanned.append(symbol)
+                    activity = intraday_metrics(symbol, intraday[symbol], daily[symbol])
+                    plays = evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
+                                     equity=self._equity, params=self._params, activity=activity, noise=self._noise,
+                                     signals=self.signals, market=self.market,
+                                     evidence_weights=self.evidence_weights,
+                                     records=self.strategy_records, benchmark=benchmark,
+                                     premarket=self.premarket.get(symbol))
+                    result.plays += plays
+                    if activity is not None:
+                        heat[symbol] = activity.heat + (_PLAY_BONUS if plays else 0.0)
+        result.symbols, result.scanned = scanned, len(scanned)
+        with self._watchlist_lock:
+            result.decisions = wl.apply_wide(heat, self.symbols.sector, cfg.kept_per_sector)
+            wl.save(self.watchlist_dir)
             result.hot = wl.hot_symbols()
         return self._finish(result, filters)
 

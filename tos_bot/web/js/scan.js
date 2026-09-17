@@ -3,7 +3,8 @@ import { $, count, escapeHtml, fmtClock, fmtEt, plural, post } from "./util.js";
 import { S, emit, on, refreshState } from "./state.js";
 import { toast } from "./ui.js";
 
-export const kindLabel = kind => ({ full: "Full scan", cycle: "Cycle", fast: "Hot-list cycle", gappers: "Gap check" }[kind] || "Scan");
+export const kindLabel = kind => ({ full: "Full scan", cycle: "Cycle", fast: "Hot-list cycle", gappers: "Gap check",
+  wide: "Wide scan" }[kind] || "Scan");
 
 let lastFailure = "";
 
