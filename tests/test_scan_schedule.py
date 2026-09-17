@@ -127,7 +127,8 @@ def test_a_cycle_adopts_keeps_or_drops_each_buffer_name(watchlist):
 def test_a_watchlist_survives_a_restart_and_old_ones_are_pruned(watchlist, tmp_path):
     watchlist.apply_cycle({"T2": 0.9}, watchlist.next_picks(1), kept_per_sector=1)
     watchlist.save(tmp_path)
-    assert DayWatchlist.load_latest(tmp_path).state() == watchlist.state()
+    back = DayWatchlist.load_latest(tmp_path)
+    assert back.state() == watchlist.state() and back.ranked == watchlist.ranked and back.state()["ranked"] == 16
     for day in range(1, 8):
         DayWatchlist.build(dt.date(2026, 8, day), dt.date(2026, 8, day), [], _sector, 5, 10, 0, 0).save(tmp_path)
     assert len(list(tmp_path.glob("watchlist_*.json"))) == 5
@@ -158,3 +159,18 @@ def test_settings_saved_under_the_old_limits_are_pulled_into_range():
         "premarket_time": "08:30", "gapper_time": "09:15", "cycle_minutes": 5, "hot_list_size": 30,
         "sector_queue_size": 25}
     assert ScanSettings.load(None, defaults).cycle_minutes == 5
+
+
+def test_the_replay_takes_the_full_scans_leaders_as_well_as_the_watchlist(watchlist):
+    from tos_bot.research.history import replay_symbols
+
+    assert watchlist.leaders(3) == ["T0", "T1", "T2"] and len(watchlist.leaders(0)) == 16
+    day = replay_symbols(watchlist)
+    assert day["intraday"] == ["T0", "T1", "E0", "E1"]                              # the hot list, nothing kept yet
+    assert set(day["swing"]) == {"T0", "T1", "E0", "E1", "T2", "T3", "T4", "E2", "E3", "E4"}   # plus the queues
+    wide = replay_symbols(watchlist, swing_stocks=12)
+    assert wide["intraday"] == day["intraday"]                                       # day trades cost requests: unchanged
+    assert set(wide["swing"]) == set(day["swing"]) | set(watchlist.leaders(12)) and "U1" in wide["swing"]
+    assert set(replay_symbols(watchlist, swing_stocks=0)["swing"]) == set(day["swing"])
+    assert replay_symbols(None, 400) == {"intraday": [], "swing": []}
+

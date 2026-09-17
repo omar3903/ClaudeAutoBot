@@ -778,6 +778,10 @@ follows every play the way the automatic exits would. Its settings are in
   worker process, and a day-trade replay is cut into jobs of `sessions_per_job` (10) sessions so the
   long ones don't leave workers idle at the end. Series that are the same for every bar of a session
   (the session VWAP, the opening range) are computed once per session.
+* **Which stocks.** Day-trade setups replay on the hot list and the kept buffer names (their 5-minute
+  candles cost IBKR requests). Swing setups replay on every watchlist stock **and on the full scan's
+  400 leaders** (`replay.swing_stocks`; 0 = the watchlist only) - their daily candles are already on
+  disk, so a strategy's record rests on hundreds of stocks rather than the day's forty.
 * **60 day-trade sessions and 250 swing sessions** by default. Sixty sessions give
   most setups the 30+ trades a record needs *with* a month held out; 250 is a
   year, as far back as the stored daily candles go. Up to 120 day-trade sessions

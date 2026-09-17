@@ -104,12 +104,16 @@ def _merge(old: Optional[pd.DataFrame], new: pd.DataFrame) -> pd.DataFrame:
     return combined[~combined.index.duplicated(keep="last")].sort_index()
 
 
-def replay_symbols(watchlist) -> Dict[str, List[str]]:
-    """Which stocks the replay uses: day-trade setups on the hot list and the kept
-    buffer names (their 5-minute candles cost IBKR requests), swing setups on every
-    watchlist stock (their daily candles are already on disk)."""
+def replay_symbols(watchlist, swing_stocks: int = 0) -> Dict[str, List[str]]:
+    """Which stocks the replay uses: day-trade setups on the hot list and the kept buffer names
+    (their 5-minute candles cost IBKR requests); swing setups on every watchlist stock and, with
+    ``swing_stocks``, on that many of the full scan's leaders too - their daily candles are
+    already on disk, so a wide swing replay costs no requests. A strategy's record then rests on
+    hundreds of stocks rather than the day's forty."""
     if watchlist is None:
         return {"intraday": [], "swing": []}
     intraday = list(dict.fromkeys(watchlist.hot_symbols() + watchlist.kept_symbols()))
-    swing = list(dict.fromkeys(intraday + [c.symbol for queue in watchlist.queues.values() for c in queue]))
+    queued = [c.symbol for queue in watchlist.queues.values() for c in queue]
+    leaders = watchlist.leaders(swing_stocks) if swing_stocks else []
+    swing = list(dict.fromkeys(intraday + queued + leaders))
     return {"intraday": intraday, "swing": swing}

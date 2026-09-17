@@ -34,7 +34,7 @@ class ResearchOps:
         """Replay the strategies over recent candles in the background (see research/)."""
         if not self.md.attached:
             return {"ok": False, "reason": "IB Gateway isn't connected, so there are no candles to replay."}
-        symbols = replay_symbols(self.scanner.watchlist)
+        symbols = replay_symbols(self.scanner.watchlist, int(self.settings.config.replay.swing_stocks or 0))
         if not symbols["swing"]:
             return {"ok": False, "reason": "Run the full scan first - the replay uses the stocks on its watchlist."}
         cfg = self.settings.config

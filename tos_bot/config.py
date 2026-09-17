@@ -212,6 +212,8 @@ class ReplayCfg(_Model):
 
     sessions: int = 60                    # day-trade sessions of 5-minute candles (5-120)
     swing_sessions: int = 250             # swing sessions of daily candles (20-250)
+    swing_stocks: int = 400               # swing setups replayed on this many of the full scan's leaders as well
+                                          # as the day's watchlist (0 = the watchlist only); costs no requests
     slippage_bps: float = 5.0             # on every market fill, each way
     commission_bps: float = 1.0           # on every fill
     held_out_fraction: float = 0.3334     # the latest sessions kept out of sample
