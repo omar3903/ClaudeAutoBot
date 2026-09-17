@@ -64,9 +64,6 @@ class AdfResult:
     critical: Dict[str, float]
     n: int
 
-    def rejects_random_walk(self, level: str = "10%") -> bool:
-        return self.stat < self.critical[level]
-
 
 def adf(series, lags: int = 1) -> Optional[AdfResult]:
     """Augmented Dickey-Fuller test with a constant and ``lags`` lagged changes (Chan uses 1)."""

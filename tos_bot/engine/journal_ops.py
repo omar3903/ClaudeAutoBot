@@ -112,9 +112,10 @@ class JournalOps:
         skipped = ap.skipped_noise()
         review = build_review(
             day, trades=trades, plays=plays, rolling=self.repo.closed_trades_between(first, day),
-            replay_records=self.replay.records(skipped, ap.min_confirmations), evidence=self.evidence_state(),
+            replay_records=self.replay.records(*self._record_terms()), evidence=self.evidence_state(),
             regime=self.regime.reading(), bars=self._session_bars(day, plays),
-            settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay), skip_noise=skipped,
+            settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay, cfg.risk.min_reward_risk),
+            skip_noise=skipped,
             min_confirmations=ap.min_confirmations, passes=self._passes_checks,
             styles={k: c.style for k, c in REGISTRY.items()}, titles={k: c.title for k, c in REGISTRY.items()},
             breakeven_at_r=float(cfg.exit_manager.breakeven_at_r))

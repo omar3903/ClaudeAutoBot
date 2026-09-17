@@ -47,7 +47,7 @@ function toggle() {
       : "The bot will <b>place entries for you</b> when a play clears the gate. Exits are already automatic. It stays inside the per-day and position caps and the 2:1 minimum."}
       </div>
       <p class="muted">Trade types: <b>${(ap.trade_types || ["INTRADAY"]).map(typeName).join(", ")}</b> ·
-      ≤ ${ap.max_auto_positions ?? 2} open · ≤ ${ap.max_auto_trades_per_day ?? 3}/day · ≥ conf ${ap.min_confidence ?? 0.62}.
+      ≤ ${ap.max_auto_positions ?? 2} open · ≤ ${ap.max_auto_trades_per_day ?? 3}/day · ≥ conf ${ap.min_confidence ?? 0.5}.
       Change these with the ⚙ button.</p>`,
     okText: "Turn on", okClass: live && !ap.allow_live ? "danger" : "long",
     onOk: () => postAutopilot({ enabled: true }),
@@ -62,8 +62,8 @@ function configure() {
       <label>Auto-take these trade types</label>
       <p class="muted small">Autopilot takes what the <b>Intraday</b>, <b>Swing</b> and <b>Pairs</b> boxes above the plays switch on -
         now: <b>${(ap.trade_types || []).map(typeName).join(", ") || "none"}</b>.</p>
-      <label>Minimum confidence, day trades <b id="ap-conf-v">${ap.min_confidence ?? 0.62}</b></label>
-      <input type="range" id="ap-conf" min="0.4" max="0.9" step="0.01" value="${ap.min_confidence ?? 0.62}">
+      <label>Minimum confidence, day trades <b id="ap-conf-v">${ap.min_confidence ?? 0.5}</b></label>
+      <input type="range" id="ap-conf" min="0.4" max="0.9" step="0.01" value="${ap.min_confidence ?? 0.5}">
       <label title="Swing setups state flat, modest confidences (0.55-0.58); the replay's proof is their real gate, so this only keeps out the weakest">Minimum confidence, swing trades <b id="ap-sconf-v">${ap.min_swing_confidence ?? 0.5}</b></label>
       <input type="range" id="ap-sconf" min="0.3" max="0.9" step="0.01" value="${ap.min_swing_confidence ?? 0.5}">
       <label>Minimum reward : risk</label>

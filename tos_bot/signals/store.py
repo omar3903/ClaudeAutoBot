@@ -71,11 +71,6 @@ class SignalStore:
         with session_scope() as s:
             return {symbol: int(cik or 0) for symbol, cik in s.execute(q)}
 
-    def last_filed(self) -> Optional[dt.date]:
-        """The latest filing date read so far."""
-        with session_scope() as s:
-            return s.scalar(select(func.max(FilingRead.filed)))
-
     # ---- news -------------------------------------------------------------- #
     def save_news(self, items: Sequence[NewsItem]) -> int:
         """Keeps the stories not kept yet; returns how many were new."""

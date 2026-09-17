@@ -460,7 +460,7 @@ class AutoPilot:
         if p.confidence < floor:
             return f"confidence {p.confidence:.2f} < {floor:.2f}{'' if tf == 'INTRADAY' else ' (the swing floor)'}"
         if p.reward_risk < self.min_reward_risk:
-            return f"reward:risk {p.reward_risk:.1f} < {self.min_reward_risk:.1f}"
+            return f"reward:risk {p.reward_risk:.2f} < {self.min_reward_risk:.2f}"
         if p.kind.value == "FUNDAMENTAL":
             return "valuation plays are not day/swing entries - not auto-traded"
         skipped = self.skipped_noise()

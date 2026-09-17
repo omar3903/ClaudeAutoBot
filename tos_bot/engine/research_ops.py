@@ -44,12 +44,13 @@ class ResearchOps:
             strategies=self.scanner.strategies, source=self.md.source, daily_frame=self.md.daily_frame,
             intraday_symbols=symbols["intraday"], swing_symbols=symbols["swing"],
             sessions=max(5, min(120, int(sessions))), swing_sessions=max(20, min(250, int(swing_sessions))),
-            settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay),
+            settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay, cfg.risk.min_reward_risk),
             noise=NoiseSettings.from_config(cfg.noise), con_ids=self.scanner.con_ids(symbols["intraday"]),
             market=self._regime_history, earnings=self.earnings.times if cfg.signals.enabled else None,
             pairs=self._pair_replay_inputs() if cfg.pairs.enabled else None,
             held_out_fraction=float(cfg.replay.held_out_fraction),
-            news=self._news_history if cfg.signals.enabled else None, benchmark=BENCHMARK)
+            news=self._news_history if cfg.signals.enabled else None, benchmark=BENCHMARK,
+            records=self.strategy_odds())
 
     def _keep_sim_trades(self, data: Dict[str, Any], trades: Sequence[Any]) -> None:
         """The replay's sink: its simulated trades go to the database, next to the real ones and
@@ -73,7 +74,7 @@ class ResearchOps:
 
     def replay_state(self) -> Dict[str, Any]:
         cfg = self.settings.config.replay
-        state = self.replay.state(self.autopilot.skipped_noise(), self.autopilot.min_confirmations)
+        state = self.replay.state(*self._record_terms())
         return {**state, "evidence": self.evidence_state(), "look_ahead_regime": self.regime.look_ahead,
                 "defaults": {"sessions": cfg.sessions, "swing_sessions": cfg.swing_sessions,
                              "held_out_fraction": cfg.held_out_fraction}}
@@ -83,7 +84,15 @@ class ResearchOps:
 
     def strategy_record(self, key: str) -> Optional[Dict[str, Any]]:
         """A strategy's replayed record over the trades Autopilot would have taken."""
-        return self.replay.records(self.autopilot.skipped_noise(), self.autopilot.min_confirmations).get(key)
+        return self.replay.records(*self._record_terms()).get(key)
+
+    def _record_terms(self) -> tuple:
+        """How Autopilot judges plays, for the replay's records: its skipped flags, confirmations,
+        reward:risk floor and confidence floors - so a strategy's record is over the trades it
+        would actually take."""
+        ap = self.autopilot
+        return (ap.skipped_noise(), ap.min_confirmations, float(ap.min_reward_risk),
+                {"INTRADAY": ap.confidence_floor("INTRADAY"), "SWING": ap.confidence_floor("SWING")})
 
     def learned_skips(self) -> List[str]:
         """Noise checks the replay has shown are worth skipping (see replay.learned_skips)."""
@@ -123,7 +132,7 @@ class ResearchOps:
 
     def evidence_state(self) -> Dict[str, Dict[str, Any]]:
         """Each active strategy's evidence multiplier and what it rests on (research/weights.py)."""
-        records = self.replay.records(self.autopilot.skipped_noise(), self.autopilot.min_confirmations)
+        records = self.replay.records(*self._record_terms())
         live = self.live_stats()
         return {s.key: evidence_multiplier(records.get(s.key), live.get(s.key)).as_dict() for s in self.scanner.strategies}
 
@@ -133,7 +142,7 @@ class ResearchOps:
     def strategy_odds(self) -> Dict[str, Dict[str, Any]]:
         """Each active strategy's pooled win rate and trade count (research/weights.py pooled_odds),
         which calibrate the odds its plays state (strategies/base.py calibrated_probability)."""
-        records = self.replay.records(self.autopilot.skipped_noise(), self.autopilot.min_confirmations)
+        records = self.replay.records(*self._record_terms())
         live = self.live_stats()
         odds = ((s.key, pooled_odds(records.get(s.key), live.get(s.key))) for s in self.scanner.strategies)
         return {key: row for key, row in odds if row is not None}
@@ -151,7 +160,7 @@ class ResearchOps:
         if key not in self._risk_pct:
             cap = float(self.settings.config.risk.max_risk_per_trade_pct)
             live = stats.get(key, {}).get("r", [])
-            rs = live if len(live) >= KELLY_MIN_TRADES else self.replay.r_multiples(key, skipped, ap.min_confirmations)
+            rs = live if len(live) >= KELLY_MIN_TRADES else self.replay.r_multiples(key, *self._record_terms())
             pct = half_kelly_risk_pct(rs, cap)
             self._risk_pct[key] = None if pct is None else max(pct, 0.25 * cap)
         return self._risk_pct[key]

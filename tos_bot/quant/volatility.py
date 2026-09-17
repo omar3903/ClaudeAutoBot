@@ -41,13 +41,6 @@ class GarchFit:
     def persistence(self) -> float:
         return self.alpha + self.beta
 
-    def forecast_var(self, horizon: int = 1) -> float:
-        """Variance ``horizon`` steps ahead, percent² (Tsay eq. 3.17)."""
-        var = self.next_var
-        for _ in range(max(0, horizon - 1)):
-            var = self.omega + self.persistence * var
-        return var
-
 
 def _variances(a: np.ndarray, omega: float, alpha: float, beta: float, start: float) -> np.ndarray:
     out = np.empty(len(a) + 1)

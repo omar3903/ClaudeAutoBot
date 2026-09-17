@@ -609,7 +609,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | master switch | off | `enabled` (UI toggle) |
 | **route real orders** | **off** | `allow_live` — *config-file only*; with it off, Autopilot is armed for **paper only** even in Live mode, and says so |
 | which trade types it may take | the **Intraday** / **Swing** / **Pairs** boxes over the plays, switched live | `trade_types` (`PAIRS`) |
-| minimum strategy confidence, day trades | 0.62 | `min_confidence` |
+| minimum strategy confidence, day trades | 0.5 | `min_confidence` (the replay found higher stated confidence went with worse trades) |
 | minimum strategy confidence, swing trades | 0.5 | `min_swing_confidence` (the swing setups state flat 0.55–0.58 confidences; the replay's proof is their real gate) |
 | minimum reward : risk | 2.0 | `min_reward_risk` (Aziz Rule 5) |
 | concurrent open auto positions | 2 | `max_auto_positions` |
@@ -821,6 +821,12 @@ follows every play the way the automatic exits would. Its settings are in
   worker process, and a day-trade replay is cut into jobs of `sessions_per_job` (10) sessions so the
   long ones don't leave workers idle at the end. Series that are the same for every bar of a session
   (the session VWAP, the opening range) are computed once per session.
+* **Only the plays the app would show and take.** A play under the scanner's reward:risk floor
+  (`risk.min_reward_risk`) is never on the board, so the replay never trades it; and a strategy's
+  Autopilot record counts only the trades Autopilot would take - its skipped flags, its confirmations,
+  its own reward:risk floor and its confidence floors, read off the features kept on each replayed
+  trade. The replayed plays also state the same calibrated odds as live, from the strategy records
+  the replay is handed.
 * **Which stocks.** Day-trade setups replay on the hot list and the kept buffer names (their 5-minute
   candles cost IBKR requests). Swing setups replay on every watchlist stock **and on the full scan's
   400 leaders** (`replay.swing_stocks`; 0 = the watchlist only) - their daily candles are already on

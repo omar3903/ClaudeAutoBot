@@ -33,7 +33,6 @@ def test_filings_are_read_once_and_their_trades_come_back():
     assert store.insider_trades(dt.date(2026, 9, 1), ["STOR"]) == [trade]
     assert store.insider_trades(dt.date(2026, 9, 13), ["STOR"]) == []
     assert "STOR" in store.symbols_traded(dt.date(2026, 9, 1))
-    assert store.last_filed() >= dt.date(2026, 9, 14)
 
 
 def test_news_is_kept_once_and_scored_later():

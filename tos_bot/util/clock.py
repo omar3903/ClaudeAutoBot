@@ -39,10 +39,6 @@ class Session(str, Enum):
     POST = "POST"        # after-hours
 
     @property
-    def is_open(self) -> bool:
-        return self is not Session.CLOSED
-
-    @property
     def is_extended(self) -> bool:
         return self in (Session.PRE, Session.POST)
 

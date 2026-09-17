@@ -175,7 +175,8 @@ class AutopilotCfg(_Model):
     enabled: bool = False
     allow_live: bool = False              # HARD gate: never auto-route real orders unless true
     trade_types: list = Field(default_factory=lambda: ["INTRADAY"])
-    min_confidence: float = 0.62          # day trades: the setup's own conviction, tuned after the first live run
+    min_confidence: float = 0.5           # day trades: the setup's own conviction. The replay found higher stated
+                                          # confidence went with worse trades, so the gate only keeps out the weakest
     min_swing_confidence: float = 0.5     # swing setups state flat, modest confidences (0.55-0.58); their real
                                           # gate is the replay's proof, so this only keeps out the weakest
     min_reward_risk: float = 2.0
@@ -186,8 +187,10 @@ class AutopilotCfg(_Model):
     max_new_per_cycle: int = 1
     max_gross_exposure_pct: float = 100.0  # all positions together, as % of equity - 100 = never on margin
     min_confirmations: int = 2            # a day-trade setup must show up in this many scans in a row
-    skip_noise: list = Field(default_factory=lambda: ["against_trend", "wrong_side_of_vwap", "against_gap",
-                                                       "volume_against", "conflict", "low_expected_value"])
+    # the flags Autopilot refuses. Only against_gap removed worse trades on both halves of a year's replay;
+    # the others removed trades that did as well or better, so they stay visible on the board but aren't
+    # skipped. The replay adds the learnable checks that prove themselves (learned skips).
+    skip_noise: list = Field(default_factory=lambda: ["against_gap"])
     require_proven: bool = True           # only strategies whose replayed record is good enough
     min_replay_trades: int = 30
     min_replay_expectancy_r: float = 0.05
