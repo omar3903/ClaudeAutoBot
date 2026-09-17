@@ -168,6 +168,46 @@ class DayWatchlist:
         self.decisions = (self.decisions + decisions)[-_DECISIONS_KEPT:]
         return decisions
 
+    def apply_wide(self, heat: Mapping[str, float], sector_of: Callable[[str], str],
+                   kept_per_sector: int) -> List[Decision]:
+        """After a look at every ranked stock: the hot list's heats are refreshed; any stock hotter
+        than the coolest hot-list name by the margin takes its slot (within the cap of a third per
+        sector, so it replaces a name of its own sector when that sector is full); the best of the
+        rest in each sector are kept waiting. Only adoptions and keeps are recorded - a sweep of
+        thousands would drown the decisions in drops."""
+        per_sector_cap = max(1, math.ceil(len(self.hot) / 3))
+        for c in self.hot:
+            if c.symbol in heat:
+                c.heat = heat[c.symbol]
+        known = {c.symbol: c for cs in [*self.queues.values(), *self.kept.values()] for c in cs}
+        hot_symbols = {c.symbol for c in self.hot}
+        kept: Dict[str, List[Candidate]] = {}
+        decisions: List[Decision] = []
+        for symbol, h in sorted(heat.items(), key=lambda kv: kv[1], reverse=True):
+            if symbol in hot_symbols:
+                continue
+            seen = known.get(symbol)
+            sector = seen.sector if seen else sector_of(symbol)
+            if not sector:
+                continue
+            c = seen or Candidate(symbol, sector, 0.0)
+            c.heat = h
+            same = [x for x in self.hot if x.sector == sector]
+            pool = same if len(same) >= per_sector_cap else self.hot
+            coolest = min(pool, key=lambda x: x.heat or 0.0) if pool else None
+            if coolest is not None and h > (coolest.heat or 0.0) * (1 + ADOPT_MARGIN):
+                self.hot[self.hot.index(coolest)] = c
+                hot_symbols = (hot_symbols - {coolest.symbol}) | {symbol}
+                self._forget(symbol)
+                decisions.append(self._decide(c, "adopted", h, replaced=coolest.symbol,
+                                              note="the wide scan found it hotter"))
+            elif len(kept.setdefault(sector, [])) < kept_per_sector:
+                kept[sector].append(c)
+                decisions.append(self._decide(c, "kept", h, note="the wide scan's best in its sector"))
+        self.kept = kept
+        self.decisions = (self.decisions + decisions)[-_DECISIONS_KEPT:]
+        return decisions
+
     def _forget(self, symbol: str) -> None:
         """Take a stock out of the queues and the kept lists - it has a hot-list slot now."""
         self.queues = {s: [c for c in q if c.symbol != symbol] for s, q in self.queues.items()}

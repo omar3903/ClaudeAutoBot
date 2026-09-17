@@ -41,6 +41,8 @@ function render(scan) {
         ${numberField("cycle_minutes", "Rescan every (min)", "How often the hot list and buffers are rescanned in the session", limits.cycle_minutes, s.cycle_minutes)}
         ${numberField("hot_list_size", "Hot list size", "Stocks rescanned every cycle", limits.hot_list_size, s.hot_list_size)}
         ${numberField("sector_queue_size", "Buffer per sector", "Candidates lined up in each sector", limits.sector_queue_size, s.sector_queue_size)}
+        ${numberField("wide_minutes", "Wide scan every (min)", `Every liquid stock's 5-minute candles, one request each, and the setups on all of them - so a stock that heats up mid-session is seen. 0 = off, else at least ${scan.wide_minimum_minutes || 15}`, limits.wide_minutes || [0, 120], s.wide_minutes ?? 30)}
+        ${numberField("wide_stocks", "Wide scan covers", "The hottest N of the full scan's liquid stocks; 0 = all of them (a few minutes per scan)", limits.wide_stocks || [0, 6000], s.wide_stocks ?? 0)}
       </form>
       <div class="row-gap"><button class="mini lockable" id="settings-save">Save</button></div>
     </section>
@@ -52,6 +54,7 @@ function render(scan) {
         <button class="mini lockable" id="settings-full">Run full scan now</button>
         <button class="ghost mini lockable" id="settings-cycle">Rescan hot list now</button>
         <button class="ghost mini lockable" id="settings-gappers" title="Read the pre-market candles now (before the open)">Check gappers now</button>
+        <button class="ghost mini lockable" id="settings-wide" title="Every liquid stock's 5-minute candles now - one request each, a few minutes">Scan every stock now</button>
       </div>
       <p class="muted small">A full scan re-ranks every stock and rebuilds today's hot list and buffers. Candles already downloaded
         are reused, so running it again later in the day is quick.</p>
@@ -60,6 +63,7 @@ function render(scan) {
   $("#settings-full").onclick = e => requestScan("full", e.currentTarget);
   $("#settings-cycle").onclick = e => requestScan("cycle", e.currentTarget);
   $("#settings-gappers").onclick = e => requestScan("gappers", e.currentTarget);
+  $("#settings-wide").onclick = e => requestScan("wide", e.currentTarget);
 }
 
 function summary(label, sum) {
@@ -76,6 +80,7 @@ function statusHTML(scan) {
     <span>Now</span><span>${run ? progressHTML(run) : "idle"}</span>
     ${summary("Last full scan", scan.last_full)}
     ${summary("Last gap check", scan.last_gappers)}
+    ${summary("Last wide scan", scan.last_wide)}
     ${summary(`Last ${scan.last_cycle ? kindLabel(scan.last_cycle.kind).toLowerCase() : "cycle"}`, scan.last_cycle)}
     <span>Watchlist for</span><span>${escapeHtml(scan.watchlist_session || "none yet")}</span>
     <span>Next full scan</span><span>${nextFullScanText(scan)}</span>

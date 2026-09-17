@@ -40,6 +40,9 @@ scanner:
   cycle_minutes: 5                     # 3-5 - rescan the hot list and buffer names
   hot_list_size: 20                    # 5-50 - no more than a third from one sector
   sector_queue_size: 25                # 10-50 - buffer candidates lined up per sector
+  wide_minutes: 30                     # the wide scan: every liquid stock's 5-minute candles this often in the
+                                       # session (15-120; 0 = off) - one request per stock, a few minutes each
+  wide_stocks: 0                       # the hottest N of the full scan's liquid stocks; 0 = all of them
   buffer_picks_per_sector: 2           # new buffer names looked at per sector each cycle
   kept_per_sector: 2                   # promising buffer names kept waiting for a hot-list slot
   fast_cycle_seconds: 60               # hot list only, while Autopilot day-trades an open session

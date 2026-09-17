@@ -77,6 +77,20 @@ def test_a_cycle_scans_the_hot_list_and_the_next_buffer_names(scanner, monkeypat
     assert set(fast.symbols) == set(wl.hot_symbols()) and not fast.decisions
 
 
+def test_the_wide_scan_looks_at_every_liquid_stock(scanner, monkeypatch):
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: True)
+    scanner.run_full(ScanSettings(hot_list_size=6, sector_queue_size=10))
+    wl = scanner.watchlist
+    asked = len(scanner.md.source.requests)
+    result = scanner.run_wide()
+    assert result.kind == "wide" and set(result.symbols) == set(wl.ranked) and result.scanned == len(wl.ranked)
+    assert len(scanner.md.source.requests) - asked >= len(wl.ranked)          # one request per stock
+    assert not result.errors and all(c.heat is not None for c in wl.hot)
+    assert all(d.action in ("adopted", "kept") for d in result.decisions)
+    assert all(p.symbol in wl.ranked for p in result.plays)
+    assert scanner.run_wide(stocks=5).scanned == 5                              # capped to the hottest five
+
+
 def test_the_gap_check_adopts_the_gappers_into_the_hot_list(scanner, monkeypatch):
     from tos_bot.analysis.levels import find_levels
     from tos_bot.scanner.heat import GapperMetrics, rank_gappers

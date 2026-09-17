@@ -158,6 +158,20 @@ So each sector's buffer is worked through over the day for a handful of requests
 per cycle — about 60 every 15 minutes. While **Autopilot** is day-trading an
 open session, the hot list alone is also rescanned every minute.
 
+**The wide scan — every 30 minutes** (15–120 in Settings, 0 = off): every
+liquid stock the full scan ranked (about 2,400; `wide_stocks` caps it to the
+hottest N) gets one request for its 5-minute candles, in chunks of 250, and the
+day-trade and swing setups the filters allow run on all of them with today's
+partial candle — so a stock that heats up mid-session is seen even if the
+morning's ranking had it cold, and a swing setup that forms during the day is on
+the board within the half hour. Its intraday heat refreshes the hot list: a
+stock hotter than the coolest hot-list name by 10 % takes its slot (within the
+cap of a third per sector), and the best of the rest per sector are kept
+waiting. It takes a few minutes of Gateway time (about 11 stocks a second) and
+the 5-minute cycle waits for it; plays it finds stay on the board and are
+re-checked every 15 seconds like any other. **Settings → Scan every stock now**
+runs it on demand.
+
 If the app starts after the full-scan time with no watchlist for the day (or on a
 day off with none at all), the full scan runs as soon as prices are available.
 **Settings → Run full scan now** rebuilds the lists at any time; candles already
@@ -171,6 +185,8 @@ next buffer names.
 | Hot list size | 20 | 5–50 | `hot_list_size` |
 | Buffer per sector | 25 | 10–50 | `sector_queue_size` |
 | Gap check at | 09:15 ET | 08:00–09:25 | `gapper_time` |
+| Wide scan every | 30 min | 15–120, 0 = off | `wide_minutes` |
+| Wide scan covers | all liquid stocks | 0 = all, else the hottest N | `wide_stocks` |
 
 Also in `config.yaml`: `gapper_symbols` (400), `gapper_min_gap_pct` (2), `gapper_min_volume`
 (50,000), `buffer_picks_per_sector` (2), `kept_per_sector` (2),

@@ -137,7 +137,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         sc = cfg.scanner
         self.scan_settings = ScanSettings.load(saved.get("scan"), ScanSettings(
             premarket_time=sc.premarket_time, gapper_time=sc.gapper_time, cycle_minutes=sc.cycle_minutes,
-            hot_list_size=sc.hot_list_size, sector_queue_size=sc.sector_queue_size))
+            hot_list_size=sc.hot_list_size, sector_queue_size=sc.sector_queue_size,
+            wide_minutes=sc.wide_minutes, wide_stocks=sc.wide_stocks))
 
         self.scanner = Scanner(
             self.settings, self.md, SymbolMaster(data_dir / "symbols.json"),
@@ -218,6 +219,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         self._last_cycle_at = float("-inf")
         self._last_fast_at = float("-inf")
         self._last_plays_at = float("-inf")
+        self._last_wide_at = time.monotonic()         # the first wide scan comes a spacing after the start
         self._noted: Dict[tuple, float] = {}          # Autopilot notes already shown, and when
         self._scan_retry_at = 0.0
 
@@ -710,6 +712,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             return None
         if mono - self._last_cycle_at >= self.scan_settings.cycle_minutes * 60:
             return "cycle"
+        if self.scan_settings.wide_on and mono - self._last_wide_at >= self.scan_settings.wide_minutes * 60:
+            return "wide"
         if self._autopilot_day_active() and mono - self._last_fast_at >= self.settings.config.scanner.fast_cycle_seconds:
             return "fast"
         refresh = self.settings.config.scanner.plays_refresh_seconds
@@ -741,6 +745,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
                 result = self.scanner.run_full(self.scan_settings)
             elif kind == "gappers":
                 result = self.scanner.run_gappers()
+            elif kind == "wide":
+                result = self.scanner.run_wide(self.scan_settings.wide_stocks)
             elif quick:
                 result = self.scanner.run_plays(self._board_symbols())
             else:
@@ -774,6 +780,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
                 self._last_fast_at = mono
                 if kind == "cycle":
                     self._last_cycle_at = mono
+                elif kind == "wide":                     # it covered the hot list and buffers too
+                    self._last_wide_at = self._last_cycle_at = mono
         if kind == "gappers":                    # it moves names between the lists; the plays are untouched
             wl = self.scanner.watchlist
             self._gappers_session = wl.session if wl else None
@@ -809,15 +817,17 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         locked = self._locked()
         if locked:
             return {"ok": False, "reason": locked}
-        if kind not in ("full", "cycle", "gappers"):
-            return {"ok": False, "reason": "scan must be 'full', 'cycle' or 'gappers'"}
+        if kind not in ("full", "cycle", "gappers", "wide"):
+            return {"ok": False, "reason": "scan must be 'full', 'cycle', 'gappers' or 'wide'"}
         if kind != "full" and self.scanner.watchlist is None:
             kind = "full"
         self._queue_scan(kind)
         note = {"full": "Full scan queued: every US stock gets ranked and today's hot list and sector buffers are rebuilt.",
                 "cycle": "Rescanning the hot list and the next buffer names.",
                 "gappers": "Reading the hot list and buffer names' pre-market candles: the stocks gapping on volume "
-                           "join the hot list."}[kind]
+                           "join the hot list.",
+                "wide": "Wide scan queued: every liquid stock's 5-minute candles, one request each - it takes a few "
+                        "minutes, and the setups run on all of them."}[kind]
         running = self._scan_running
         if running:
             note += f" It starts once the {running['kind']} scan that's running finishes."
@@ -837,6 +847,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             "running": self._scan_running,
             "last_full": self._last_scans.get("full"),
             "last_gappers": self._last_scans.get("gappers"),
+            "last_wide": self._last_scans.get("wide"),
+            "wide_minimum_minutes": ScanSettings.WIDE_MIN_MINUTES,
             "last_cycle": max(cycles, key=lambda s: s["started_at"]) if cycles else None,
             "watchlist_session": session.isoformat() if session else None,
             "next_full_scan": schedule.next_full_scan_at(clock.now_ny(), self.scan_settings, session).isoformat(),
@@ -864,6 +876,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             notes.append(f"The pre-open gap check now runs at {new.gapper_time} ET.")
         if new.cycle_minutes != old.cycle_minutes:
             notes.append(f"The hot list and buffers are rescanned every {new.cycle_minutes} minutes.")
+        if (new.wide_minutes, new.wide_stocks) != (old.wide_minutes, old.wide_stocks):
+            which = f"the hottest {new.wide_stocks:,}" if new.wide_stocks else "every liquid stock"
+            notes.append(f"The wide scan is off." if not new.wide_on
+                         else f"The wide scan reads {which} every {new.wide_minutes} minutes.")
         if (new.hot_list_size, new.sector_queue_size) != (old.hot_list_size, old.sector_queue_size):
             notes.append("List sizes apply from the next full scan - Run full scan now rebuilds today's lists.")
         state = self.scan_status()

@@ -254,6 +254,16 @@ def test_scans_follow_the_schedule(engine, port, monkeypatch):
     engine._run_scan("plays")
     assert engine._due_scan() is None and engine.scan_status()["running"] is None
 
+    engine._last_wide_at -= engine.scan_settings.wide_minutes * 60 + 1     # half an hour on: every stock
+    assert engine._due_scan() == "wide"
+    engine._run_scan("wide")
+    assert engine.scan_status()["last_wide"]["kind"] == "wide" and engine._due_scan() is None
+    engine._last_wide_at -= engine.scan_settings.wide_minutes * 60 + 1
+    assert engine.set_scan_settings(wide_minutes=0)["note"] == "The wide scan is off."
+    assert engine._due_scan() is None                                     # switched off: never due
+    assert engine.request_scan("wide")["ok"]                              # but it can still be asked for...
+    assert engine._due_scan() == "wide" and engine._due_scan() is None    # ...and the request is honoured once
+
     engine.set_autopilot(enabled=True, trade_types=["INTRADAY"])
     engine._last_fast_at -= engine.settings.config.scanner.fast_cycle_seconds + 1
     assert engine._due_scan() == "fast"
