@@ -226,7 +226,7 @@ def fig_components() -> str:
                                                                           "news, account, orders"], lsize=8.5,
                fill="#fff7e6")
     db = s.box(260, 510, 200, 50, "SQLite  data/autotradebot.sqlite", ["(MySQL if DATABASE_URL is set)",
-                                                                       "11 tables - see figure 6"], lsize=8.5,
+                                                                       "13 tables - see figure 6"], lsize=8.5,
                fill="#f0fff0")
     fs = s.box(40, 510, 200, 50, "Files under data/", ["bars/, cache/, watchlists/, journal/,",
                                                        "research/, signals/, runtime.json"], lsize=8.5,
@@ -372,7 +372,7 @@ def fig_classes() -> str:
 #  Figure 3 - the entity-relationship diagram
 # ----------------------------------------------------------------------------------------------
 def fig_er() -> str:
-    s = Svg(720, 640)
+    s = Svg(720, 790)
 
     def ent(x, y, w, name, cols, fill="#fff"):
         ls = 8.5
@@ -388,16 +388,18 @@ def fig_er() -> str:
                                         "universe_size, scanned, n_plays", "hot (JSON), elapsed_s"])
     pl = ent(260, 20, 200, "play_logs", ["id  PK", "scan_run_id  FK -> scan_runs", "symbol, side, strategy, kind",
                                          "timeframe, entry, stop, targets", "reward_risk, confidence, score",
-                                         "noise (JSON), confirmations", "status, decided_at, decided_by"])
+                                         "probability, evidence (JSON)", "noise (JSON), confirmations",
+                                         "status, decided_at, decided_by"])
     tr = ent(500, 20, 200, "trades", ["id  PK", "play_id  FK -> play_logs (0..1)", "symbol, side, strategy, kind",
                                       "timeframe, broker (venue), status", "quantity, initial_quantity",
                                       "entry_price, entry_time", "stop_price, target_price, target2",
                                       "initial_stop/target, hwm_price", "managed_exit, expected_exit_at",
                                       "exit_price, exit_time, exit_reason", "fees, realized_pl, r_multiple",
-                                      "mae, mfe, banked_pl", "is_day_trade, session_date", "pair_id  (-> pair_trades)"])
-    fl = ent(500, 300, 200, "fills", ["id  PK (autoincrement)", "trade_id  FK -> trades", "broker_order_id, ts",
+                                      "mae, mfe, mfe_at, banked_pl", "submitted_at, entry_context (JSON)",
+                                      "is_day_trade, session_date", "pair_id  (-> pair_trades)"])
+    fl = ent(500, 312, 200, "fills", ["id  PK (autoincrement)", "trade_id  FK -> trades", "broker_order_id, ts",
                                       "side, leg (ENTRY/EXIT)", "quantity, price, commission"])
-    pt = ent(260, 300, 200, "pair_trades", ["id  PK", "pair (FIRST/SECOND), side", "status, venue, by",
+    pt = ent(260, 312, 200, "pair_trades", ["id  PK", "pair (FIRST/SECOND), side", "status, venue, by",
                                             "hedge, half_life, entry_z, band_z", "stop_z, exit_z, time_stop_days",
                                             "qty_first, qty_second", "trade_first_id, trade_second_id",
                                             "realized_pl, r_multiple, model"])
@@ -405,11 +407,11 @@ def fig_er() -> str:
     s.label(240, 52, "1 : n", 8)
     s.line(460, 60, 500, 60, end="arr")
     s.label(480, 52, "1 : 0..1", 8)
-    s.line(600, tr[1] + tr[3], 600, 300, end="crow")
-    s.label(620, 290, "1 : n", 8)
-    s.line(460, 370, 500, 370, end="arr", dash="4,3")
-    s.line(460, 385, 500, 385, end="arr", dash="4,3")
-    s.label(480, 362, "two legs", 8)
+    s.line(600, tr[1] + tr[3], 600, 312, end="crow")
+    s.label(620, 302, "1 : n", 8)
+    s.line(460, 382, 500, 382, end="arr", dash="4,3")
+    s.line(460, 397, 500, 397, end="arr", dash="4,3")
+    s.label(480, 374, "two legs", 8)
 
     ac = ent(20, 200, 200, "account_snapshots", ["id  PK", "ts, broker", "equity, cash, buying_power",
                                                   "day_trades_5d, open_positions", "unrealized_pl, realized_pl_day"])
@@ -417,15 +419,26 @@ def fig_er() -> str:
                                             "request, response (JSON)", "ok, message"])
     dr = ent(20, 445, 200, "daily_reviews", ["session_date  PK", "trades, total_r, realized_pl",
                                               "mistakes, review (JSON)"])
-    nw = ent(260, 470, 200, "news_items", ["key  PK", "symbol, source, provider, kind", "headline, url, ref, items",
+    nw = ent(260, 482, 200, "news_items", ["key  PK", "symbol, source, provider, kind", "headline, url, ref, items",
                                             "published_at", "sentiment, sentiment_conf"])
-    it = ent(500, 420, 200, "insider_trades", ["accession + line  PK", "symbol, issuer_*, owner_*",
+    it = ent(500, 432, 200, "insider_trades", ["accession + line  PK", "symbol, issuer_*, owner_*",
                                                 "role, title, code (P/S)", "trade_date, shares, price",
                                                 "planned, direct, offering, filed"])
-    fr = ent(500, 555, 200, "filings_read", ["accession  PK", "form, filed, trades, read_at"])
-    s.text(20, 630, "Money columns use a NUMERIC(18,6) type; JSON columns hold dicts/lists. "
-                    "Missing columns are added at start-up (persistence/db.py _add_missing_columns).", 8.5, fill="#555")
-    return s.render("Figure 6 - The database (persistence/models_orm.py): eleven tables, SQLite by default.")
+    fr = ent(500, 567, 200, "filings_read", ["accession  PK", "form, filed, trades, read_at"])
+    st = ent(20, 560, 200, "sim_trades", ["id  PK, run_id, ran_at", "strategy, symbol, side, timeframe",
+                                           "entered_at, exited_at, entry, exit", "r, exit_reason, mfe_r, held_out",
+                                           "features (JSON), feature_schema"], fill="#f3f0ff")
+    sh = ent(260, 612, 200, "shadow_trades", ["play_id  PK (-> play_logs)", "session_date, symbol, strategy",
+                                               "seen_at, passed_checks, filled", "entered_at, exited_at, r, mfe_r",
+                                               "exit_reason, features (JSON)"], fill="#f3f0ff")
+    s.path(f"M260,640 L245,640 L245,60 L{pl[0]},60", dash="4,3", end="arr")
+    s.parts.append(f'<text x="241" y="400" font-family="{Svg.FONT}" font-size="7.5" fill="#333" text-anchor="middle" '
+                   'transform="rotate(-90 241 400)">one per play not taken</text>')
+    s.text(20, 750, "Money columns use a NUMERIC(20,6) type; JSON columns hold dicts/lists. Missing columns are added "
+                    "at start-up (persistence/db.py _add_missing_columns).", 8.5, fill="#555")
+    s.text(20, 764, "Shaded: what a model learns from (research/dataset.py) - with trades.entry_context, the three "
+                    "populations of the learning guide.", 8.5, fill="#555")
+    return s.render("Figure 6 - The database (persistence/models_orm.py): thirteen tables, SQLite by default.")
 
 
 # ----------------------------------------------------------------------------------------------
@@ -725,8 +738,9 @@ def build() -> str:
       '<div class="m">Repository: omar3903/ClaudeAutoBot (master, 16 September 2026)<br>'
       'Python 3.10 · FastAPI · SQLAlchemy · ib_async · pandas/numpy · plain ES-module dashboard<br><br>'
       'Contents: the twelve books · the big picture · the runtime · a play\'s life · the strategies · '
-      'the data and the databases · the research loop · the dashboard and the API · the important functions · '
-      'a glossary of the trading terms</div></div>')
+      'the data and the databases · the research loop and the learning storage · the dashboard and the API · '
+      'the important functions · a glossary of the trading terms<br><br>'
+      'Companion: AutoTradeBot-learning.pdf, the machine-learning plan in detail</div></div>')
 
     # ---- 1 the books ------------------------------------------------------------------------
     A('<h2 class="first">1. The twelve books the app was trained on</h2>')
@@ -1047,7 +1061,18 @@ def build() -> str:
         ("news_items", "a headline from IBKR, SEC 8-K or Finnhub, with FinBERT sentiment", "SignalStore"),
         ("insider_trades / filings_read", "Form 4 open-market trades and which filings were parsed", "SignalStore"),
         ("pair_trades", "a two-leg pair position with its z-score model and both trade ids", "PairDesk"),
+        ("sim_trades", "one simulated trade of a replay run, with the play's features at the signal and a held_out "
+         "flag", "the runner's sink -> repo.save_sim_trades"),
+        ("shadow_trades", "one play shown and not taken, followed to its outcome on the session's candles, with "
+         "its features", "the 16:15 review -> repo.save_shadow_trades"),
     ]))
+    A('<p>Three of the columns above are the learning storage: <code>trades.entry_context</code> holds the '
+      'play\'s features at the fill (with <code>submitted_at</code> and <code>mfe_at</code>), and the two '
+      'shaded tables hold the plays not taken and the replay\'s trades with the same features. '
+      '<code>research/features.py</code> is the one function that produces them, versioned by '
+      '<code>FEATURE_SCHEMA</code>; <code>research/dataset.py</code> joins the three into one training table and '
+      '<code>scripts/export_training_set.py</code> writes it as CSV. The learning guide '
+      '(<code>docs/AutoTradeBot-learning.pdf</code>) explains what is done with it.</p>')
     A('<h3>Files under data/ (git-ignored, all rebuildable)</h3>')
     A(table(["Path", "Format", "Holds"], [
         ("bars/&lt;SYMBOL&gt;.pkl", "pickled DataFrame", "one year of daily candles per stock (5,500+ files)"),
@@ -1058,6 +1083,7 @@ def build() -> str:
          "Autopilot settings - wins over config.yaml"),
         ("paper_state.json", "JSON", "the simulator's cash, positions and round trips"),
         ("research/replay.json, replay_runs.jsonl", "JSON", "the latest replay's records and every run's summary"),
+        ("research/training_set.csv", "CSV", "the exported training set (scripts/export_training_set.py)"),
         ("research/intraday/", "pickles", "5-minute history kept for the replay"),
         ("research/benchmark_spy.pkl", "pickle", "SPY daily returns and the fitted regime model"),
         ("journal/&lt;date&gt;.json", "JSON", "the daily review with the movers report"),
@@ -1099,6 +1125,14 @@ def build() -> str:
       'the shadow outcomes of plays that were shown but not taken, per-strategy tables, and the session\'s '
       'biggest movers with why they moved and whether the bot traded, offered or missed them. Saved to '
       '<code>daily_reviews</code> and <code>data/journal/</code>, shown on the Reports page.</p>')
+    A('<p><b>The learning storage.</b> Everything above judges strategies as a whole. To judge one play at a '
+      'time, the app keeps what every play looked like at the decision next to what happened to it, for three '
+      'populations: the trades taken (<code>trades.entry_context</code>), the plays shown and not taken '
+      '(<code>shadow_trades</code>, from the review) and the replay\'s simulated trades (<code>sim_trades</code>, '
+      'from a sink on the runner). One function, <code>research/features.py play_features()</code>, describes a '
+      'play with a fixed, versioned set of keys, and <code>research/dataset.py</code> joins the three. The '
+      'companion guide <code>docs/AutoTradeBot-learning.pdf</code> covers the model to be trained on it, its '
+      'validation and how it plugs into the gates.</p>')
     A('<p><b>Market regime</b> (<code>engine/market_regime.py</code>, <code>quant/regime.py</code>). A two-state '
       'Markov switching model fitted by EM on three years of SPY daily returns gives the probability the market is '
       'in its turbulent state today. It feeds the <code>turbulent_market</code> noise flag and the header pill.</p>')
@@ -1211,6 +1245,11 @@ def build() -> str:
          "and its records"),
         ("research/runner.py", "ReplayRunner.start(), replay_job(), session_chunks()", "the parallel replay"),
         ("research/weights.py", "evidence_multiplier(), pooled_odds()", "how records change scores and odds"),
+        ("research/features.py", "play_features()", "a play as one flat, versioned row of features - the same "
+         "for live, shadow and replayed plays"),
+        ("research/dataset.py", "training_rows(), write_csv()", "the training set joined from the three "
+         "populations"),
+        ("persistence/repository.py", "save_sim_trades(), save_shadow_trades()", "the learning tables' writers"),
         ("research/journal.py", "build_review(), find_mistakes(), shadow_outcomes(), lessons()", "the daily review"),
         ("pairs/desk.py", "PairDesk.refresh(), watch(), enter(), manage(), close()", "the pairs desk: both legs, "
          "the z-score bands, the time stop"),
@@ -1282,8 +1321,8 @@ def build() -> str:
         ("Form 4, 8-K, EDGAR", "SEC filings: insider trades (Form 4), material events including earnings (8-K "
          "item 2.02), and EDGAR is the SEC's free API for them."),
     ]))
-    A('<p class="small">Generated from the code on master as of 16 September 2026. When the code changes, the '
-      'README and this guide should be updated together.</p>')
+    A('<p class="small">Generated from the code as of 16 September 2026 (master plus the learning storage). '
+      'When the code changes, the README and this guide should be updated together.</p>')
     return "".join(parts)
 
 
