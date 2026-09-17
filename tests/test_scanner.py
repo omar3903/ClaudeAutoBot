@@ -91,6 +91,32 @@ def test_the_wide_scan_looks_at_every_liquid_stock(scanner, monkeypatch):
     assert scanner.run_wide(stocks=5).scanned == 5                              # capped to the hottest five
 
 
+def test_yesterdays_movers_get_hot_list_slots_from_the_full_scan(scanner):
+    from tos_bot.scanner.heat import daily_metrics
+
+    scanner.settings.config.scanner.movers_min_rvol = 0.0
+    result = scanner.run_full(ScanSettings(hot_list_size=6, sector_queue_size=10, yesterday_movers=3))
+    wl = scanner.watchlist
+    ranked = sorted((daily_metrics(s, scanner.md.daily_frame(s)) for s in wl.ranked), key=lambda m: -m.move_atr)
+    movers = [m.symbol for m in ranked[:3] if scanner.symbols.sector(m.symbol)]
+    assert movers and all(s in wl.hot_symbols() for s in movers) and len(wl.hot) == 6
+    assert all(c.why.startswith("moved") for c in wl.hot if c.symbol in movers)
+    assert all(d.action == "adopted" and d.note.startswith("moved") for d in result.decisions)
+
+
+def test_todays_movers_get_hot_list_slots_from_the_wide_scan(scanner, monkeypatch):
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: True)
+    scanner.settings.config.scanner.movers_min_rvol = 0.0
+    scanner.run_full(ScanSettings(hot_list_size=6, sector_queue_size=10, yesterday_movers=0))
+    wl = scanner.watchlist
+    result = scanner.run_wide(movers=3)
+    today = {s: intraday_metrics(s, scanner.md.intraday([s])[s], scanner.md.daily_frame(s)) for s in wl.ranked}
+    movers = [s for s, m in sorted(today.items(), key=lambda kv: -abs(kv[1].change_pct)) if m and scanner.symbols.sector(s)][:3]
+    assert movers and all(s in wl.hot_symbols() for s in movers)
+    assert all("today" in c.why for c in wl.hot if c.symbol in movers)                  # marked, adopted or already hot
+    assert all(d.note for d in result.decisions if d.symbol in movers and d.action == "adopted")
+
+
 def test_the_gap_check_adopts_the_gappers_into_the_hot_list(scanner, monkeypatch):
     from tos_bot.analysis.levels import find_levels
     from tos_bot.scanner.heat import GapperMetrics, rank_gappers

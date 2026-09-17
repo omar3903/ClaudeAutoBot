@@ -16,6 +16,11 @@ alongside the buffer names already kept:
 
 So each sector's queue is worked through over the day with only a handful of
 extra requests per cycle.
+
+The day's **movers** hold slots of their own: the last session's biggest movers
+from the full scan (in case they move for a second day), today's from every wide
+scan. A stock in play trumps the sector cap (Aziz), so a mover replaces the
+coolest hot-list name that isn't a mover itself.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ import json
 import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .heat import DailyMetrics
 
@@ -41,6 +46,7 @@ class Candidate:
     daily_heat: float
     heat: Optional[float] = None          # latest intraday heat
     gap_pct: Optional[float] = None       # the pre-market gap the gap check saw, %
+    why: str = ""                         # why it holds a slot when not by heat: a mover's move, in words
 
 
 @dataclass
@@ -205,6 +211,36 @@ class DayWatchlist:
                 kept[sector].append(c)
                 decisions.append(self._decide(c, "kept", h, note="the wide scan's best in its sector"))
         self.kept = kept
+        self.decisions = (self.decisions + decisions)[-_DECISIONS_KEPT:]
+        return decisions
+
+    def apply_movers(self, movers: Sequence[Tuple[str, str, float, str]], limit: int) -> List[Decision]:
+        """The biggest movers - ``(symbol, sector, heat, why)``, biggest first - hold hot-list
+        slots: each one not already hot takes the slot of the coolest hot-list name that isn't one
+        of them, whatever its sector (a stock in play trumps the sector cap), and leaves its queue.
+        At most ``limit`` of them; a mover already on the list keeps its slot and its reason."""
+        chosen = list(movers[:max(0, int(limit))])
+        mover_symbols = {m[0] for m in chosen}
+        known = {c.symbol: c for cs in [*self.queues.values(), *self.kept.values()] for c in cs}
+        decisions: List[Decision] = []
+        for symbol, sector, heat, why in chosen:
+            held = next((h for h in self.hot if h.symbol == symbol), None)
+            if held is not None:
+                held.heat, held.why = heat, why
+                continue
+            if not sector:
+                continue
+            seen = known.get(symbol)
+            c = seen or Candidate(symbol, sector, 0.0)
+            c.heat, c.why = heat, why
+            pool = [h for h in self.hot if h.symbol not in mover_symbols]
+            if not pool:
+                decisions.append(self._decide(c, "dropped", heat, note=why + " - no hot-list slot free"))
+                continue
+            coolest = min(pool, key=lambda h: h.heat if h.heat is not None else h.daily_heat)
+            self.hot[self.hot.index(coolest)] = c
+            self._forget(symbol)
+            decisions.append(self._decide(c, "adopted", heat, replaced=coolest.symbol, note=why))
         self.decisions = (self.decisions + decisions)[-_DECISIONS_KEPT:]
         return decisions
 

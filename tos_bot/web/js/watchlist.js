@@ -25,7 +25,7 @@ export function renderWatchlist(wl, scan) {
   }
   const gapCell = g => g == null ? '<span class="muted">–</span>'
     : `<span class="${g >= 0 ? "pl-pos" : "pl-neg"}">${g >= 0 ? "+" : ""}${num(g, 1)}%</span>`;
-  const hot = wl.hot.map(c => `<tr><td class="sym">${escapeHtml(c.symbol)} ${sectorTag(c.sector)}</td>
+  const hot = wl.hot.map(c => `<tr><td class="sym" title="${escapeHtml(c.why || "")}">${escapeHtml(c.symbol)} ${sectorTag(c.sector)}${c.why ? ' <span class="chip" title="' + escapeHtml(c.why) + '">mover</span>' : ""}</td>
     <td>${heatBar(c.daily_heat)}</td><td>${gapCell(c.gap_pct)}</td><td>${heatBar(c.heat)}</td></tr>`).join("");
   const sectors = wl.sectors.map(s => `<tr><td>${escapeHtml(s.sector)}</td>
     <td>${s.kept.map(c => `<span class="chip" title="intraday heat ${num(c.heat, 2)}">${escapeHtml(c.symbol)}</span>`).join(" ") || '<span class="muted">–</span>'}</td>

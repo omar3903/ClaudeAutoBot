@@ -166,6 +166,13 @@ class Scanner:
         watchlist = DayWatchlist.build(
             schedule.watchlist_session(now), through, ranked, self.symbols.sector,
             scan.hot_list_size, scan.sector_queue_size, universe=len(symbols), liquid=result.liquid)
+        if scan.yesterday_movers:
+            # the last session's biggest movers hold slots, in case they move for a second day
+            moved = sorted((m for m in ranked if m.rvol >= cfg.movers_min_rvol), key=lambda m: -m.move_atr)
+            result.decisions += watchlist.apply_movers(
+                [(m.symbol, self.symbols.sector(m.symbol), m.heat,
+                  f"moved {m.move_atr:.1f} ATRs on {m.rvol:.1f}x volume last session") for m in moved],
+                scan.yesterday_movers)
         with self._watchlist_lock:
             self.watchlist = watchlist
             watchlist.save(self.watchlist_dir)
@@ -313,11 +320,12 @@ class Scanner:
         return self._finish(result, filters)
 
     # ---- the wide scan: every liquid stock ------------------------------- #
-    def run_wide(self, stocks: int = 0) -> ScanResult:
+    def run_wide(self, stocks: int = 0, movers: int = 0) -> ScanResult:
         """Every liquid stock the full scan ranked - or the hottest ``stocks`` of them - on its
         5-minute candles: the day-trade and swing setups the filters allow run on all of them, with
         today's partial candle, and the hot list is refreshed from what has heated up since the
-        morning. One request per stock, in chunks; a chunk that fails is noted and skipped."""
+        morning; today's ``movers`` biggest movers on volume hold slots outright. One request per
+        stock, in chunks; a chunk that fails is noted and skipped."""
         cfg = self.settings.config.scanner
         filters, strategies = self.filters, list(self.strategies)
         result = ScanResult("wide")
@@ -335,6 +343,7 @@ class Scanner:
                   and (s.timeframe is Timeframe.SWING or market_open)]
         benchmark = self._benchmark(True)
         heat: Dict[str, float] = {}
+        seen: Dict[str, Any] = {}                       # each stock's intraday metrics, for the movers
         scanned: List[str] = []
         with self._timed(result, "setups"):
             for start in range(0, len(symbols), self.WIDE_CHUNK):
@@ -363,9 +372,16 @@ class Scanner:
                     result.plays += plays
                     if activity is not None:
                         heat[symbol] = activity.heat + (_PLAY_BONUS if plays else 0.0)
+                        seen[symbol] = activity
         result.symbols, result.scanned = scanned, len(scanned)
         with self._watchlist_lock:
             result.decisions = wl.apply_wide(heat, self.symbols.sector, cfg.kept_per_sector)
+            if movers:
+                moved = sorted((m for m in seen.values() if m.rvol >= cfg.movers_min_rvol),
+                               key=lambda m: -abs(m.change_pct))
+                result.decisions += wl.apply_movers(
+                    [(m.symbol, self.symbols.sector(m.symbol), heat.get(m.symbol, m.heat),
+                      f"moved {m.change_pct:+.1f}% today on {m.rvol:.1f}x volume") for m in moved], movers)
             wl.save(self.watchlist_dir)
             result.hot = wl.hot_symbols()
         return self._finish(result, filters)

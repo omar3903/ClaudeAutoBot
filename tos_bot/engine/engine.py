@@ -138,7 +138,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         self.scan_settings = ScanSettings.load(saved.get("scan"), ScanSettings(
             premarket_time=sc.premarket_time, gapper_time=sc.gapper_time, cycle_minutes=sc.cycle_minutes,
             hot_list_size=sc.hot_list_size, sector_queue_size=sc.sector_queue_size,
-            wide_minutes=sc.wide_minutes, wide_stocks=sc.wide_stocks))
+            wide_minutes=sc.wide_minutes, wide_stocks=sc.wide_stocks,
+            movers=sc.movers, yesterday_movers=sc.yesterday_movers))
 
         self.scanner = Scanner(
             self.settings, self.md, SymbolMaster(data_dir / "symbols.json"),
@@ -746,7 +747,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             elif kind == "gappers":
                 result = self.scanner.run_gappers()
             elif kind == "wide":
-                result = self.scanner.run_wide(self.scan_settings.wide_stocks)
+                result = self.scanner.run_wide(self.scan_settings.wide_stocks, self.scan_settings.movers)
             elif quick:
                 result = self.scanner.run_plays(self._board_symbols())
             else:
@@ -876,6 +877,11 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             notes.append(f"The pre-open gap check now runs at {new.gapper_time} ET.")
         if new.cycle_minutes != old.cycle_minutes:
             notes.append(f"The hot list and buffers are rescanned every {new.cycle_minutes} minutes.")
+        if (new.movers, new.yesterday_movers) != (old.movers, old.yesterday_movers):
+            parts = ([f"today's {new.movers} biggest movers after each wide scan"] if new.movers else []) + (
+                [f"yesterday's {new.yesterday_movers} from the full scan"] if new.yesterday_movers else [])
+            notes.append("Hot-list slots for " + " and ".join(parts) + "." if parts
+                         else "Movers no longer hold hot-list slots of their own.")
         if (new.wide_minutes, new.wide_stocks) != (old.wide_minutes, old.wide_stocks):
             which = f"the hottest {new.wide_stocks:,}" if new.wide_stocks else "every liquid stock"
             notes.append(f"The wide scan is off." if not new.wide_on

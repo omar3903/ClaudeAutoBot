@@ -43,6 +43,9 @@ scanner:
   wide_minutes: 30                     # the wide scan: every liquid stock's 5-minute candles this often in the
                                        # session (15-120; 0 = off) - one request per stock, a few minutes each
   wide_stocks: 0                       # the hottest N of the full scan's liquid stocks; 0 = all of them
+  movers: 10                           # today's biggest movers on volume hold hot-list slots after each wide scan
+  yesterday_movers: 10                 # ...and the last session's biggest movers, from the full scan (0 = off)
+  movers_min_rvol: 1.5                 # a mover counts only on at least this much relative volume
   buffer_picks_per_sector: 2           # new buffer names looked at per sector each cycle
   kept_per_sector: 2                   # promising buffer names kept waiting for a hot-list slot
   fast_cycle_seconds: 60               # hot list only, while Autopilot day-trades an open session

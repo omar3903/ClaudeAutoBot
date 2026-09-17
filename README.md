@@ -172,6 +172,13 @@ the 5-minute cycle waits for it; plays it finds stay on the board and are
 re-checked every 15 seconds like any other. **Settings → Scan every stock now**
 runs it on demand.
 
+**The movers hold slots of their own.** After each wide scan, today's biggest movers
+(by % change since yesterday's close, on at least 1.5× their usual volume; default
+10) take hot-list slots outright, whatever their sector — Aziz's stocks in play trump
+sector diversity — each replacing the coolest hot-list name that isn't a mover
+itself. The full scan does the same for the last session's biggest movers (default
+10), in case they move for a second day. The Watchlist tab marks them and says why.
+
 If the app starts after the full-scan time with no watchlist for the day (or on a
 day off with none at all), the full scan runs as soon as prices are available.
 **Settings → Run full scan now** rebuilds the lists at any time; candles already
@@ -187,6 +194,8 @@ next buffer names.
 | Gap check at | 09:15 ET | 08:00–09:25 | `gapper_time` |
 | Wide scan every | 30 min | 15–120, 0 = off | `wide_minutes` |
 | Wide scan covers | all liquid stocks | 0 = all, else the hottest N | `wide_stocks` |
+| Today's movers on the hot list | 10 | 0–20 | `movers` (`movers_min_rvol` 1.5) |
+| Yesterday's movers on the hot list | 10 | 0–20 | `yesterday_movers` |
 
 Also in `config.yaml`: `gapper_symbols` (400), `gapper_min_gap_pct` (2), `gapper_min_volume`
 (50,000), `buffer_picks_per_sector` (2), `kept_per_sector` (2),

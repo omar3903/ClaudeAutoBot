@@ -122,6 +122,11 @@ class ScannerCfg(_Model):
     wide_minutes: int = 30                # the wide scan - every liquid stock's 5-minute candles - this often
                                           # in the session (15-120; 0 = off); one request per stock
     wide_stocks: int = 0                  # the hottest N of the full scan's liquid stocks; 0 = all of them
+    movers: int = 10                      # today's biggest movers (by % change, on volume) hold hot-list slots
+                                          # after each wide scan (0-20; 0 = off) - Aziz's stocks in play
+    yesterday_movers: int = 10            # the last session's biggest movers hold slots from the full scan, in
+                                          # case they move for a second day (0-20; 0 = off)
+    movers_min_rvol: float = 1.5          # a mover counts only on at least this much relative volume
     buffer_picks_per_sector: int = 2      # new buffer names scanned per sector per cycle
     kept_per_sector: int = 2              # buffer names kept waiting for a hot-list slot
     fundamentals_leaders: int = 8         # valuation setups run on this many top names
