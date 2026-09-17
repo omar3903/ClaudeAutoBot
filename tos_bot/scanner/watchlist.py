@@ -66,6 +66,8 @@ class DayWatchlist:
     kept: Dict[str, List[Candidate]] = field(default_factory=dict)
     searched: Dict[str, int] = field(default_factory=dict)
     decisions: List[Decision] = field(default_factory=list)
+    #: every liquid stock the full scan ranked, hottest first - the pool the wider looks draw from
+    ranked: List[str] = field(default_factory=list)
 
     @classmethod
     def build(cls, session: dt.date, bars_through: dt.date, ranked: Iterable[DailyMetrics],
@@ -84,11 +86,16 @@ class DayWatchlist:
             elif len(queues.setdefault(sector, [])) < queue_size:
                 queues[sector].append(c)
         return cls(session=session, bars_through=bars_through, built_at=_now_iso(),
-                   universe=universe, liquid=liquid, hot=hot, queues=queues)
+                   universe=universe, liquid=liquid, hot=hot, queues=queues, ranked=[m.symbol for m in ranked])
 
     # ---- what to scan ----------------------------------------------------- #
     def hot_symbols(self) -> List[str]:
         return [c.symbol for c in self.hot]
+
+    def leaders(self, n: int) -> List[str]:
+        """The ``n`` hottest liquid stocks of the full scan's ranking (all of them when n is 0 or more
+        than there are)."""
+        return list(self.ranked[:n] if n > 0 else self.ranked)
 
     def kept_symbols(self) -> List[str]:
         return [c.symbol for cs in self.kept.values() for c in cs]
@@ -177,6 +184,7 @@ class DayWatchlist:
         return {
             "session": self.session.isoformat(), "bars_through": self.bars_through.isoformat(),
             "built_at": self.built_at, "universe": self.universe, "liquid": self.liquid,
+            "ranked": len(self.ranked),
             "hot": [asdict(c) for c in self.hot],
             "sectors": [{"sector": s, "kept": [asdict(c) for c in self.kept.get(s, [])],
                          "queued": len(self.queues.get(s, [])), "searched": self.searched.get(s, 0)}
@@ -188,7 +196,7 @@ class DayWatchlist:
         directory.mkdir(parents=True, exist_ok=True)
         doc = {**self.state(), "queues": {s: [asdict(c) for c in q] for s, q in self.queues.items()},
                "kept": {s: [asdict(c) for c in q] for s, q in self.kept.items()},
-               "searched": self.searched}
+               "searched": self.searched, "ranked": list(self.ranked)}
         (directory / f"watchlist_{self.session.isoformat()}.json").write_text(json.dumps(doc), encoding="utf-8")
         for old in sorted(directory.glob("watchlist_*.json"))[:-5]:
             old.unlink(missing_ok=True)
@@ -215,6 +223,7 @@ class DayWatchlist:
                     kept={s: [Candidate(**c) for c in q] for s, q in d["kept"].items()},
                     searched=d.get("searched", {}),
                     decisions=[Decision(**x) for x in reversed(d.get("decisions", []))],
+                    ranked=[str(s) for s in d.get("ranked", [])] if isinstance(d.get("ranked"), list) else [],
                 )
             except (OSError, ValueError, KeyError, TypeError):
                 continue

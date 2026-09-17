@@ -185,6 +185,8 @@ replay:
   # 250 swing sessions is a year, as far back as the stored daily candles go.
   sessions: 60                        # day-trade sessions of 5-minute candles (5-120)
   swing_sessions: 250                 # swing sessions of daily candles (20-250)
+  swing_stocks: 400                   # swing setups replayed on this many of the full scan's leaders too, not
+                                      # just the day's watchlist (0 = watchlist only); their candles are on disk
   slippage_bps: 5.0                   # on every market fill, each way
   commission_bps: 1.0                 # on every fill
   held_out_fraction: 0.3334           # the latest sessions kept out of sample; Autopilot wants profits there too
