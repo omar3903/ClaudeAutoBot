@@ -483,6 +483,24 @@ python scripts/export_training_set.py            # -> data/research/training_set
 The data collection is passive: the app trades as usual and the rows accumulate. See
 `docs/AutoTradeBot-learning.pdf` for how they are meant to be used.
 
+**Judging a model** (`tos_bot/research/validate.py`, `scripts/validate_model.py`): before any model
+touches a decision it is judged the way the learning guide says - **purged walk-forward folds**
+(each fold trains on rows that finished before its test window, less an embargo; never a random
+split), against the **baselines** it must beat (the confidence the setup states and the calibrated
+probability the app shows), against a **shuffled-label baseline** (the same model fitted on random
+labels, many times: the real one must beat the best of those), and on a metric table - log loss
+and Brier score, calibration by bins, the win rate and expectancy in R of the top decile and above
+a floor. The first learned model is a regularised logistic regression in NumPy, fitted per fold.
+
+```
+python scripts/validate_model.py                      # every row in the database
+python scripts/validate_model.py --source replay      # the replay's rows only
+python scripts/validate_model.py --csv data/research/training_set.csv --folds 6 --shuffles 50
+```
+
+It prints the table with the pass marks (`usable: YES` or `no - stays in shadow`) and writes
+`data/research/validation.json`. A model that doesn't pass is not used.
+
 ---
 
 ## Trading capital
