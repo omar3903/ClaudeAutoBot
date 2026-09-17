@@ -102,6 +102,31 @@ def write_csv(rows: Sequence[Mapping[str, Any]], path: Path) -> Path:
     return path
 
 
+def load_csv(path: Path) -> List[Dict[str, Any]]:
+    """A training set written by write_csv, read back: numbers as floats, the '|'-joined lists as
+    lists, True/False as booleans, empty cells as None."""
+    rows: List[Dict[str, Any]] = []
+    with Path(path).open("r", newline="", encoding="utf-8") as fh:
+        for raw in csv.DictReader(fh):
+            row: Dict[str, Any] = {}
+            for k, v in raw.items():
+                if k in ("noise", "tags"):
+                    row[k] = [f for f in (v or "").split("|") if f]
+                elif v is None or v == "":
+                    row[k] = None
+                elif v in ("True", "False"):
+                    row[k] = v == "True"
+                elif k in ROW_KEYS[:10]:                     # ids, names and times stay text
+                    row[k] = v
+                else:
+                    try:
+                        row[k] = float(v)
+                    except ValueError:
+                        row[k] = v
+            rows.append(row)
+    return rows
+
+
 def _mfe_r(t: Mapping[str, Any]) -> Optional[float]:
     try:
         entry, stop, mfe = float(t["entry_price"]), float(t["initial_stop_price"]), float(t["mfe"])
