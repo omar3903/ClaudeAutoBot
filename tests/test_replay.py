@@ -195,6 +195,49 @@ def test_series_shared_for_a_session_equal_the_ones_computed_per_bar():
     pd.testing.assert_series_equal(plain.vwap_series[today], ctx.vwap_series[today], check_names=False)
 
 
+def test_the_replay_leaves_out_the_plays_the_board_would_never_show():
+    import fakes
+
+    bars, daily = fakes.intraday_bars("FLR"), fakes.daily_bars("FLR")
+    shown = replay_intraday([_LongAtBar()], "FLR", bars, daily, EXACT, QUIET, sessions=2)      # 2:1 plays
+    assert shown
+    floor = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, breakeven_at_r=0.0, trail_start_r=0.0,
+                           min_reward_risk=3.0)
+    assert replay_intraday([_LongAtBar()], "FLR", bars, daily, floor, QUIET, sessions=2) == []
+    from tos_bot.config import get_settings
+    assert ReplaySettings.from_exit_rules(get_settings().config.exit_manager, None, 1.5).min_reward_risk == 1.5
+
+
+def test_the_records_count_only_what_autopilot_would_take():
+    from tos_bot.research.replay import taken
+
+    def sim(rr, conf, tf="INTRADAY", noise=(), confirmed=True):
+        return SimTrade(strategy="s", symbol="TKN", side="LONG", timeframe=tf, entered_at="2026-09-10T14:00:00",
+                        exited_at="2026-09-10T15:00:00", entry=100.0, exit=101.0, r=1.0, exit_reason="target",
+                        noise=list(noise), confirmed=confirmed, features={"reward_risk": rr, "confidence": conf})
+
+    trades = [sim(2.5, 0.7), sim(1.2, 0.7), sim(2.5, 0.4), sim(2.5, 0.55, tf="SWING"), sim(2.5, 0.7, noise=["against_gap"]),
+              SimTrade(strategy="s", symbol="OLD", side="LONG", timeframe="INTRADAY", entered_at="2026-09-10T14:00:00",
+                       exited_at="2026-09-10T15:00:00", entry=100.0, exit=101.0, r=1.0, exit_reason="target")]
+    assert len(taken(trades)) == 6                                                     # no floors: everything
+    kept = taken(trades, skip_noise=["against_gap"], min_reward_risk=2.0,
+                 confidence_floors={"INTRADAY": 0.6, "SWING": 0.5})
+    assert [(t.symbol, t.features.get("reward_risk")) for t in kept] == [("TKN", 2.5), ("TKN", 2.5), ("OLD", None)]
+    assert kept[1].timeframe == "SWING"                                                # 0.55 clears the swing floor
+
+
+def test_the_replayed_plays_state_the_calibrated_odds_like_live():
+    import fakes
+
+    bars, daily = fakes.intraday_bars("ODD"), fakes.daily_bars("ODD")
+    plain = replay_intraday([_LongAtBar()], "ODD", bars, daily, EXACT, QUIET, sessions=2)
+    leaning = replay_intraday([_LongAtBar()], "ODD", bars, daily, EXACT, QUIET, sessions=2,
+                              records={"long_at_bar": {"trades": 300, "win_rate": 0.3}})
+    assert plain and len(plain) == len(leaning)
+    assert plain[0].features["probability"] > leaning[0].features["probability"]      # shrunk toward the record
+    assert plain[0].features["confidence"] == leaning[0].features["confidence"]       # the setup's own view is unchanged
+
+
 def test_no_fill_when_the_next_open_has_already_run_away():
     assert _replay([(101.0, 101.1, 100.9, 101.0)]) == []
 

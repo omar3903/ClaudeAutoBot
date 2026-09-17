@@ -9,7 +9,7 @@ Pignataro Ch. 12, which uses the 52-week high/low as a valuation anchor.
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import pandas as pd
 

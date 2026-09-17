@@ -26,7 +26,7 @@ import datetime as dt
 import logging
 import math
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -398,7 +398,7 @@ def _sigmoid(z: np.ndarray) -> np.ndarray:
 
 
 def _num(v: Any) -> Optional[float]:
-    if v is None or v == "" or isinstance(v, bool) and False:
+    if v is None or v == "":
         return None
     if isinstance(v, bool):
         return 1.0 if v else 0.0

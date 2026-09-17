@@ -82,12 +82,14 @@ class ReplayRunner:
               pairs: Optional[Mapping[str, Any]] = None,
               held_out_fraction: float = HELD_OUT_FRACTION,
               news: Optional[Callable[[Sequence[str], dt.date], Mapping[str, Sequence[Mapping[str, Any]]]]] = None,
-              benchmark: Optional[str] = None) -> Dict[str, Any]:
+              benchmark: Optional[str] = None,
+              records: Optional[Mapping[str, Mapping[str, Any]]] = None) -> Dict[str, Any]:
         """``market``: the turbulent regime's probability per day, from a model fitted before the
         given first day; ``earnings``: when each stock's earnings filings were accepted; ``news``:
         each stock's stored stories since a first day, for the news checks; ``benchmark``: the
-        S&P 500 ETF's symbol, whose candles the market model behind those checks needs. All are
-        asked for on the replay's own thread, and the replay goes on without them if they fail."""
+        S&P 500 ETF's symbol, whose candles the market model behind those checks needs; ``records``:
+        each strategy's pooled record, so the replayed plays state the same calibrated odds as live.
+        All are asked for on the replay's own thread, and the replay goes on without them if they fail."""
         with self._lock:
             if self.running:
                 return {"ok": False, "reason": "A replay is already running."}
@@ -96,7 +98,7 @@ class ReplayRunner:
                 target=self._run, name="replay", daemon=True,
                 args=(list(strategies), source, daily_frame, list(intraday_symbols), list(swing_symbols),
                       sessions, swing_sessions, settings, noise, con_ids or {}, market, earnings,
-                      held_out_fraction, pairs, news, benchmark))
+                      held_out_fraction, pairs, news, benchmark, dict(records or {})))
             self._thread.start()
         held = f"{held_out_fraction:.0%}"
         return {"ok": True, "note": (f"Replaying the last {sessions} sessions of day-trade setups on "
@@ -109,7 +111,8 @@ class ReplayRunner:
             self._thread.join(timeout)
 
     def _run(self, strategies, source, daily_frame, intraday_symbols, swing_symbols, sessions, swing_sessions,
-             settings, noise, con_ids, market, earnings, fraction, pairs=None, news=None, benchmark=None) -> None:
+             settings, noise, con_ids, market, earnings, fraction, pairs=None, news=None, benchmark=None,
+             records=None) -> None:
         started = time.monotonic()
         try:
             wanted = intraday_symbols + ([benchmark] if benchmark and benchmark not in intraday_symbols else [])
@@ -127,11 +130,11 @@ class ReplayRunner:
             split = {"INTRADAY": held_out_from(last, sessions, fraction),
                      "SWING": held_out_from(last, swing_sessions, fraction)}
             jobs = [("intraday", strategies, s, chunk, daily, settings, noise, n, regime, reports.get(s, ()),
-                     stories.get(s, ()), bench_bars, bench_daily)
+                     stories.get(s, ()), bench_bars, bench_daily, records)
                     for s in intraday_symbols if s in bars and (daily := daily_frame(s)) is not None
                     for chunk, n in session_chunks(bars[s], sessions, self.sessions_per_job)]
             jobs += [("swing", strategies, s, None, daily, settings, noise, swing_sessions, regime, (),
-                      stories.get(s, ()), None, bench_daily)
+                      stories.get(s, ()), None, bench_daily, records)
                      for s in swing_symbols if (daily := daily_frame(s)) is not None]
             if pairs:
                 frames = {s: f for s in pairs["groups"] if (f := daily_frame(s)) is not None}
@@ -199,38 +202,46 @@ class ReplayRunner:
     def split(self) -> Optional[Dict[str, Optional[str]]]:
         return self._results.get("held_out_from")
 
-    def records(self, skip_noise: Iterable[str], min_confirmations: int) -> Dict[str, Dict[str, Any]]:
-        """Each strategy's replayed record over the trades Autopilot would have taken, with its
+    def records(self, skip_noise: Iterable[str], min_confirmations: int, min_reward_risk: float = 0.0,
+                confidence_floors: Optional[Mapping[str, float]] = None) -> Dict[str, Dict[str, Any]]:
+        """Each strategy's replayed record over the trades Autopilot would have taken - its skipped
+        flags, its confirmations, its reward:risk floor and its confidence floors - with the
         held-out sessions' record. Asked for on every play, so kept until the settings or the
         results change."""
-        self._refresh(skip_noise, min_confirmations)
+        self._refresh(skip_noise, min_confirmations, min_reward_risk, confidence_floors)
         return self._records
 
-    def r_multiples(self, strategy: str, skip_noise: Iterable[str], min_confirmations: int) -> List[float]:
+    def r_multiples(self, strategy: str, skip_noise: Iterable[str], min_confirmations: int,
+                    min_reward_risk: float = 0.0, confidence_floors: Optional[Mapping[str, float]] = None) -> List[float]:
         """The R of every replayed trade of ``strategy`` that Autopilot would have taken."""
-        self._refresh(skip_noise, min_confirmations)
+        self._refresh(skip_noise, min_confirmations, min_reward_risk, confidence_floors)
         return self._taken.get(strategy, [])
 
     def learned_skips(self) -> List[str]:
         return learned_skips(self._results.get("noise"))
 
-    def _refresh(self, skip_noise: Iterable[str], min_confirmations: int) -> None:
-        key = (tuple(sorted(skip_noise)), int(min_confirmations), self._results.get("ran_at"))
+    def _refresh(self, skip_noise: Iterable[str], min_confirmations: int, min_reward_risk: float = 0.0,
+                 confidence_floors: Optional[Mapping[str, float]] = None) -> None:
+        floors = tuple(sorted((confidence_floors or {}).items()))
+        key = (tuple(sorted(skip_noise)), int(min_confirmations), float(min_reward_risk or 0.0), floors,
+               self._results.get("ran_at"))
         if key == self._records_key:
             return
-        chosen = taken(self._trades, key[0], min_confirmations)
+        chosen = taken(self._trades, key[0], min_confirmations, key[2], dict(floors))
         by_strategy: Dict[str, List[float]] = {}
         for t in chosen:
             by_strategy.setdefault(t.strategy, []).append(t.r)
         self._records = records_by_strategy(chosen, self.split)
         self._taken, self._records_key = by_strategy, key
 
-    def state(self, skip_noise: Iterable[str], min_confirmations: int) -> Dict[str, Any]:
+    def state(self, skip_noise: Iterable[str], min_confirmations: int, min_reward_risk: float = 0.0,
+              confidence_floors: Optional[Mapping[str, float]] = None) -> Dict[str, Any]:
         meta = {k: v for k, v in self._results.items() if k != "trades"}
         return {**meta, "running": self.running, "progress": self._progress, "trade_count": len(self._trades),
                 "learned_skips": self.learned_skips(),
                 "records": {"all": strategy_records(self._trades, split=self.split),
-                            "autopilot": self.records(skip_noise, min_confirmations)}}
+                            "autopilot": self.records(skip_noise, min_confirmations, min_reward_risk,
+                                                      confidence_floors)}}
 
     def runs(self, limit: int = 30) -> List[Dict[str, Any]]:
         """The latest runs' summaries, newest first."""
@@ -303,9 +314,10 @@ def replay_job(job: tuple) -> List[Dict[str, Any]]:
         _, pairs, frames, sessions = job
         trades = replay_pairs(frames, pairs["groups"], pairs["rules"], pairs["finder"], sessions)
         return [dataclasses.asdict(t) for t in trades]
-    kind, strategies, symbol, bars, daily, settings, noise, sessions, market, earnings, news, bench_bars, bench_daily = job
+    (kind, strategies, symbol, bars, daily, settings, noise, sessions, market, earnings, news, bench_bars,
+     bench_daily, records) = job
     trades = (replay_intraday(strategies, symbol, bars, daily, settings, noise, sessions, market, earnings,
-                              news, bench_bars, bench_daily)
+                              news, bench_bars, bench_daily, records)
               if kind == "intraday" else replay_swing(strategies, symbol, daily, settings, noise, sessions, market,
-                                                      news, bench_daily))
+                                                      news, bench_daily, records))
     return [dataclasses.asdict(t) for t in trades]

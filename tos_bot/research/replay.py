@@ -80,13 +80,17 @@ class ReplaySettings:
     max_swing_hold_days: int = 10
     scale_out_pct: float = 50.0           # at the first target of a play with two, this much comes off...
     scale_out_lock_r: float = 0.0         # ...and the stop goes to the entry plus this R; the rest runs to the second
+    min_reward_risk: float = 0.0          # the scanner's floor: a play below it is never shown, so never replayed
 
     @classmethod
-    def from_exit_rules(cls, cfg, costs=None) -> "ReplaySettings":
-        """``cfg``: the exit manager's settings; ``costs``: the replay's (slippage and commission)."""
+    def from_exit_rules(cls, cfg, costs=None, min_reward_risk: float = 0.0) -> "ReplaySettings":
+        """``cfg``: the exit manager's settings; ``costs``: the replay's (slippage and commission);
+        ``min_reward_risk``: the scanner's floor (risk.min_reward_risk), so the replay only trades
+        plays the board would have shown."""
         extra = {} if costs is None else {"slippage_bps": float(costs.slippage_bps),
                                           "commission_bps": float(costs.commission_bps)}
-        return cls(breakeven_at_r=float(cfg.breakeven_at_r), breakeven_lock_r=float(cfg.breakeven_lock_r),
+        return cls(min_reward_risk=float(min_reward_risk or 0.0),
+                   breakeven_at_r=float(cfg.breakeven_at_r), breakeven_lock_r=float(cfg.breakeven_lock_r),
                    trail_start_r=float(cfg.trail_start_r), trail_lock_ratio=float(cfg.trail_lock_ratio),
                    flatten_before_close_min=int(cfg.flatten_intraday_before_close_min),
                    max_swing_hold_days=int(cfg.max_swing_hold_days) or 10,
@@ -141,8 +145,11 @@ def replay_intraday(strategies: Sequence[Strategy], symbol: str, bars: pd.DataFr
                     sessions: Optional[int] = None, market: Optional[Mapping[dt.date, float]] = None,
                     earnings: Sequence[str] = (), news: Sequence[Mapping[str, Any]] = (),
                     benchmark_bars: Optional[pd.DataFrame] = None,
-                    benchmark_daily: Optional[pd.DataFrame] = None) -> List[SimTrade]:
+                    benchmark_daily: Optional[pd.DataFrame] = None,
+                    records: Optional[Mapping[str, Mapping[str, Any]]] = None) -> List[SimTrade]:
     """``bars``: 5-minute candles over several sessions; ``daily``: completed daily candles;
+    ``records``: each strategy's pooled record (research/weights.py pooled_odds), so the plays state
+    the same calibrated odds they state live;
     ``market``: the probability of the turbulent regime for each day, known before it opened;
     ``earnings``: when SEC accepted the stock's earnings filings (8-K item 2.02), ISO times in UTC;
     ``news``: the stock's stored stories, each with ``at`` (ISO, UTC) - the news checks see, at
@@ -160,7 +167,7 @@ def replay_intraday(strategies: Sequence[Strategy], symbol: str, bars: pd.DataFr
         flatten_at = _at(day, clock.regular_close_time(day)) - pd.Timedelta(minutes=settings.flatten_before_close_min)
         benchmark = _Benchmark(benchmark_daily, benchmark_bars, day)
         trades += _replay_session(day_trades, symbol, session, bars, prior_daily, flatten_at, settings, noise,
-                                  regime(market, day), earnings_signals(earnings, day), stories, benchmark)
+                                  regime(market, day), earnings_signals(earnings, day), stories, benchmark, records)
     return trades
 
 
@@ -168,10 +175,12 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
                     prior_daily: pd.DataFrame, flatten_at: pd.Timestamp, settings: ReplaySettings,
                     noise: NoiseSettings, market: Dict[str, Any], signals: Any,
                     stories: Sequence[Tuple[pd.Timestamp, Mapping[str, Any]]] = (),
-                    benchmark: Optional["_Benchmark"] = None) -> List[SimTrade]:
+                    benchmark: Optional["_Benchmark"] = None,
+                    records: Optional[Mapping[str, Mapping[str, Any]]] = None) -> List[SimTrade]:
     trades: List[SimTrade] = []
     open_positions: Dict[str, _Position] = {}
     seen_before: set = set()
+    records = {k: dict(v) for k, v in (records or {}).items()}
     shared = session_series(history, strategies)
     for i in range(settings.warmup_bars, len(session) - 1):
         closed_at, next_at, next_bar = session.index[i] + BAR, session.index[i + 1], session.iloc[i + 1]
@@ -184,8 +193,8 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
                               now=closed_at.to_pydatetime(), signals=signals, market=dict(market),
                               news=news_at(stories, closed_at),
                               benchmark=benchmark.closes_at(closed_at) if benchmark is not None else None,
-                              shared=shared)
-        signals_now = _signals(strategies, ctx, noise)
+                              shared=shared, records=records)
+        signals_now = _signals(strategies, ctx, noise, settings.min_reward_risk)
         activity = intraday_metrics(symbol, window, prior_daily) if signals_now else None
         for strategy, play, flags in signals_now:
             if strategy.key not in open_positions:
@@ -214,11 +223,13 @@ def replay_swing(strategies: Sequence[Strategy], symbol: str, daily: pd.DataFram
                  settings: ReplaySettings = ReplaySettings(), noise: NoiseSettings = NoiseSettings(),
                  sessions: int = 250, market: Optional[Mapping[dt.date, float]] = None,
                  news: Sequence[Mapping[str, Any]] = (),
-                 benchmark_daily: Optional[pd.DataFrame] = None) -> List[SimTrade]:
+                 benchmark_daily: Optional[pd.DataFrame] = None,
+                 records: Optional[Mapping[str, Mapping[str, Any]]] = None) -> List[SimTrade]:
     """Signals at each session's close, fills at the next open. Trades still open
     when the candles run out are left out - their result isn't known yet."""
     swing = [s for s in strategies if s.kind is StrategyKind.TECHNICAL and s.timeframe is Timeframe.SWING]
     stories = _stories(news)
+    records = {k: dict(v) for k, v in (records or {}).items()}
     trades: List[SimTrade] = []
     open_positions: Dict[str, _Position] = {}
     for i in range(max(60, len(daily) - sessions - 1), len(daily) - 1):
@@ -229,8 +240,9 @@ def replay_swing(strategies: Sequence[Strategy], symbol: str, daily: pd.DataFram
         ctx = StrategyContext(symbol=symbol, intraday=None, daily=history,
                               quote=quote_from_price(symbol, float(history["close"].iloc[-1])),
                               now=close_at.to_pydatetime(), market=regime(market, next_at.date()),
-                              news=news_at(stories, close_at), benchmark=benchmark.closes_at(close_at, whole_day=True))
-        signals_now = _signals(swing, ctx, noise) if swing else []
+                              news=news_at(stories, close_at), benchmark=benchmark.closes_at(close_at, whole_day=True),
+                              records=records)
+        signals_now = _signals(swing, ctx, noise, settings.min_reward_risk) if swing else []
         activity = daily_metrics(symbol, history) if signals_now else None
         for strategy, play, flags in signals_now:
             if strategy.key not in open_positions:
@@ -356,9 +368,10 @@ def earnings_signals(accepted: Sequence[str], day: dt.date) -> Any:
                            buying=None, selling=None, news=None)
 
 
-def _signals(strategies: Sequence[Strategy], ctx: StrategyContext,
-             noise: NoiseSettings) -> List[Tuple[Strategy, Play, List[str]]]:
-    """Each strategy's play at this moment, flagged the way the scans flag it."""
+def _signals(strategies: Sequence[Strategy], ctx: StrategyContext, noise: NoiseSettings,
+             min_reward_risk: float = 0.0) -> List[Tuple[Strategy, Play, List[str]]]:
+    """Each strategy's play at this moment, flagged the way the scans flag it. A play under the
+    scanner's reward:risk floor is left out - the board would never have shown it."""
     out: List[Tuple[Strategy, Play, List[str]]] = []
     for strategy in strategies:
         try:
@@ -366,6 +379,8 @@ def _signals(strategies: Sequence[Strategy], ctx: StrategyContext,
         except Exception:  # noqa: BLE001 - a strategy that trips on odd candles just sits this bar out
             continue
         for play in plays[:1]:
+            if play.reward_risk < min_reward_risk:
+                continue
             flags = context_flags(play, ctx, strategy.style, noise)
             play.evidence["expected_r"] = round(expected_r(play, ctx.daily_atr), 3)
             if play.evidence["expected_r"] < noise.min_expected_r:
@@ -540,19 +555,33 @@ def _compare(removed: Sequence[SimTrade], kept: Sequence[SimTrade]) -> Dict[str,
     return out
 
 
-def taken(trades: Sequence[SimTrade], skip_noise: Iterable[str] = (), min_confirmations: int = 1) -> List[SimTrade]:
-    """The trades Autopilot would actually have taken: none with a skipped noise flag, and
-    day trades confirmed when it asks for that."""
+def taken(trades: Sequence[SimTrade], skip_noise: Iterable[str] = (), min_confirmations: int = 1,
+          min_reward_risk: float = 0.0, confidence_floors: Optional[Mapping[str, float]] = None) -> List[SimTrade]:
+    """The trades Autopilot would actually have taken: none with a skipped noise flag, day trades
+    confirmed when it asks for that, and - through the features the replay keeps on a trade - none
+    under its reward:risk floor or under the confidence floor of its timeframe."""
     skip = set(skip_noise)
-    return [t for t in trades if not skip.intersection(t.noise)
-            and not (min_confirmations > 1 and flagged(t, "unconfirmed"))]
+    floors = dict(confidence_floors or {})
+
+    def passes(t: SimTrade) -> bool:
+        if skip.intersection(t.noise) or (min_confirmations > 1 and flagged(t, "unconfirmed")):
+            return False
+        f = t.features or {}
+        rr, conf = f.get("reward_risk"), f.get("confidence")
+        if min_reward_risk and rr is not None and float(rr) < min_reward_risk:
+            return False
+        floor = floors.get(t.timeframe, 0.0)
+        return not (floor and conf is not None and float(conf) < floor)
+
+    return [t for t in trades if passes(t)]
 
 
 def strategy_records(trades: Sequence[SimTrade], skip_noise: Iterable[str] = (), min_confirmations: int = 1,
-                     split: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, Dict[str, Any]]:
+                     split: Optional[Mapping[str, Optional[str]]] = None, min_reward_risk: float = 0.0,
+                     confidence_floors: Optional[Mapping[str, float]] = None) -> Dict[str, Dict[str, Any]]:
     """Each strategy's record over the trades Autopilot would have taken, with the held-out
     sessions' record alongside when ``split`` says where they start."""
-    return records_by_strategy(taken(trades, skip_noise, min_confirmations), split)
+    return records_by_strategy(taken(trades, skip_noise, min_confirmations, min_reward_risk, confidence_floors), split)
 
 
 def records_by_strategy(trades: Iterable[SimTrade],

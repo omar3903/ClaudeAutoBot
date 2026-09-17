@@ -49,12 +49,6 @@ class Quote:
             return (self.bid + self.ask) / 2.0
         return self.last
 
-    @property
-    def spread_bps(self) -> float:
-        if self.bid and self.ask and self.mid:
-            return (self.ask - self.bid) / self.mid * 1e4
-        return 0.0
-
 
 # --------------------------------------------------------------------------- #
 #  Account / positions                                                       #

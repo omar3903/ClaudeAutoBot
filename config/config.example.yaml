@@ -135,7 +135,8 @@ autopilot:
   enabled: false                     # master switch
   allow_live: false                  # HARD gate - Autopilot NEVER routes a real order unless true
   trade_types: ["INTRADAY"]          # what it may auto-take: INTRADAY, SWING and/or PAIRS
-  min_confidence: 0.62               # day trades: skip plays the strategy itself isn't confident in
+  min_confidence: 0.5                # day trades: only the weakest are kept out - the replay found higher stated
+                                     # confidence went with worse trades, so it is no filter for quality
   min_swing_confidence: 0.5          # swing trades: their setups state flat 0.55-0.58 confidences and the
                                      # replay's proof is their real gate, so only the weakest are kept out
   min_reward_risk: 2.0               # never auto-take a play worse than this (Aziz Rule 5)
@@ -146,7 +147,8 @@ autopilot:
   max_new_per_cycle: 1               # at most this many NEW auto entries per scan (no bursts)
   max_gross_exposure_pct: 100.0      # all positions together as % of equity - 100 = Autopilot never uses margin
   min_confirmations: 2               # a day-trade setup must show up in this many scans in a row
-  skip_noise: [against_trend, wrong_side_of_vwap, against_gap, volume_against, conflict, low_expected_value]
+  skip_noise: [against_gap]          # the only flag that removed worse trades on both halves of a year's replay;
+                                     # the other flags stay visible on the board, and the replay adds the checks it proves
                                      # noise flags Autopilot won't trade - see noise: below. It also skips
                                      # not_trending / not_mean_reverting / turbulent_market once the replay
                                      # shows they remove losers, on every session and the held-out ones
