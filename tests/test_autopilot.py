@@ -162,6 +162,26 @@ def test_confidence_and_rr_floors():
     assert eng.approved == []
 
 
+def test_autopilots_own_boxes_cap_what_the_filters_put_on_the_board():
+    from types import SimpleNamespace
+
+    eng = FakeEngine()
+    eng.filters = SimpleNamespace(timeframes=["INTRADAY", "SWING"])          # day plays are scanned and shown...
+    ap = AutoPilot(eng, _cfg(trade_types=["SWING", "PAIRS"], min_confidence=0.5, min_swing_confidence=0.5),
+                   bus=SILENT)
+    day, swing = mkplay(sym="DAY", conf=0.7), mkplay(sym="SWG", tf=Timeframe.SWING, conf=0.6)
+    assert ap.play_types() == ["SWING"] and ap.effective_trade_types() == ["SWING", "PAIRS"]
+    _run(ap, day, swing)
+    assert eng.approved_ids() == [swing.id]                                  # ...but only the swing is taken
+    assert "switched off" in ap.verdict(day) and "own boxes" in ap.verdict(day)
+    assert ap.status()["own_trade_types"] == ["SWING", "PAIRS"] and ap.status()["trade_types"] == ["SWING", "PAIRS"]
+
+    ap.configure(trade_types=["INTRADAY", "SWING", "PAIRS"])
+    assert ap.play_types() == ["INTRADAY", "SWING"]
+    eng.filters = SimpleNamespace(timeframes=["SWING"])                     # the filter bar still caps it too
+    assert ap.play_types() == ["SWING"]
+
+
 def test_swing_plays_have_a_confidence_floor_of_their_own():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(trade_types=["INTRADAY", "SWING"], min_confidence=0.62, min_swing_confidence=0.5),

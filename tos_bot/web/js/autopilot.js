@@ -60,8 +60,14 @@ function configure() {
     title: "Autopilot settings",
     bodyHTML: `<div class="ap-form">
       <label>Auto-take these trade types</label>
-      <p class="muted small">Autopilot takes what the <b>Intraday</b>, <b>Swing</b> and <b>Pairs</b> boxes above the plays switch on -
-        now: <b>${(ap.trade_types || []).map(typeName).join(", ") || "none"}</b>.</p>
+      <div class="row-gap">
+        <label><input type="checkbox" id="ap-type-day" ${(ap.own_trade_types || ap.trade_types || []).includes("INTRADAY") ? "checked" : ""}> day trades</label>
+        <label><input type="checkbox" id="ap-type-swing" ${(ap.own_trade_types || ap.trade_types || []).includes("SWING") ? "checked" : ""}> swing trades</label>
+        <label><input type="checkbox" id="ap-type-pairs" ${(ap.own_trade_types || ap.trade_types || []).includes("PAIRS") ? "checked" : ""}> pairs</label>
+      </div>
+      <p class="muted small">The <b>Intraday</b> / <b>Swing</b> boxes above the plays say what is scanned and shown; these say what
+        Autopilot may take of it. Untick day trades here to keep day plays on the board for the review without trading them.
+        Taking now: <b>${(ap.trade_types || []).map(typeName).join(", ") || "none"}</b>.</p>
       <label>Minimum confidence, day trades <b id="ap-conf-v">${ap.min_confidence ?? 0.5}</b></label>
       <input type="range" id="ap-conf" min="0.4" max="0.9" step="0.01" value="${ap.min_confidence ?? 0.5}">
       <label title="Swing setups state flat, modest confidences (0.55-0.58); the replay's proof is their real gate, so this only keeps out the weakest">Minimum confidence, swing trades <b id="ap-sconf-v">${ap.min_swing_confidence ?? 0.5}</b></label>
@@ -95,8 +101,10 @@ function configure() {
     </div>`,
     okText: "Save", okClass: "long",
     onOk: async () => {
-      const types = ["INTRADAY", "SWING"];                      // day and swing follow the filters
-      if ((ap.trade_types || []).includes("PAIRS")) types.push("PAIRS");     // pairs: the box next to them
+      const types = [];
+      if ($("#ap-type-day").checked) types.push("INTRADAY");
+      if ($("#ap-type-swing").checked) types.push("SWING");
+      if ($("#ap-type-pairs").checked) types.push("PAIRS");
       const int = sel => parseInt($(sel).value, 10);
       await postAutopilot({
         trade_types: types.length ? types : ["INTRADAY"],
