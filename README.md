@@ -434,6 +434,14 @@ positions:
 | **Live, nothing open** | the app shuts down |
 | **IBKR (paper or live), swing positions with a stop at the broker** | the dialog also offers **Keep them open & quit**: those positions stay open, protected by their stop orders resting at IBKR, and the app picks them up again when it starts; day trades, pair legs and any position without a resting stop are closed first. Targets and trailing are not worked while the app is off |
 
+**After hours** an exit can't fill, so the app never sends one into a closed exchange - and never takes a
+position's stop off the broker for an exit that can't go out. **Close all & quit** is refused while the market is
+closed; **Keep them open & quit** then keeps every position. A quit that can't finish can be stopped from the
+banner (**Stop quitting**): the positions still open stay open and managed, and the app unlocks.
+
+The Active orders tab has **Cancel working orders**: every working entry, exit and stray order is cancelled;
+the stops protecting open positions stay (close the position and its stop goes with it).
+
 While it closes out, a red banner shows what's left and the app is **locked**:
 routing, filters, strategies, scan settings, Autopilot, scanning and new entries
 are refused (the API says why) — only exits go through. Closes that haven't

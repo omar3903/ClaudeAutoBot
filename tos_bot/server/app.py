@@ -178,6 +178,14 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
         return _result(eng().begin_quit(close_all=bool((body or {}).get("close_all", True)),
                                         keep=bool((body or {}).get("keep", False))))
 
+    @app.post("/api/quit/cancel", dependencies=LOCAL_ONLY)
+    def quit_cancel():
+        return _result(eng().cancel_quit())
+
+    @app.post("/api/orders/cancel-all", dependencies=LOCAL_ONLY)
+    def orders_cancel_all():
+        return _result(eng().cancel_working_orders())
+
     # ---- connections (same machine only) -------------------------------- #
     @app.get("/api/setup", dependencies=LOCAL_ONLY)
     def setup():

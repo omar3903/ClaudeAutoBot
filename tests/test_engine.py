@@ -325,6 +325,28 @@ def test_without_stops_at_the_broker_nothing_can_be_kept(engine):
     assert closed == ["AAPL"] and engine.repo.open_trades() == []
 
 
+def test_after_hours_a_quit_keeps_the_positions_or_is_refused_and_a_stuck_quit_can_be_stopped(engine):
+    engine._venue = "ibkr-paper"
+    a, b = _open(engine, "AAPL", venue="ibkr-paper"), _open(engine, "MSFT", venue="ibkr-paper")
+    closed = _closes_fill(engine)
+    engine.executor._exchange_closed = lambda: "The market is closed, so an exit can't fill now."
+    refused = engine.begin_quit(close_all=True)
+    assert not refused["ok"] and refused["market_closed"] and "Keep them open" in refused["reason"]
+    assert engine.quit_state is None and closed == []                       # nothing locked, nothing sent
+    done = threading.Event()
+    engine.on_shutdown = done.set
+    assert engine.begin_quit(close_all=True, keep=True)["ok"] and done.wait(3)
+    assert closed == [] and {t["id"] for t in engine.repo.open_trades()} == {a, b}   # every position kept
+
+    engine.executor._exchange_closed = lambda: None
+    engine.executor.close_trade = lambda tid, reason="manual": {"ok": False, "reason": "rejected"}   # a quit that can't finish
+    engine.on_shutdown = None
+    assert engine.begin_quit(close_all=True)["ok"] and engine.quit_state
+    out = engine.cancel_quit()
+    assert out["ok"] and engine.quit_state is None and "quit" not in engine.runtime.read()
+    assert not engine.cancel_quit()["ok"]
+
+
 def test_while_quitting_nothing_but_exits_can_change(engine):
     tid = _open(engine, "AAPL")
     engine.executor.close_trade = lambda tid, reason="manual": {"ok": True, "status": "WORKING", "order_id": "o1"}

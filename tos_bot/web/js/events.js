@@ -223,6 +223,12 @@ function handle(topic, p) {
     case "quit.done":
       showShutdown(p.note);
       break;
+    case "quit.cancelled":
+      S.state.quit = null;
+      renderLock();
+      toast(`Quit cancelled - ${p.left} position${p.left === 1 ? "" : "s"} stay open and managed`, "warn");
+      refreshState();
+      break;
 
     case "autopilot.config":
       S.state.autopilot = p;
