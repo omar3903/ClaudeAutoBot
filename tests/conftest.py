@@ -26,6 +26,15 @@ def _db():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _regular_session(monkeypatch):
+    """The executor refuses exits while the exchange is closed; the tests run at any hour, so for them
+    the session is open unless a test says otherwise."""
+    from tos_bot.execution.executor import Executor
+    from tos_bot.util import clock
+    monkeypatch.setattr(Executor, "_session_now", staticmethod(lambda: clock.Session.REGULAR))
+
+
 @pytest.fixture
 def repo():
     from tos_bot.persistence.repository import Repository

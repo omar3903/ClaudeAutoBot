@@ -240,3 +240,45 @@ def test_switching_venue_forgets_the_stops_without_touching_them():
     ex.sync_open_orders()
     ex.rebind(_Broker(), venue="paper")
     assert ex.protective_stops() == [] and broker.cancelled == []
+
+
+def test_an_exit_the_exchange_cannot_fill_never_touches_the_stop(monkeypatch):
+    from tos_bot.execution.executor import Executor
+    from tos_bot.util import clock
+
+    broker, _, ex, _ = _setup()
+    ex.sync_open_orders()
+    monkeypatch.setattr(Executor, "_session_now", staticmethod(lambda: clock.Session.POST))     # after the close
+    out = ex.close_trade("t1", reason="quit")
+    assert not out["ok"] and out["market_closed"] and "market is closed" in out["reason"]
+    assert broker.cancelled == [] and broker.exits() == [] and len(ex.protective_stops()) == 1   # nothing was touched
+    monkeypatch.setattr(Executor, "_session_now", staticmethod(lambda: clock.Session.REGULAR))
+    assert ex.close_trade("t1", reason="quit")["ok"] and broker.cancelled == ["1"]
+
+
+def test_cancelling_the_working_orders_keeps_the_stops_that_protect_positions():
+    from tos_bot.core.enums import StrategyKind, Timeframe
+    from tos_bot.core.models import Account, Play
+    from test_order_follow_up import PLAN
+
+    stray = OrderResult(order_id="90", status="SUBMITTED", symbol="ZZZ", submitted_qty=4, side=Side.LONG, tag="")
+    broker, _, ex, _ = _setup(working=[stray])
+    ex.sync_open_orders()                                                       # the stop for t1: order 1
+    entry = Play(symbol="BBB", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                 timeframe=Timeframe.SWING, entry=50.0, stop=48.0, targets=[56.0])
+    entry.suggested_qty = 10
+    ex.execute_play(entry, Account(account_id="DU"), plan=PLAN)                # a working entry: order 2
+    counts = ex.cancel_working_orders()
+    assert counts == {"entries": 1, "exits": 0, "others": 1, "stops_kept": 1}
+    assert sorted(broker.cancelled) == ["2", "90"] and len(ex.protective_stops()) == 1
+
+
+def test_stopping_a_quit_calls_off_the_exits_it_sent_and_the_stops_go_back():
+    broker, _, ex, _ = _setup()
+    ex.sync_open_orders()                                                       # stop: order 1
+    assert ex.close_trade("t1", reason="quit")["ok"]                           # the quit's exit: order 2, left working
+    assert ex.cancel_exits() == 1 and broker.cancelled == ["1", "2"]
+    broker.reports["2"] = OrderResult(order_id="2", status="CANCELED", symbol="AAA", submitted_qty=10)
+    ex.sync_open_orders()                                                       # the exit is gone...
+    assert ex.pending_exit_trade_ids() == set() and len(ex.protective_stops()) == 1   # ...and a stop rests again
+    assert [s.quantity for s in broker.stops()] == [10, 10]

@@ -14,9 +14,12 @@ export function renderLock() {
   b.innerHTML = q.left
     ? `<span>⏻ Quitting — closing ${plural(q.left, "open position")}${symbols ? ` (${symbols})` : ""}. Nothing else can change until
        ${q.left === 1 ? "it's" : "they're all"} out; then the app ${q.reset_sim ? "resets the simulator and " : ""}shuts down.
-       You can still exit positions yourself.</span>`
+       You can still exit positions yourself.${q.waiting ? ` <b>${escapeHtml(q.waiting)}</b>` : ""}</span>
+       <button class="mini" id="quit-cancel" title="Stop quitting: the positions still open stay open and managed, and the app unlocks">Stop quitting</button>`
     : `<span>⏻ Quitting — all positions are closed, finishing up…</span>`;
   b.classList.remove("hidden");
+  const stop = $("#quit-cancel");
+  if (stop) stop.onclick = async () => { toastResult(await post("/api/quit/cancel", {})); refreshState(); };
 }
 
 export function openQuitDialog(pv) {

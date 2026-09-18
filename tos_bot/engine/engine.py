@@ -445,6 +445,22 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             self._refresh_orders()
         return self._orders_payload()
 
+    def cancel_working_orders(self, operator: str = "operator") -> Dict[str, Any]:
+        """Cancel every working order on the venue except the stops protecting open positions."""
+        if self.executor is None:
+            return {"ok": False, "reason": "no broker is connected"}
+        try:
+            counts = self.executor.cancel_working_orders()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "reason": f"the orders couldn't be cancelled: {e}"}
+        self._refresh_orders()
+        gone = counts["entries"] + counts["exits"] + counts["others"]
+        log.warning("%s cancelled %d working order(s)", operator, gone)
+        return {"ok": True, "counts": counts,
+                "note": (f"Cancelled {gone} working order(s): {counts['entries']} entries, {counts['exits']} exits, "
+                         f"{counts['others']} others. {counts['stops_kept']} protective stop(s) stay - they go "
+                         "when their position is closed.")}
+
     def _orders_payload(self) -> Dict[str, Any]:
         return {"orders": list(self._orders), "ok": self._orders_ok, "checked_at": self._orders_checked,
                 "venue_label": venue_label(self._venue)}

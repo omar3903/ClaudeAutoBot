@@ -324,6 +324,11 @@ class Executor(ProtectiveStops):
                                            f"switch back to that platform to close it."}
         if trade_id in self.pending_exit_trade_ids():
             return {"ok": False, "reason": f"An exit order for this {t['symbol']} position is already working."}
+        closed = self._exchange_closed()
+        if closed:
+            # a market exit would be rejected, and standing the stop down for it would leave the position
+            # with nothing at the broker - so nothing is touched until the session opens
+            return {"ok": False, "market_closed": True, "reason": closed}
         working = self._working_at_broker()
         order = _match_exit(t, working, set(self._pending))
         if order is not None:
@@ -403,6 +408,49 @@ class Executor(ProtectiveStops):
         self._open_by_symbol.pop(symbol, None)
         self.bus.publish("trade.closed", trade=out, reason=reason)
         return out, True
+
+    @staticmethod
+    def _session_now() -> "clock.Session":
+        return clock.current_session()
+
+    def _exchange_closed(self) -> Optional[str]:
+        """Why an exit can't be sent right now, on a venue that only fills in the regular session."""
+        if getattr(self.broker, "name", "") != "ibkr" or self._session_now() is clock.Session.REGULAR:
+            return None
+        return ("The market is closed, so an exit can't fill now. The position keeps its stop order at the broker; "
+                "the exit goes out when the regular session opens.")
+
+    def cancel_exits(self, reasons=("quit", "exit")) -> int:
+        """Call off the app's own exit orders still working that were sent for ``reasons`` - the
+        exits a quit sent ("exit" is what one taken over after a restart is called). After the
+        close IBKR holds a market exit for the next open; stopping the quit must not leave it
+        there to sell the position on Monday."""
+        n = 0
+        for oid, p in list(self._pending.items()):
+            if p.kind == "exit" and p.reason in reasons:
+                self._cancel_quietly(oid)
+                n += 1
+        return n
+
+    def cancel_working_orders(self) -> Dict[str, int]:
+        """Cancel every order working at the broker - entries, the app's own exits, anything else on
+        the account - except the stops protecting open positions: those go when their position
+        does. A cancelled order's fills, if it had any, are booked when the broker reports it."""
+        counts = {"entries": 0, "exits": 0, "others": 0, "stops_kept": len(self._stops)}
+        for oid, p in list(self._pending.items()):
+            self._cancel_quietly(oid)
+            counts["entries" if p.kind == "entry" else "exits"] += 1
+        followed = set(self._pending) | {s.order_id for s in self._stops.values()}
+        for o in self._working_at_broker():
+            if o.order_id in followed:
+                continue
+            if o.tag.startswith(STOP_TAG):
+                counts["stops_kept"] += 1
+                continue
+            self._cancel_quietly(o.order_id)
+            counts["others"] += 1
+        log.warning("cancelled the working orders: %s", counts)
+        return counts
 
     def _held_quantity(self, symbol: str) -> Optional[float]:
         """Signed quantity the broker reports for ``symbol`` (0.0 if none), or

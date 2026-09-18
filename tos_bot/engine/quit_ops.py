@@ -65,6 +65,14 @@ class QuitOps:
                 return {"ok": True, "note": "Already closing out before quitting.", "quit": self._quit_status()}
             kept = self._keepable_ids() if keep else set()
             held = [t for t in self._positions_here() if t["id"] not in kept]
+            shut = self._exits_cant_fill()
+            if shut and held:
+                if not keep:
+                    return {"ok": False, "market_closed": True,
+                            "reason": shut + " Choose 'Keep them open & quit', or quit when the market is open."}
+                # nothing can be closed now: keep every position - the ones without a stop at the broker too,
+                # since trying to close them would only lock the app until the next session
+                kept, held = {t["id"] for t in self._positions_here()}, []
             if self.mode == "live" and held and not close_all:
                 return {"ok": False, "reason": "Quit cancelled - your live positions stay open and managed."}
             self.quit_state = {"started_at": dt.datetime.now(dt.timezone.utc).isoformat(), "mode": self.mode,
@@ -90,11 +98,34 @@ class QuitOps:
             note = f"Exit sent for {len(held)} position(s). Shutting down once they've all closed."
         return {"ok": True, "note": note, "results": results, "quit": self._quit_status()}
 
+    def _exits_cant_fill(self) -> Optional[str]:
+        executor = self.executor
+        return executor._exchange_closed() if executor is not None else None
+
+    def cancel_quit(self, operator: str = "operator") -> Dict[str, Any]:
+        """Stop a quit in progress: the positions still open stay open and managed, and the app
+        unlocks. For a quit that can't finish - the market closed under it - or a change of mind."""
+        with self._switch_lock:
+            if not self.quit_state:
+                return {"ok": False, "reason": "The app isn't quitting."}
+            left = len(self._to_close())
+            self.quit_state = None
+            self._save_runtime()
+            called_off = self.executor.cancel_exits() if self.executor is not None else 0
+        log.warning("quit cancelled by %s with %d position(s) still open; %d exit order(s) called off", operator, left,
+                    called_off)
+        self._publish("quit.cancelled", left=left)
+        self._publish("account.snapshot", state=self.snapshot())
+        return {"ok": True, "note": (f"Quit cancelled - {left} position(s) stay open and managed"
+                                     + (f"; {called_off} exit order(s) the quit had sent were called off, and their "
+                                        "stops go back on at the broker." if called_off else "."))}
+
     def _quit_status(self) -> Optional[Dict[str, Any]]:
         if not self.quit_state:
             return None
         left = self._to_close()
-        return {**self.quit_state, "left": len(left), "symbols": sorted({t["symbol"] for t in left})}
+        return {**self.quit_state, "left": len(left), "symbols": sorted({t["symbol"] for t in left}),
+                "waiting": self._exits_cant_fill() if left else None}
 
     def _to_close(self) -> List[Dict[str, Any]]:
         """The positions a quit in progress still has to get out of - not the ones it keeps."""

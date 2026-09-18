@@ -1,7 +1,8 @@
 /* Active orders: every order still working at the broker and what it is for, and the
    ⏳ marker on plays whose stock has one. The engine re-checks the broker every few
    seconds and pushes orders.updated when anything changed. */
-import { $, $$, api, count, escapeHtml, fmtClock, num, pretty } from "./util.js";
+import { $, $$, api, count, escapeHtml, fmtClock, num, post, pretty } from "./util.js";
+import { openModal, toastResult } from "./ui.js";
 import { S, emit } from "./state.js";
 import { openRecord, tabVisible } from "./blotter.js";
 import { selectPlay } from "./plays.js";
@@ -52,10 +53,22 @@ function renderOrders() {
     el.innerHTML = d.ok ? `<p class="muted pad">No orders working at ${where}.</p>` : note;
     return;
   }
-  el.innerHTML = note + `<table class="orders-table"><thead><tr><th data-term="symbol">Symbol</th><th>Side</th>
+  el.innerHTML = note + `<p><button class="danger mini" id="orders-cancel-all" title="Cancel every working order - entries, the app's exits, anything else on the account. The stops protecting open positions stay: they go when their position is closed.">Cancel working orders</button></p>
+    <table class="orders-table"><thead><tr><th data-term="symbol">Symbol</th><th>Side</th>
     <th data-term="order_for">For</th><th>Type</th><th class="num">Qty</th><th class="num">Filled</th>
     <th class="num">Limit</th><th class="num">Stop</th><th>Time in force</th><th data-term="order_status">Status</th>
     <th data-term="strategy_col">Strategy</th><th>Order id</th></tr></thead><tbody>${rows.map(orderRow).join("")}</tbody></table>`;
+  $("#orders-cancel-all").onclick = () => {
+    const stops = rows.filter(o => o.purpose === "stop").length, rest = rows.length - stops;
+    openModal({
+      title: "Cancel the working orders?",
+      bodyHTML: `<p>${rest} working order${rest === 1 ? "" : "s"} will be cancelled: entries that haven't filled, the app's own exits, and anything
+        else working on the account.</p><p class="muted">${stops ? `${stops} protective stop${stops === 1 ? "" : "s"} stay${stops === 1 ? "s" : ""} - ` : ""}A stop
+        protecting an open position is never cancelled here: close the position and its stop goes with it.</p>`,
+      okText: "Cancel the orders", okClass: "danger", cancelText: "Keep them",
+      onOk: async () => { toastResult(await post("/api/orders/cancel-all", {})); loadOrders(true); },
+    });
+  };
   const byId = Object.fromEntries(rows.map(o => [o.order_id, o]));
   $$("tr[data-order]", el).forEach(tr => {
     const o = byId[tr.dataset.order];
