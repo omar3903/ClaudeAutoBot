@@ -340,6 +340,8 @@ class SimTradeLog(Base):
     held_out: Mapped[bool] = mapped_column(sa.Boolean, default=False)      # in the out-of-sample sessions
     features: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     feature_schema: Mapped[int] = mapped_column(sa.Integer, default=0)   # research/features.py FEATURE_SCHEMA
+    drift_r: Mapped[float] = mapped_column(sa.Float, default=0.0)        # the stock's own drift while held, in R
+    cost_r: Mapped[float] = mapped_column(sa.Float, default=0.0)         # slippage and commission paid, in R
 
 
 class ShadowTradeLog(Base):

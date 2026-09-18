@@ -68,6 +68,7 @@ class ReplayRunner:
         self._records_key: Optional[tuple] = None
         self._records: Dict[str, Dict[str, Any]] = {}
         self._taken: Dict[str, List[float]] = {}
+        self._all_records: tuple = (None, {})           # (the results they were made from, the records)
         self._load()
 
     @property
@@ -239,9 +240,17 @@ class ReplayRunner:
         meta = {k: v for k, v in self._results.items() if k != "trades"}
         return {**meta, "running": self.running, "progress": self._progress, "trade_count": len(self._trades),
                 "learned_skips": self.learned_skips(),
-                "records": {"all": strategy_records(self._trades, split=self.split),
+                "records": {"all": self._records_of_all(),
                             "autopilot": self.records(skip_noise, min_confirmations, min_reward_risk,
                                                       confidence_floors)}}
+
+    def _records_of_all(self) -> Dict[str, Dict[str, Any]]:
+        """Every replayed trade's records - judged for luck with a few thousand resamples, so made
+        once per replay rather than on every look at the panel."""
+        if self._all_records[0] != (self._results.get("ran_at"), len(self._trades)):
+            self._all_records = ((self._results.get("ran_at"), len(self._trades)),
+                                 strategy_records(self._trades, split=self.split))
+        return self._all_records[1]
 
     def runs(self, limit: int = 30) -> List[Dict[str, Any]]:
         """The latest runs' summaries, newest first."""

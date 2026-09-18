@@ -520,6 +520,7 @@ class Repository:
             "confirmed": bool(t.confirmed), "mfe_r": t.mfe_r, "scaled": bool(t.scaled),
             "held_out": held_out(t, split), "features": dict(t.features or {}),
             "feature_schema": int((t.features or {}).get("schema", 0) or 0),
+            "drift_r": float(getattr(t, "drift_r", 0.0) or 0.0), "cost_r": float(getattr(t, "cost_r", 0.0) or 0.0),
         } for t in trades]
         with session_scope() as s:
             s.execute(delete(SimTradeLog).where(SimTradeLog.run_id == run_id))
@@ -713,7 +714,7 @@ def sim_to_dict(t: SimTradeLog) -> Dict[str, Any]:
             "entry": _f(t.entry_price), "exit": _f(t.exit_price), "r": _f(t.r), "exit_reason": t.exit_reason,
             "noise": list(t.noise or []), "confirmed": bool(t.confirmed), "mfe_r": _f(t.mfe_r),
             "scaled": bool(t.scaled), "held_out": bool(t.held_out), "features": t.features or {},
-            "schema": int(t.feature_schema or 0)}
+            "schema": int(t.feature_schema or 0), "drift_r": _f(t.drift_r), "cost_r": _f(t.cost_r)}
 
 
 def shadow_to_dict(t: ShadowTradeLog) -> Dict[str, Any]:

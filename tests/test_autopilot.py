@@ -546,3 +546,23 @@ def test_the_daily_loss_limit_is_tunable_and_remembered():
     other = AutoPilot(FakeEngine(), _cfg(), bus=SILENT)
     other.load_runtime(ap.to_runtime())
     assert other.max_daily_loss_pct == 3.5 and other.max_giveback_pct == 40.0
+
+
+def test_proof_also_asks_whether_the_edge_is_luck_drift_or_eaten_by_costs():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(require_proven=True, min_replay_trades=30, min_replay_expectancy_r=0.05,
+                             proof_p_value=0.10), bus=SILENT)
+    p = mkplay()
+    record = {"trades": 40, "expectancy_r": 0.20, "edge_r": 0.18, "p_adjusted": 0.04, "setups_tested": 20}
+    for worse, words in (({"p_adjusted": 0.40}, "could be luck"),              # the best of 20 tries proves little
+                         ({"edge_r": 0.01}, "own drift"),                      # long in a rising market isn't an edge
+                         ({"cost_share": 0.50}, "speed limit")):               # costs past a third of the edge
+        eng.records["opening_range_breakout"] = {**record, **worse}
+        _run(ap, p)
+        assert eng.approved == [] and words in ap.verdict(p)
+    eng.records["opening_range_breakout"] = {**record, "cost_share": 0.2}
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id] and ap.status()["proof_p_value"] == 0.10
+    ap.proof_p_value = 0.0                                                     # the luck test switched off
+    eng.records["opening_range_breakout"] = {**record, "p_adjusted": 0.9}
+    assert ap.proof_missing("opening_range_breakout") is None

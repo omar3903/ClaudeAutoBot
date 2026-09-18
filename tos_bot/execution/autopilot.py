@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..core.eventbus import BUS
 from ..scanner.noise import LABELS as NOISE_LABELS
+from ..research.significance import SPEED_LIMIT
 from ..util import clock
 
 log = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ class AutoPilot:
         self.require_proven: bool = bool(getattr(cfg, "require_proven", True))
         self.min_replay_trades: int = int(getattr(cfg, "min_replay_trades", 30))
         self.min_replay_expectancy_r: float = float(getattr(cfg, "min_replay_expectancy_r", 0.05))
+        self.proof_p_value: float = float(getattr(cfg, "proof_p_value", 0.10))
         self.dry_run: bool = bool(cfg.dry_run)
 
         self._acted: set[str] = set()          # play ids already handled
@@ -257,6 +259,7 @@ class AutoPilot:
             "require_proven": self.require_proven,
             "min_replay_trades": self.min_replay_trades,
             "min_replay_expectancy_r": self.min_replay_expectancy_r,
+            "proof_p_value": self.proof_p_value,
             "open_auto_positions": open_auto,
             "auto_trades_today": self._count_today,
             "mode": getattr(self.engine, "mode", "paper"),
@@ -543,6 +546,19 @@ class AutoPilot:
                     "trades it needs (Strategies -> Run replay)")
         if record["expectancy_r"] < self.min_replay_expectancy_r:
             return f"{strategy} averaged {record['expectancy_r']:+.2f}R over {trades} replayed trades"
+        edge = record.get("edge_r")
+        if edge is not None and edge < self.min_replay_expectancy_r:
+            return (f"{strategy} averaged {edge:+.2f}R over {trades} replayed trades once the stocks' own drift is "
+                    "taken out - being on the right side of the market isn't the setup's edge (Aronson)")
+        p = record.get("p_adjusted")
+        if self.proof_p_value > 0 and p is not None and p > self.proof_p_value:
+            tried = int(record.get("setups_tested") or 1)
+            return (f"{strategy}'s {record['expectancy_r']:+.2f}R could be luck: p = {p:.2f} once the {tried} setups "
+                    f"tried are allowed for, and proof needs {self.proof_p_value:g} or less (Aronson's reality check)")
+        share = record.get("cost_share")
+        if share is not None and share > SPEED_LIMIT:
+            return (f"costs take {share:.0%} of {strategy}'s pre-cost edge - Carver's speed limit is a third, "
+                    "past which a rule is trading too fast for what it earns")
         held = record.get("out_of_sample")
         if held is not None:
             n = int(held.get("trades", 0))

@@ -204,6 +204,8 @@ class AutopilotCfg(_Model):
     require_proven: bool = True           # only strategies whose replayed record is good enough
     min_replay_trades: int = 30
     min_replay_expectancy_r: float = 0.05
+    proof_p_value: float = 0.10           # ...and the chance its edge is luck, once every setup tried is allowed for
+                                          # (Aronson's reality check on the replayed trades), is this or less; 0 = off
     cooldown_after_loss: bool = True
     max_daily_loss_pct: float = 2.0       # no new entries once today's closed trades have lost this % of equity (0 = off)
     max_giveback_pct: float = 30.0        # ...or once the day's realized gain has given back this % of its peak (0 = off)

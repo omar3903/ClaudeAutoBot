@@ -75,7 +75,8 @@ class ResearchOps:
     def replay_state(self) -> Dict[str, Any]:
         cfg = self.settings.config.replay
         state = self.replay.state(*self._record_terms())
-        return {**state, "evidence": self.evidence_state(), "look_ahead_regime": self.regime.look_ahead,
+        proof = {s.key: self.autopilot.proof_missing(s.key) or "" for s in self.scanner.strategies}
+        return {**state, "evidence": self.evidence_state(), "proof": proof, "look_ahead_regime": self.regime.look_ahead,
                 "defaults": {"sessions": cfg.sessions, "swing_sessions": cfg.swing_sessions,
                              "held_out_fraction": cfg.held_out_fraction}}
 
