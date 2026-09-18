@@ -607,6 +607,18 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
     # ------------------------------------------------------------------ #
     #  Background loops                                                  #
     # ------------------------------------------------------------------ #
+    def prices_refused(self) -> str:
+        """Why no price can be read right now, if none can (MarketData.refused). Autopilot takes
+        no entries then: the board is stale and the last look before an order would be blind."""
+        return self.md.refused
+
+    def entry_pace_seconds(self, timeframe: str) -> float:
+        """How long one scan cycle lasts for Autopilot's new-entries-per-cycle cap: the fast hot-list
+        cycle for a day trade, the regular cycle for anything else."""
+        if timeframe == "INTRADAY":
+            return float(self.settings.config.scanner.fast_cycle_seconds)
+        return float(self.scan_settings.cycle_minutes) * 60.0
+
     def _autopilot_day_active(self) -> bool:
         """Autopilot day-trading an open session -> fast hot-list cycles and a
         tighter account refresh."""
@@ -1302,20 +1314,23 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
           waiting for the price to come back through the entry, which is the move failing. A
           pullback under the entry is not a chase.
 
-        Without a price source there is nothing to check."""
+        With no price source attached there is nothing to check (and no plays to take). With one
+        attached, an entry whose price can't be read is refused - an order is never sent blind."""
         cfg = self.settings.config.execution
         risk = abs(float(p.entry) - float(p.stop))
         if risk <= 0 or not self.md.attached:
             return None
+        blind = (f"no current price for {p.symbol} - not entering blind"
+                 + (f" ({self.md.refused})" if self.md.refused else ""))
         try:
             q = self.md.quote(p.symbol)
             px = float(q.last or q.mid or 0.0)
             live = not bool(getattr(self.md, "delayed", True))
-        except Exception:  # noqa: BLE001
-            log.debug("no quote for %s at the entry check", p.symbol, exc_info=True)
-            return None
+        except Exception as e:  # noqa: BLE001
+            log.warning("no quote for %s at the entry check (%s) - the entry is refused", p.symbol, e)
+            return blind
         if px <= 0:
-            return None
+            return blind
         bid, ask = float(q.bid or 0.0), float(q.ask or 0.0)
         spread = ask - bid if 0 < bid < ask else 0.0
         mid = (bid + ask) / 2.0 if spread else px

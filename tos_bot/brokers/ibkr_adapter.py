@@ -318,6 +318,13 @@ class IbkrBroker(BrokerAdapter):
         return "Delayed data was chosen in the IBKR settings (IBKR_MARKET_DATA)." if self._md_pref != "auto" else ""
 
     @property
+    def candles_refused(self) -> str:
+        """Why IBKR is refusing candles right now, if it is: the login is active somewhere else, and
+        until that session ends every price request fails - the app is blind. Empty otherwise."""
+        recent = self._competing_at is not None and time.monotonic() - self._competing_at < self.LIVE_RECHECK_S
+        return COMPETING_REASON if recent else ""
+
+    @property
     def quotes_from_bars(self) -> bool:
         """Without real-time data a quote is a slow delayed snapshot, so prices
         are read off the latest candles instead."""

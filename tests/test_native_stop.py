@@ -92,6 +92,16 @@ def test_no_stop_is_rested_that_the_account_could_not_cover():
     assert broker.stops() == []
 
 
+def test_a_fill_still_arriving_in_pieces_is_looked_at_again_within_seconds():
+    broker, _, ex, _ = _setup(positions={"AAA": 6})                           # six of the ten shares have landed
+    ex.SHARES_RETRY_S, ex.STOP_RETRY_S = 0.0, 3600.0
+    ex.sync_open_orders()
+    assert broker.stops() == []
+    broker.positions["AAA"] = 10
+    ex.sync_open_orders()                                                      # no half-minute wait for the rest
+    assert len(broker.stops()) == 1 and broker.stops()[0].quantity == 10
+
+
 def test_a_venue_that_cannot_hold_a_stop_is_left_alone():
     broker, repo = _Broker({"AAA": 10}), _Repo([_trade()])
     ex = _executor(broker, repo)

@@ -208,4 +208,10 @@ class ResearchOps:
                 "market_regime": self.regime.context(), "skipped_noise": self.autopilot.skipped_noise(),
                 "unproven": self.autopilot.proof_missing(p.strategy), "replay_record": self.strategy_record(p.strategy),
                 "evidence_weight": self.evidence_weights().get(p.strategy, 1.0),
-                "risk_pct": self.strategy_risk_pct(p.strategy)}
+                "risk_pct": self.strategy_risk_pct(p.strategy),
+                # the gates in force when it was taken, so a trade taken on looser rules is never mistaken for
+                # one the strict rules would have taken
+                "settings": {k: getattr(self.autopilot, k) for k in (
+                    "require_proven", "min_confidence", "min_swing_confidence", "min_reward_risk",
+                    "min_confirmations", "model_mode", "max_auto_positions", "max_auto_trades_per_day")},
+                "data_delayed": bool(self.md.delayed)}

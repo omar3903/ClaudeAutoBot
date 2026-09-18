@@ -685,7 +685,8 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | auto trades per session | 3 | `max_auto_trades_per_day` |
 | aggregate open auto $-risk | 4 % of equity | `max_open_risk_pct` |
 | concurrent auto trades from **one** strategy | 2 | `max_per_strategy` |
-| new auto entries **per scan** | 1 | `max_new_per_cycle` |
+| new auto entries **per scan cycle** | 1 | `max_new_per_cycle` - a cycle is a scan of the market (5 minutes for swing trades, the 60-second fast cycle for day trades), not the 15-second re-check of the board |
+| **no entries while prices can't be read** | always | IBKR refusing candles (the login active somewhere else) stops every entry, and an order whose last-look quote fails is refused - never sent blind |
 | **cool off** a ticker after it stops out today | on | `cooldown_after_loss` |
 | **proof is not luck**: the replayed edge, net of the stocks' own drift, survives a reality check across every setup tried, and costs take no more than a third of it | p ≤ 0.10 | `proof_p_value` (Aronson; Carver's speed limit; 0 = the luck test off) |
 | **the learned model** | shadow | `model_mode`: `shadow` logs its odds, `gate` refuses plays under `model_min_p`, `size` also scales the risk - only while the model is usable |

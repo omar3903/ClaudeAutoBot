@@ -88,6 +88,7 @@ class AutoPilot:
         self._loss_stop_day: str = ""           # the session the daily loss limit was reached on
         self._peak_realized: float = 0.0        # the best the day's realized P/L has been
         self._realized: tuple = (float("-inf"), 0.0)   # (monotonic time read, realized P/L today)
+        self._entries_at: List[float] = []      # monotonic times of the latest entries, for the per-cycle cap
 
     # ------------------------------------------------------------------ #
     #  Persistable slice (goes into data/runtime.json alongside `mode`)  #
@@ -322,6 +323,18 @@ class AutoPilot:
                 self._blocked_note = "live"
                 self.bus.publish("autopilot.blocked", reason=self.status()["blocked_note"])
             return []
+        refused = getattr(self.engine, "prices_refused", None)
+        blind = refused() if callable(refused) else ""
+        if blind:
+            # the scans are reading nothing, so the board is stale, and no quote can be had for a last look
+            if self._blocked_note != "blind":
+                self._blocked_note = "blind"
+                log.warning("autopilot is taking no entries: prices can't be read - %s", blind)
+                self.bus.publish("autopilot.blocked", reason="No entries while prices can't be read: " + blind)
+            for p in plays.values():
+                if p.id not in self._acted:
+                    self._last_reason[p.id] = "no entries while prices can't be read - " + blind
+            return []
         self._blocked_note = ""
 
         # the account as sizing sees it - a trading-capital limit shrinks it
@@ -347,8 +360,10 @@ class AutoPilot:
         for p in ordered:
             if p.id in self._acted:
                 continue
-            if taken >= self.max_new_per_cycle:
-                self._last_reason[p.id] = f"one entry per scan cycle (max_new_per_cycle={self.max_new_per_cycle})"
+            wait = self._pace_wait(p.timeframe.value, taken)
+            if wait is not None:
+                self._last_reason[p.id] = (f"{self.max_new_per_cycle} new entr{'y' if self.max_new_per_cycle == 1 else 'ies'} "
+                                           "per scan cycle" + (f" - the next in {wait:.0f}s" if wait > 0 else ""))
                 continue
             gate = self._pre_gate(p, equity)
             if gate is not None:
@@ -397,6 +412,7 @@ class AutoPilot:
             self._acted.add(p.id)
             if self.dry_run:
                 taken += 1
+                self._entries_at.append(time.monotonic())
                 actions.append({"play_id": p.id, "symbol": p.symbol, "action": "would_enter",
                                 "qty": pre["order_preview"]["qty"], "risk": est_risk})
                 self.bus.publish("autopilot.would_enter", play_id=p.id, symbol=p.symbol,
@@ -411,6 +427,7 @@ class AutoPilot:
             if out.get("ok"):
                 self._count_today += 1
                 taken += 1
+                self._entries_at.append(time.monotonic())
                 self._auto_play_ids.add(p.id)
                 tid = out.get("trade_id") or getattr(p, "trade_id", None)
                 if tid:
@@ -434,6 +451,24 @@ class AutoPilot:
                                  strategy=p.strategy, reason=self._last_reason[p.id])
 
         return actions
+
+    def _pace_wait(self, timeframe: str, taken: int) -> Optional[float]:
+        """Seconds until the per-cycle cap lets another entry through, or None when it does now. A
+        cycle is a scan of the market - the engine says how long one lasts for this kind of trade
+        (``entry_pace_seconds``: the fast cycle for a day trade, the regular cycle otherwise) - and
+        not the 15-second re-check of the board, which would turn "one per cycle" into ten entries
+        in three minutes, all the same bet on that moment. Without an engine that says, a cycle is
+        one call."""
+        pace = getattr(self.engine, "entry_pace_seconds", None)
+        window = float(pace(timeframe)) if callable(pace) else 0.0
+        if window <= 0:
+            return 0.0 if taken >= self.max_new_per_cycle else None
+        now = time.monotonic()
+        self._entries_at = [at for at in self._entries_at if now - at < 3600.0]
+        recent = sorted(at for at in self._entries_at if now - at < window)
+        if len(recent) < self.max_new_per_cycle:
+            return None
+        return max(0.0, window - (now - recent[-self.max_new_per_cycle]))
 
     # ------------------------------------------------------------------ #
     #: how long the realized P/L of the day is kept before it is read again
