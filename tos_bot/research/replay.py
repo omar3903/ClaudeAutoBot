@@ -61,6 +61,8 @@ from .significance import judge, reality_check
 NY = "America/New_York"
 BAR = pd.Timedelta(minutes=5)
 LIVE_INTRADAY_BARS = 5 * 78          # the scans look at five sessions of 5-minute candles
+LIVE_DAILY_BARS = 300                # ...and at the daily candles the live store keeps (data/bars.py KEEP_SESSIONS):
+                                     # however long the replayed history, a setup sees what it would have seen live
 #: fewer removed trades than this and a check's verdict is only noise itself
 MIN_SAMPLE = 10
 MEASURED_CHECKS = CHECKS + ("unconfirmed",)
@@ -169,7 +171,7 @@ def replay_intraday(strategies: Sequence[Strategy], symbol: str, bars: pd.DataFr
     drift = drift_per_bar(bars, intraday=True)
     for day in days[-sessions:] if sessions else days:
         session = bars[bars.index.date == day]
-        prior_daily = daily[daily.index.date < day]
+        prior_daily = daily[daily.index.date < day].tail(LIVE_DAILY_BARS)
         if not day_trades or len(prior_daily) < 20 or len(session) < settings.warmup_bars + 2:
             continue
         flatten_at = _at(day, clock.regular_close_time(day)) - pd.Timedelta(minutes=settings.flatten_before_close_min)
@@ -244,7 +246,8 @@ def replay_swing(strategies: Sequence[Strategy], symbol: str, daily: pd.DataFram
     open_positions: Dict[str, _Position] = {}
     drift = drift_per_bar(daily.iloc[max(60, len(daily) - sessions - 1):], intraday=False)
     for i in range(max(60, len(daily) - sessions - 1), len(daily) - 1):
-        history, next_at, next_bar = daily.iloc[:i + 1], daily.index[i + 1], daily.iloc[i + 1]
+        history = daily.iloc[max(0, i + 1 - LIVE_DAILY_BARS):i + 1]
+        next_at, next_bar = daily.index[i + 1], daily.iloc[i + 1]
         closed_on = history.index[-1].date()
         close_at = _at(closed_on, clock.regular_close_time(closed_on))
         benchmark = _Benchmark(benchmark_daily, None, closed_on)

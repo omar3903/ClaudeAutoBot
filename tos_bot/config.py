@@ -242,7 +242,11 @@ class ReplayCfg(_Model):
     """How the strategy replay tests the setups - see research/replay.py."""
 
     sessions: int = 60                    # day-trade sessions of 5-minute candles (5-120)
-    swing_sessions: int = 250             # swing sessions of daily candles (20-250)
+    swing_sessions: int = 700             # swing sessions of daily candles (20-1250; as far as daily_years reaches)
+    daily_years: int = 3                  # years of daily candles kept for the stocks the replay runs on, in
+                                          # data/research/daily (1-5; 1 = the live store's year only). One request
+                                          # per stock the first time, none after: a year is one market - three
+                                          # give the proof rule's statistics something to work with
     swing_stocks: int = 400               # swing setups replayed on this many of the full scan's leaders as well
                                           # as the day's watchlist (0 = the watchlist only); costs no requests
     slippage_bps: float = 5.0             # on every market fill, each way

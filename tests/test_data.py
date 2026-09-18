@@ -129,3 +129,28 @@ def test_the_quick_refresh_merges_the_latest_candles_into_the_cache(tmp_path):
     assert (first_symbol, "5 mins", REFRESH_DURATION) in gateway.requests       # cached: only the last half hour
     assert got[first_symbol].index.is_unique and len(got[first_symbol]) == len(first)
     assert set(got) == {first_symbol, second_symbol}
+
+
+def test_the_research_store_keeps_years_of_candles_for_the_stocks_the_replay_runs_on(tmp_path):
+    deep = DailyBarStore(tmp_path / "deep", keep_sessions=3 * 253 + 10, full_history="3 Y")
+    gateway, md = fakes.FakeGateway(), MarketData(DailyBarStore(tmp_path / "bars"), deep=deep)
+    md.attach(gateway)
+    through = schedule.last_completed_session(clock.now_ny())
+    md.update_daily(["AAA", "CCC"], through)                                   # the live store: a year of each
+    assert md.deepen_daily(["AAA", "BBB"], through) == 2
+    assert [d for s, _, d in gateway.requests if s in ("AAA", "BBB")][-2:] == ["3 Y", "3 Y"]
+    assert len(md.deep_frame("AAA")) == 756 > len(md.daily_frame("AAA"))
+    assert md.deepen_daily(["AAA", "BBB"], through) == 0                        # current: nothing to ask for
+
+    week_ago = through
+    for _ in range(5):
+        week_ago = clock.prev_trading_day(week_ago)
+    deep.merge("CCC", fakes.daily_bars("CCC", 756, through=week_ago), week_ago)     # a long history gone a week stale
+    joined = md.deep_frame("CCC")                                               # ...is carried forward in memory
+    assert joined.index[-1].date() == through and joined.index.is_unique and len(joined) == 761
+    asked = len(gateway.requests)
+    assert md.deepen_daily(["CCC"], through) == 0 and len(gateway.requests) == asked   # ...and topped up for nothing
+    assert deep.last_session("CCC") == through
+
+    plain = MarketData(DailyBarStore(tmp_path / "bars"))                        # no research store: the live year
+    assert plain.deepen_daily(["AAA"], through) == 0 and len(plain.deep_frame("AAA")) == len(md.daily_frame("AAA"))

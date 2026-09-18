@@ -60,8 +60,11 @@ def quote_from_price(symbol: str, last: float, volume: float = 0.0) -> Quote:
 
 
 class MarketData:
-    def __init__(self, bars: DailyBarStore) -> None:
+    def __init__(self, bars: DailyBarStore, deep: Optional[DailyBarStore] = None) -> None:
+        """``deep``: the research store - several years of daily candles for the stocks the replay
+        runs on (see deepen_daily). The scans never read it."""
         self.bars = bars
+        self.deep = deep
         self._source: Optional[PriceSource] = None
         self._lock = threading.Lock()
         self._intraday: Dict[str, Tuple[float, pd.DataFrame]] = {}
@@ -124,6 +127,49 @@ class MarketData:
                 if progress:
                     progress(done, len(items))
             return len(plan)
+
+    def deepen_daily(self, symbols: Iterable[str], through: dt.date,
+                     con_ids: Optional[Mapping[str, int]] = None,
+                     progress: Optional[Callable[[int, int], None]] = None) -> int:
+        """Bring the research store's long history of ``symbols`` up to ``through``. A stock it has
+        never seen costs one request for the whole history; after that the live store's candles top
+        it up for nothing. Returns how many stocks needed a request."""
+        if self.deep is None:
+            return 0
+        with self._daily_lock:
+            plan: Dict[str, str] = {}
+            for s in dict.fromkeys(symbols):
+                need = self.deep.duration_needed(s, through)
+                if need is None:
+                    continue
+                last, live = self.deep.last_session(s), self.bars.frame(s)
+                if last is not None and live is not None and len(live) and live.index[0].date() <= last:
+                    self.deep.merge(s, live[live.index.date > last], through)      # the live store covers the gap
+                    continue
+                plan[s] = need
+            items, done = list(plan.items()), 0
+            for i in range(0, len(items), _DAILY_CHUNK):
+                chunk = dict(items[i:i + _DAILY_CHUNK])
+                got = self.source.history_many({s: ("1 day", d) for s, d in chunk.items()}, con_ids)
+                for symbol, frame in got.items():
+                    self.deep.merge(symbol, frame, through)
+                done += len(chunk)
+                if progress:
+                    progress(done, len(items))
+            return len(plan)
+
+    def deep_frame(self, symbol: str) -> Optional[pd.DataFrame]:
+        """A stock's longest daily history: the research store's, carried forward with the live
+        store's latest candles - or just the live store's when there is no long one to join."""
+        live = self.bars.frame(symbol)
+        deep = self.deep.frame(symbol) if self.deep is not None else None
+        if deep is None or not len(deep):
+            return live
+        if live is None or not len(live) or live.index[-1] <= deep.index[-1]:
+            return deep
+        if live.index[0] > deep.index[-1]:
+            return live                                   # a hole between them: the long history is too old to join
+        return pd.concat([deep, live[live.index > deep.index[-1]]])
 
     def daily(self, symbols: Iterable[str]) -> Dict[str, pd.DataFrame]:
         return self.bars.frames(symbols)

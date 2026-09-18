@@ -84,8 +84,10 @@ class ReplayRunner:
               held_out_fraction: float = HELD_OUT_FRACTION,
               news: Optional[Callable[[Sequence[str], dt.date], Mapping[str, Sequence[Mapping[str, Any]]]]] = None,
               benchmark: Optional[str] = None,
-              records: Optional[Mapping[str, Mapping[str, Any]]] = None) -> Dict[str, Any]:
-        """``market``: the turbulent regime's probability per day, from a model fitted before the
+              records: Optional[Mapping[str, Mapping[str, Any]]] = None,
+              prepare: Optional[Callable[[Callable[[int, int], None]], Any]] = None) -> Dict[str, Any]:
+        """``prepare``: called first, on the replay's thread, with a progress function - the engine
+        downloads the long daily history there; ``market``: the turbulent regime's probability per day, from a model fitted before the
         given first day; ``earnings``: when each stock's earnings filings were accepted; ``news``:
         each stock's stored stories since a first day, for the news checks; ``benchmark``: the
         S&P 500 ETF's symbol, whose candles the market model behind those checks needs; ``records``:
@@ -99,7 +101,7 @@ class ReplayRunner:
                 target=self._run, name="replay", daemon=True,
                 args=(list(strategies), source, daily_frame, list(intraday_symbols), list(swing_symbols),
                       sessions, swing_sessions, settings, noise, con_ids or {}, market, earnings,
-                      held_out_fraction, pairs, news, benchmark, dict(records or {})))
+                      held_out_fraction, pairs, news, benchmark, dict(records or {}), prepare))
             self._thread.start()
         held = f"{held_out_fraction:.0%}"
         return {"ok": True, "note": (f"Replaying the last {sessions} sessions of day-trade setups on "
@@ -113,9 +115,11 @@ class ReplayRunner:
 
     def _run(self, strategies, source, daily_frame, intraday_symbols, swing_symbols, sessions, swing_sessions,
              settings, noise, con_ids, market, earnings, fraction, pairs=None, news=None, benchmark=None,
-             records=None) -> None:
+             records=None, prepare=None) -> None:
         started = time.monotonic()
         try:
+            self._optional("the long daily history", prepare,
+                           lambda done, total: self._report("years of daily candles", done, total))
             wanted = intraday_symbols + ([benchmark] if benchmark and benchmark not in intraday_symbols else [])
             bars = self.history.load(source, wanted, sessions, con_ids,
                                      progress=lambda done, total: self._report("5-minute candles", done, total))
@@ -138,8 +142,9 @@ class ReplayRunner:
                       stories.get(s, ()), None, bench_daily, records)
                      for s in swing_symbols if (daily := daily_frame(s)) is not None]
             if pairs:
-                frames = {s: f for s in pairs["groups"] if (f := daily_frame(s)) is not None}
-                jobs.append(("pairs", pairs, frames, swing_sessions))
+                # the pair desk forms and trades its pairs on the live store's year, so its replay does too
+                frames = {s: f.tail(PAIR_BARS) for s in pairs["groups"] if (f := daily_frame(s)) is not None}
+                jobs.append(("pairs", pairs, frames, min(swing_sessions, PAIR_SESSIONS)))
             trades = self._replay(jobs)
             data = {
                 "ran_at": dt.datetime.now(dt.timezone.utc).isoformat(), "sessions": sessions,
@@ -297,6 +302,9 @@ class ReplayRunner:
                 f.write(json.dumps(summary) + "\n")
         except OSError:
             log.warning("could not add the replay to its history", exc_info=True)
+
+
+PAIR_BARS, PAIR_SESSIONS = 300, 250
 
 
 def session_chunks(bars: pd.DataFrame, sessions: int, size: int) -> List[Tuple[pd.DataFrame, int]]:

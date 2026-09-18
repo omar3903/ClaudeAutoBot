@@ -53,9 +53,24 @@ def _daily(symbol: str, through: dt.date) -> pd.DataFrame:
                          "volume": rng.uniform(2e6, 8e6, _SESSIONS)}, index=index)
 
 
+@functools.lru_cache(maxsize=32)
+def _long_daily(symbol: str, through: dt.date, sessions: int) -> pd.DataFrame:
+    """Years of candles, for the research store - a walk of its own, so the usual 300 stay as they were."""
+    rng = np.random.default_rng(_seed(symbol, 7))
+    close = rng.uniform(20, 250) * np.exp(np.cumsum(rng.normal(0.0003, 0.02, sessions)))
+    open_ = np.concatenate([[close[0]], close[:-1]]) * (1 + rng.normal(0, 0.004, sessions))
+    high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.008, sessions)))
+    low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.008, sessions)))
+    index = pd.DatetimeIndex([pd.Timestamp(d) for d in clock.last_n_sessions(through, sessions)]).tz_localize(NY)
+    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close,
+                         "volume": rng.uniform(2e6, 8e6, sessions)}, index=index)
+
+
 def daily_bars(symbol: str, sessions: int = _SESSIONS, through: Optional[dt.date] = None) -> pd.DataFrame:
     """Completed daily candles, through the last completed session unless told otherwise."""
     through = through or schedule.last_completed_session(clock.now_ny())
+    if sessions > _SESSIONS:
+        return _long_daily(symbol, through, sessions).copy()
     return _daily(symbol, through).tail(sessions).copy()
 
 

@@ -1161,6 +1161,9 @@ def build() -> str:
     A('<h3>Files under data/ (git-ignored, all rebuildable)</h3>')
     A(table(["Path", "Format", "Holds"], [
         ("bars/&lt;SYMBOL&gt;.pkl", "pickled DataFrame", "one year of daily candles per stock (5,500+ files)"),
+        ("research/daily/&lt;SYMBOL&gt;.pkl", "pickled DataFrame", "three years of daily candles (replay.daily_years) "
+         "for the stocks the replay runs on; one request per stock the first time, then topped up from bars/"),
+        ("research/models/", "joblib + current.json", "the trained meta-label models and the latest model's card"),
         ("cache/", "pickles + JSON", "5-minute candle windows, the Nasdaq listing, SEC financials (7 days)"),
         ("symbols.json", "JSON", "IBKR contract ids, stock types, sectors (the SymbolMaster)"),
         ("watchlists/watchlist_&lt;date&gt;.json", "JSON", "the day's hot list, buffers and decisions (5 days kept)"),
@@ -1189,7 +1192,8 @@ def build() -> str:
     A(fig_research())
     A('<p><b>Replay</b> (<code>research/replay.py</code>). A backtest that walks candles bar by bar and lets the '
       'same strategy code propose plays as if it were live: day trades on 5-minute candles over the last 60 '
-      'sessions, swings on daily candles over 250 sessions, fills at the next bar or next open, 5 bps slippage '
+      'sessions, swings on three years of daily candles (700 sessions; each setup still sees the 300 it would see '
+      'live), fills at the next bar or next open, 5 bps slippage '
       'and 1 bp commission each way, the same exit rules as the exit manager (including scale-out), news flags '
       'from the stored headlines, and the market regime as it was known that day. The latest third of sessions '
       'is <b>held out</b>: a strategy must also work on data it was not tuned on.</p>')

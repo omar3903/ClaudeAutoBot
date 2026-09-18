@@ -107,7 +107,7 @@ function replayHTML() {
     <div class="group-title">Replay</div>
     <p class="muted">${when} A noise check earns its place when the trades it removes did worse than the ones it keeps.</p>
     <div class="row-gap"><label title="60 gives most setups the 30+ trades a record needs, with the latest third held out">Day-trade sessions <input type="number" id="replay-sessions" min="5" max="120" step="1" value="${rp.sessions || (rp.defaults || {}).sessions || 60}"></label>
-      <label title="Up to a year - as far back as the stored daily candles go">Swing sessions <input type="number" id="replay-swing" min="20" max="250" step="10" value="${rp.swing_sessions || (rp.defaults || {}).swing_sessions || 250}"></label>
+      <label title="As far back as the long daily history goes - three years by default (replay.daily_years). The first replay downloads it for the stocks it runs on; after that it costs nothing">Swing sessions <input type="number" id="replay-swing" min="20" max="1250" step="10" value="${Math.max(rp.swing_sessions || 0, (rp.defaults || {}).swing_sessions || 250)}"></label>
       <button class="mini lockable" id="replay-run" ${rp.running ? "disabled" : ""}>${rp.running ? "Replaying…" : "Run replay"}</button> ${progress}</div>
     ${noise}
   </div>`;
@@ -167,7 +167,7 @@ function renderStrategies() {
   });
   $("#replay-run").onclick = async () => {
     const r = await post("/api/replay", { sessions: parseInt($("#replay-sessions").value, 10) || 60,
-                                          swing_sessions: parseInt($("#replay-swing").value, 10) || 250 });
+                                          swing_sessions: parseInt($("#replay-swing").value, 10) || 700 });
     toastResult(r);
     if (r.ok) {
       S.replay = { ...(S.replay || {}), running: true, progress: { stage: "starting", done: 0, total: 1 } };
