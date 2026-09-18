@@ -2,7 +2,7 @@
    P/L summary, the watchlist, and the trade-record drawer. */
 import {
   $, $$, SECTOR_SHORT, VENUE_SHORT, api, escapeHtml, fmtTime, num, pct, plural, positionList, post,
-  sectorTag, sideBadge, tfLabel, usd,
+  sectorTag, sideBadge, tfLabel, usd, fmtDay, fmtClock,
 } from "./util.js";
 import { S, on, refreshState } from "./state.js";
 import { closeDrawer, drawerOpen, openDrawer, openModal, toast, toastResult } from "./ui.js";
@@ -136,8 +136,19 @@ function openRow(t, here) {
   const stopCell = moved ? `<span title="moved from ${num(t.initial_stop_price)}">${num(t.stop_price)} ▲</span>` : num(t.stop_price);
   const status = t.time_status || "on_track";
   const barCls = status === "overdue" ? "bad" : status === "aging" ? "warn" : "ok";
-  const timeCell = `<div class="timecell">
+  // when the setup usually exits, when it is due a look, and - for a swing trade - the day the time stop closes it
+  const swing = t.timeframe === "SWING", when = swing ? fmtDay : fmtClock;
+  const maxDays = (S.state.exit_manager || {}).max_swing_hold_days;
+  const last = swing && maxDays && t.entry_time ? new Date(new Date(/[zZ]|[+-]\d\d:\d\d$/.test(t.entry_time) ? t.entry_time : t.entry_time + "Z").getTime() + maxDays * 864e5) : null;
+  const usual = t.expected_exit_at ? new Date(/[zZ]|[+-]\d\d:\d\d$/.test(t.expected_exit_at) ? t.expected_exit_at : t.expected_exit_at + "Z") : null;
+  const byTimeStop = !!(last && usual && last < usual);           // the time stop comes before the setup's usual exit
+  const expectTitle = [t.expected_exit_at ? `This setup usually exits by ${when(t.expected_exit_at)}` : "",
+    t.overwatch_at ? `it is flagged for a look after ${when(t.overwatch_at)}` : "",
+    last ? `the time stop closes it on ${fmtDay(last.toISOString())} at the latest (${maxDays} days)` : (swing ? "" : "day trades are flat before the close")]
+    .filter(Boolean).join("; ");
+  const timeCell = `<div class="timecell" title="${escapeHtml(expectTitle)}">
     <span>${t.held_label || "–"}</span>
+    ${t.expected_exit_at ? `<span class="muted small">exit by ${byTimeStop ? fmtDay(last.toISOString()) + " (time stop)" : when(t.expected_exit_at)}</span>` : ""}
     <span class="timebar"><i class="${barCls}" style="width:${Math.min(100, t.time_used_pct ?? 0)}%"></i></span>
     ${status === "overdue" ? '<span class="badge bad">⏰ overdue</span>' : status === "aging" ? '<span class="badge warn">aging</span>' : ""}</div>`;
   const parkedTag = parked
