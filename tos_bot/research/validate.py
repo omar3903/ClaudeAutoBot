@@ -26,7 +26,7 @@ import datetime as dt
 import logging
 import math
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -64,6 +64,7 @@ class Design:
     confidence: np.ndarray                 # (n,) the setup's own confidence
     source: List[str]
     strategy: List[str]
+    symbol: List[str] = field(default_factory=list)   # for the sample weights: rows on one stock overlap
 
     def __len__(self) -> int:
         return int(self.y.shape[0])
@@ -71,7 +72,7 @@ class Design:
     def subset(self, idx: np.ndarray) -> "Design":
         return Design(self.X[idx], self.columns, self.y[idx], self.r[idx], self.entered[idx], self.exited[idx],
                       self.stated[idx], self.confidence[idx], [self.source[i] for i in idx],
-                      [self.strategy[i] for i in idx])
+                      [self.strategy[i] for i in idx], [self.symbol[i] for i in idx] if self.symbol else [])
 
 
 def prepare(rows: Sequence[Mapping[str, Any]], sources: Optional[Iterable[str]] = None) -> Design:
@@ -95,7 +96,7 @@ def prepare(rows: Sequence[Mapping[str, Any]], sources: Optional[Iterable[str]] 
     X = np.full((n, len(columns)), np.nan)
     y, r_out, ent, ext, stated, conf = (np.zeros(n, dtype=bool), np.zeros(n), np.zeros(n), np.zeros(n),
                                         np.zeros(n), np.zeros(n))
-    source, strategy = [], []
+    source, strategy, symbol = [], [], []
     for i, (row, r, entered, exited) in enumerate(kept):
         for j, k in enumerate(NUMERIC):
             v = _num(row.get(k))
@@ -117,8 +118,9 @@ def prepare(rows: Sequence[Mapping[str, Any]], sources: Optional[Iterable[str]] 
         stated[i] = conf[i] if p_ is None else p_
         source.append(str(row.get("source") or ""))
         strategy.append(str(row.get("strategy") or ""))
+        symbol.append(str(row.get("symbol") or ""))
     return Design(X, columns, y, r_out, ent, ext, np.clip(stated, 0.01, 0.99), np.clip(conf, 0.01, 0.99),
-                  source, strategy)
+                  source, strategy, symbol)
 
 
 # ---------------------------------------------------------------- the folds
@@ -306,7 +308,7 @@ def shuffled_baseline(design: Design, folds: Sequence[Fold], model_factory, shuf
     wins, losses = [], []
     for _ in range(shuffles):
         fake = Design(design.X, design.columns, rng.permutation(design.y), design.r, design.entered, design.exited,
-                      design.stated, design.confidence, design.source, design.strategy)
+                      design.stated, design.confidence, design.source, design.strategy, design.symbol)
         m = evaluate(fake, folds, model_factory)
         if m.get("rows"):
             wins.append(m["top_decile"]["win_rate"])
@@ -336,9 +338,12 @@ def verdicts(report: Dict[str, Any], model: str = "logistic") -> Dict[str, Any]:
 
 def run(rows: Sequence[Mapping[str, Any]], *, sources: Optional[Iterable[str]] = None, folds: int = 5,
         embargo_days: float = 1.0, shuffles: int = 20, models: Iterable[str] = ("stated", "confidence", "logistic"),
-        seed: int = 7, l2: float = Logistic.L2) -> Dict[str, Any]:
+        seed: int = 7, l2: float = Logistic.L2, extra: Optional[Mapping[str, Any]] = None,
+        judged: str = "logistic") -> Dict[str, Any]:
     """The whole judgement on a set of rows: the folds, every model's pooled out-of-fold metrics,
-    the shuffled-label baseline for the learned model, and the verdicts."""
+    the shuffled-label baseline for the learned model, and the verdicts. ``extra``: more model
+    factories by name (research/model.py brings the boosted trees); ``judged``: the learned model
+    the shuffled baseline and the verdict are for."""
     design = prepare(rows, sources)
     splits = walk_forward(design, folds, embargo_days)
     by_source: Dict[str, int] = {}
@@ -351,12 +356,13 @@ def run(rows: Sequence[Mapping[str, Any]], *, sources: Optional[Iterable[str]] =
         "span": [_iso(float(design.entered.min())), _iso(float(design.entered.max()))] if len(design) else None,
         "folds": [f.as_dict() for f in splits], "embargo_days": embargo_days, "l2": l2, "models": {},
     }
-    factories = {"stated": Stated, "confidence": Confidence, "logistic": lambda: Logistic(l2=l2)}
+    factories = {"stated": Stated, "confidence": Confidence, "logistic": lambda: Logistic(l2=l2), **dict(extra or {})}
     for name in models:
         report["models"][name] = evaluate(design, splits, factories[name])
-    if "logistic" in report["models"] and splits:
-        report["shuffled"] = shuffled_baseline(design, splits, factories["logistic"], shuffles, seed)
-    report["verdict"] = verdicts(report)
+    if judged in report["models"] and splits:
+        report["shuffled"] = shuffled_baseline(design, splits, factories[judged], shuffles, seed)
+    report["judged"] = judged
+    report["verdict"] = verdicts(report, judged)
     return report
 
 

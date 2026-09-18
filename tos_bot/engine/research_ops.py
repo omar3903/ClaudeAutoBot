@@ -8,6 +8,7 @@ only so each concern reads on its own. Nothing here is instantiated by itself.
 from __future__ import annotations
 
 import logging
+import threading
 import datetime as dt
 import time
 from typing import Any, Dict, List, Optional, Sequence
@@ -79,6 +80,35 @@ class ResearchOps:
         return {**state, "evidence": self.evidence_state(), "proof": proof, "look_ahead_regime": self.regime.look_ahead,
                 "defaults": {"sessions": cfg.sessions, "swing_sessions": cfg.swing_sessions,
                              "held_out_fraction": cfg.held_out_fraction}}
+
+    def train_model(self) -> Dict[str, Any]:
+        """Retrain the meta-label model on every row the database holds - live, shadow and the
+        latest replay (research/model.py) - and keep it with its card. One at a time; the scorer
+        picks the new model up by itself. It takes a minute or two, so callers use a thread."""
+        from ..research import model as meta
+        from ..research.dataset import training_rows
+
+        if not meta.available():
+            return {"ok": False, "reason": "scikit-learn isn't installed (pip install scikit-learn)"}
+        if not self._training.acquire(blocking=False):
+            return {"ok": False, "reason": "a model is being trained already"}
+        try:
+            out = meta.train(training_rows(self.repo), self.model.directory)
+            if not out.get("saved"):
+                return {"ok": False, "reason": out.get("why", "not trained")}
+            card = out["card"]
+            log.info("meta-label model %s trained on %s rows - usable: %s", card["id"], card["rows"], card["usable"])
+            self._publish("model.trained", id=card["id"], rows=card["rows"], usable=card["usable"])
+            return {"ok": True, "card": card}
+        except Exception as e:  # noqa: BLE001
+            log.exception("training the model failed")
+            return {"ok": False, "reason": str(e)}
+        finally:
+            self._training.release()
+
+    def train_model_soon(self) -> None:
+        """Train in the background - after the day's review has added its rows."""
+        threading.Thread(target=self.train_model, name="train-model", daemon=True).start()
 
     def replay_history(self, limit: int = 30) -> List[Dict[str, Any]]:
         return self.replay.runs(limit)

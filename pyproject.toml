@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "httpx>=0.27"]
 sentiment = ["transformers>=4.40", "torch>=2.2"]    # FinBERT headline sentiment for the signals
+learning = ["scikit-learn>=1.5"]                    # the meta-label model (research/model.py)
 
 [project.scripts]
 autotradebot = "run:main"

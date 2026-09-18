@@ -117,4 +117,4 @@ class CapitalOps:
         exposure = self.exposure_by_symbol()
         for p in plays:
             size_play(p, accounts[capital.kind_of(p.timeframe)], self.settings.config.risk,
-                      symbol_notional=exposure.get(p.symbol, 0.0), risk_pct=self.strategy_risk_pct(p.strategy))
+                      symbol_notional=exposure.get(p.symbol, 0.0), risk_pct=self._play_risk_pct(p))

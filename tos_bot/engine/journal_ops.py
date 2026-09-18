@@ -139,6 +139,7 @@ class JournalOps:
             kept = self.repo.save_shadow_trades(day, review["shadows"].get("plays") or [])
             if kept:
                 log.info("%d plays not taken on %s followed and kept for learning", kept, day.isoformat())
+                self.train_model_soon()                  # the day's rows are in: the model learns from them tonight
         except Exception:  # noqa: BLE001
             log.warning("the shadow trades couldn't be kept", exc_info=True)
         self._live_stats_at = float("-inf")

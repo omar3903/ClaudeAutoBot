@@ -53,6 +53,7 @@ from ..persistence.repository import Repository
 from ..risk.pdt_guard import PdtGuard
 from ..risk.position_sizing import size_play
 from ..research.features import play_features
+from ..research.model import Scorer, risk_factor
 from ..research.history import IntradayHistory
 from ..research.runner import ReplayRunner
 from ..research.journal import Journal
@@ -167,6 +168,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
                                    IntradayHistory(data_dir / "research" / "intraday"),
                                    workers=self.settings.config.replay.workers or None,
                                    sink=self._keep_sim_trades)
+        self.model = Scorer(data_dir / "research" / "models")      # the meta-label model, in shadow until it earns it
+        self._training = threading.Lock()
         #: calm or turbulent, from SPY's daily returns (Hamilton's Markov switching model)
         self.regime = MarketRegime(data_dir / "research" / "benchmark_spy.pkl")
         #: when companies reported earnings (SEC 8-K item 2.02), for the replay
@@ -791,6 +794,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             return
         self._size_plays(result.plays)
         # the cycles don't re-check valuation setups, so those stay; a quick re-check isn't a confirmation
+        self._score_plays(result.plays)
         changes = self.board.replace(result.plays, None if kind == "full" else result.symbols,
                                      keep=lambda p: p.kind.value == "FUNDAMENTAL", confirm=not quick)
         self._last_scans[kind] = result.summary()
@@ -1158,7 +1162,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         # sized against the trading capital; the PDT rule and the floor see the real account
         sizing = size_play(p, self.sizing_account(p.timeframe) or acc, cfg.risk,
                            symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0),
-                           risk_pct=self.strategy_risk_pct(p.strategy))
+                           risk_pct=self._play_risk_pct(p))
         decision = self.pdt.assess(acc, p)
         session = clock.current_session()
         plan = plan_order(p, session, cfg.execution)
@@ -1249,6 +1253,37 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             self._publish("play.decided", play_id=p.id, decision="approved", result=out, play=self._decorate(p))
             self._refresh_account()
             return {"ok": out.get("ok", False), **out}
+
+    def _score_plays(self, plays) -> None:
+        """The learned model's odds on each fresh play (research/model.py), kept in its evidence so
+        they are logged with it - in shadow mode that record is how the model earns trust."""
+        try:
+            if self.model.card is None:
+                return
+            now, market = clock.now_ny(), self.regime.context()
+            for p in plays:
+                score = self.model.score(play_features(p, now=now, market=market))
+                if score:
+                    p.evidence["model"] = score
+        except Exception:  # noqa: BLE001
+            log.debug("scoring the plays failed", exc_info=True)
+
+    def model_card(self) -> Optional[Dict[str, Any]]:
+        """The trained model's card, trimmed for the dashboard."""
+        card = self.model.card
+        if not card:
+            return None
+        return {k: card.get(k) for k in ("id", "trained_at", "rows", "by_source", "usable", "verdict")}
+
+    def _play_risk_pct(self, p: Play) -> Optional[float]:
+        """The risk a play is sized with: the strategy's half-Kelly share, scaled by the learned
+        model's odds when Autopilot is set to size by them and the model is usable (AFML ch. 10)."""
+        pct = self.strategy_risk_pct(p.strategy)
+        score = (p.evidence or {}).get("model") or {}
+        if self.autopilot.model_mode == "size" and score.get("usable") and score.get("p") is not None:
+            base = pct if pct is not None else float(self.settings.config.risk.max_risk_per_trade_pct)
+            return round(base * risk_factor(float(score["p"])), 4)
+        return pct
 
     def _chase_check(self, p: Play, plan: Dict[str, Any], seen: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """The last look before an order goes out, at the live quote. Returns why the entry is

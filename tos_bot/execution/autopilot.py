@@ -36,6 +36,12 @@ log = logging.getLogger(__name__)
 
 #: what Autopilot can be told to take: day trades, swing trades, pairs (pairs/desk.py)
 TRADE_TYPES = ("INTRADAY", "SWING", "PAIRS")
+MODEL_MODES = ("shadow", "gate", "size")
+
+
+def _mode(value: Any) -> str:
+    value = str(value or "shadow").lower()
+    return value if value in MODEL_MODES else "shadow"
 
 
 class AutoPilot:
@@ -68,6 +74,8 @@ class AutoPilot:
         self.min_replay_trades: int = int(getattr(cfg, "min_replay_trades", 30))
         self.min_replay_expectancy_r: float = float(getattr(cfg, "min_replay_expectancy_r", 0.05))
         self.proof_p_value: float = float(getattr(cfg, "proof_p_value", 0.10))
+        self.model_mode: str = _mode(getattr(cfg, "model_mode", "shadow"))
+        self.model_min_p: float = float(getattr(cfg, "model_min_p", 0.55))
         self.dry_run: bool = bool(cfg.dry_run)
 
         self._acted: set[str] = set()          # play ids already handled
@@ -104,6 +112,8 @@ class AutoPilot:
             "min_minutes_to_close": self.min_minutes_to_close,
             "skip_noise": list(self.skip_noise),
             "require_proven": self.require_proven,
+            "model_mode": self.model_mode,
+            "model_min_p": self.model_min_p,
             "dry_run": self.dry_run,
             "day": self._day,
             "count_today": self._count_today,
@@ -130,6 +140,10 @@ class AutoPilot:
             self.cooldown_after_loss = bool(d["cooldown_after_loss"])
         if "require_proven" in d:
             self.require_proven = bool(d["require_proven"])
+        if "model_mode" in d:
+            self.model_mode = _mode(d["model_mode"])
+        if isinstance(d.get("model_min_p"), (int, float)):
+            self.model_min_p = min(0.9, max(0.5, float(d["model_min_p"])))
         self.dry_run = bool(d.get("dry_run", self.dry_run))
         # only restore the day counter if it is still the same session
         if d.get("day") == clock.session_date().isoformat():
@@ -177,6 +191,10 @@ class AutoPilot:
             self.min_confirmations = max(1, min(10, int(kw["min_confirmations"])))
         if isinstance(kw.get("min_minutes_to_close"), int):
             self.min_minutes_to_close = max(0, min(120, int(kw["min_minutes_to_close"])))
+        if "model_mode" in kw:
+            self.model_mode = _mode(kw["model_mode"])
+        if isinstance(kw.get("model_min_p"), (int, float)):
+            self.model_min_p = min(0.9, max(0.5, float(kw["model_min_p"])))
         if isinstance(kw.get("skip_noise"), list):
             self.skip_noise = [str(n) for n in kw["skip_noise"] if str(n) in NOISE_LABELS]
         self._persist()
@@ -260,6 +278,9 @@ class AutoPilot:
             "min_replay_trades": self.min_replay_trades,
             "min_replay_expectancy_r": self.min_replay_expectancy_r,
             "proof_p_value": self.proof_p_value,
+            "model_mode": self.model_mode,
+            "model_min_p": round(self.model_min_p, 2),
+            "model": self._model_card(),
             "open_auto_positions": open_auto,
             "auto_trades_today": self._count_today,
             "mode": getattr(self.engine, "mode", "paper"),
@@ -489,6 +510,9 @@ class AutoPilot:
         unproven = self._unproven(p.strategy)
         if unproven:
             return unproven
+        doubted = self.model_refusal(p)
+        if doubted:
+            return doubted
         if self.cfg.require_catalyst and not any(t in ("catalyst", "gap") for t in (p.tags or [])):
             return "no catalyst tag (autopilot.require_catalyst is on)"
         try:
@@ -515,6 +539,24 @@ class AutoPilot:
             except Exception:  # noqa: BLE001
                 pass
         return None
+
+    def model_refusal(self, p: Any) -> Optional[str]:
+        """Why the learned model keeps Autopilot out of a play, if it does: only in gate or size
+        mode, and only while the model's own walk-forward judgement calls it usable."""
+        score = (getattr(p, "evidence", None) or {}).get("model") or {}
+        if self.model_mode == "shadow" or not score.get("usable") or score.get("p") is None:
+            return None
+        if float(score["p"]) < self.model_min_p:
+            return (f"the learned model gives plays like this {float(score['p']):.0%} to pay - under the "
+                    f"{self.model_min_p:.0%} it is asked for")
+        return None
+
+    def _model_card(self) -> Optional[Dict[str, Any]]:
+        card = getattr(self.engine, "model_card", None)
+        try:
+            return card() if callable(card) else None
+        except Exception:  # noqa: BLE001
+            return None
 
     def confidence_floor(self, timeframe: str) -> float:
         """The conviction a play must state: day trades use min_confidence; swing plays their own,
