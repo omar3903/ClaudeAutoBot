@@ -121,8 +121,10 @@ function exitCell(t, parked) {
   const exiting = ((S.orders || {}).orders || []).find(o => o.purpose === "exit" && o.trade_id === t.id);
   if (exiting) return `<span class="badge warn" title="An exit order is working at the broker">exit working · ${escapeHtml(exiting.reason || exiting.order_type || "")}</span>`;
   const late = t.timeframe === "INTRADAY" ? " · flat before the close" : "";
+  const target = ((S.orders || {}).orders || []).find(o => o.purpose === "target" && o.trade_id === t.id);
+  const tgt = target ? ` · <span title="A limit order rests at the broker at the target, in one group with the stop: when one fills the broker shrinks the other, so they can never both fill for the whole position">target ${num(target.limit_price)} ×${num(target.qty, 0)}</span>` : "";
   return stop
-    ? `<span title="A good-till-cancelled stop order rests at the broker for these shares - it protects the position even while the app is closed">stop ${num(stop.stop_price)} at the broker</span>${late}`
+    ? `<span title="A good-till-cancelled stop order rests at the broker for these shares - it protects the position even while the app is closed">stop ${num(stop.stop_price)}</span>${tgt} at the broker${late}`
     : `<span title="No stop order rests at the broker: the app watches the price and sends the exit itself">stop watched by the app</span>${late}`;
 }
 

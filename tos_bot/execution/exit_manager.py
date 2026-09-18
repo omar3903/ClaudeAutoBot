@@ -35,6 +35,31 @@ from ..util import clock
 log = logging.getLogger(__name__)
 
 
+def scale_out_plan(t: Dict[str, Any], cfg) -> Optional[Tuple[float, Dict[str, float]]]:
+    """At the first target of a play that has a second: the shares to take off, and the stop and
+    target the rest gets - break-even (plus ``scale_out_lock_r`` R and the usual buffer) and the
+    second target. None when the position is exited whole: no second target, the scale-out switched
+    off, exits by hand, too few shares, or already taken. The exit manager and the target order
+    resting at the broker (execution/protective_stops.py) share it, so both take off the same part."""
+    if cfg is None:
+        return None
+    pct = float(getattr(cfg, "scale_out_pct", 0.0) or 0.0)
+    target2 = t.get("target2_price")
+    qty = abs(float(t.get("quantity") or 0.0))
+    initial = abs(float(t.get("initial_quantity") or qty))
+    entry = float(t.get("entry_price") or 0.0)
+    if (not bool(t.get("managed_exit", True)) or not 0.0 < pct < 100.0 or not target2 or qty < 2
+            or qty < initial - 1e-9 or entry <= 0):
+        return None
+    sign = 1.0 if t.get("side") == "LONG" else -1.0
+    first_stop = t.get("initial_stop_price") or t.get("stop_price")
+    risk_ps = abs(entry - float(first_stop)) if first_stop else 0.0
+    part = float(max(1, min(int(qty) - 1, round(qty * pct / 100.0))))
+    lock_r = float(getattr(cfg, "scale_out_lock_r", 0.0) or 0.0)
+    buf = entry * float(getattr(cfg, "breakeven_buffer_bps", 5) or 0) / 1e4
+    return part, {"stop_price": round(entry + sign * (lock_r * risk_ps + buf), 4), "target_price": float(target2)}
+
+
 class ExitManager:
     #: seconds to wait before the next exit for a trade, after its 1st, 2nd, ... one
     RETRY_DELAYS_S = (5.0, 15.0, 30.0, 60.0, 120.0, 300.0)
@@ -153,17 +178,7 @@ class ExitManager:
         and target the rest gets - break-even (plus ``scale_out_lock_r`` R and the usual buffer)
         and the second target. None when the position is exited whole: no second target, the
         scale-out switched off, exits by hand, too few shares, or already taken."""
-        pct = float(getattr(self.cfg, "scale_out_pct", 0.0) or 0.0)
-        target2 = t.get("target2_price")
-        qty = float(t.get("quantity") or 0.0)
-        initial = float(t.get("initial_quantity") or qty)
-        if not managed or not 0.0 < pct < 100.0 or not target2 or qty < 2 or qty < initial - 1e-9:
-            return None
-        part = float(max(1, min(int(qty) - 1, round(qty * pct / 100.0))))
-        lock_r = float(getattr(self.cfg, "scale_out_lock_r", 0.0) or 0.0)
-        buf = entry * float(getattr(self.cfg, "breakeven_buffer_bps", 5) or 0) / 1e4
-        stop = entry + sign * (lock_r * risk_ps + buf)
-        return part, {"stop_price": round(stop, 4), "target_price": float(target2)}
+        return scale_out_plan({**t, "managed_exit": managed}, self.cfg)
 
     def _forget_all_but(self, open_ids: set) -> None:
         """Drop what's remembered about trades that are no longer open."""
@@ -221,7 +236,9 @@ class ExitManager:
             if (side == "LONG" and px <= float(work_stop)) or (side == "SHORT" and px >= float(work_stop)):
                 moved = init_stop is not None and abs(float(work_stop) - float(init_stop)) > 1e-6
                 return self._close(t["id"], "trailing-stop" if moved else "stop", seen=px)
-        if target:
+        resting = getattr(self.executor, "target_resting", None)
+        if target and not (callable(resting) and resting(t["id"])):
+            # (a target order resting at the broker is the broker's to fill, on prices the app may see late)
             if (side == "LONG" and px >= float(target)) or (side == "SHORT" and px <= float(target)):
                 part = self._scale_out(t, managed, entry, sign, risk_ps)
                 if part is not None:

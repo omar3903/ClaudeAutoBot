@@ -118,6 +118,9 @@ function handle(topic, p) {
     case "stop.placed":
       toast(`${p.symbol}: stop order resting at the broker @ ${num(p.stop_price)} for ${num(p.qty, 0)} shares`, "good");
       break;
+    case "target.placed":
+      toast(`${p.symbol}: target order resting at the broker @ ${num(p.limit_price)} for ${num(p.qty, 0)} shares - one fill shrinks the other`, "good");
+      break;
     case "stop.lost":
       toast(`⚠ ${p.symbol}: the stop order at the broker is gone (${p.reason}) - placing it again`, "bad");
       break;

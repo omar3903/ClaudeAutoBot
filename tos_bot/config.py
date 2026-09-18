@@ -157,6 +157,10 @@ class ExecutionCfg(_Model):
                                           # at the broker for every open position, at the trade's working stop - it
                                           # protects the position while the app, the computer or the connection is
                                           # down (execution/protective_stops.py)
+    native_target: bool = True            # ...and, in a one-cancels-all group with that stop, a limit order at the
+                                          # target: the part that comes off at the first target when the position
+                                          # scales out, all of it otherwise. The broker works it on real prices, which
+                                          # the app, on delayed quotes, sees fifteen minutes late
     entry_timeout_min: int = 10           # a day-trade entry order not filled in this many minutes is cancelled - a
                                           # fill later, when the price comes back through it, is the move failing
                                           # (Aziz: never chase); 0 = leave it working for the day like a swing entry

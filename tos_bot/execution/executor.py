@@ -28,7 +28,7 @@ from ..core.eventbus import BUS
 from ..core.models import Account, OrderRequest, OrderResult, Play
 from ..util import clock
 from .order_builder import build_entry_order, build_exit_order, plan_order
-from .protective_stops import TAG as STOP_TAG, ProtectiveStops
+from .protective_stops import TAG as STOP_TAG, TARGET_TAG, ProtectiveStops
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +71,8 @@ class Executor(ProtectiveStops):
         #: the exit manager takes part of a position off at the first target, so a native bracket
         #: (the simulator's) carries the stop only - a take-profit child would close all of it there
         self.scale_out: bool = False
+        #: the exit manager's settings - how a position scales out decides the shares a resting target covers
+        self.exit_cfg: Any = None
         self._init_stops()
 
     def rebind(self, broker: BrokerAdapter, venue: Optional[str] = None) -> None:
@@ -157,7 +159,7 @@ class Executor(ProtectiveStops):
     def _describe(self, o: OrderResult, trades: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         p = self._pending.get(o.order_id)
         followed = p is not None
-        trade_id = p.trade_id if followed else next((o.tag[len(prefix):] for prefix in ("exit:", STOP_TAG)
+        trade_id = p.trade_id if followed else next((o.tag[len(prefix):] for prefix in ("exit:", STOP_TAG, TARGET_TAG)
                                                      if o.tag.startswith(prefix)), None)
         play_id = (p.play.id if p.kind == "entry" else None) if followed else \
             (o.tag.split(":")[0] if o.tag.startswith("play_") else None)
@@ -244,8 +246,8 @@ class Executor(ProtectiveStops):
             mine = o.tag.startswith("exit:") or (o.raw or {}).get("mine")
             if o.order_id in self._pending or o.symbol not in recorded or o.side is not sides[o.symbol] or not mine:
                 continue
-            if o.tag.startswith(STOP_TAG):
-                continue                                 # a protective stop is not an exit; protective_stops.py owns it
+            if o.tag.startswith((STOP_TAG, TARGET_TAG)):
+                continue                                 # a resting stop or target is not an exit; protective_stops.py owns it
             if self._exiting_quantity(o.symbol) + _remaining(o) > recorded[o.symbol] + 1e-9:
                 self._cancel_quietly(o.order_id)
                 extra.append(o)
@@ -440,11 +442,12 @@ class Executor(ProtectiveStops):
         for oid, p in list(self._pending.items()):
             self._cancel_quietly(oid)
             counts["entries" if p.kind == "entry" else "exits"] += 1
-        followed = set(self._pending) | {s.order_id for s in self._stops.values()}
+        counts["stops_kept"] += len(self._targets)       # a target resting with a stop is part of the same protection
+        followed = set(self._pending) | {s.order_id for book in (self._stops, self._targets) for s in book.values()}
         for o in self._working_at_broker():
             if o.order_id in followed:
                 continue
-            if o.tag.startswith(STOP_TAG):
+            if o.tag.startswith((STOP_TAG, TARGET_TAG)):
                 counts["stops_kept"] += 1
                 continue
             self._cancel_quietly(o.order_id)
@@ -688,6 +691,8 @@ def _purpose(o: OrderResult) -> str:
         return "stop" if o.order_type in ("STOP", "STOP_LIMIT", "TRAILING_STOP") else "target"
     if o.tag.startswith(STOP_TAG):
         return "stop"
+    if o.tag.startswith(TARGET_TAG):
+        return "target"
     if o.tag.startswith("exit:"):
         return "exit"
     if o.tag.startswith("play_"):

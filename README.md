@@ -649,8 +649,22 @@ Two rules keep it safe:
   the shares and the broker's orders could be read; a stop whose trade is no longer
   open is cancelled; a stop an earlier run left is followed, never doubled.
 
-The Open orders panel lists it as a **stop** with its trade. The simulator keeps
-its own bracket and gets no such order.
+**And a target, in one group with it.** Beside the stop rests a good-till-cancelled
+**limit order at the target** (`execution.native_target`, on by default): for the part
+that comes off at the first target when the position scales out, for all of it
+otherwise. The two share a **one-cancels-all group** at IBKR (type 3: when one fills,
+the other is reduced by the shares filled) - the target taking half off shrinks the
+stop to the other half, the stop filling cancels the target, and the two can never
+both fill for the whole position. IBKR works them on real prices, so profit is taken
+at the target even on delayed quotes, and while the app is off. When the first
+target fills, the app books the scale-out (stop to break-even, second target) and
+rests a fresh pair for what is left; while a target rests the exit manager leaves
+the target to the broker. A plain stop left by an earlier version is stood down and
+replaced by the pair. If IBKR refuses the pair, the trade gets a stop alone and the
+app works its target itself, as before.
+
+The Open orders panel lists them as **stop** and **target** with their trade. The
+simulator keeps its own bracket and gets no such orders.
 
 `tos_bot/execution/exit_manager.py` runs every few seconds on every open trade
 held on the active platform — **entries need your click, exits never do**:

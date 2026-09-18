@@ -521,3 +521,17 @@ def test_a_stop_order_rests_good_till_cancelled_and_can_be_moved_in_place(broker
     assert again.orderId == order.orderId and again.auxPrice == 100.25 and again.totalQuantity == 5
     with pytest.raises(Exception):
         broker.place_order(OrderRequest(symbol="AAPL", side=Side.SHORT, quantity=10, order_type=OrderType.STOP))
+
+
+def test_a_resting_target_joins_the_stops_one_cancels_all_group(broker):
+    group = "oca:trd_1:1:1"
+    broker.place_order(OrderRequest(symbol="AAPL", side=Side.SHORT, quantity=10, order_type=OrderType.STOP, stop_price=98.5,
+                                    tif=TimeInForce.GTC, is_entry=False, client_tag="stop:trd_1", oca_group=group, oca_type=3))
+    broker.place_order(OrderRequest(symbol="AAPL", side=Side.SHORT, quantity=5, order_type=OrderType.LIMIT, limit_price=104.0,
+                                    tif=TimeInForce.GTC, is_entry=False, client_tag="tgt:trd_1", oca_group=group, oca_type=3))
+    (_, stop), (_, target) = broker._session.ib.placed[-2:]
+    assert (stop.ocaGroup, stop.ocaType, target.ocaGroup, target.ocaType) == (group, 3, group, 3)
+    assert (target.orderType, target.action, target.lmtPrice, target.tif, target.orderRef) == ("LMT", "SELL", 104.0, "GTC",
+                                                                                               "tgt:trd_1")
+    broker.place_order(OrderRequest(symbol="AAPL", side=Side.LONG, quantity=5, order_type=OrderType.LIMIT, limit_price=100.0))
+    assert not getattr(broker._session.ib.placed[-1][1], "ocaGroup", "")       # an ordinary order is in no group

@@ -115,6 +115,9 @@ class OrderRequest:
     take_profit: Optional[float] = None
     stop_loss: Optional[float] = None
     client_tag: str = ""
+    #: a one-cancels-all group at the broker, and how a fill in it treats the others (IBKR: 3 = reduce them)
+    oca_group: str = ""
+    oca_type: int = 0
 
 
 @dataclass
