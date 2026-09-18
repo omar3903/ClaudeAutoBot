@@ -111,10 +111,14 @@ class QuitOps:
             left = len(self._to_close())
             self.quit_state = None
             self._save_runtime()
-        log.warning("quit cancelled by %s with %d position(s) still open", operator, left)
+            called_off = self.executor.cancel_exits() if self.executor is not None else 0
+        log.warning("quit cancelled by %s with %d position(s) still open; %d exit order(s) called off", operator, left,
+                    called_off)
         self._publish("quit.cancelled", left=left)
         self._publish("account.snapshot", state=self.snapshot())
-        return {"ok": True, "note": f"Quit cancelled - {left} position(s) stay open and managed."}
+        return {"ok": True, "note": (f"Quit cancelled - {left} position(s) stay open and managed"
+                                     + (f"; {called_off} exit order(s) the quit had sent were called off, and their "
+                                        "stops go back on at the broker." if called_off else "."))}
 
     def _quit_status(self) -> Optional[Dict[str, Any]]:
         if not self.quit_state:

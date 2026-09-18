@@ -420,6 +420,18 @@ class Executor(ProtectiveStops):
         return ("The market is closed, so an exit can't fill now. The position keeps its stop order at the broker; "
                 "the exit goes out when the regular session opens.")
 
+    def cancel_exits(self, reasons=("quit", "exit")) -> int:
+        """Call off the app's own exit orders still working that were sent for ``reasons`` - the
+        exits a quit sent ("exit" is what one taken over after a restart is called). After the
+        close IBKR holds a market exit for the next open; stopping the quit must not leave it
+        there to sell the position on Monday."""
+        n = 0
+        for oid, p in list(self._pending.items()):
+            if p.kind == "exit" and p.reason in reasons:
+                self._cancel_quietly(oid)
+                n += 1
+        return n
+
     def cancel_working_orders(self) -> Dict[str, int]:
         """Cancel every order working at the broker - entries, the app's own exits, anything else on
         the account - except the stops protecting open positions: those go when their position

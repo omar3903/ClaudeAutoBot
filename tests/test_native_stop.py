@@ -271,3 +271,14 @@ def test_cancelling_the_working_orders_keeps_the_stops_that_protect_positions():
     counts = ex.cancel_working_orders()
     assert counts == {"entries": 1, "exits": 0, "others": 1, "stops_kept": 1}
     assert sorted(broker.cancelled) == ["2", "90"] and len(ex.protective_stops()) == 1
+
+
+def test_stopping_a_quit_calls_off_the_exits_it_sent_and_the_stops_go_back():
+    broker, _, ex, _ = _setup()
+    ex.sync_open_orders()                                                       # stop: order 1
+    assert ex.close_trade("t1", reason="quit")["ok"]                           # the quit's exit: order 2, left working
+    assert ex.cancel_exits() == 1 and broker.cancelled == ["1", "2"]
+    broker.reports["2"] = OrderResult(order_id="2", status="CANCELED", symbol="AAA", submitted_qty=10)
+    ex.sync_open_orders()                                                       # the exit is gone...
+    assert ex.pending_exit_trade_ids() == set() and len(ex.protective_stops()) == 1   # ...and a stop rests again
+    assert [s.quantity for s in broker.stops()] == [10, 10]
