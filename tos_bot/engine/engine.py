@@ -121,7 +121,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         self.runtime = RuntimeFile(runtime_path or RUNTIME_PATH)
         saved = self.runtime.read()
 
-        self.md = MarketData(DailyBarStore(data_dir / "bars"))
+        years = max(1, min(5, int(self.settings.config.replay.daily_years or 1)))
+        self.md = MarketData(DailyBarStore(data_dir / "bars"),
+                             deep=DailyBarStore(data_dir / "research" / "daily", keep_sessions=years * 253 + 10,
+                                                full_history=f"{years} Y") if years > 1 else None)
         self.connections = Connections(
             self.settings, self.md, broker_factory=broker_factory, port_check=port_check,
             simulator_state=(data_dir / "paper_state.json") if self.settings.secrets.paper_persist else None)

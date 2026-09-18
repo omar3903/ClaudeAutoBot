@@ -21,6 +21,7 @@ from ..research.weights import evidence_multiplier, pooled_odds
 from ..quant.sizing import MIN_TRADES as KELLY_MIN_TRADES, half_kelly_risk_pct
 from ..pairs.model import KEY as PAIRS_KEY
 from .market_regime import BENCHMARK
+from ..scanner import schedule
 from ..scanner.noise import NoiseSettings
 from ..util import clock
 
@@ -41,10 +42,13 @@ class ResearchOps:
         cfg = self.settings.config
         sessions = cfg.replay.sessions if sessions is None else sessions
         swing_sessions = cfg.replay.swing_sessions if swing_sessions is None else swing_sessions
+        deep = list(dict.fromkeys(list(symbols["swing"]) + list(symbols["intraday"]) + [BENCHMARK]))
+        through = schedule.last_completed_session(clock.now_ny())
         return self.replay.start(
-            strategies=self.scanner.strategies, source=self.md.source, daily_frame=self.md.daily_frame,
+            strategies=self.scanner.strategies, source=self.md.source, daily_frame=self.md.deep_frame,
+            prepare=lambda progress: self.md.deepen_daily(deep, through, self.scanner.con_ids(deep), progress),
             intraday_symbols=symbols["intraday"], swing_symbols=symbols["swing"],
-            sessions=max(5, min(120, int(sessions))), swing_sessions=max(20, min(250, int(swing_sessions))),
+            sessions=max(5, min(120, int(sessions))), swing_sessions=max(20, min(1250, int(swing_sessions))),
             settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay, cfg.risk.min_reward_risk),
             noise=NoiseSettings.from_config(cfg.noise), con_ids=self.scanner.con_ids(symbols["intraday"]),
             market=self._regime_history, earnings=self.earnings.times if cfg.signals.enabled else None,

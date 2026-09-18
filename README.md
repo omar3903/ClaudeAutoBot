@@ -888,10 +888,16 @@ follows every play the way the automatic exits would. Its settings are in
   candles cost IBKR requests). Swing setups replay on every watchlist stock **and on the full scan's
   400 leaders** (`replay.swing_stocks`; 0 = the watchlist only) - their daily candles are already on
   disk, so a strategy's record rests on hundreds of stocks rather than the day's forty.
-* **60 day-trade sessions and 250 swing sessions** by default. Sixty sessions give
-  most setups the 30+ trades a record needs *with* a month held out; 250 is a
-  year, as far back as the stored daily candles go. Up to 120 day-trade sessions
-  can be asked for — 5-minute candles are downloaded once and kept.
+* **60 day-trade sessions and 700 swing sessions** by default. Sixty sessions give
+  most setups the 30+ trades a record needs *with* a month held out. The swing
+  replay runs on **three years of daily candles** (`replay.daily_years`, 1-5): one
+  year is one market, and a proof rule that asks whether an edge is luck needs more
+  than one. The long history is kept apart from the live store, in
+  `data/research/daily/`, only for the stocks the replay runs on: the first replay
+  asks IBKR once per stock ("years of daily candles" in the progress line), and
+  after that the live store's candles keep it current for nothing. However long the
+  history, a replayed setup sees the 300 sessions it would see live. Up to 120
+  day-trade sessions can be asked for — 5-minute candles are downloaded once and kept.
 * **Costs**: 5 bps slippage on every market fill and 1 bp commission on every fill.
 * **Held out**: the latest third of the sessions. Every strategy record and every
   noise verdict is also given for those sessions alone, and Autopilot wants a

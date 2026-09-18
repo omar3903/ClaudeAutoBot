@@ -315,3 +315,49 @@ def test_worker_processes_replay_exactly_what_one_process_does(tmp_path):
         results.append(runner.state([], 1))
     assert results[0]["ran_at"] and results[1]["ran_at"]
     assert results[0]["records"] == results[1]["records"] and results[0]["noise"] == results[1]["noise"]
+
+
+def test_however_long_the_history_a_replayed_swing_setup_sees_what_it_would_see_live():
+    import fakes
+    from tos_bot.research.replay import LIVE_DAILY_BARS, replay_swing
+
+    class _Watcher(Strategy):
+        key, kind, timeframe, title, thesis = "watcher", StrategyKind.TECHNICAL, Timeframe.SWING, "Test", "t"
+        seen: list = []
+
+        def generate(self, ctx):
+            self.seen.append(len(ctx.daily))
+            return []
+
+    watcher = _Watcher()
+    replay_swing([watcher], "LNG", fakes.daily_bars("LNG", 756), EXACT, QUIET, sessions=700)
+    assert len(watcher.seen) == 756 - 60 - 1                                    # three years of sessions replayed...
+    assert max(watcher.seen) == LIVE_DAILY_BARS and watcher.seen[0] == 61       # ...each on the window the scans have
+
+
+def test_the_replay_prepares_its_long_history_first_and_runs_on_without_it_if_that_fails(tmp_path):
+    from types import SimpleNamespace
+
+    import fakes
+    from tos_bot.research.history import IntradayHistory
+    from tos_bot.research.runner import ReplayRunner
+
+    silent = SimpleNamespace(publish=lambda *a, **k: None)
+    calls = []
+
+    def prepare(progress):
+        progress(1, 1)
+        calls.append("prepared")
+
+    def broken(progress):
+        raise RuntimeError("no connection")
+
+    for n, step in enumerate((prepare, broken)):
+        runner = ReplayRunner(tmp_path / f"replay{n}.json", IntradayHistory(tmp_path / f"intraday{n}"), bus=silent,
+                              workers=1)
+        runner.start(strategies=[_LongAtBar()], source=fakes.FakeGateway(["PRP"]), daily_frame=fakes.daily_bars,
+                     intraday_symbols=["PRP"], swing_symbols=["PRP"], sessions=3, swing_sessions=30,
+                     settings=EXACT, noise=QUIET, prepare=step)
+        runner.wait(60)
+        assert runner.state([], 1)["ran_at"]
+    assert calls == ["prepared"]

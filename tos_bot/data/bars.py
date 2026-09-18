@@ -30,8 +30,13 @@ _FRAMES_IN_MEMORY = 800       # the hot list, the buffers and the swing leaders
 
 
 class DailyBarStore:
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, keep_sessions: int = KEEP_SESSIONS, full_history: str = FULL_HISTORY) -> None:
+        """``keep_sessions`` / ``full_history``: how much of each stock is kept and asked for the
+        first time. The live store keeps a year of every listing; the research store beside it
+        (data/research/daily) keeps several years of the stocks the replay runs on."""
         self.directory = directory
+        self.keep_sessions = int(keep_sessions)
+        self.full_history = str(full_history)
         self._frames: "OrderedDict[str, pd.DataFrame]" = OrderedDict()
         self._last: Dict[str, Optional[dt.date]] = {}
         self._lock = threading.Lock()
@@ -61,18 +66,18 @@ class DailyBarStore:
         """The IBKR duration that brings ``symbol`` up to ``through``, or None if it's current."""
         last = self.last_session(symbol)
         if last is None:
-            return FULL_HISTORY
+            return self.full_history
         if last >= through:
             return None
         gap_days = (through - last).days
-        return FULL_HISTORY if gap_days > 250 else f"{gap_days + 3} D"
+        return self.full_history if gap_days > 250 else f"{gap_days + 3} D"
 
     def merge(self, symbol: str, bars: pd.DataFrame, through: dt.date) -> pd.DataFrame:
         """Add freshly downloaded bars (dropping any session after ``through``) and save."""
         new = bars[bars.index.date <= through]
         old = self.frame(symbol)
         combined = new if old is None else pd.concat([old, new])
-        combined = combined[~combined.index.duplicated(keep="last")].sort_index().tail(KEEP_SESSIONS)
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index().tail(self.keep_sessions)
         self.directory.mkdir(parents=True, exist_ok=True)
         tmp = self._path(symbol).with_suffix(".tmp")
         combined.to_pickle(tmp)

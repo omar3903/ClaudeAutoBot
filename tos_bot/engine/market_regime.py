@@ -30,7 +30,7 @@ from ..util import clock
 log = logging.getLogger(__name__)
 
 BENCHMARK = "SPY"
-DURATION = "3 Y"
+DURATION = "5 Y"              # two years to fit on before a three-year replay begins, so its regime flags never look ahead
 MIN_RETURNS = 250
 TURBULENT = 0.5
 
