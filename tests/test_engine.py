@@ -628,3 +628,20 @@ def test_autopilot_takes_only_what_the_filters_and_its_own_boxes_both_allow(engi
     ap.trade_types = ["SWING"]                                             # ...but its own box says no day trades
     assert ap.play_types() == ["SWING"] and not ap.day_mode_active(market_open=True)
     assert "day trades are switched off" in ap._pre_gate(day, 50_000) and ap.status()["own_trade_types"] == ["SWING"]
+
+
+def test_the_review_judges_a_play_on_autopilots_checks_not_on_its_type_boxes(engine):
+    ap = engine.autopilot
+    ap.trade_types, ap.skip_noise = ["SWING"], ["against_gap"]              # day trades unticked in its own boxes...
+    ap.min_confidence, ap.min_reward_risk, ap.min_confirmations = 0.5, 2.0, 1
+    assert engine.set_filters(timeframes=["INTRADAY", "SWING"])["ok"]      # ...while the filters put day plays on the board
+    row = {"timeframe": "INTRADAY", "confidence": 0.6, "reward_risk": 2.5, "noise": [], "confirmations": 1}
+    assert engine._passes_checks(row)                                      # judged on its merits, not on the box
+    assert not engine._passes_checks({**row, "confidence": 0.4})
+    assert not engine._passes_checks({**row, "reward_risk": 1.8})
+    assert not engine._passes_checks({**row, "noise": ["against_gap", "conflict"]})
+    assert engine._passes_checks({**row, "noise": ["conflict"]})            # a flag not skipped is only a flag
+    ap.min_confirmations = 2
+    assert not engine._passes_checks(row) and engine._passes_checks({**row, "confirmations": 2})
+    swing = {**row, "timeframe": "SWING", "confidence": ap.min_swing_confidence}
+    assert engine._passes_checks(swing) and not engine._passes_checks({**swing, "confidence": ap.min_swing_confidence - 0.01})
