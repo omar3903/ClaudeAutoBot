@@ -1,6 +1,6 @@
 # docs/
 
-* `AutoTradeBot-architecture.pdf` - how the app works: the twelve books, the components, the classes (UML),
+* `AutoTradeBot-architecture.pdf` - how the app works: the twenty books, the components, the classes (UML),
   the threads, a play's life (sequence), the state machines, the database (ER), the research loop, the API,
   the important functions and a glossary. Written for a computer scientist.
 * `AutoTradeBot-architecture.html` - the same page as HTML (the diagrams are inline SVG).

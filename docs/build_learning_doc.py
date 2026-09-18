@@ -358,8 +358,9 @@ def build() -> str:
     A('<p><b>Version everything.</b> A model file carries the feature schema it was trained on, the rows it saw '
       '(counts per source, first and last session), the fold scores and a model id. The play panel and the '
       'journal show the id, so a bad week can be traced to the model that made it.</p>')
-    A('<p><b>Retrain weekly</b>, after the replay run, on a fixed script. Never retrain on the live rows of the '
-      'same day they were made.</p>')
+    A('<p><b>Retrain nightly.</b> The engine retrains in the background after each day\'s 16:15 review has added '
+      'its rows (<code>ResearchOps.train_model</code>); <code>scripts/train_model.py</code> does the same by hand. '
+      'The scorer picks a new model up within a minute, without a restart.</p>')
 
     # ---- 6 --------------------------------------------------------------------------------
     A('<h2>6. How it plugs into the app</h2>')
@@ -395,7 +396,39 @@ def build() -> str:
       'setup should bump its own record (its replay rows are re-created on the next run anyway).</p>')
 
     # ---- 8 --------------------------------------------------------------------------------
-    A('<h2>8. What would help most, and what to read</h2>')
+    A('<h2>8. Where it stands (2026-09-18)</h2>')
+    A('<p>Everything in the plan up to shadow mode is built. What the numbers say so far is sobering, and '
+      'that is the point of measuring:</p>')
+    A(table(["Piece", "What is built", "What it says today"], [
+        ("Records judged for luck", "<code>research/significance.py</code>: Aronson's bootstrap and White's "
+         "reality check across every setup tried, net of each stock's own drift; Tharp's quality number and "
+         "marble-bag drawdowns; Carver's cost share",
+         "no setup is proven: the best one's +0.10R has a 29% chance of being luck alone and 99% once the other "
+         "setups tried are allowed for"),
+        ("The meta-label model", "<code>research/model.py</code>: boosted trees, uniqueness weights with time "
+         "decay, purged walk-forward verdict, isotonic calibration, out-of-sample feature importance; retrained "
+         "nightly; scores every play",
+         "not usable on 4,868 rows: it ties the stated odds on log loss and its top decile wins no more than "
+         "the base rate. It runs in shadow and has no say"),
+        ("Execution quality", "the quote at the decision is stored with every trade, slippage is measured at "
+         "the fill, a wide spread refuses the entry on live quotes, stale day-trade entries are cancelled",
+         "no live fills measured yet; the daily review reports the averages against the replay's 6 bps a side "
+         "once there are five"),
+        ("Three more book setups", "<code>strategies/patterns.py</code>: Grimes's failure test and pullback, "
+         "Bulkowski's confirmed double bottom",
+         "a year's replay on 400 stocks: -0.01R to -0.09R after costs, shorts worse than longs. They face the "
+         "same proof as every other setup"),
+        ("An independent audit", "<code>scripts/r/audit_records.R</code> recomputes the record statistics in "
+         "base R", "it agrees with the Python numbers to the second decimal"),
+    ]))
+    A('<p><b>What would change the picture.</b> Rows and better features, not a cleverer model: every day adds '
+      'shadow rows at no risk; real-time data makes the day-trade features current instead of 15 minutes old; '
+      'and the features with the highest information coefficients so far (recent volatility, the stop distance, '
+      'the market\'s move) suggest the next ones to build. The honest default until then: Autopilot\'s proof rule '
+      'keeps it out of unproven setups, and paper practice with the rule switched off is for collecting rows, '
+      'not for expecting profit.</p>')
+
+    A('<h2>9. What would help most, and what to read</h2>')
     A('<p><b>Data before books.</b> The single most useful thing is to run the replay after each morning\'s full '
       'scan and to keep the app paper trading with the proof rule on. Rows are the constraint.</p>')
     A('<p><b>Books and papers, in the order they will be used:</b></p>')
