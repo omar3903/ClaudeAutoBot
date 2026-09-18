@@ -31,6 +31,7 @@ _QUOTE_TTL_S = 20.0
 #: candles and quotes nothing has asked for in this long are let go - the app runs for days
 _CACHE_KEEP_S = 1800.0
 _DAILY_CHUNK = 200
+_DEEP_CHUNK = 50             # the long history comes in smaller batches, so its progress line moves
 
 
 class NoDataSource(RuntimeError):
@@ -148,8 +149,10 @@ class MarketData:
                     continue
                 plan[s] = need
             items, done = list(plan.items()), 0
-            for i in range(0, len(items), _DAILY_CHUNK):
-                chunk = dict(items[i:i + _DAILY_CHUNK])
+            if progress and items:
+                progress(0, len(items))                   # say what is happening before the first batch is in
+            for i in range(0, len(items), _DEEP_CHUNK):
+                chunk = dict(items[i:i + _DEEP_CHUNK])
                 got = self.source.history_many({s: ("1 day", d) for s, d in chunk.items()}, con_ids)
                 for symbol, frame in got.items():
                     self.deep.merge(symbol, frame, through)
