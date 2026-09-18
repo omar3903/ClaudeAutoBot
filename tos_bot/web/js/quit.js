@@ -25,7 +25,22 @@ export function openQuitDialog(pv) {
   const parked = (pv.parked || []).length
     ? `<p class="muted">Not touched — held on another platform: ${pv.parked.map(t =>
       `${escapeHtml(t.symbol)} (${VENUE_SHORT[t.venue] || escapeHtml(t.venue)})`).join(", ")}.</p>` : "";
-  if (pv.paper) {
+  const keep = pv.keepable || [];
+  if (keep.length) {
+    const rest = n - keep.length;
+    openModal({
+      title: "Quit AutoTradeBot?",
+      bodyHTML: `<p><b>${plural(keep.length, "swing position")}</b> on ${escapeHtml(pv.venue_label)} ${keep.length === 1 ? "has" : "have"} a stop order
+        resting at the broker, so ${keep.length === 1 ? "it" : "they"} can stay open while the app is off:</p>${positionList(keep)}
+        <p><button class="long" id="quit-keep">Keep ${keep.length === 1 ? "it" : "them"} open &amp; quit</button></p>
+        <p class="muted">The broker's stops protect them until the app is back; it picks them up again when it starts. Targets and
+        trailing are not worked while it is off.${rest > 0 ? ` The other ${plural(rest, "position")} (day trades, pair legs, or without a stop at the broker) ${rest === 1 ? "is" : "are"} closed first.` : ""}</p>
+        <p><b>Close all &amp; quit</b> sends a market order for every position instead${pv.resets_simulator ? " and resets the simulator" : ""}.</p>${parked}`,
+      okText: "Close all & quit", okClass: "danger", cancelText: "Cancel",
+      onOk: () => sendQuit(true),
+    });
+    $("#quit-keep").onclick = () => { closeModal(); sendQuit(true, true); };
+  } else if (pv.paper) {
     openModal({
       title: "Quit AutoTradeBot?",
       bodyHTML: `${n ? `<p>Every open paper position on ${escapeHtml(pv.venue_label)} is closed first:</p>${positionList(pv.positions)}` : "<p>No open paper positions.</p>"}
@@ -53,8 +68,8 @@ export function openQuitDialog(pv) {
   }
 }
 
-async function sendQuit(closeAll) {
-  const r = await post("/api/quit", { close_all: closeAll });
+async function sendQuit(closeAll, keep = false) {
+  const r = await post("/api/quit", { close_all: closeAll, keep });
   toastResult(r);
   if (r.quit) { S.state.quit = r.quit; renderLock(); }
 }

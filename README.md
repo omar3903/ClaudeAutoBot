@@ -432,6 +432,7 @@ positions:
 | **Paper** | working entry orders are cancelled, every open paper position is closed at the market, the simulator is reset to `account.paper_start_cash` (when trading on it), and the app shuts down |
 | **Live, positions open** | a dialog lists them: **Exit all & quit** closes every one and shuts down once they're out; **Cancel** keeps them open and the app running, so their exits stay managed |
 | **Live, nothing open** | the app shuts down |
+| **IBKR (paper or live), swing positions with a stop at the broker** | the dialog also offers **Keep them open & quit**: those positions stay open, protected by their stop orders resting at IBKR, and the app picks them up again when it starts; day trades, pair legs and any position without a resting stop are closed first. Targets and trailing are not worked while the app is off |
 
 While it closes out, a red banner shows what's left and the app is **locked**:
 routing, filters, strategies, scan settings, Autopilot, scanning and new entries

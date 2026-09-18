@@ -299,6 +299,32 @@ def test_paper_quit_closes_everything_resets_and_shuts_down(engine):
     assert done.wait(3)
 
 
+def test_a_quit_can_keep_the_swing_positions_that_have_a_stop_at_the_broker(engine):
+    engine._venue = "ibkr-paper"
+    kept, closed_one = _open(engine, "AAPL", venue="ibkr-paper"), _open(engine, "MSFT", venue="ibkr-paper")
+    engine.executor.native_stops_on = lambda: True
+    engine.executor.protective_stops = lambda: [{"trade_id": kept, "symbol": "AAPL"}]      # MSFT has no stop resting
+    closed = _closes_fill(engine)
+    done = threading.Event()
+    engine.on_shutdown = done.set
+
+    preview = engine.quit_preview()
+    assert [b["id"] for b in preview["keepable"]] == [kept] and preview["left"] == 2
+    r = engine.begin_quit(close_all=True, keep=True)
+    assert r["ok"] and closed == ["MSFT"]                                  # only the unprotected one is closed
+    assert [t["id"] for t in engine.repo.open_trades()] == [kept] and engine.quit_state is None
+    assert done.wait(3)
+    assert closed_one not in [t["id"] for t in engine.repo.open_trades()]
+
+
+def test_without_stops_at_the_broker_nothing_can_be_kept(engine):
+    _open(engine, "AAPL")
+    closed = _closes_fill(engine)
+    assert engine.quit_preview()["keepable"] == []                          # the simulator rests no stops
+    engine.begin_quit(close_all=True, keep=True)
+    assert closed == ["AAPL"] and engine.repo.open_trades() == []
+
+
 def test_while_quitting_nothing_but_exits_can_change(engine):
     tid = _open(engine, "AAPL")
     engine.executor.close_trade = lambda tid, reason="manual": {"ok": True, "status": "WORKING", "order_id": "o1"}

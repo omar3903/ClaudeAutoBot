@@ -11,7 +11,7 @@ import logging
 import datetime as dt
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import List, Any, Dict, Optional
 
 from ..brokers.venues import venue_label
 
@@ -23,11 +23,14 @@ class QuitOps:
     #  Quitting                                                          #
     # ------------------------------------------------------------------ #
     def quit_preview(self) -> Dict[str, Any]:
+        keepable = self._keepable_ids()
         brief = [{"id": t["id"], "symbol": t["symbol"], "side": t["side"], "quantity": t["quantity"],
-                  "entry_price": t["entry_price"], "venue": t.get("broker") or "paper"}
+                  "entry_price": t["entry_price"], "venue": t.get("broker") or "paper",
+                  "timeframe": t.get("timeframe"), "keepable": t["id"] in keepable}
                  for t in self._open_trades()]
         here = [b for b in brief if b["venue"] == self._venue]
         return {
+            "keepable": [b for b in here if b["keepable"]],
             "mode": self.mode, "paper": self.mode == "paper",
             "venue": self._venue, "venue_label": venue_label(self._venue),
             "positions": here, "left": len(here), "parked": [b for b in brief if b["venue"] != self._venue],
@@ -40,18 +43,33 @@ class QuitOps:
         """Ask the dashboard to show the quit choices (Ctrl+C with live positions open)."""
         self._publish("quit.requested", **self.quit_preview())
 
-    def begin_quit(self, close_all: bool = True, operator: str = "operator") -> Dict[str, Any]:
+    def _keepable_ids(self) -> set:
+        """Positions that may stay open while the app is off: swing trades (a day trade must be flat
+        by the close), not pair legs (they have no stop of their own), each with its stop order
+        resting at the broker right now - that order is what protects it until the app is back."""
+        executor = self.executor
+        if executor is None or not executor.native_stops_on():
+            return set()
+        protected = {s["trade_id"] for s in executor.protective_stops()}
+        return {t["id"] for t in self._positions_here()
+                if t["id"] in protected and t.get("timeframe") == "SWING" and not t.get("pair_id")}
+
+    def begin_quit(self, close_all: bool = True, operator: str = "operator", keep: bool = False) -> Dict[str, Any]:
         """Paper: close everything, reset the simulator, shut down. Live: close
-        everything and shut down once flat (``close_all=False`` cancels). Until the
-        last position is out, nothing but exits may change."""
+        everything and shut down once flat (``close_all=False`` cancels). ``keep``: leave the
+        swing positions that have a stop resting at the broker open (_keepable_ids) and close only
+        the rest - the app picks them up again when it starts. Until the last position to be
+        closed is out, nothing but exits may change."""
         with self._switch_lock:
             if self.quit_state:
                 return {"ok": True, "note": "Already closing out before quitting.", "quit": self._quit_status()}
-            held = self._positions_here()
+            kept = self._keepable_ids() if keep else set()
+            held = [t for t in self._positions_here() if t["id"] not in kept]
             if self.mode == "live" and held and not close_all:
                 return {"ok": False, "reason": "Quit cancelled - your live positions stay open and managed."}
             self.quit_state = {"started_at": dt.datetime.now(dt.timezone.utc).isoformat(), "mode": self.mode,
-                               "venue": self._venue, "by": operator, "reset_sim": self._venue == "paper"}
+                               "venue": self._venue, "by": operator, "reset_sim": self._venue == "paper",
+                               "keeping": sorted(kept)}
             self._quit_rounds = 1
             self._save_runtime()
             cancelled = self.executor.cancel_pending_entries() if self.executor else 0
@@ -63,7 +81,8 @@ class QuitOps:
         self._check_quit_progress()
         failed = [r for r in results if not r["ok"]]
         if not held:
-            note = "No open positions - shutting down."
+            note = (f"Keeping {len(kept)} swing position(s) open with their stops at the broker - shutting down."
+                    if kept else "No open positions - shutting down.")
         elif failed:
             note = (f"Exits sent for {len(held) - len(failed)} of {len(held)} positions; retrying "
                     f"{', '.join(r['symbol'] for r in failed)}. The app stays locked until all are out.")
@@ -74,8 +93,13 @@ class QuitOps:
     def _quit_status(self) -> Optional[Dict[str, Any]]:
         if not self.quit_state:
             return None
-        left = self._positions_here()
+        left = self._to_close()
         return {**self.quit_state, "left": len(left), "symbols": sorted({t["symbol"] for t in left})}
+
+    def _to_close(self) -> List[Dict[str, Any]]:
+        """The positions a quit in progress still has to get out of - not the ones it keeps."""
+        keeping = set((self.quit_state or {}).get("keeping") or ())
+        return [t for t in self._positions_here() if t["id"] not in keeping]
 
     def _check_quit_progress(self) -> None:
         if not self.quit_state:
@@ -83,7 +107,7 @@ class QuitOps:
         with self._quit_lock:
             if not self.quit_state:
                 return
-            left = self._positions_here()
+            left = self._to_close()
             if left and time.monotonic() >= self._quit_retry_at:
                 # a simulator close can only fail on a missing price; after a retry the
                 # reset wipes those positions anyway, so don't stay stuck
@@ -96,13 +120,16 @@ class QuitOps:
                         self._close_all(retry, reason="quit")
                         self._quit_rounds += 1
                     self._quit_retry_at = time.monotonic() + self.QUIT_RETRY_S
-                    left = self._positions_here()
+                    left = self._to_close()
             if left:
                 self._publish("quit.progress", quit=self._quit_status())
                 return
 
             state, self.quit_state = self.quit_state, None
-            note = "All positions are closed."
+            keeping = len(state.get("keeping") or ())
+            note = ("All positions are closed." if not keeping else
+                    f"{keeping} swing position{'s stay' if keeping != 1 else ' stays'} open, each with its stop order "
+                    "resting at the broker. The app picks them up again when it starts.")
             if state.get("reset_sim") and self._venue == "paper":
                 cash = self.settings.config.account.paper_start_cash
                 self._reset_simulator(cash)

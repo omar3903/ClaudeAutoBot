@@ -57,6 +57,12 @@ class GuardedServer(uvicorn.Server):
             print(f"\n  Still closing {preview['left']} position(s) before quitting. "
                   "Press Ctrl+C again within 10 s to force quit.\n", flush=True)
             return None
+        if preview.get("keepable"):
+            print(f"\n  {len(preview['keepable'])} swing position(s) have a stop resting at the broker. Choose "
+                  "'Keep swing positions & quit' or 'Close all & quit' in the dashboard, or press Ctrl+C again "
+                  "within 10 s to force quit (they stay open, protected by those stops).\n", flush=True)
+            engine.request_quit_dialog()
+            return None
         if preview["paper"]:
             print("\n  Quitting paper: closing open positions"
                   + (" and resetting the simulator" if preview["resets_simulator"] else "")
