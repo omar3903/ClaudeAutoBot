@@ -6,6 +6,7 @@ from . import technical as _technical  # noqa: F401
 from . import fundamental as _fundamental  # noqa: F401
 from . import insider as _insider  # noqa: F401
 from . import statistical as _statistical  # noqa: F401
+from . import patterns as _patterns  # noqa: F401
 
 __all__ = [
     "Strategy",
