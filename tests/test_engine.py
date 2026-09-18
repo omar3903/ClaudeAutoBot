@@ -633,6 +633,13 @@ def test_an_entry_never_chases_the_price_past_the_play(engine, monkeypatch):
     assert "spread" in engine._chase_check(p, plan)
     monkeypatch.setattr(engine.md, "quote",
                         lambda s: Quote(symbol=s, bid=tape["px"] - 0.01, ask=tape["px"] + 0.01, last=tape["px"]))
+    def dead(symbol):
+        raise RuntimeError("no price")
+
+    live_quote = engine.md.quote
+    monkeypatch.setattr(engine.md, "quote", dead)                           # a price source that answers nothing
+    assert "not entering blind" in engine._chase_check(p, plan)
+    monkeypatch.setattr(engine.md, "quote", live_quote)
     tape["px"] = 102.0                                                      # 0.4R past the entry: the R:R is gone
     assert "not chasing" in engine._chase_check(p, plan)
     tape["px"], plan["limit_price"] = 99.0, 100.05                          # a pullback under the entry is no chase

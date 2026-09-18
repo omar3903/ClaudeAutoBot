@@ -566,3 +566,41 @@ def test_proof_also_asks_whether_the_edge_is_luck_drift_or_eaten_by_costs():
     ap.proof_p_value = 0.0                                                     # the luck test switched off
     eng.records["opening_range_breakout"] = {**record, "p_adjusted": 0.9}
     assert ap.proof_missing("opening_range_breakout") is None
+
+
+def test_one_entry_per_scan_cycle_means_a_scan_of_the_market_not_a_recheck_of_the_board(monkeypatch):
+    from tos_bot.execution import autopilot as module
+
+    eng = FakeEngine()
+    eng.entry_pace_seconds = lambda timeframe: 60.0 if timeframe == "INTRADAY" else 300.0
+    ap = AutoPilot(eng, _cfg(trade_types=["INTRADAY", "SWING"], max_new_per_cycle=1, max_auto_positions=9), bus=SILENT)
+    clock_ = {"t": 1000.0}
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock_["t"])
+    first, second, day = (mkplay(sym="ONE", tf=Timeframe.SWING), mkplay(sym="TWO", tf=Timeframe.SWING),
+                          mkplay(sym="DAY"))
+    _run(ap, first, second, day)
+    assert eng.approved_ids() == [first.id] and "per scan cycle - the next in" in ap.verdict(second)
+    clock_["t"] += 15.0                                                       # the 15-second re-check of the board
+    _run(ap, first, second, day)
+    assert eng.approved_ids() == [first.id]
+    clock_["t"] += 50.0                                                       # a fast cycle on: the day trade may go
+    _run(ap, first, second, day)
+    assert eng.approved_ids() == [first.id, day.id]
+    clock_["t"] += 300.0                                                      # a whole regular cycle since the last entry of any kind
+    _run(ap, first, second, day)
+    assert eng.approved_ids() == [first.id, day.id, second.id]
+
+
+def test_no_entries_while_prices_cannot_be_read():
+    heard = []
+    eng = FakeEngine()
+    state = {"why": "the login is active somewhere else"}
+    eng.prices_refused = lambda: state["why"]
+    ap = AutoPilot(eng, _cfg(), bus=SimpleNamespace(publish=lambda topic, **p: heard.append(topic)))
+    p = mkplay()
+    _run(ap, p)
+    _run(ap, p)
+    assert eng.approved == [] and "prices can't be read" in ap.verdict(p) and heard.count("autopilot.blocked") == 1
+    state["why"] = ""                                                          # the other session logged out
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]

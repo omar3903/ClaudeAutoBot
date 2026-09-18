@@ -74,6 +74,8 @@ class ProtectiveStops:
     STAND_DOWN_S, STAND_DOWN_POLL_S = 3.0, 0.25
     #: seconds before a stop that couldn't be placed, or was lost, is tried again
     STOP_RETRY_S = 30.0
+    #: ...and when the broker's share count is only catching up with a fill that arrived in pieces
+    SHARES_RETRY_S = 5.0
 
     def _init_stops(self) -> None:
         self._stops: Dict[str, _Stop] = {}
@@ -180,7 +182,8 @@ class ProtectiveStops:
         if held is not None and ((held > 0) != long or abs(held) < qty - 1e-9):
             # never rest a stop the account can't cover - triggered, it would open a position the other way
             self._note_once(tid, f"{symbol}: no stop placed - the broker shows {held:,.0f} shares, the record {qty:,.0f}")
-            self._stop_retry[tid] = time.monotonic() + self.STOP_RETRY_S
+            arriving = (held > 0) == long and abs(held) > 0            # a fill still landing in pieces: look again soon
+            self._stop_retry[tid] = time.monotonic() + (self.SHARES_RETRY_S if arriving else self.STOP_RETRY_S)
             return
         req = OrderRequest(symbol=symbol, side=Side.SHORT if long else Side.LONG, quantity=qty,
                            order_type=OrderType.STOP, stop_price=price, tif=TimeInForce.GTC, is_entry=False,

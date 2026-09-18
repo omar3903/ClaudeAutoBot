@@ -105,6 +105,12 @@ class MarketData:
         return bool(self._source is not None and self._source.quotes_from_bars)
 
     @property
+    def refused(self) -> str:
+        """Why the source is refusing prices right now (IBKR: the login is active elsewhere) - the
+        scans read nothing and no quote can be had. Empty when prices flow, delayed or not."""
+        return str(getattr(self._source, "candles_refused", "") or "") if self._source is not None else ""
+
+    @property
     def data_problem(self) -> str:
         """Why the price source isn't sending real-time data, in words (see IbkrBroker.market_data_reason)."""
         return str(getattr(self._source, "market_data_reason", "") or "") if self._source is not None else ""
