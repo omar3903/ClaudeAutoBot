@@ -139,8 +139,10 @@ class IbkrBroker(BrokerAdapter):
     supports_bracket_native = False
     supports_native_stop = True
 
-    #: IBKR paces historical requests; about six at a time runs ~10 symbols a second
-    HISTORY_CONCURRENCY = 6
+    #: candle requests in flight at once. The Gateway takes about half a second over each whatever its
+    #: length, so the rate is set by how many are open: 6 ran ~12 a second, 12 runs ~17 (measured over
+    #: 700 requests, none refused); 32 timed out
+    HISTORY_CONCURRENCY = 12
     DETAILS_CONCURRENCY = 16
     #: waits between reconnect attempts: quick at first - a Gateway restart takes a minute or two - then every 2 min
     RECONNECT_DELAYS_S = (5, 10, 15, 30, 30, 60, 60, 120)
