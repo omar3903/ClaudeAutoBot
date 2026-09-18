@@ -29,7 +29,8 @@ export async function loadOpen() {
   $("#btn-exit-all").classList.toggle("hidden", !trades.some(t => (t.broker || "paper") === here));
   if (!trades.length) { el.innerHTML = `<p class="muted pad">No open positions.</p>` + untrackedHTML(); wireUntracked(el); return; }
   el.innerHTML = exposureHTML(trades) +
-    `<table><thead><tr><th data-term="symbol">Symbol</th><th data-term="side">Side</th><th data-term="strategy_col">Strategy</th><th>Order</th>
+    `<table><thead><tr><th data-term="symbol">Symbol</th><th data-term="side">Side</th><th data-term="tf">Type</th><th data-term="strategy_col">Strategy</th>
+    <th title="The order that opened the position, and what stands ready to close it">Orders in / out</th>
     <th class="num" data-term="qty">Qty</th><th class="num" data-term="entry">Entry</th><th class="num" data-term="mark">Mark</th>
     <th class="num" data-term="unrealized">Unrealized</th><th class="num" data-term="stop">Stop</th><th class="num" data-term="target">Target</th>
     <th data-term="age">Age / Expected</th><th class="num" data-term="mfe">MFE / MAE</th>
@@ -112,6 +113,19 @@ function exposureHTML(trades) {
   return `<div class="exposure">Exposure: ${parts}</div>`;
 }
 
+/* what stands ready to close a position: the stop order resting at the broker, or the app's own watch */
+function exitCell(t, parked) {
+  if (t.pair_id) return "the pair desk";
+  if (parked) return "paused";
+  const stop = ((S.orders || {}).orders || []).find(o => o.purpose === "stop" && o.trade_id === t.id);
+  const exiting = ((S.orders || {}).orders || []).find(o => o.purpose === "exit" && o.trade_id === t.id);
+  if (exiting) return `<span class="badge warn" title="An exit order is working at the broker">exit working · ${escapeHtml(exiting.reason || exiting.order_type || "")}</span>`;
+  const late = t.timeframe === "INTRADAY" ? " · flat before the close" : "";
+  return stop
+    ? `<span title="A good-till-cancelled stop order rests at the broker for these shares - it protects the position even while the app is closed">stop ${num(stop.stop_price)} at the broker</span>${late}`
+    : `<span title="No stop order rests at the broker: the app watches the price and sends the exit itself">stop watched by the app</span>${late}`;
+}
+
 function openRow(t, here) {
   const venue = t.broker || "paper", parked = venue !== here;
   const pos = (S.state.positions || []).find(x => x.symbol === t.symbol) || {};
@@ -131,8 +145,9 @@ function openRow(t, here) {
   return `<tr class="clickable-row ${status === "overdue" ? "row-overdue" : ""}" data-record="${escapeHtml(t.id)}">
     <td class="sym">${escapeHtml(t.symbol)} ${sectorTag(t.sector)}${parkedTag}${t.pair_id
       ? ' <span class="badge" title="One leg of a pair trade - the pair desk closes both legs together (Pairs tab)">pair</span>' : ""}</td><td>${sideBadge(t.side)}</td>
+    <td class="tf">${t.timeframe ? tfLabel(t.timeframe) : "–"}</td>
     <td>${stratLabel(t.strategy)}</td>
-    <td class="muted">${t.order_type || "—"}${t.order_session === "EXTENDED" ? " · ext" : ""}</td>
+    <td class="muted small">in: ${t.order_type || "—"}${t.order_session === "EXTENDED" ? " · ext" : ""}<br>out: ${exitCell(t, parked)}</td>
     <td class="num">${num(t.quantity, 0)}${t.initial_quantity && Math.abs(t.initial_quantity - t.quantity) > 1e-9
       ? ` <span class="muted" title="part of the position was taken off at the first target">of ${num(t.initial_quantity, 0)}</span>` : ""}</td>
     <td class="num">${num(t.entry_price)}</td>
@@ -140,7 +155,8 @@ function openRow(t, here) {
     <td class="num ${upl >= 0 ? "pl-pos" : "pl-neg"}">${usd(upl)}${t.banked_pl
       ? ` <span class="muted" title="realized on the part already taken off">+${usd(t.banked_pl)} banked</span>` : ""}</td>
     <td class="num">${stopCell}</td>
-    <td class="num">${num(t.target_price)}</td>
+    <td class="num">${num(t.target_price)}${t.target2_price
+      ? ` <span class="muted" title="part comes off at the first target, the rest runs to the second">→ ${num(t.target2_price)}</span>` : ""}</td>
     <td>${timeCell}</td>
     <td class="num muted">${usd(t.mfe)} / ${usd(t.mae == null ? null : -t.mae)}</td>
     <td class="no-row-click"><label class="switch lockable"><input type="checkbox" data-managed="${escapeHtml(t.id)}" ${t.managed_exit ? "checked" : ""} ${t.pair_id ? "disabled" : ""}><span></span></label></td>
@@ -304,6 +320,7 @@ export function showTab(name) {
 }
 
 export function initBlotter() {
+  on("orders", () => { if (tabVisible("open")) loadOpen(); });
   $$(".blotter .tab").forEach(tab => { tab.onclick = () => showTab(tab.dataset.tab); });
   $("#btn-exit-all").onclick = exitAll;
   on("state", untrackedChanged);
