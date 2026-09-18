@@ -613,6 +613,29 @@ def test_the_session_review_keeps_each_trade_with_what_it_was_taken_on(engine):
     assert engine.journal_state()["days"][0]["session"] == today.isoformat()
 
 
+def test_an_entry_never_chases_the_price_past_the_play(engine, monkeypatch):
+    from tos_bot.core.models import Quote
+
+    p = _play("AAPL")                                                       # entry 100, stop 95: 1R is 5
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    assert engine._chase_check(p, plan) is None                             # no price source: nothing to check
+    engine.md.attach(object())
+    tape = {"px": 100.5}
+    monkeypatch.setattr(engine.md, "quote",
+                        lambda s: Quote(symbol=s, bid=tape["px"] - 0.01, ask=tape["px"] + 0.01, last=tape["px"]))
+    assert engine._chase_check(p, plan) is None and plan["limit_price"] == 100.55   # 0.1R past: priced off the quote
+    tape["px"] = 102.0                                                      # 0.4R past the entry: the R:R is gone
+    assert "not chasing" in engine._chase_check(p, plan)
+    tape["px"], plan["limit_price"] = 99.0, 100.05                          # a pullback under the entry is no chase
+    assert engine._chase_check(p, plan) is None and plan["limit_price"] == 100.05
+    short = Play(symbol="MSFT", side=Side.SHORT, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                 timeframe=Timeframe.INTRADAY, entry=100.0, stop=105.0, targets=[90.0])
+    tape["px"] = 98.5                                                       # 0.3R below a short's entry
+    assert "not chasing" in engine._chase_check(short, plan)
+    tape["px"] = 99.5
+    assert engine._chase_check(short, plan) is None and plan["limit_price"] == 99.45
+
+
 def test_autopilot_takes_only_what_the_filters_and_its_own_boxes_both_allow(engine):
     ap = engine.autopilot
     ap.enabled, ap.trade_types = True, ["INTRADAY", "SWING"]              # its own boxes: day and swing

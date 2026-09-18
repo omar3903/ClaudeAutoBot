@@ -188,6 +188,32 @@ def test_an_entry_cancelled_after_a_partial_fill_books_the_shares_bought():
     assert booked["entry_context"] == {"schema": 1} and booked["submitted_at"]      # the context waited for the fill
 
 
+def test_a_day_trade_entry_not_filled_in_time_is_cancelled_rather_than_left_to_chase():
+    import datetime as dt
+
+    from tos_bot.core.enums import PlayStatus
+
+    broker, repo, heard = _Broker(), _Repo([]), []
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    day = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+               timeframe=Timeframe.INTRADAY, entry=100.0, stop=98.0, targets=[104.0])
+    swing = Play(symbol="BBB", side=Side.LONG, strategy="rsi2_mean_reversion", kind=StrategyKind.TECHNICAL,
+                 timeframe=Timeframe.SWING, entry=50.0, stop=48.0, targets=[56.0])
+    day.suggested_qty = swing.suggested_qty = 10
+    assert ex.execute_play(day, Account(account_id="DU"), plan=PLAN)["status"] == "SUBMITTED"
+    assert ex.execute_play(swing, Account(account_id="DU"), plan=PLAN)["status"] == "SUBMITTED"
+    soon = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=9)
+    assert ex.expire_entries(now=soon) == [] and broker.cancelled == []             # nine minutes: still fine
+    late = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=11)
+    assert ex.expire_entries(now=late) == ["1"] and broker.cancelled == ["1"]       # the day trade's order only...
+    assert ex.expire_entries(now=late) == []                                        # ...and only once
+    broker.reports["1"] = OrderResult(order_id="1", status="CANCELED", symbol="AAA", submitted_qty=10)
+    ex.sync_open_orders()
+    assert [w["symbol"] for w in ex.working_entries()] == ["BBB"] and day.status is PlayStatus.CANCELED
+    failed = [p for topic, p in heard if topic == "order.failed"]
+    assert failed and "not filled within 10 minutes" in failed[0]["reason"]
+
+
 # ---------------------------------------------------------------- after a restart
 def test_after_a_restart_the_exit_already_working_is_followed_not_sent_again():
     broker = _Broker({"AAA": 10}, working=[_working("7")])

@@ -1223,6 +1223,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
                 return pre
             if not pre["can_execute"]:
                 return {"ok": False, "reason": "; ".join(pre["reasons"]) or "not executable"}
+            chased = self._chase_check(p, pre["order_plan"])
+            if chased:
+                return {"ok": False, "reason": chased}
 
             p.status = PlayStatus.ACCEPTED
             p.evidence["at_entry"] = at_entry = self._entry_context(p, operator)
@@ -1244,6 +1247,35 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             self._publish("play.decided", play_id=p.id, decision="approved", result=out, play=self._decorate(p))
             self._refresh_account()
             return {"ok": out.get("ok", False), **out}
+
+    def _chase_check(self, p: Play, plan: Dict[str, Any]) -> Optional[str]:
+        """Aziz: never chase. Refuses the entry once the price has run past the play's entry by more
+        than ``execution.max_chase_r`` of the distance to the stop - the reward:risk the play was
+        judged on is gone. Within that, a limit entry is priced off the live quote so it fills now
+        instead of waiting for the price to come back through the entry, which is the move failing.
+        A pullback under the entry is not a chase. Without a price source there is nothing to check."""
+        cfg = self.settings.config.execution
+        max_r = float(getattr(cfg, "max_chase_r", 0.0) or 0.0)
+        risk = abs(float(p.entry) - float(p.stop))
+        if max_r <= 0 or risk <= 0 or not self.md.attached:
+            return None
+        try:
+            q = self.md.quote(p.symbol)
+            px = float(q.last or q.mid or 0.0)
+        except Exception:  # noqa: BLE001
+            log.debug("no quote for %s at the entry check", p.symbol, exc_info=True)
+            return None
+        if px <= 0:
+            return None
+        sign = 1.0 if p.side is Side.LONG else -1.0
+        run = (px - float(p.entry)) * sign / risk
+        if run > max_r:
+            return (f"the price ({px:.2f}) has run {run:.2f}R past the entry {p.entry:.2f} - not chasing "
+                    f"(execution.max_chase_r {max_r:g})")
+        if run > 0 and plan.get("order_type") == "LIMIT" and plan.get("limit_price"):
+            offset = float(getattr(cfg, "limit_offset_bps", 5.0)) / 1e4
+            plan["limit_price"] = round(px * (1 + sign * offset), 2)
+        return None
 
     def reject_play(self, play_id: str, operator: str = "operator") -> Dict[str, Any]:
         p = self.board.get(play_id)

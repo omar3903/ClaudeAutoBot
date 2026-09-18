@@ -88,6 +88,7 @@ function configure() {
       </div>
       <div class="ap-row">
         <span><label>Day trades: seen in scans in a row</label><input type="number" id="ap-confirm" min="1" max="10" step="1" value="${ap.min_confirmations ?? 2}"></span>
+        <span><label title="Aziz keeps the last half hour for closing, and the exit manager flattens day trades 10 minutes before the bell - a new one this late has no time to work. 0 = off">Day trades: none in the last N minutes</label><input type="number" id="ap-close" min="0" max="120" step="5" value="${ap.min_minutes_to_close ?? 30}"></span>
         <span><label>Max % of equity in positions</label><input type="number" id="ap-gross" min="10" max="400" step="5" value="${ap.max_gross_exposure_pct ?? 100}"></span>
       </div>
       <label data-term="noise">Skip plays flagged as noise</label>
@@ -116,6 +117,7 @@ function configure() {
         max_per_strategy: int("#ap-maxstrat"),
         max_new_per_cycle: int("#ap-maxcycle"),
         min_confirmations: int("#ap-confirm"),
+        min_minutes_to_close: int("#ap-close"),
         max_gross_exposure_pct: parseFloat($("#ap-gross").value),
         max_daily_loss_pct: parseFloat($("#ap-dayloss").value),
         max_giveback_pct: parseFloat($("#ap-giveback").value),
