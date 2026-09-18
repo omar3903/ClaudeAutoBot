@@ -175,7 +175,8 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
 
     @app.post("/api/quit", dependencies=LOCAL_ONLY)
     def quit_app(body: dict):
-        return _result(eng().begin_quit(close_all=bool((body or {}).get("close_all", True))))
+        return _result(eng().begin_quit(close_all=bool((body or {}).get("close_all", True)),
+                                        keep=bool((body or {}).get("keep", False))))
 
     # ---- connections (same machine only) -------------------------------- #
     @app.get("/api/setup", dependencies=LOCAL_ONLY)
