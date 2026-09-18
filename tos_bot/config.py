@@ -153,6 +153,10 @@ class ExecutionCfg(_Model):
     limit_offset_bps: float = 5.0
     time_in_force: str = "DAY"
     bracket_orders: bool = True
+    native_stop: bool = True              # on a venue that can hold one (IBKR), keep a good-till-cancelled stop order
+                                          # at the broker for every open position, at the trade's working stop - it
+                                          # protects the position while the app, the computer or the connection is
+                                          # down (execution/protective_stops.py)
     entry_timeout_min: int = 10           # a day-trade entry order not filled in this many minutes is cancelled - a
                                           # fill later, when the price comes back through it, is the move failing
                                           # (Aziz: never chase); 0 = leave it working for the day like a swing entry

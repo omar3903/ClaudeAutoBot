@@ -1015,7 +1015,12 @@ def build() -> str:
       'where the broker supports it, a native bracket with the stop and target attached. An immediate fill opens '
       'the trade; otherwise the order is tracked and <code>sync_open_orders()</code> books the fill later.</li>'
       '<li><b>Exit.</b> The sync loop runs <code>ExitManager.run_once()</code> every 4 s on every open trade '
-      'of this venue (figure 5).</li></ol>')
+      'of this venue (figure 5).</li>'
+      '<li><b>A stop that outlives the app.</b> On IBKR the executor also keeps a good-till-cancelled stop order '
+      'resting at the broker for every open trade (<code>execution/protective_stops.py</code>), made to match the '
+      'trade record on every pass. It is cancelled, and the cancel confirmed, before the app sends any exit of its '
+      'own; if it filled first, that fill is booked and nothing else is sent; a stop whose trade is no longer open '
+      'is swept away.</li></ol>')
     A('<h3>The Autopilot gates, in order (execution/autopilot.py)</h3>')
     A(table(["Gate", "Rule", "Setting"], [
         ("switched on, venue ok", "Autopilot on; live trading only when the live checks pass", "enabled"),
@@ -1321,6 +1326,9 @@ def build() -> str:
          "orders in and out, fills booked, orders already at the broker followed after a restart"),
         ("execution/exit_manager.py", "ExitManager.run_once() -> _manage()", "stop, target, scale-out, EOD flatten, "
          "time stop, break-even, trailing (figure 5)"),
+        ("execution/protective_stops.py", "_protect_positions(), _stand_down(), _watch_stops()", "the stop order "
+         "resting at IBKR for each open trade: placed, moved with the record, stood down before the app's own exits, "
+         "booked when it fills, swept when its trade is gone"),
         ("execution/order_builder.py", "plan_order(), build_entry_order()", "which order type and session a play "
          "may use; the limit offset"),
         ("brokers/ibkr_adapter.py", "IbkrBroker (get_account, history_many, place_bracket, get_fills, "

@@ -115,6 +115,15 @@ function handle(topic, p) {
       (p.mismatches || []).forEach(m => toast("⚠ " + m.note, "bad"));
       refreshState();
       break;
+    case "stop.placed":
+      toast(`${p.symbol}: stop order resting at the broker @ ${num(p.stop_price)} for ${num(p.qty, 0)} shares`, "good");
+      break;
+    case "stop.lost":
+      toast(`⚠ ${p.symbol}: the stop order at the broker is gone (${p.reason}) - placing it again`, "bad");
+      break;
+    case "stop.failed":
+      toast("⚠ Protective stop: " + (p.reason || "could not be placed"), "warn");
+      break;
     case "exit.stop_moved":
       toast(`${p.symbol}: stop → ${num(p.new_stop)} (${num(p.r, 1)}R locked)`, "good");
       loadOpen();

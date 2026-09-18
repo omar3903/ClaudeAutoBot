@@ -133,9 +133,11 @@ class IbkrBroker(BrokerAdapter):
     name = "ibkr"
     # The ExitManager owns exits and sends real close orders. No native bracket
     # is attached at IBKR - two exit managers on one position fight, and a
-    # resting child can outlive the position. The cost: no stop rests at IBKR
-    # while the app isn't running.
+    # resting child can outlive the position. What rests at IBKR instead is a
+    # stand-alone stop the executor keeps in step with the trade record and
+    # stands down before any exit of its own (execution/protective_stops.py).
     supports_bracket_native = False
+    supports_native_stop = True
 
     #: IBKR paces historical requests; about six at a time runs ~10 symbols a second
     HISTORY_CONCURRENCY = 6
@@ -699,13 +701,18 @@ class IbkrBroker(BrokerAdapter):
 
     def place_order(self, req: OrderRequest) -> OrderResult:
         self._guard_orders()
-        from ib_async import LimitOrder, MarketOrder
+        from ib_async import LimitOrder, MarketOrder, StopOrder
 
         contract = self._contract(req.symbol)
         action = "BUY" if req.side is Side.LONG else "SELL"      # the side is the order's direction, exits too
         qty = abs(float(req.quantity))
-        order = (MarketOrder(action, qty) if req.order_type is OrderType.MARKET or not req.limit_price
-                 else LimitOrder(action, qty, float(req.limit_price)))
+        if req.order_type is OrderType.STOP:
+            if not req.stop_price:
+                raise OrderRejected("a stop order needs its trigger price")
+            order = StopOrder(action, qty, float(req.stop_price))   # a market order once the price trades through it
+        else:
+            order = (MarketOrder(action, qty) if req.order_type is OrderType.MARKET or not req.limit_price
+                     else LimitOrder(action, qty, float(req.limit_price)))
         order.tif = _tif(req.tif)
         order.outsideRth = req.session in ("EXTENDED", "SEAMLESS")
         order.orderRef = req.client_tag            # lets a restarted app recognise its own working orders
@@ -716,6 +723,21 @@ class IbkrBroker(BrokerAdapter):
         status = getattr(trade.orderStatus, "status", "") or "Submitted"
         return OrderResult(order_id=oid, status=_norm_status(status), symbol=req.symbol,
                            submitted_qty=req.quantity, raw={"tif": order.tif}, side=req.side, tag=req.client_tag)
+
+    def modify_stop(self, order_id: str, stop_price: Optional[float] = None,
+                    quantity: Optional[float] = None) -> OrderResult:
+        """Change a resting stop's trigger and shares in place - IBKR takes the same order id again."""
+        self._guard_orders()
+        trade = self._find_trade(order_id)
+        if trade is None:
+            raise OrderRejected(f"IBKR: no live order {order_id} to modify")
+        order = trade.order
+        if stop_price is not None:
+            order.auxPrice = float(stop_price)
+        if quantity is not None:
+            order.totalQuantity = abs(float(quantity))
+        changed = self._session.call(lambda ib: ib.placeOrder(trade.contract, order), timeout=10)
+        return self._result(changed)
 
     def _find_trade(self, order_id: str):
         def _find(ib):

@@ -622,6 +622,27 @@ than the replay charges.
 
 ## Automatic exit strategy
 
+**A stop that outlives the app.** On IBKR every open position also has a
+good-till-cancelled **stop order resting at the broker** (`execution.native_stop`,
+on by default; `tos_bot/execution/protective_stops.py`), at the trade's working
+stop and for exactly the shares held. It protects the position while the app,
+the computer or the connection is down, and on delayed quotes it reacts to the
+real price instead of one fifteen minutes old. The trade record is the source of
+truth: every few seconds the order is made to match it - the break-even and
+trailing ratchets move it (at most once every 15 s), the scale-out resizes it.
+Two rules keep it safe:
+
+* **Never two exits on one position.** Before the app sends an exit of its own it
+  cancels the stop and waits for IBKR to confirm; if the stop filled first, that
+  fill is booked and nothing else is sent; if IBKR hasn't confirmed, the exit waits
+  for the next pass. A partial exit first shrinks the stop to the shares that remain.
+* **Never a stop without a position.** A stop is placed only while the account shows
+  the shares and the broker's orders could be read; a stop whose trade is no longer
+  open is cancelled; a stop an earlier run left is followed, never doubled.
+
+The Open orders panel lists it as a **stop** with its trade. The simulator keeps
+its own bracket and gets no such order.
+
 `tos_bot/execution/exit_manager.py` runs every few seconds on every open trade
 held on the active platform — **entries need your click, exits never do**:
 
