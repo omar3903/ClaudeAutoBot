@@ -43,6 +43,12 @@ export function fmtTime(s) {
   const d = parseDate(s);
   return isNaN(d) ? s : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
+/** A day, short: "Tue, Sep 22". */
+export function fmtDay(s) {
+  if (!s) return "–";
+  const d = parseDate(s);
+  return isNaN(d) ? s : d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+}
 export function fmtClock(s) {
   if (!s) return "–";
   const d = parseDate(s);
