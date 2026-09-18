@@ -723,6 +723,8 @@ class IbkrBroker(BrokerAdapter):
         order.tif = _tif(req.tif)
         order.outsideRth = req.session in ("EXTENDED", "SEAMLESS")
         order.orderRef = req.client_tag            # lets a restarted app recognise its own working orders
+        if req.oca_group:
+            order.ocaGroup, order.ocaType = req.oca_group, int(req.oca_type or 3)
         if self.account_id:
             order.account = self.account_id
         trade = self._session.call(lambda ib: ib.placeOrder(contract, order), timeout=10)

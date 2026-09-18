@@ -1020,7 +1020,9 @@ def build() -> str:
       'resting at the broker for every open trade (<code>execution/protective_stops.py</code>), made to match the '
       'trade record on every pass. It is cancelled, and the cancel confirmed, before the app sends any exit of its '
       'own; if it filled first, that fill is booked and nothing else is sent; a stop whose trade is no longer open '
-      'is swept away.</li></ol>')
+      'is swept away. Beside the stop rests a limit order at the target, in one one-cancels-all group with it (IBKR '
+      'reduces the other by what fills): profit is taken at the target on real prices, even on delayed quotes or with '
+      'the app off, and the two can never both fill for the whole position.</li></ol>')
     A('<h3>The Autopilot gates, in order (execution/autopilot.py)</h3>')
     A(table(["Gate", "Rule", "Setting"], [
         ("switched on, venue ok", "Autopilot on; live trading only when the live checks pass", "enabled"),
@@ -1326,9 +1328,10 @@ def build() -> str:
          "orders in and out, fills booked, orders already at the broker followed after a restart"),
         ("execution/exit_manager.py", "ExitManager.run_once() -> _manage()", "stop, target, scale-out, EOD flatten, "
          "time stop, break-even, trailing (figure 5)"),
-        ("execution/protective_stops.py", "_protect_positions(), _stand_down(), _watch_stops()", "the stop order "
-         "resting at IBKR for each open trade: placed, moved with the record, stood down before the app's own exits, "
-         "booked when it fills, swept when its trade is gone"),
+        ("execution/protective_stops.py", "_protect_positions(), _stand_down(), _watch_stops(), _book_target_fill()",
+         "the stop and the target resting at IBKR for each open trade, in one one-cancels-all group: placed, moved with "
+         "the record, rebuilt after the scale-out, stood down before the app's own exits, booked when they fill, swept "
+         "when their trade is gone"),
         ("execution/order_builder.py", "plan_order(), build_entry_order()", "which order type and session a play "
          "may use; the limit offset"),
         ("brokers/ibkr_adapter.py", "IbkrBroker (get_account, history_many, place_bracket, get_fills, "
