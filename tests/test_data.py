@@ -137,7 +137,9 @@ def test_the_research_store_keeps_years_of_candles_for_the_stocks_the_replay_run
     md.attach(gateway)
     through = schedule.last_completed_session(clock.now_ny())
     md.update_daily(["AAA", "CCC"], through)                                   # the live store: a year of each
-    assert md.deepen_daily(["AAA", "BBB"], through) == 2
+    seen = []
+    assert md.deepen_daily(["AAA", "BBB"], through, progress=lambda done, total: seen.append((done, total))) == 2
+    assert seen == [(0, 2), (2, 2)]                                             # the stage shows from the first second
     assert [d for s, _, d in gateway.requests if s in ("AAA", "BBB")][-2:] == ["3 Y", "3 Y"]
     assert len(md.deep_frame("AAA")) == 756 > len(md.daily_frame("AAA"))
     assert md.deepen_daily(["AAA", "BBB"], through) == 0                        # current: nothing to ask for
