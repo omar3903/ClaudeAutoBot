@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime as dt
+
 from tos_bot.core.enums import PlayStatus, Side, StrategyKind, Timeframe
 from tos_bot.core.models import Play
 from tos_bot.engine.board import PlayBoard
@@ -49,3 +51,34 @@ def test_opposite_setups_on_one_stock_are_both_flagged_until_one_goes():
     board.replace([_play()], scanned={"AAA"})
     [p] = board.plays.values()
     assert "conflict" not in p.noise
+
+
+def test_a_saved_board_comes_back_with_its_plays_and_what_was_settled():
+    board = PlayBoard()
+    offered, taken = _play("AAA"), _play("BBB")
+    board.replace([offered, taken], scanned=None)
+    board.replace([_play("AAA", entry=100.2), _play("BBB")], scanned=None)      # found twice
+    board.get(taken.id).status = PlayStatus.FILLED
+    plays, settled = board.saved()
+
+    again = PlayBoard()
+    assert again.restore(plays, settled) == 2
+    assert again.get(offered.id).confirmations == 2 and again.get(taken.id).status is PlayStatus.FILLED
+    again.replace([_play("AAA"), _play("BBB")], scanned={"AAA", "BBB"})
+    assert again.get(offered.id).confirmations == 3                             # the count carries on
+    assert [p.status for p in again.plays.values() if p.symbol == "BBB"] == [PlayStatus.FILLED]   # not offered again
+
+
+def test_only_this_sessions_unexpired_plays_come_back_but_a_settled_setup_stays_settled():
+    now = dt.datetime.now(dt.timezone.utc)
+    stale, old, done = _play("AAA"), _play("BBB"), _play("CCC")
+    stale.expires_at = now - dt.timedelta(minutes=1)
+    old.created_at = now - dt.timedelta(days=9)
+    done.status, done.expires_at = PlayStatus.REJECTED, now - dt.timedelta(minutes=1)
+    fresh = _play("DDD")
+    fresh.expires_at = now + dt.timedelta(minutes=30)
+
+    board = PlayBoard()
+    assert board.restore([stale, old, done, fresh], now=now) == 1 and list(board.plays) == [fresh.id]
+    board.replace([_play("AAA"), _play("CCC")], scanned={"AAA", "CCC"}, now=now)
+    assert sorted(p.symbol for p in board.plays.values()) == ["AAA", "DDD"]     # the dismissed one isn't offered again

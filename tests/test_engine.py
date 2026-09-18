@@ -283,6 +283,71 @@ def test_scans_follow_the_schedule(engine, port, monkeypatch):
     assert engine.request_scan("gappers")["ok"] and engine._scan_request == "gappers"
 
 
+# ---------------------------------------------------------------- a restart
+def _started_again(tmp_path, gateway, port, before=None):
+    again = _new_engine(tmp_path, gateway, port)
+    again._bind()
+    if before:
+        before(again)
+    again._restore_day()
+    return again
+
+
+def test_a_restart_picks_the_day_up_where_it_left_off(engine, tmp_path, gateway, port):
+    offered, dismissed = _play("AAPL"), _play("MSFT")
+    engine.board.replace([offered, dismissed], None)
+    engine.board.replace([_play("AAPL"), _play("MSFT")], None)                 # both confirmed by a second scan
+    assert engine.reject_play(dismissed.id)["ok"]                              # a decision is saved at once
+    assert engine._day_file.read()["plays"]
+    today = clock.now_ny().date()
+    engine._gappers_session, engine.scanner.premarket = today, {"AAPL": {"high": 101.0, "low": 99.0}}
+    engine._last_wide_done = clock.now_ny() - dt.timedelta(minutes=10)
+    engine._last_scans["wide"] = {"kind": "wide", "started_at": clock.now_ny().isoformat(), "n_plays": 2}
+    engine.stop()                                                              # and the rest when the app stops
+
+    again = _started_again(tmp_path, gateway, port)
+    try:
+        back = again.board.plays
+        assert set(back) == {offered.id, dismissed.id} and back[offered.id].confirmations == 2
+        assert back[dismissed.id].status.value == "REJECTED"
+        again.board.replace([_play("AAPL"), _play("MSFT")], {"AAPL", "MSFT"})
+        assert [p.id for p in again.board.plays.values() if p.symbol == "MSFT"] == [dismissed.id]   # not offered again
+        assert again.board.plays[offered.id].confirmations == 3
+
+        assert again._gappers_session == today and again.scanner.premarket["AAPL"]["high"] == 101.0
+        assert again.scan_status()["last_wide"]["n_plays"] == 2
+        since_wide = time.monotonic() - again._last_wide_at                    # a spacing after the last one,
+        assert 595 <= since_wide <= 660                                        # not after this start
+    finally:
+        again.stop()
+
+
+def test_a_saved_day_from_another_session_or_one_that_cant_be_read_is_ignored(engine, tmp_path, gateway, port):
+    engine._day_file.write({"session": "2020-01-02", "plays": [_play("AAPL")], "settled": [],
+                            "last_wide_done": "2020-01-02T10:00:00-05:00", "last_scans": {"wide": {"kind": "wide"}}})
+    again = _started_again(tmp_path, gateway, port)
+    started = again._last_wide_at
+    assert not again.board.plays and again._last_scans == {} and again._last_wide_at == started
+    again.stop()
+
+    engine._day_file.path.write_bytes(b"not a saved day")
+    again = _started_again(tmp_path, gateway, port)
+    assert not again.board.plays
+    again.stop()
+
+
+def test_plays_the_filters_stopped_allowing_while_the_app_was_off_stay_off(engine, tmp_path, gateway, port):
+    engine.board.replace([_play("AAPL", Side.LONG), _play("MSFT", Side.SHORT)], None)
+    engine.stop()
+
+    def longs_only(e):
+        e.filters = e.scanner.filters = TradeFilters.build(["LONG"], None, None)
+
+    again = _started_again(tmp_path, gateway, port, before=longs_only)
+    assert [p.symbol for p in again.board.plays.values()] == ["AAPL"]
+    again.stop()
+
+
 # ---------------------------------------------------------------- quitting
 def test_paper_quit_closes_everything_resets_and_shuts_down(engine):
     _open(engine, "AAPL")

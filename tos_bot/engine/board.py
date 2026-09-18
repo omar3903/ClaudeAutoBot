@@ -13,6 +13,11 @@ both flagged as a conflict (see scanner/noise.py).
 Every change says why: a new setup was found, or a play left because its setup
 no longer shows on the latest candles, it expired, or a filter or strategy switch
 dropped it. The engine turns these into the dashboard's Autopilot notes.
+
+The board outlives a restart: the engine saves ``saved()`` as the day goes
+(engine/day_state.py) and hands it back to ``restore()`` when it starts, so the
+setups the morning's full scan and the last wide scan found are on offer at once,
+and a setup already acted on or dismissed today stays settled.
 """
 
 from __future__ import annotations
@@ -96,6 +101,26 @@ class PlayBoard:
                         for pid, p in before.items() if pid not in kept and p.status is PlayStatus.PROPOSED]
             self._plays = kept
             return changes
+
+    def saved(self) -> Tuple[List[Play], List[SetupKey]]:
+        """The plays and the session's settled setups, for the day's state file."""
+        with self._lock:
+            return list(self._plays.values()), sorted(self._settled)
+
+    def restore(self, plays: Iterable[Play], settled: Iterable[SetupKey] = (),
+                now: Optional[dt.datetime] = None) -> int:
+        """Put back what an earlier run saved. Only this session's plays that haven't expired
+        return; a setup acted on or dismissed stays settled even when its play has expired.
+        Returns how many plays are back on the board."""
+        now = now or dt.datetime.now(dt.timezone.utc)
+        today = clock.session_date(now)
+        with self._lock:
+            mine = [p for p in plays if setup_key(p)[-1] == today]
+            self._settled = {tuple(k) for k in settled if k[-1] == today}
+            self._settled.update(setup_key(p) for p in mine if p.status is not PlayStatus.PROPOSED)
+            self._plays = {p.id: p for p in mine if p.expires_at is None or p.expires_at > now}
+            _flag_conflicts(self._plays.values())
+            return len(self._plays)
 
     def drop(self, wanted: Callable[[Play], bool], why: str) -> List[BoardChange]:
         """Drop the plays that aren't wanted, saying ``why``."""

@@ -75,6 +75,7 @@ from ..util.logging_setup import setup_logging
 from ..util.net import port_is_open
 from . import views
 from .board import PlayBoard
+from .day_state import DayStateOps
 from .research_ops import ResearchOps
 from .journal_ops import JournalOps
 from .pairs_ops import PairsOps
@@ -94,7 +95,7 @@ ORDERS_MAX_AGE_S = 8.0
 
 
 
-class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
+class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayStateOps):
     #: retry the Gateway the switches want this often (longer after a failed connect)
     CONNECT_RETRY_S = 15.0
     CONNECT_RETRY_AFTER_FAIL_S = 60.0
@@ -166,6 +167,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         self.on_shutdown: Optional[Callable[[], None]] = None
 
         self.board = PlayBoard()
+        self._init_day_state(data_dir / "day_state.bin")     # the board and the scans' state outlive a restart
         self.position_check = PositionCheck()
         self.replay = ReplayRunner(data_dir / "research" / "replay.json",
                                    IntradayHistory(data_dir / "research" / "intraday"),
@@ -226,7 +228,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         self._last_cycle_at = float("-inf")
         self._last_fast_at = float("-inf")
         self._last_plays_at = float("-inf")
-        self._last_wide_at = time.monotonic()         # the first wide scan comes a spacing after the start
+        # the day's first wide scan comes a spacing after the start; after a restart, a spacing after the
+        # last one (day_state.py)
+        self._last_wide_at = time.monotonic()
         self._noted: Dict[tuple, float] = {}          # Autopilot notes already shown, and when
         self._scan_retry_at = 0.0
 
@@ -260,6 +264,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         self._bind()
         self._refresh_account()
         self._check_arm()
+        self._restore_day()
         if self.quit_state:
             log.warning("resuming an unfinished quit - closing the remaining positions first")
         self._threads = [threading.Thread(target=loop, name=name, daemon=True) for name, loop in (
@@ -273,6 +278,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
     def stop(self) -> None:
         self._stop.set()
         self._scan_wake.set()
+        self._day_changed(now=True)
         self.connections.close_all()
         log.info("engine stopped")
 
@@ -673,6 +679,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             kind = self._due_scan()
             if kind:
                 self._run_scan(kind)
+            self._save_day()
             self._scan_wake.wait(5.0)
             self._scan_wake.clear()
 
@@ -818,10 +825,12 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
                     self._last_cycle_at = mono
                 elif kind == "wide":                     # it covered the hot list and buffers too
                     self._last_wide_at = self._last_cycle_at = mono
+                    self._last_wide_done = clock.now_ny()
         if kind == "gappers":                    # it moves names between the lists; the plays are untouched
             wl = self.scanner.watchlist
             self._gappers_session = wl.session if wl else None
             self._last_scans[kind] = result.summary()
+            self._day_changed()
             self._publish("watchlist.updated", **self.watchlist_state())
             return
         self._size_plays(result.plays)
@@ -830,6 +839,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         changes = self.board.replace(result.plays, None if kind == "full" else result.symbols,
                                      keep=lambda p: p.kind.value == "FUNDAMENTAL", confirm=not quick)
         self._last_scans[kind] = result.summary()
+        self._day_changed()
         if not quick:
             try:
                 self.repo.record_scan(result, keep_rejected=self.settings.config.database.record_rejected_plays)
@@ -1284,6 +1294,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             self.repo.set_play_status(p.id, p.status.value, operator)
             self._publish("play.decided", play_id=p.id, decision="approved", result=out, play=self._decorate(p))
             self._refresh_account()
+            self._day_changed(now=True)                   # a restart mustn't offer this setup again today
             return {"ok": out.get("ok", False), **out}
 
     def _score_plays(self, plays) -> None:
@@ -1376,6 +1387,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         if p:
             p.status = PlayStatus.REJECTED
         self.repo.set_play_status(play_id, PlayStatus.REJECTED.value, operator)
+        self._day_changed(now=True)
         self._publish("play.decided", play_id=play_id, decision="rejected")
         return {"ok": True}
 

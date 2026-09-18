@@ -175,8 +175,11 @@ morning's ranking had it cold, and a swing setup that forms during the day is on
 the board within the half hour. Its intraday heat refreshes the hot list: a
 stock hotter than the coolest hot-list name by 10 % takes its slot (within the
 cap of a third per sector), and the best of the rest per sector are kept
-waiting. It takes a few minutes of Gateway time (about 11 stocks a second) and
-the 5-minute cycle waits for it; plays it finds stay on the board and are
+waiting. It takes two to three minutes of Gateway time and the 5-minute cycle
+waits for it. (The Gateway takes about half a second over a candle request
+whether it asks for an hour or a week, so the rate is set by how many are in
+flight: twelve at once read about 17 stocks a second, none refused in a test of
+700; thirty-two timed out.) The plays it finds stay on the board and are
 re-checked every 15 seconds like any other. **Settings → Scan every stock now**
 runs it on demand.
 
@@ -414,6 +417,18 @@ The app is built to be left running:
   answer in time (the Gateway busy with a big download, say) keeps the last snapshot, which then
   counts as stale: no record is deleted or closed on its say-so, no exit is refused for a position
   that "isn't there", and the shares-without-a-record list doesn't blink.
+* **A restart picks the day up where it left off.** The plays on the board, the setups already traded
+  or dismissed this session, the pre-market levels the gap check read and the time of the last wide
+  scan are saved as the day goes (`data/day_state.bin`: after a scan at most every two minutes, at once
+  when you or Autopilot decide on a play, and when the app stops). So after a restart the morning's
+  swing and valuation setups and the last wide scan's finds are on the board straight away instead of
+  waiting for the next morning or the next wide scan, a setup acted on isn't offered a second time, and
+  the wide scan comes a spacing after the *last* one, not after the start. Only the current session's
+  state returns, plays that have expired or that the filters and strategies no longer allow stay off,
+  and no price is restored: the first cycle reads fresh candles within seconds, and an entry still
+  needs a current quote. With today's watchlist on disk the full scan isn't repeated either; open
+  positions and their resting stop and target orders are found again from the trade records and the
+  order tags.
 * **Days on end** - candles and quotes nothing has asked for in half an hour are let go, the log
   rotates at 5 MB, and the scans, the reports, Autopilot's daily counts and the pairs roll over by date.
 * **Sleep.** While the app runs it asks Windows not to go to sleep (the screen can still turn off);
@@ -1123,6 +1138,7 @@ taking precedence, cached for a week. Companies that don't file US-GAAP figures
 | company financials | SEC EDGAR companyfacts | `data/cache/sec/` (7 days) |
 | exchange rates | IB Gateway, else ECB reference rates | memory (6 hours) |
 | the day's hot list, buffers, decisions | the full scan and cycles | `data/watchlists/` (last 5 days) |
+| the day so far: the board's plays, settled setups, the gap check's levels, the last scans | the scans | `data/day_state.bin` (the current session) |
 | your dashboard choices | you | `data/runtime.json` |
 | the simulator's balance and positions | the simulator | `data/paper_state.json` |
 
@@ -1163,6 +1179,7 @@ tos_bot/
     support.py               small helpers the engine and its mixins share
     connections.py           the one IB Gateway connection + the simulator
     board.py                 the plays on the dashboard
+    day_state.py             the board and the scans' state, kept across a restart
     capital.py               trading capital
     reconcile.py             when an open-trade record counts as gone at the broker
     runtime.py               data/runtime.json

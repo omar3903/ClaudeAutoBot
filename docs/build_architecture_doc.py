@@ -194,7 +194,7 @@ def fig_components() -> str:
     sc = s.box(cols[0], r1, cw, ch, "Scanner", ["scanner/  full scan 08:30,", "gap check 09:15, cycles 5 min,",
                                               "DayWatchlist, evaluate()"], lsize=8.5)
     bd = s.box(cols[1], r1, cw, ch, "PlayBoard", ["engine/board.py", "the plays on the dashboard,",
-                                                "ranked, changes noted"], lsize=8.5)
+                                                "ranked, kept across a restart"], lsize=8.5)
     ap = s.box(cols[2], r1, cw, ch, "AutoPilot", ["execution/autopilot.py", "gates a play, caps, daily",
                                                 "loss stop, proof rule"], lsize=8.5)
     ex = s.box(cols[3], r1, cw, ch, "Executor + ExitManager", ["execution/  orders in,",
@@ -975,8 +975,9 @@ def build() -> str:
         ("<b>plays</b>", "every 15 s", "the stocks that already have plays on the board", "re-evaluates them so "
          "stale plays leave"),
     ]))
-    A('<p>The design is deliberate: a full sweep of the market takes about 15 minutes of Gateway time (measured '
-      'at ~11 stocks/s), and IBKR paces historical requests. So the whole market is read once a day and the '
+    A('<p>The design is deliberate: a full sweep of the market takes about ten minutes of Gateway time (each '
+      'candle request takes the Gateway about half a second whatever its length; twelve in flight read ~17 '
+      'stocks/s, and thirty-two time out). So the whole market is read once a day and the '
       'day\'s attention goes to a small, sector-diverse list. Swing setups read daily candles, which change once '
       'a day, so rescanning everything intraday would not find more of them.</p>')
 
@@ -1176,6 +1177,9 @@ def build() -> str:
         ("watchlists/watchlist_&lt;date&gt;.json", "JSON", "the day's hot list, buffers and decisions (5 days kept)"),
         ("runtime.json", "JSON", "every dashboard choice: mode, filters, strategies, capital, scan settings, "
          "Autopilot settings - wins over config.yaml"),
+        ("day_state.bin", "compressed pickle", "the current session so far: the board's plays, the setups settled, "
+         "the gap check's pre-market levels, the last wide scan's time, the last scans' summaries - a restart "
+         "picks the day up from it (engine/day_state.py)"),
         ("paper_state.json", "JSON", "the simulator's cash, positions and round trips"),
         ("research/replay.json, replay_runs.jsonl", "JSON", "the latest replay's records and every run's summary"),
         ("research/training_set.csv", "CSV", "the exported training set (scripts/export_training_set.py)"),
@@ -1337,6 +1341,8 @@ def build() -> str:
         ("brokers/ibkr_adapter.py", "IbkrBroker (get_account, history_many, place_bracket, get_fills, "
          "news_headlines)", "everything IBKR, on one asyncio loop thread with timeouts"),
         ("brokers/paper_adapter.py", "PaperBroker.place_order(), poll()", "the simulator's fills on real prices"),
+        ("engine/day_state.py", "DayStateOps._save_day(), _restore_day()", "saves the board and the scans' state as "
+         "the day goes; start() picks up the current session's, never a price"),
         ("engine/reconcile.py", "PositionCheck.gone(), share_counts()", "when a missing position counts as gone "
          "(fresh account, settled connection, grace, two misses)"),
         ("persistence/repository.py", "open_trade(), reduce_trade(), close_trade(), trade_record(), pnl_summary()",
