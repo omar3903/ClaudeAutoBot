@@ -53,6 +53,7 @@ from ..persistence.repository import Repository
 from ..risk.pdt_guard import PdtGuard
 from ..risk.position_sizing import size_play
 from ..research.features import play_features
+from ..research.model import Scorer, risk_factor
 from ..research.history import IntradayHistory
 from ..research.runner import ReplayRunner
 from ..research.journal import Journal
@@ -167,6 +168,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
                                    IntradayHistory(data_dir / "research" / "intraday"),
                                    workers=self.settings.config.replay.workers or None,
                                    sink=self._keep_sim_trades)
+        self.model = Scorer(data_dir / "research" / "models")      # the meta-label model, in shadow until it earns it
+        self._training = threading.Lock()
         #: calm or turbulent, from SPY's daily returns (Hamilton's Markov switching model)
         self.regime = MarketRegime(data_dir / "research" / "benchmark_spy.pkl")
         #: when companies reported earnings (SEC 8-K item 2.02), for the replay
@@ -791,6 +794,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             return
         self._size_plays(result.plays)
         # the cycles don't re-check valuation setups, so those stay; a quick re-check isn't a confirmation
+        self._score_plays(result.plays)
         changes = self.board.replace(result.plays, None if kind == "full" else result.symbols,
                                      keep=lambda p: p.kind.value == "FUNDAMENTAL", confirm=not quick)
         self._last_scans[kind] = result.summary()
@@ -1158,7 +1162,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
         # sized against the trading capital; the PDT rule and the floor see the real account
         sizing = size_play(p, self.sizing_account(p.timeframe) or acc, cfg.risk,
                            symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0),
-                           risk_pct=self.strategy_risk_pct(p.strategy))
+                           risk_pct=self._play_risk_pct(p))
         decision = self.pdt.assess(acc, p)
         session = clock.current_session()
         plan = plan_order(p, session, cfg.execution)
@@ -1223,7 +1227,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
                 return pre
             if not pre["can_execute"]:
                 return {"ok": False, "reason": "; ".join(pre["reasons"]) or "not executable"}
-            chased = self._chase_check(p, pre["order_plan"])
+            seen: Dict[str, Any] = {}
+            chased = self._chase_check(p, pre["order_plan"], seen)
             if chased:
                 return {"ok": False, "reason": chased}
 
@@ -1234,7 +1239,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             self.repo.record_play(p)
             self.repo.set_play_status(p.id, p.status.value, operator)
             try:
-                out = self.executor.execute_play(p, self._account, plan=pre["order_plan"], context=context)
+                out = self.executor.execute_play(p, self._account, plan=pre["order_plan"], context=context,
+                                                 decision=seen or None)
             except Exception as e:  # noqa: BLE001
                 p.status = PlayStatus.ERROR
                 self.repo.set_play_status(p.id, p.status.value, operator)
@@ -1248,24 +1254,77 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps):
             self._refresh_account()
             return {"ok": out.get("ok", False), **out}
 
-    def _chase_check(self, p: Play, plan: Dict[str, Any]) -> Optional[str]:
-        """Aziz: never chase. Refuses the entry once the price has run past the play's entry by more
-        than ``execution.max_chase_r`` of the distance to the stop - the reward:risk the play was
-        judged on is gone. Within that, a limit entry is priced off the live quote so it fills now
-        instead of waiting for the price to come back through the entry, which is the move failing.
-        A pullback under the entry is not a chase. Without a price source there is nothing to check."""
+    def _score_plays(self, plays) -> None:
+        """The learned model's odds on each fresh play (research/model.py), kept in its evidence so
+        they are logged with it - in shadow mode that record is how the model earns trust."""
+        try:
+            if self.model.card is None:
+                return
+            now, market = clock.now_ny(), self.regime.context()
+            for p in plays:
+                score = self.model.score(play_features(p, now=now, market=market))
+                if score:
+                    p.evidence["model"] = score
+        except Exception:  # noqa: BLE001
+            log.debug("scoring the plays failed", exc_info=True)
+
+    def model_card(self) -> Optional[Dict[str, Any]]:
+        """The trained model's card, trimmed for the dashboard."""
+        card = self.model.card
+        if not card:
+            return None
+        return {k: card.get(k) for k in ("id", "trained_at", "rows", "by_source", "usable", "verdict")}
+
+    def _play_risk_pct(self, p: Play) -> Optional[float]:
+        """The risk a play is sized with: the strategy's half-Kelly share, scaled by the learned
+        model's odds when Autopilot is set to size by them and the model is usable (AFML ch. 10)."""
+        pct = self.strategy_risk_pct(p.strategy)
+        score = (p.evidence or {}).get("model") or {}
+        if self.autopilot.model_mode == "size" and score.get("usable") and score.get("p") is not None:
+            base = pct if pct is not None else float(self.settings.config.risk.max_risk_per_trade_pct)
+            return round(base * risk_factor(float(score["p"])), 4)
+        return pct
+
+    def _chase_check(self, p: Play, plan: Dict[str, Any], seen: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """The last look before an order goes out, at the live quote. Returns why the entry is
+        refused, if it is; ``seen`` is filled with the quote (mid, bid, ask, spread_bps, live), which
+        the fill is later measured against - Harris's implementation shortfall.
+
+        * Harris: the spread is the price of immediacy, paid going in and again coming out. On live
+          quotes an entry is refused when the spread is more than ``execution.max_spread_r`` of the
+          distance to the stop.
+        * Aziz: never chase. Once the price has run past the play's entry by more than
+          ``execution.max_chase_r`` of the distance to the stop, the reward:risk the play was judged
+          on is gone. Within that, a limit entry is priced off the quote so it fills now instead of
+          waiting for the price to come back through the entry, which is the move failing. A
+          pullback under the entry is not a chase.
+
+        Without a price source there is nothing to check."""
         cfg = self.settings.config.execution
-        max_r = float(getattr(cfg, "max_chase_r", 0.0) or 0.0)
         risk = abs(float(p.entry) - float(p.stop))
-        if max_r <= 0 or risk <= 0 or not self.md.attached:
+        if risk <= 0 or not self.md.attached:
             return None
         try:
             q = self.md.quote(p.symbol)
             px = float(q.last or q.mid or 0.0)
+            live = not bool(getattr(self.md, "delayed", True))
         except Exception:  # noqa: BLE001
             log.debug("no quote for %s at the entry check", p.symbol, exc_info=True)
             return None
         if px <= 0:
+            return None
+        bid, ask = float(q.bid or 0.0), float(q.ask or 0.0)
+        spread = ask - bid if 0 < bid < ask else 0.0
+        mid = (bid + ask) / 2.0 if spread else px
+        if seen is not None:
+            seen.update(mid=round(mid, 4), bid=bid or None, ask=ask or None, live=live,
+                        spread_bps=round(spread / mid * 1e4, 2) if spread and mid else None)
+        max_spread = float(getattr(cfg, "max_spread_r", 0.0) or 0.0)
+        if live and max_spread > 0 and spread / risk > max_spread:
+            return (f"the spread ({bid:.2f} x {ask:.2f}) is {spread / risk:.2f}R of this trade's risk - too dear to "
+                    f"cross (execution.max_spread_r {max_spread:g})")
+        max_r = float(getattr(cfg, "max_chase_r", 0.0) or 0.0)
+        if max_r <= 0:
             return None
         sign = 1.0 if p.side is Side.LONG else -1.0
         run = (px - float(p.entry)) * sign / risk

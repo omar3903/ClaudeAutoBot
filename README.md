@@ -31,6 +31,14 @@ Series*** (volatility forecasts), **Hamilton, *Time Series Analysis*** (calm and
 turbulent market regimes), and **Vidyamurthy, *Pairs Trading***, **Johansen** and
 **Juselius** (cointegration) - see
 [What the books taught it](#what-the-books-taught-it--the-quantitative-layer).
+A third shelf (2026-09-18) is about **not fooling yourself**: **Aronson,
+*Evidence-Based Technical Analysis*** (is a record luck?), **López de Prado,
+*Advances in Financial Machine Learning*** and **Jansen, *Machine Learning for
+Algorithmic Trading*** (the learned model), **Tharp, *Trade Your Way to Financial
+Freedom*** (the quality of an R-multiple distribution), **Carver, *Systematic
+Trading*** (costs), **Harris, *Trading and Exchanges*** (what fills cost), and two
+more books of setups, **Grimes, *The Art and Science of Technical Analysis*** and
+**Bulkowski, *Encyclopedia of Chart Patterns***.
 
 - **One data source: IB Gateway** — prices, candles and each stock's sector come
   from IBKR. Company financials come from the SEC's own filings (EDGAR) and
@@ -64,7 +72,7 @@ turbulent market regimes), and **Vidyamurthy, *Pairs Trading***, **Johansen** an
 - **Pairs trading** — cointegrated stocks from one industry, one long and one short,
   entered and closed together (see [Pairs trading](#pairs-trading)).
 - **Light / dark theme** — follows your OS setting; one click to switch.
-- **Strategies:** 16 technical day-trade / swing setups (2 statistical ones from Chan),
+- **Strategies:** 19 technical day-trade / swing setups (2 statistical ones from Chan, 3 from Grimes and Bulkowski),
   insider buying from SEC Form 4 filings, + 3 valuation setups from
   *Pignataro* (comps, a UFCF DCF with exit-multiple **and** perpetuity terminal
   value, a blended "football-field" band).
@@ -510,6 +518,29 @@ python scripts/validate_model.py --csv data/research/training_set.csv --folds 6 
 It prints the table with the pass marks (`usable: YES` or `no - stays in shadow`) and writes
 `data/research/validation.json`. A model that doesn't pass is not used.
 
+**The model** (`tos_bot/research/model.py`, `scripts/train_model.py`; needs `pip install scikit-learn`,
+the `[learning]` extra). López de Prado's meta-labelling: the setups keep choosing the side, entry,
+stop and target, and gradient-boosted trees learn the odds that a play pays. Rows alive together on
+one stock share their weight and old rows count for less (AFML ch. 4); the verdict comes from the
+harness above, walking forward, against the stated odds and against shuffled labels; probabilities
+are calibrated on the model's own out-of-fold predictions; the card keeps each feature's
+out-of-sample importance and information coefficient.
+
+* The engine **retrains after each day's review** and scores every fresh play; the odds are logged
+  in the play's evidence (`model: {p, id, usable}`).
+* Autopilot's **learned model** setting (⚙): `shadow` (default) only logs; `gate` refuses plays under
+  `model_min_p` (55%); `size` also scales the risk by the bet size of AFML ch. 10. Gate and size act
+  **only while the model's own walk-forward verdict calls it usable** - today it does not.
+
+```bash
+python scripts/train_model.py                 # train, judge and keep a model now
+python scripts/export_training_set.py
+Rscript scripts/r/audit_records.R data/research/training_set.csv    # an independent check in base R
+```
+
+The R script recomputes the record statistics (expectancy, quality number, bootstrap and reality-check
+p-values, calibration) with nothing but base R. It is an audit, run by hand: nothing live waits on R.
+
 ---
 
 ## Trading capital
@@ -579,6 +610,14 @@ back through the entry — which is the move failing. A day-trade entry still
 working after `execution.entry_timeout_min` (10) minutes is cancelled for the
 same reason; swing entries keep their DAY life.
 
+**What fills cost (Harris).** The same last look keeps the quote it saw, and the
+trade record stores the fill against it: `decision_price`, `spread_bps`,
+`entry_slippage_bps`, and for exits `exit_decision_price`, `exit_slippage_bps` -
+the implementation shortfall. On live quotes an entry is refused when the spread
+is more than `execution.max_spread_r` (0.10) of the distance to the stop. The
+daily review averages the measured slippage and says when the account pays more
+than the replay charges.
+
 ---
 
 ## Automatic exit strategy
@@ -627,6 +666,8 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | concurrent auto trades from **one** strategy | 2 | `max_per_strategy` |
 | new auto entries **per scan** | 1 | `max_new_per_cycle` |
 | **cool off** a ticker after it stops out today | on | `cooldown_after_loss` |
+| **proof is not luck**: the replayed edge, net of the stocks' own drift, survives a reality check across every setup tried, and costs take no more than a third of it | p ≤ 0.10 | `proof_p_value` (Aronson; Carver's speed limit; 0 = the luck test off) |
+| **the learned model** | shadow | `model_mode`: `shadow` logs its odds, `gate` refuses plays under `model_min_p`, `size` also scales the risk - only while the model is usable |
 | **stop for the day** once today's closed trades have lost this % of equity | 2 % | `max_daily_loss_pct` (Aziz's daily maximum loss; 0 = off) |
 | **stop for the day** once the day's realized gain has given back this % of its best | 30 % | `max_giveback_pct` (Aziz: never lose more than 30 % of what the morning made; `giveback_floor_pct` 0.25 % of equity is the smallest gain that counts; 0 = off) |
 | **no new day trades** in the last minutes of the session | 30 | `min_minutes_to_close` (Aziz keeps the last half hour for closing; the exit manager flattens day trades 10 minutes before the bell; 0 = off) |
@@ -777,6 +818,12 @@ is tested on simulated series whose answer is known.
 | Tsay, *Analysis of Financial Time Series*; Enders, *Applied Econometric Time Series* | GARCH(1,1) and RiskMetrics volatility forecasts | `quant/volatility.py`, the stop floor |
 | Hamilton, *Time Series Analysis* | the Markov switching model of calm and turbulent markets (ch. 22) | `quant/regime.py`, `engine/market_regime.py` |
 | Vidyamurthy, *Pairs Trading*; Johansen; Juselius | cointegration (Engle–Granger, Johansen), zero crossings, the entry-band design | `quant/cointegration.py`, `quant/bands.py`, `pairs/` — see [Pairs trading](#pairs-trading) |
+| Aronson, *Evidence-Based Technical Analysis* | a record is a hypothesis test: the bootstrap against zero, White's reality check across every setup tried, detrending so being long in a rising market is no edge | `research/significance.py`, `SimTrade.drift_r`, the proof rule's `proof_p_value` |
+| Tharp, *Trade Your Way to Financial Freedom* | R-multiples and expectancy; the quality of the R distribution (SQN); the marble-bag drawdown simulation | `research/significance.py` (`sqn`, `marble_bag`), the Strategies panel |
+| Carver, *Systematic Trading* | the speed limit: costs may take no more than a third of a rule's pre-cost return | `SimTrade.cost_r`, `significance.cost_share`, the proof rule |
+| Harris, *Trading and Exchanges* | implementation shortfall; the spread as the price of immediacy; a stale limit order is a free option for someone else | `Engine._chase_check` (spread gate, the quote kept), `Executor.expire_entries`, `trades.*_slippage_bps`, the review's execution block |
+| López de Prado, *Advances in Financial Machine Learning*; Jansen, *Machine Learning for Algorithmic Trading* | meta-labelling, uniqueness weights, purged walk-forward, MDA importance, bet sizing; boosted trees, calibration, information coefficients | `research/model.py`, `research/validate.py`, `scripts/train_model.py` |
+| Grimes, *The Art and Science of Technical Analysis*; Bulkowski, *Encyclopedia of Chart Patterns* | the failure test, the pullback after a thrust, the confirmed double bottom - with their measured statistics | `strategies/patterns.py` |
 
 **On every play** (open a play → *Statistics*):
 
@@ -991,6 +1038,9 @@ volume, the S/R map, the daily trend) are computed once per stock per scan.
 | `bollinger_fade` | swing | close outside the 2σ band while ADX < 20 |
 | `atr_channel_breakout` | swing | close beyond a Keltner/ATR channel with ADX rising through 20 |
 | `divergence_reversal` | swing | RSI / MACD-histogram divergence **at a horizontal level** (Murphy) |
+| `failure_test` | swing | a probe through a swing level at least 5 sessions old that **closes back inside** - Wyckoff's spring / upthrust; the stop goes just beyond the test (Grimes) |
+| `trend_pullback` | swing | the first shallow, quiet pullback to the 20-EMA after a close outside the **2.25-ATR Keltner channel**, entered when a candle closes back beyond the one before (Grimes) |
+| `double_bottom` | swing | twin lows within 4%, 2–7 weeks apart, a 10% rally between - taken **only on the confirming close** above that rally's peak; the stop sits inside the pattern (Bulkowski, Murphy). Tops are the mirror |
 | `week52_breakout` | swing | push to a new 52-week high/low on volume expansion |
 
 Also: `gap_reversion` and `earnings_drift` (see [What the books taught it](#what-the-books-taught-it--the-quantitative-layer)) and `insider_buying` (see [Signals](#signals--insider-trades-and-company-news)).

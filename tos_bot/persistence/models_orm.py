@@ -146,6 +146,12 @@ class Trade(Base):
     mae: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)   # max adverse excursion
     mfe: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)   # max favourable excursion
     mfe_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)   # when the MFE was set
+    # execution quality (Harris: implementation shortfall) - the fill against the quote at the decision
+    decision_price: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)       # the quote's mid at the entry decision
+    spread_bps: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)           # the quoted spread then
+    entry_slippage_bps: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)   # paid at the entry (+ = worse than the mid)
+    exit_decision_price: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)  # the price that triggered the exit
+    exit_slippage_bps: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)    # paid at the exit (+ = worse)
     is_day_trade: Mapped[bool] = mapped_column(sa.Boolean, default=False, index=True)
     session_date: Mapped[Optional[dt.date]] = mapped_column(sa.Date, nullable=True, index=True)
     #: the pair trade this is one leg of (see pairs/desk.py); its exits belong to the pair desk
@@ -340,6 +346,8 @@ class SimTradeLog(Base):
     held_out: Mapped[bool] = mapped_column(sa.Boolean, default=False)      # in the out-of-sample sessions
     features: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     feature_schema: Mapped[int] = mapped_column(sa.Integer, default=0)   # research/features.py FEATURE_SCHEMA
+    drift_r: Mapped[float] = mapped_column(sa.Float, default=0.0)        # the stock's own drift while held, in R
+    cost_r: Mapped[float] = mapped_column(sa.Float, default=0.0)         # slippage and commission paid, in R
 
 
 class ShadowTradeLog(Base):

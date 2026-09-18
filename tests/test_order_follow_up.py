@@ -43,14 +43,16 @@ class _Repo:
         self.t[tid].update({k: v for k, v in kw.items() if v is not None})
 
     def open_trade(self, play, price, qty, venue, order_id, order_type="LIMIT", order_session="REGULAR",
-                   entry_context=None, submitted_at=None):
+                   entry_context=None, submitted_at=None, decision=None):
         tid = f"t{len(self.t) + 1}"
         self.t[tid] = _trade(id=tid, symbol=play.symbol, entry_price=price, quantity=qty, broker=venue)
         self.t[tid]["entry_context"], self.t[tid]["submitted_at"] = entry_context, submitted_at
+        self.t[tid]["decision"] = decision
         return tid
 
-    def close_trade(self, tid, exit_price, exit_reason=""):
-        self.t[tid].update(status="CLOSED", exit_price=exit_price, exit_reason=exit_reason)
+    def close_trade(self, tid, exit_price, exit_reason="", decision_price=None):
+        self.t[tid].update(status="CLOSED", exit_price=exit_price, exit_reason=exit_reason,
+                           exit_decision_price=decision_price)
         return dict(self.t[tid])
 
     def reduce_trade(self, tid, exit_qty, exit_price, exit_reason="", commission=0.0, stop_price=None,

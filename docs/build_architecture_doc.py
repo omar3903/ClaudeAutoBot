@@ -263,7 +263,8 @@ def fig_classes() -> str:
                       ["repo: Repository", "md: MarketData", "connections: Connections", "scanner: Scanner",
                        "board: PlayBoard", "autopilot: AutoPilot", "executor: Executor", "exit_manager: ExitManager",
                        "pairs: PairDesk", "signals: SignalService", "replay: ReplayRunner", "journal: Journal",
-                       "regime: MarketRegime", "mode: paper | live", "filters, strategy_overrides, capital"],
+                       "model: Scorer", "regime: MarketRegime", "mode: paper | live",
+                       "filters, strategy_overrides, capital"],
                       ["start() / stop()", "snapshot() -> dict", "request_scan(kind)", "assess_play(id) -> dict",
                        "approve_play(id) / reject_play(id)", "close_position(trade_id)", "set_autopilot(**kw)",
                        "set_filters(...) / set_strategy(key, ...)", "untracked_positions() / close_untracked()"])
@@ -287,8 +288,8 @@ def fig_classes() -> str:
                                                    "params, weight"],
                         ["generate(ctx) -> list[Play]", "_mk_play(...)  (geometry floors)"], stereo="abstract",
                         abstract=True)
-    sub = s.box(510, 175, 195, 50, "17 concrete setups",
-                ["technical.py (13)  statistical.py (2)", "fundamental.py (3)  insider.py (1)"], lsize=8.5,
+    sub = s.box(510, 175, 195, 50, "22 concrete setups",
+                ["technical.py (13)  patterns.py (3)  insider.py (1)", "statistical.py (2)  fundamental.py (3)"], lsize=8.5,
                 fill="#f7f7f7")
     s.line(607, 175, 607, strat[1] + strat[3], end="tri")
     ctx = s.uml_class(510, 245, 195, "StrategyContext",
@@ -362,6 +363,9 @@ def fig_classes() -> str:
 
     bus = s.uml_class(510, 880, 195, "EventBus", ["queues: asyncio.Queue[]"],
                       ["publish(topic, **payload)", "add_queue(q) / remove_queue(q)"])
+    sc = s.uml_class(280, 880, 200, "Scorer  (research/model.py)",
+                     ["bundle: model + calibrator + columns"],
+                     ["score(features) -> {p, id, usable}", "card: the walk-forward verdict"])
     s.text(20, 990, "Notation: a filled diamond = composition (the owner's end); a hollow triangle = inheritance; "
                     "a dashed arrow = a call or dependency.", 8.5, fill="#555")
     return s.render("Figure 2 - Class diagram of the core: the engine and what it owns, the scanner and the "
@@ -638,15 +642,15 @@ def fig_states() -> str:
 #  Figure 7 - the research loop
 # ----------------------------------------------------------------------------------------------
 def fig_research() -> str:
-    s = Svg(720, 300)
+    s = Svg(720, 420)
     a = s.box(20, 30, 200, 70, "Replay (backtest)", ["research/replay.py + runner.py",
                                                     "5-bps slippage, 1-bp commission,", "latest third held out"],
               lsize=8.5, fill="#f3f0ff")
     b = s.box(260, 30, 200, 70, "Records per strategy", ["trades, win rate, expectancy R,",
                                                         "out_of_sample block,", "learned noise skips"],
               lsize=8.5, fill="#f3f0ff")
-    c = s.box(500, 30, 200, 70, "Autopilot proof rule", ["require_proven: n >= 30,",
-                                                        "R >= +0.05, held-out n >= 10", "and held-out R > 0"],
+    c = s.box(500, 30, 200, 70, "Autopilot proof rule", ["n >= 30, R >= +0.05 net of drift,",
+                                                        "held-out R > 0, luck p <= 0.10,", "costs <= 1/3 of the edge"],
               lsize=8.5, fill="#fff3e0")
     d = s.box(20, 170, 200, 70, "Live trades + journal", ["research/journal.py, movers.py",
                                                          "16:15 review: mistakes, shadows,", "lessons, market movers"],
@@ -666,7 +670,23 @@ def fig_research() -> str:
     s.label(640, 140, "records -> odds", 8)
     s.path("M120,170 L120,100", end="arr", dash="4,3")
     s.label(150, 140, "same exit rules", 8)
-    s.text(20, 280, "Everything on this page is stored under data/research/ and data/journal/, and shown on the "
+    g = s.box(20, 300, 200, 70, "Significance", ["research/significance.py: bootstrap,",
+                                                "reality check, SQN, marble bag,", "drift and cost per trade"],
+              lsize=8.5, fill="#f3f0ff")
+    h = s.box(260, 300, 200, 70, "Meta-label model", ["research/model.py: boosted trees,",
+                                                    "purged walk-forward verdict,", "retrained nightly, shadow first"],
+              lsize=8.5, fill="#e3f2fd")
+    i = s.box(500, 300, 200, 70, "Execution quality", ["the quote at the decision, the fill",
+                                                     "against it (slippage bps), the", "spread gate, entry time-outs"],
+              lsize=8.5, fill="#e3f2fd")
+    s.path("M120,300 L120,240", end="none", stroke="none")
+    s.path("M60,300 L60,250 L8,250 L8,65 L20,65", end="arr", dash="4,3")
+    s.label(40, 270, "judges", 8)
+    connect(s, d, h, "rows", offset=0)
+    s.path("M360,300 L360,240", end="none", stroke="none")
+    s.path("M600,300 L600,240", end="arr", dash="4,3")
+    s.label(650, 275, "real costs", 8)
+    s.text(20, 400, "Everything on this page is stored under data/research/ and data/journal/, and shown on the "
                     "Research and Reports panels.", 8.5, fill="#555")
     return s.render("Figure 7 - The evidence loop: the replay proves a setup, live results re-weight it, "
                     "and both calibrate the odds the plays state.")
@@ -743,11 +763,13 @@ def build() -> str:
       'Companion: AutoTradeBot-learning.pdf, the machine-learning plan in detail</div></div>')
 
     # ---- 1 the books ------------------------------------------------------------------------
-    A('<h2 class="first">1. The twelve books the app was trained on</h2>')
+    A('<h2 class="first">1. The twenty books the app was trained on</h2>')
     A('<p>The PDFs live in <i>OneDrive/Desktop/Training books &amp; Documentation papers/Financial-Economic books/'
-      'Used books/</i>. The first four gave the app its trade setups and the way it explains a trade; the other '
+      'Used books/</i>. The first four gave the app its trade setups and the way it explains a trade; the next '
       'eight gave it the statistics behind the replay, the noise checks, the volatility model, the market regime '
-      'and the pairs desk. The last column says where each idea lives in the code.</p>')
+      'and the pairs desk. The last eight (added 2026-09-18) are about not fooling yourself: whether a record is '
+      'luck, what trading really costs, a model that learns which plays pay, and two more books of setups. '
+      'The last column says where each idea lives in the code.</p>')
     books = [
         ("How to Day Trade for a Living", "Andrew Aziz", "self-published, 2016",
          "the day-trade setups (opening-range breakout, VWAP, flags, ABCD, reversals), 2:1 reward-to-risk, the 2% "
@@ -796,12 +818,54 @@ def build() -> str:
          "Oxford University Press, 2007",
          "how to read the cointegration rank in practice; Engle-Granger as the first pass",
          "quant/cointegration.py (engle_granger), pairs/finder.py"),
+        ("Evidence-Based Technical Analysis", "David R. Aronson", "Wiley, 2006",
+         "a rule's record is a hypothesis test: bootstrap the mean against zero, test the best of many rules "
+         "against the best that luck makes (White's reality check), and detrend first so being long in a rising "
+         "market is not an edge",
+         "research/significance.py (luck_test, reality_check), research/replay.py (drift_r on every trade), "
+         "execution/autopilot.py (proof_p_value in the proof rule)"),
+        ("Advances in Financial Machine Learning", "Marcos López de Prado", "Wiley, 2018",
+         "meta-labelling (the setups pick the side, a model decides whether to act and how big), sample weights by "
+         "uniqueness with time decay, purged walk-forward folds with an embargo, out-of-sample feature importance, "
+         "bet size from the predicted probability",
+         "research/model.py (Boosted, sample_weights, importance, bet_size), research/validate.py (the folds)"),
+        ("Machine Learning for Algorithmic Trading, 2nd ed.", "Stefan Jansen", "Packt, 2020",
+         "gradient boosting on tabular features with gaps, calibrated probabilities, the information coefficient "
+         "of a feature, time-series cross-validation",
+         "research/model.py (HistGradientBoosting, isotonic calibration, information_coefficients), "
+         "scripts/train_model.py"),
+        ("Trade Your Way to Financial Freedom, 2nd ed.", "Van K. Tharp", "McGraw-Hill, 2006",
+         "R-multiples and expectancy (the app's unit of account), the quality of an R-multiple distribution (the "
+         "number he later named SQN), the marble-bag simulation of drawdowns, the percent-risk sizing model",
+         "research/significance.py (sqn, marble_bag), risk/position_sizing.py"),
+        ("Systematic Trading", "Robert Carver", "Harriman House, 2015",
+         "costs are the one number known in advance: a rule that pays more than a third of its pre-cost return "
+         "in costs trades too fast (the speed limit)",
+         "research/replay.py (cost_r on every trade), research/significance.py (cost_share, SPEED_LIMIT), the "
+         "proof rule"),
+        ("Trading and Exchanges: Market Microstructure for Practitioners", "Larry Harris",
+         "Oxford University Press, 2003",
+         "implementation shortfall (the fill against the price at the decision), the spread as the price of "
+         "immediacy, why a stale limit order is a free option for someone else",
+         "engine.py (_chase_check: spread gate, the quote kept at the decision), execution/executor.py "
+         "(expire_entries), trades.entry_slippage_bps / exit_slippage_bps, research/journal.py (execution_quality)"),
+        ("The Art and Science of Technical Analysis", "Adam H. Grimes", "Wiley, 2012",
+         "market structure tested statistically; the two templates he trades: the failure test (Wyckoff's spring "
+         "and upthrust) and the pullback after a momentum thrust, read with a 20-EMA inside 2.25-ATR Keltner channels",
+         "strategies/patterns.py (failure_test, trend_pullback)"),
+        ("Encyclopedia of Chart Patterns, 2nd ed.", "Thomas N. Bulkowski", "Wiley, 2005",
+         "measured statistics for chart patterns: twin bottoms fail 64% of the time until a close confirms them; "
+         "confirmed, the projected height is met about two times in three and half throw back first",
+         "strategies/patterns.py (double_bottom: confirmation, measure rule, a stop inside the pattern)"),
     ]
     A(table(["Title", "Author", "Edition", "What it contributed", "Where in the code"],
             [(f"<b>{esc(t)}</b>", esc(a), esc(e), esc(w), c(w2)) for t, a, e, w, w2 in books]))
     A('<p class="small">Only Murphy and Hamilton are scanned images; the rest are text PDFs. None of the '
-      'statistics needs SciPy or statsmodels: the models in <code>quant/</code> are hand-written NumPy '
-      '(OLS, Nelder-Mead, EM).</p>')
+      'statistics needs SciPy or statsmodels: the models in <code>quant/</code> and '
+      '<code>research/significance.py</code> are hand-written NumPy (OLS, Nelder-Mead, EM, the bootstrap). Only '
+      'the learned model (<code>research/model.py</code>) uses scikit-learn, and the app runs without it. '
+      '<code>scripts/r/audit_records.R</code> recomputes the record statistics in base R as an independent '
+      'check; nothing live ever waits on R.</p>')
 
     # ---- 2 big picture --------------------------------------------------------------------------
     A('<h2>2. The big picture</h2>')
@@ -851,9 +915,13 @@ def build() -> str:
          "defaults, <code>data/runtime.json</code> for dashboard choices (it wins)"),
         ("Dashboard", "Vanilla JS ES modules", "No bundler, no framework; <code>state.js</code> is a small "
          "pub/sub store"),
-        ("Tests", "pytest, 419 tests in 50 files", "<code>tests/fakes.py</code> fakes the Gateway; "
+        ("Tests", "pytest, 474 tests in 52 files", "<code>tests/fakes.py</code> fakes the Gateway; "
          "<code>-m slow</code> boots the whole engine"),
         ("Optional ML", "transformers + torch (FinBERT)", "Headline sentiment; the app runs without it"),
+        ("Optional learning", "scikit-learn", "The meta-label model (<code>research/model.py</code>): boosted "
+         "trees and isotonic calibration; the app runs without it, with no model"),
+        ("Independent audit", "base R (optional)", "<code>scripts/r/audit_records.R</code> recomputes the record "
+         "statistics offline; nothing live waits on R"),
     ]))
     A('<h3>How the repository is laid out</h3>')
     A('<pre>run.py                      boot the engine + dashboard (Ctrl+C follows the quit rules)\n'
@@ -964,10 +1032,18 @@ def build() -> str:
         ("confirmations", "a day-trade setup must appear in 2 scans in a row", "min_confirmations"),
         ("catalyst", "optional: a news or earnings tag", "require_catalyst"),
         ("already in it", "not holding the symbol, no entry working, not stopped out today (cooldown)", "-"),
-        ("<b>proof</b>", "the strategy's replay record: >= 30 trades at >= +0.05R and a positive held-out sample "
-         "of >= 10 trades", "require_proven"),
+        ("late in the day", "no new day trade with fewer than 30 minutes to the close", "min_minutes_to_close"),
+        ("<b>proof</b>", "the strategy's replay record: >= 30 trades at >= +0.05R (also net of the stocks' own "
+         "drift), a positive held-out sample of >= 10 trades, a reality-check p-value <= 0.10 across every setup "
+         "tried, and costs within a third of the pre-cost edge", "require_proven, proof_p_value"),
+        ("the learned model", "in gate or size mode, and only while its own walk-forward verdict calls it usable: "
+         "plays it gives under 55% are refused; shadow (the default) only logs its odds",
+         "model_mode, model_min_p"),
         ("engine assessment", "session valid, PDT ok, size > 0, R:R ok, open-risk and gross-exposure ceilings",
          "risk.*, max_gross_exposure_pct"),
+        ("the last look", "at the live quote: refused when the spread is over 0.10R of the risk or the price has "
+         "run 0.25R past the entry; within that the limit is priced off the quote; a day-trade entry unfilled "
+         "after 10 minutes is cancelled", "execution.max_spread_r, max_chase_r, entry_timeout_min"),
     ]))
     A(fig_states())
 
@@ -1005,6 +1081,12 @@ def build() -> str:
          "volume", "Murphy"),
         ("divergence_reversal", "Oscillator Divergence at a Level", "swing", "reversal", "RSI/MACD divergence at "
          "support or resistance", "Murphy"),
+        ("failure_test", "Failure Test (spring / upthrust)", "swing", "reversal", "a probe through a swing level "
+         "that closes back inside; the stop goes just beyond the test", "Grimes"),
+        ("trend_pullback", "Pullback After a Momentum Thrust", "swing", "momentum", "the first shallow, quiet "
+         "pullback to the 20-EMA after a close outside the 2.25-ATR Keltner channel", "Grimes"),
+        ("double_bottom", "Confirmed Double Bottom / Top", "swing", "momentum", "twin lows 2-7 weeks apart, taken "
+         "only on the close beyond the peak between them; the stop sits inside the pattern", "Bulkowski, Murphy"),
         ("gap_reversion", "Gap reversion", "day", "reversal", "buy-on-gap: an overnight gap against the trend "
          "reverts", "Chan (Algorithmic)"),
         ("earnings_drift", "Post-earnings drift", "day", "momentum", "drift after an 8-K earnings surprise",
@@ -1052,7 +1134,9 @@ def build() -> str:
          "engine._run_scan -> repo.record_scan"),
         ("play_logs", "one play shown on the board, with its decision (approved, rejected, expired, auto)",
          "repo.record_play / set_play_status"),
-        ("trades", "one position from entry to exit, including partial exits (banked_pl) and the R multiple",
+        ("trades", "one position from entry to exit, including partial exits (banked_pl), the R multiple, the "
+         "play's features at the decision (entry_context) and what the fills cost: decision_price, spread_bps, "
+         "entry_slippage_bps, exit_decision_price, exit_slippage_bps",
          "repo.open_trade / reduce_trade / close_trade"),
         ("fills", "each broker fill, entry or exit leg, with commission", "executor via the repository"),
         ("account_snapshots", "equity, cash, buying power every snapshot-loop pass", "engine snapshot loop"),
@@ -1061,8 +1145,9 @@ def build() -> str:
         ("news_items", "a headline from IBKR, SEC 8-K or Finnhub, with FinBERT sentiment", "SignalStore"),
         ("insider_trades / filings_read", "Form 4 open-market trades and which filings were parsed", "SignalStore"),
         ("pair_trades", "a two-leg pair position with its z-score model and both trade ids", "PairDesk"),
-        ("sim_trades", "one simulated trade of a replay run, with the play's features at the signal and a held_out "
-         "flag", "the runner's sink -> repo.save_sim_trades"),
+        ("sim_trades", "one simulated trade of a replay run, with the play's features at the signal, a held_out "
+         "flag, and what the stock's own drift made (drift_r) and costs took (cost_r) while it was held",
+         "the runner's sink -> repo.save_sim_trades"),
         ("shadow_trades", "one play shown and not taken, followed to its outcome on the session's candles, with "
          "its features", "the 16:15 review -> repo.save_shadow_trades"),
     ]))

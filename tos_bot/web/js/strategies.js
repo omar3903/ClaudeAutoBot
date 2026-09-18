@@ -33,6 +33,14 @@ export async function openStrategies() {
 const EXTRA_CHECK_LABELS = { unconfirmed: "seen in only one scan", all_checks: "all of them together" };
 const inR = v => v == null ? "–" : `${v >= 0 ? "+" : ""}${num(v, 2)}R`;
 const recordText = r => `${r.trades} trades · ${Math.round((r.win_rate || 0) * 100)}% wins · ${inR(r.expectancy_r)} a trade`;
+/* what the books ask of a record: Tharp's quality number, Aronson's odds that it is luck, Carver's cost share */
+const judgedText = r => [
+  r.sqn != null ? `quality ${num(r.sqn, 1)} (${escapeHtml(r.sqn_grade || "")})` : "",
+  r.p_adjusted != null ? `could be luck: p ${num(r.p_adjusted, 2)} across ${r.setups_tested} setups` : "",
+  r.edge_r != null && Math.abs(r.edge_r - r.expectancy_r) >= 0.01 ? `${inR(r.edge_r)} net of the stocks' own drift` : "",
+  r.cost_share != null ? `costs take ${Math.round(r.cost_share * 100)}% of the edge` : "",
+  r.drawdown ? `expect a ${num(Math.abs(r.drawdown.median_drawdown_r), 0)}R drawdown in 100 trades (${num(Math.abs(r.drawdown.p95_drawdown_r), 0)}R one time in twenty)` : "",
+].filter(Boolean).join(" · ");
 
 async function loadReplay() {
   try { S.replay = await api("/api/replay"); } catch { S.replay = null; }
@@ -57,9 +65,13 @@ function recordLine(key) {
   const ap = S.state.autopilot || {};
   const held = auto && auto.out_of_sample;
   const heldOk = !held || (held.trades >= 10 && held.expectancy_r > 0);
-  const proven = !!auto && auto.trades >= (ap.min_replay_trades ?? 30) && auto.expectancy_r >= (ap.min_replay_expectancy_r ?? 0.05) && heldOk;
+  const missing = (rp.proof || {})[key];                     // the engine's own verdict, in words ("" = proven)
+  const proven = missing != null ? missing === ""
+    : !!auto && auto.trades >= (ap.min_replay_trades ?? 30) && auto.expectancy_r >= (ap.min_replay_expectancy_r ?? 0.05) && heldOk;
+  const judged = judgedText(auto && auto.trades ? auto : all);
   return `<div class="record">Replay: ${recordText(all)}${auto && auto.trades ? ` · the ones Autopilot would take: ${recordText(auto)}` : ""}${held && held.trades ? ` · held-out sessions: ${recordText(held)}` : ""}
-    <span class="badge ${proven ? "good" : "warn"}">${proven ? "proven" : "not proven"}</span></div>`;
+    <span class="badge ${proven ? "good" : "warn"}" title="${escapeHtml(missing || "")}">${proven ? "proven" : "not proven"}</span></div>
+    ${judged ? `<div class="record muted">${judged}.</div>` : ""}`;
 }
 
 /* your weight × what the record says = the weight the ranking uses */

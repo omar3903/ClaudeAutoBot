@@ -156,6 +156,9 @@ class ExecutionCfg(_Model):
     entry_timeout_min: int = 10           # a day-trade entry order not filled in this many minutes is cancelled - a
                                           # fill later, when the price comes back through it, is the move failing
                                           # (Aziz: never chase); 0 = leave it working for the day like a swing entry
+    max_spread_r: float = 0.10            # on live quotes, an entry is refused when the bid-ask spread is more than this
+                                          # share of the distance to the stop: the spread is the price of immediacy
+                                          # (Harris), paid on the way in and again on the way out (0 = off)
     max_chase_r: float = 0.25             # an entry is refused once the price has run past the play's entry by more
                                           # than this share of the distance to the stop - the reward:risk the play was
                                           # judged on is gone; within it a limit entry is priced off the live quote so
@@ -204,6 +207,13 @@ class AutopilotCfg(_Model):
     require_proven: bool = True           # only strategies whose replayed record is good enough
     min_replay_trades: int = 30
     min_replay_expectancy_r: float = 0.05
+    model_mode: str = "shadow"            # the learned model (research/model.py): shadow = its odds are logged with every
+                                          # play and never acted on; gate = plays under model_min_p are refused; size =
+                                          # gate, and the risk follows the odds (AFML ch. 10). gate and size act only
+                                          # while the model's own walk-forward judgement calls it usable
+    model_min_p: float = 0.55
+    proof_p_value: float = 0.10           # ...and the chance its edge is luck, once every setup tried is allowed for
+                                          # (Aronson's reality check on the replayed trades), is this or less; 0 = off
     cooldown_after_loss: bool = True
     max_daily_loss_pct: float = 2.0       # no new entries once today's closed trades have lost this % of equity (0 = off)
     max_giveback_pct: float = 30.0        # ...or once the day's realized gain has given back this % of its peak (0 = off)

@@ -619,11 +619,20 @@ def test_an_entry_never_chases_the_price_past_the_play(engine, monkeypatch):
     p = _play("AAPL")                                                       # entry 100, stop 95: 1R is 5
     plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
     assert engine._chase_check(p, plan) is None                             # no price source: nothing to check
-    engine.md.attach(object())
+    from types import SimpleNamespace
+
+    engine.md.attach(SimpleNamespace(quotes_from_bars=False, name="fake"))   # a live quote source
     tape = {"px": 100.5}
     monkeypatch.setattr(engine.md, "quote",
                         lambda s: Quote(symbol=s, bid=tape["px"] - 0.01, ask=tape["px"] + 0.01, last=tape["px"]))
-    assert engine._chase_check(p, plan) is None and plan["limit_price"] == 100.55   # 0.1R past: priced off the quote
+    seen = {}
+    assert engine._chase_check(p, plan, seen) is None and plan["limit_price"] == 100.55   # 0.1R past: priced off the quote
+    assert seen["mid"] == 100.5 and seen["live"] and abs(seen["spread_bps"] - 1.99) < 0.01  # kept for the shortfall
+    wide = Quote(symbol="AAPL", bid=100.0, ask=100.8, last=100.4)             # a spread of 0.16R of the risk
+    monkeypatch.setattr(engine.md, "quote", lambda s: wide)
+    assert "spread" in engine._chase_check(p, plan)
+    monkeypatch.setattr(engine.md, "quote",
+                        lambda s: Quote(symbol=s, bid=tape["px"] - 0.01, ask=tape["px"] + 0.01, last=tape["px"]))
     tape["px"] = 102.0                                                      # 0.4R past the entry: the R:R is gone
     assert "not chasing" in engine._chase_check(p, plan)
     tape["px"], plan["limit_price"] = 99.0, 100.05                          # a pullback under the entry is no chase

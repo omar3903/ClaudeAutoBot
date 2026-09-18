@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 
 from ..core.enums import Side, StrategyKind, Timeframe
@@ -55,6 +56,7 @@ from .features import play_features
 from ..scanner.noise import CHECKS, LEARNABLE_CHECKS, NoiseSettings, context_flags
 from ..strategies.base import Strategy, StrategyContext
 from ..util import clock
+from .significance import judge, reality_check
 
 NY = "America/New_York"
 BAR = pd.Timedelta(minutes=5)
@@ -115,6 +117,9 @@ class SimTrade:
     mfe_r: float = 0.0                    # the best it got, in R, before it closed
     scaled: bool = False                  # part of it was taken off at the first target
     features: Dict[str, Any] = field(default_factory=dict)   # the play at the signal (research/features.py)
+    drift_r: float = 0.0                  # what the stock's own average drift made while it was held, in R - a
+                                          # record is judged net of it (Aronson: detrend, or being long pays)
+    cost_r: float = 0.0                   # the slippage and commission it paid, in R (Carver: know your costs)
 
 
 @dataclass
@@ -133,6 +138,8 @@ class _Position:
     banked_r: float = 0.0                 # in R of the whole position, from the part taken off
     scaled: bool = False
     features: Dict[str, Any] = field(default_factory=dict)
+    drift_per_bar: float = 0.0            # the stock's average return per bar over the replayed window
+    cost: float = 0.0                     # slippage and commission paid so far, per share of the whole position
 
     @property
     def sign(self) -> int:
@@ -159,6 +166,7 @@ def replay_intraday(strategies: Sequence[Strategy], symbol: str, bars: pd.DataFr
     days = sorted(set(bars.index.date))
     stories = _stories(news)
     trades: List[SimTrade] = []
+    drift = drift_per_bar(bars, intraday=True)
     for day in days[-sessions:] if sessions else days:
         session = bars[bars.index.date == day]
         prior_daily = daily[daily.index.date < day]
@@ -167,7 +175,8 @@ def replay_intraday(strategies: Sequence[Strategy], symbol: str, bars: pd.DataFr
         flatten_at = _at(day, clock.regular_close_time(day)) - pd.Timedelta(minutes=settings.flatten_before_close_min)
         benchmark = _Benchmark(benchmark_daily, benchmark_bars, day)
         trades += _replay_session(day_trades, symbol, session, bars, prior_daily, flatten_at, settings, noise,
-                                  regime(market, day), earnings_signals(earnings, day), stories, benchmark, records)
+                                  regime(market, day), earnings_signals(earnings, day), stories, benchmark, records,
+                                  drift)
     return trades
 
 
@@ -176,7 +185,7 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
                     noise: NoiseSettings, market: Dict[str, Any], signals: Any,
                     stories: Sequence[Tuple[pd.Timestamp, Mapping[str, Any]]] = (),
                     benchmark: Optional["_Benchmark"] = None,
-                    records: Optional[Mapping[str, Mapping[str, Any]]] = None) -> List[SimTrade]:
+                    records: Optional[Mapping[str, Mapping[str, Any]]] = None, drift: float = 0.0) -> List[SimTrade]:
     trades: List[SimTrade] = []
     open_positions: Dict[str, _Position] = {}
     seen_before: set = set()
@@ -204,6 +213,7 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
                                   features=play_features(play, now=ctx.now, market=ctx.market, noise=flags,
                                                          confirmations=2 if confirmed else 1, activity=activity))
                 if position is not None:
+                    position.drift_per_bar = drift
                     open_positions[strategy.key] = position
         seen_before = {(s.key, p.side) for s, p, _ in signals_now}
 
@@ -232,6 +242,7 @@ def replay_swing(strategies: Sequence[Strategy], symbol: str, daily: pd.DataFram
     records = {k: dict(v) for k, v in (records or {}).items()}
     trades: List[SimTrade] = []
     open_positions: Dict[str, _Position] = {}
+    drift = drift_per_bar(daily.iloc[max(60, len(daily) - sessions - 1):], intraday=False)
     for i in range(max(60, len(daily) - sessions - 1), len(daily) - 1):
         history, next_at, next_bar = daily.iloc[:i + 1], daily.index[i + 1], daily.iloc[i + 1]
         closed_on = history.index[-1].date()
@@ -251,6 +262,7 @@ def replay_swing(strategies: Sequence[Strategy], symbol: str, daily: pd.DataFram
                                   features=play_features(play, now=ctx.now, market=ctx.market, noise=flags,
                                                          confirmations=1, activity=activity))
                 if position is not None:
+                    position.drift_per_bar = drift
                     open_positions[strategy.key] = position
         for key, position in list(open_positions.items()):
             timed_out = position.bars_held + 1 >= settings.max_swing_hold_days
@@ -404,7 +416,7 @@ def _enter(key: str, play: Play, flags: List[str], confirmed: bool, at: pd.Times
     if risk <= 0:
         return None                                  # opened through the stop
     return _Position(key, play, fill, play.stop, risk, at, list(flags), confirmed, best=fill,
-                     features=dict(features or {}))
+                     features=dict(features or {}), cost=abs(fill - open_price))
 
 
 def _step(position: _Position, bar: pd.Series, bar_end: pd.Timestamp, settings: ReplaySettings,
@@ -426,6 +438,7 @@ def _step(position: _Position, bar: pd.Series, bar_end: pd.Timestamp, settings: 
             # Aziz: part off at the first target, stop to break-even, the rest runs to the second
             part = settings.scale_out_pct / 100.0
             fill = price * (1 - position.sign * settings.commission_bps / 1e4)          # a limit fill
+            position.cost += part * abs(price - fill)
             position.banked_r += part * (fill - position.entry) * position.sign / position.risk
             position.fraction -= part
             position.scaled = True
@@ -450,8 +463,10 @@ def _tighten(position: _Position, stop: float) -> None:
 def _close(position: _Position, price: float, at: pd.Timestamp, reason: str, settings: ReplaySettings,
            limit: bool = False) -> SimTrade:
     cost_bps = settings.commission_bps + (0.0 if limit else settings.slippage_bps)
+    paid = position.cost + position.fraction * price * cost_bps / 1e4
     price *= 1 - position.sign * cost_bps / 1e4
     play = position.play
+    drift = position.sign * position.drift_per_bar * position.bars_held * position.entry
     rest = position.fraction * (price - position.entry) * position.sign / position.risk
     return SimTrade(strategy=position.strategy, symbol=play.symbol, side=play.side.value,
                     timeframe=play.timeframe.value, entered_at=position.entered_at.isoformat(),
@@ -459,7 +474,26 @@ def _close(position: _Position, price: float, at: pd.Timestamp, reason: str, set
                     r=round(position.banked_r + rest, 3), exit_reason=reason,
                     noise=list(position.noise), confirmed=position.confirmed,
                     mfe_r=round(max(0.0, (position.best - position.entry) * position.sign / position.risk), 3),
-                    scaled=position.scaled, features=dict(position.features))
+                    scaled=position.scaled, features=dict(position.features),
+                    drift_r=round(drift / position.risk, 4), cost_r=round(paid / position.risk, 4))
+
+
+def drift_per_bar(frame: Optional[pd.DataFrame], intraday: bool) -> float:
+    """The stock's own average return per bar over the replayed candles. A trade held ``n`` bars
+    would have made ``n`` of these just by being long (lost them, short), whatever the setup saw
+    - Aronson's position bias. Day trades never hold overnight, so only the moves inside the
+    sessions count for them."""
+    if frame is None or len(frame) < 2:
+        return 0.0
+    try:
+        if intraday:
+            days = frame.groupby(frame.index.date)
+            moved = float(np.log(days["close"].last() / days["open"].first()).sum())
+        else:
+            moved = float(np.log(float(frame["close"].iloc[-1]) / float(frame["close"].iloc[0])))
+    except (KeyError, ValueError, ZeroDivisionError):
+        return 0.0
+    return moved / len(frame) if np.isfinite(moved) else 0.0
 
 
 def _at(day: dt.date, time: dt.time) -> pd.Timestamp:
@@ -592,7 +626,17 @@ def records_by_strategy(trades: Iterable[SimTrade],
         by_strategy.setdefault(t.strategy, []).append(t)
     records = {}
     for key, ts in by_strategy.items():
-        records[key] = summarize(ts)
+        records[key] = {**summarize(ts), **_judged(ts)}
         if split:
-            records[key]["out_of_sample"] = summarize([t for t in ts if held_out(t, split)])
+            held = [t for t in ts if held_out(t, split)]
+            records[key]["out_of_sample"] = {**summarize(held), **_judged(held)}
+    # Aronson's reality check: each setup against the best that luck makes of all the setups tried
+    adjusted = reality_check({key: [t.r - t.drift_r for t in ts] for key, ts in by_strategy.items()})
+    for key, p in adjusted.items():
+        records[key]["p_adjusted"], records[key]["setups_tested"] = p, len(adjusted)
     return records
+
+
+def _judged(trades: Sequence[SimTrade]) -> Dict[str, Any]:
+    """The record's quality, luck, drift and costs (research/significance.py)."""
+    return judge([t.r for t in trades], [t.drift_r for t in trades], [t.cost_r for t in trades])

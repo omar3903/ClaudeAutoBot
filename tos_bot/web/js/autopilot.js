@@ -95,6 +95,13 @@ function configure() {
       <div class="ap-noise">${Object.entries(ap.noise_labels || {}).map(([flag, label]) =>
         `<label><input type="checkbox" class="ap-noise-check" value="${escapeHtml(flag)}" ${(ap.skip_noise || []).includes(flag) ? "checked" : ""}> ${escapeHtml(label)}</label>`).join("")}</div>
       <label><input type="checkbox" id="ap-proven" ${ap.require_proven !== false ? "checked" : ""}> Only trade strategies the replay has proven (Strategies panel)</label>
+      <label title="The model learns, every night, the odds that a play pays from what happened to plays like it - live, not taken, and replayed. It only has a say while its own walk-forward test calls it usable.">The learned model
+        <select id="ap-model">
+          <option value="shadow" ${(ap.model_mode || "shadow") === "shadow" ? "selected" : ""}>shadow - log its odds, never act on them</option>
+          <option value="gate" ${ap.model_mode === "gate" ? "selected" : ""}>gate - refuse plays it gives under ${Math.round((ap.model_min_p ?? 0.55) * 100)}%</option>
+          <option value="size" ${ap.model_mode === "size" ? "selected" : ""}>size - gate, and risk more on better odds</option>
+        </select></label>
+      <p class="muted small">${ap.model ? `Model ${escapeHtml(ap.model.id)}: ${ap.model.rows} rows, ${ap.model.usable ? "<b>usable</b>" : "<b>not usable yet</b> - it has no say whatever is chosen here"}.` : "No model trained yet - the first is trained after a day's review once there are 500 rows."}</p>
       <label><input type="checkbox" id="ap-cooldown" ${ap.cooldown_after_loss !== false ? "checked" : ""}> Cool off a ticker for the day after it stops out</label>
       <label><input type="checkbox" id="ap-dry" ${ap.dry_run ? "checked" : ""}> Dry run (log what it would do, place nothing)</label>
       <p class="muted">Live routing also needs <code>autopilot.allow_live: true</code> in config.yaml. The Long / Short, Intraday / Swing and
@@ -123,6 +130,7 @@ function configure() {
         max_giveback_pct: parseFloat($("#ap-giveback").value),
         skip_noise: $$(".ap-noise-check").filter(c => c.checked).map(c => c.value),
         require_proven: $("#ap-proven").checked,
+        model_mode: $("#ap-model").value,
         cooldown_after_loss: $("#ap-cooldown").checked,
         dry_run: $("#ap-dry").checked,
       });

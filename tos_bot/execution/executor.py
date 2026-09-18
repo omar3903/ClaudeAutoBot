@@ -48,6 +48,8 @@ class _Pending:
     context: Optional[Dict[str, Any]] = None        # an entry's features at the decision (research/features.py)
     submitted_at: Optional[dt.datetime] = None
     expired: str = ""               # why the app cancelled this entry itself (a day trade not filled in time)
+    decision: Optional[Dict[str, Any]] = None       # an entry: the quote at the decision (mid, spread_bps)
+    decision_price: Optional[float] = None          # an exit: the price that triggered it
 
 
 class Executor:
@@ -245,9 +247,11 @@ class Executor:
     # ------------------------------------------------------------------ #
     def execute_play(self, play: Play, account: Account,
                      plan: Optional[Dict[str, Any]] = None,
-                     context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                     context: Optional[Dict[str, Any]] = None,
+                     decision: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """``context``: what the play looked like at the decision (research/features.py), kept on
-        the trade record for learning."""
+        the trade record for learning; ``decision``: the quote then, which the fill is measured
+        against (Harris's implementation shortfall)."""
         qty = int(play.suggested_qty or 0)
         if qty <= 0:
             return {"ok": False, "reason": "position size is zero (risk budget / buying power)"}
@@ -281,7 +285,7 @@ class Executor:
         if res.status in ("FILLED",) or res.filled_qty >= qty > 0:
             fill_price = res.avg_fill_price or (res.fills[-1].price if res.fills else play.entry)
             tid = self._open_trade(play, fill_price, res.filled_qty or qty, res.order_id, ot, osess,
-                                   context=context, submitted_at=submitted_at)
+                                   context=context, submitted_at=submitted_at, decision=decision)
             return {"ok": True, "status": "FILLED", "trade_id": tid,
                     "fill_price": round(fill_price, 4), "qty": res.filled_qty or qty,
                     "order_id": res.order_id, "order_type": ot, "order_session": osess,
@@ -290,7 +294,7 @@ class Executor:
         # otherwise track it; sync_open_orders() will pick up the fill
         p = _Pending(res.order_id, play, "entry", qty=qty)
         p.order_type, p.order_session = ot, osess
-        p.context, p.submitted_at = context, submitted_at
+        p.context, p.submitted_at, p.decision = context, submitted_at, decision
         self._pending[res.order_id] = p
         return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id,
                 "order_type": ot, "order_session": osess,
@@ -298,7 +302,8 @@ class Executor:
 
     # ------------------------------------------------------------------ #
     def close_trade(self, trade_id: str, reason: str = "manual", limit_price: Optional[float] = None,
-                    qty: Optional[float] = None, after_fill: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+                    qty: Optional[float] = None, after_fill: Optional[Dict[str, float]] = None,
+                    decision_price: Optional[float] = None) -> Dict[str, Any]:
         """Send the order that closes a position - or, with ``qty`` short of the whole position, the
         part of it the exit manager takes off at the first target; ``after_fill`` is the stop and
         target the rest gets once that part has gone (see Repository.reduce_trade)."""
@@ -350,16 +355,18 @@ class Executor:
         if res.status == "FILLED" or res.filled_qty > 0:
             px = res.avg_fill_price or (res.fills[-1].price if res.fills else limit_price)
             out, closed = self._book_exit(t["symbol"], trade_id, float(px), res.filled_qty or qty, reason,
-                                          partial, after_fill)
+                                          partial, after_fill, decision_price)
             return {"ok": True, "status": "FILLED", "trade": out, "reduced": not closed}
 
         self._pending[res.order_id] = _Pending(res.order_id, Play(**_min_play(t)), "exit",
                                                trade_id=trade_id, qty=qty, reason=reason,
-                                               partial=partial, after_fill=after_fill)
+                                               partial=partial, after_fill=after_fill,
+                                               decision_price=decision_price)
         return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id}
 
     def _book_exit(self, symbol: str, trade_id: str, price: float, qty: float, reason: str,
-                   partial: bool = False, after_fill: Optional[Dict[str, float]] = None):
+                   partial: bool = False, after_fill: Optional[Dict[str, float]] = None,
+                   decision_price: Optional[float] = None):
         """Book an exit fill: the whole position closes the record, part of it (the scale-out)
         reduces it. Returns (the record, whether it is now closed)."""
         if partial:
@@ -369,7 +376,8 @@ class Executor:
                 self.bus.publish("trade.reduced", trade=out, reason=reason, qty=qty, price=round(price, 4))
                 return out, False
         else:
-            out = self.repo.close_trade(trade_id, float(price), exit_reason=reason)
+            seen = {"decision_price": float(decision_price)} if decision_price else {}
+            out = self.repo.close_trade(trade_id, float(price), exit_reason=reason, **seen)
         self._open_by_symbol.pop(symbol, None)
         self.bus.publish("trade.closed", trade=out, reason=reason)
         return out, True
@@ -465,10 +473,11 @@ class Executor:
         px = res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0)
         if p.kind == "entry":
             self._open_trade(p.play, px, res.filled_qty or p.qty, res.order_id,
-                             p.order_type, p.order_session, context=p.context, submitted_at=p.submitted_at)
+                             p.order_type, p.order_session, context=p.context, submitted_at=p.submitted_at,
+                             decision=p.decision)
         else:
             self._book_exit(res.symbol, p.trade_id, float(px), res.filled_qty or p.qty, p.reason or "order",
-                            p.partial, p.after_fill)
+                            p.partial, p.after_fill, p.decision_price)
 
     def _on_unfilled(self, p: _Pending, res) -> None:
         """The broker finished an order without filling all of it - rejected,
@@ -479,7 +488,7 @@ class Executor:
             if filled > 0:
                 px = res.avg_fill_price or (res.fills[-1].price if res.fills else p.play.entry)
                 self._open_trade(p.play, px, filled, res.order_id, p.order_type, p.order_session,
-                                 context=p.context, submitted_at=p.submitted_at)
+                                 context=p.context, submitted_at=p.submitted_at, decision=p.decision)
             else:
                 p.play.status = PlayStatus.CANCELED if res.status in ("CANCELED", "EXPIRED") else PlayStatus.ERROR
         if res.status == "REJECTED":
@@ -521,10 +530,12 @@ class Executor:
     def _open_trade(self, play: Play, price: float, qty: float, order_id: str,
                     order_type: str = "LIMIT", order_session: str = "REGULAR",
                     context: Optional[Dict[str, Any]] = None,
-                    submitted_at: Optional[dt.datetime] = None) -> str:
+                    submitted_at: Optional[dt.datetime] = None,
+                    decision: Optional[Dict[str, Any]] = None) -> str:
+        seen = {"decision": decision} if decision else {}
         tid = self.repo.open_trade(play, float(price), float(qty), self.venue, order_id,
                                    order_type=order_type, order_session=order_session,
-                                   entry_context=context, submitted_at=submitted_at)
+                                   entry_context=context, submitted_at=submitted_at, **seen)
         self._open_by_symbol[play.symbol] = tid
         play.status = PlayStatus.FILLED
         play.trade_id = tid
