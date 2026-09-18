@@ -254,12 +254,17 @@ class JournalOps:
             return None
 
     def _passes_checks(self, row: Mapping[str, Any]) -> bool:
-        """Whether a recorded play clears Autopilot's own checks on it (not the account's caps)."""
+        """Whether a recorded play clears Autopilot's checks on the play itself: its confidence floor for
+        the timeframe, its reward:risk floor, the skipped flags and, for day trades, the confirmations.
+        Not the day / swing boxes or the account's caps - those say what Autopilot may take, not what
+        the play was worth, and the review compares the plays its checks would pass against the rest
+        whether or not the box for their kind is ticked."""
         ap = self.autopilot
-        return (row.get("timeframe") in ap.play_types() and float(row.get("confidence") or 0) >= ap.min_confidence
+        timeframe = str(row.get("timeframe") or "")
+        return (float(row.get("confidence") or 0) >= ap.confidence_floor(timeframe)
                 and float(row.get("reward_risk") or 0) >= ap.min_reward_risk
                 and not set(ap.skipped_noise()).intersection(row.get("noise") or [])
-                and (row.get("timeframe") != "INTRADAY" or int(row.get("confirmations") or 1) >= ap.min_confirmations))
+                and (timeframe != "INTRADAY" or int(row.get("confirmations") or 1) >= ap.min_confirmations))
 
     def journal_state(self, limit: int = 60) -> Dict[str, Any]:
         cfg = self.settings.config.journal
