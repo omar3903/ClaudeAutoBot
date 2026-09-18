@@ -28,6 +28,7 @@ from ..core.eventbus import BUS
 from ..core.models import Account, OrderRequest, OrderResult, Play
 from ..util import clock
 from .order_builder import build_entry_order, build_exit_order, plan_order
+from .protective_stops import TAG as STOP_TAG, ProtectiveStops
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ class _Pending:
     decision_price: Optional[float] = None          # an exit: the price that triggered it
 
 
-class Executor:
+class Executor(ProtectiveStops):
     #: polls in a row (the sync loop runs every 4 s) a connected broker may not know an order before it's given up
     LOST_AFTER_POLLS = 5
     #: after the broker (re)connects - IB Gateway's nightly restart - its order list takes a while to reload
@@ -70,6 +71,7 @@ class Executor:
         #: the exit manager takes part of a position off at the first target, so a native bracket
         #: (the simulator's) carries the stop only - a take-profit child would close all of it there
         self.scale_out: bool = False
+        self._init_stops()
 
     def rebind(self, broker: BrokerAdapter, venue: Optional[str] = None) -> None:
         """Point at a different broker (paper <-> live / platform switch).
@@ -79,6 +81,7 @@ class Executor:
         self.venue = venue or broker.name
         self._pending.clear()
         self._open_by_symbol.clear()
+        self._init_stops()              # the other venue's stops stay where they are; they are found again by their tags
 
     def cancel_pending_entries(self) -> int:
         """Cancel entry orders still working at the broker (used when quitting)."""
@@ -114,6 +117,7 @@ class Executor:
     def forget_open(self, symbol: str) -> None:
         """Drop the note that ``symbol`` is held - its record was closed without an exit going through here."""
         self._open_by_symbol.pop(symbol, None)
+        self._swept_at = 0.0            # ...so its stop at the broker goes on the very next pass
 
     def cancel_entries_for(self, play_id: str) -> int:
         """Call off the entry orders still working for one play - a pair leg whose other leg failed."""
@@ -153,7 +157,8 @@ class Executor:
     def _describe(self, o: OrderResult, trades: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         p = self._pending.get(o.order_id)
         followed = p is not None
-        trade_id = p.trade_id if followed else (o.tag[len("exit:"):] if o.tag.startswith("exit:") else None)
+        trade_id = p.trade_id if followed else next((o.tag[len(prefix):] for prefix in ("exit:", STOP_TAG)
+                                                     if o.tag.startswith(prefix)), None)
         play_id = (p.play.id if p.kind == "entry" else None) if followed else \
             (o.tag.split(":")[0] if o.tag.startswith("play_") else None)
         trade = trades.get(trade_id or "") or {}
@@ -239,6 +244,8 @@ class Executor:
             mine = o.tag.startswith("exit:") or (o.raw or {}).get("mine")
             if o.order_id in self._pending or o.symbol not in recorded or o.side is not sides[o.symbol] or not mine:
                 continue
+            if o.tag.startswith(STOP_TAG):
+                continue                                 # a protective stop is not an exit; protective_stops.py owns it
             if self._exiting_quantity(o.symbol) + _remaining(o) > recorded[o.symbol] + 1e-9:
                 self._cancel_quietly(o.order_id)
                 extra.append(o)
@@ -327,6 +334,21 @@ class Executor:
             return {"ok": True, "status": order.status, "order_id": order.order_id, "adopted": True}
         wanted = abs(float(t["quantity"]))
         partial = qty is not None and 0 < float(qty) < wanted - 1e-9
+        # the stop resting at the broker first: two exits on one position must never both fill
+        if partial:
+            if not self._shrink_stop(trade_id, wanted - float(qty)):
+                return {"ok": False, "reason": "The stop at the broker couldn't be resized for the part coming off - "
+                                               "trying again shortly."}
+        else:
+            stood = self._stand_down(trade_id)
+            if stood == "busy":
+                return {"ok": False, "reason": "Waiting for the broker to confirm the protective stop is cancelled "
+                                               "before sending the exit."}
+            if stood in ("filled", "cancelled"):
+                t = self.repo.get_trade(trade_id) or t      # the stop, or part of it, may have filled first
+                if stood == "filled" or t["status"] == "CLOSED":
+                    return {"ok": True, "status": "FILLED", "trade": t, "by": "broker-stop"}
+                wanted = abs(float(t["quantity"]))
         qty = min(float(qty), wanted) if partial else wanted
         held = self._held_quantity(t["symbol"])
         if held is not None:
@@ -420,7 +442,14 @@ class Executor:
             except Exception:  # noqa: BLE001
                 continue
 
-        # 4) detect broker-side bracket exits (child order filled against an open trade)
+        # 4) the stops resting at the broker: book the ones that filled, keep the rest in step with the records
+        try:
+            self._watch_stops()
+            self._protect_positions()
+        except Exception:  # noqa: BLE001
+            log.exception("protective stops check failed")
+
+        # 5) detect broker-side bracket exits (child order filled against an open trade)
         try:
             for o in self.broker.list_orders(status="FILLED"):
                 self._maybe_close_from_bracket(o)
@@ -609,6 +638,8 @@ def _purpose(o: OrderResult) -> str:
     raw = o.raw or {}
     if raw.get("parent_id"):
         return "stop" if o.order_type in ("STOP", "STOP_LIMIT", "TRAILING_STOP") else "target"
+    if o.tag.startswith(STOP_TAG):
+        return "stop"
     if o.tag.startswith("exit:"):
         return "exit"
     if o.tag.startswith("play_"):

@@ -506,3 +506,18 @@ def test_open_orders_report_their_type_prices_and_time_in_force(broker):
     assert order.order_type == "LIMIT" and order.limit_price == pytest.approx(123.45)
     assert order.stop_price is None                     # IBKR's "unset" price is not a price
     assert order.tif == "GTC" and order.raw["parent_id"] is None
+
+
+def test_a_stop_order_rests_good_till_cancelled_and_can_be_moved_in_place(broker):
+    req = OrderRequest(symbol="AAPL", side=Side.SHORT, quantity=10, order_type=OrderType.STOP, stop_price=98.5,
+                       tif=TimeInForce.GTC, is_entry=False, client_tag="stop:trd_1")
+    res = broker.place_order(req)
+    _, order = broker._session.ib.placed[-1]
+    assert (order.orderType, order.action, order.auxPrice, order.tif, order.orderRef) == ("STP", "SELL", 98.5, "GTC",
+                                                                                         "stop:trd_1")
+    assert order.outsideRth is False and broker.supports_native_stop
+    broker.modify_stop(res.order_id, stop_price=100.25, quantity=5)
+    _, again = broker._session.ib.placed[-1]
+    assert again.orderId == order.orderId and again.auxPrice == 100.25 and again.totalQuantity == 5
+    with pytest.raises(Exception):
+        broker.place_order(OrderRequest(symbol="AAPL", side=Side.SHORT, quantity=10, order_type=OrderType.STOP))
