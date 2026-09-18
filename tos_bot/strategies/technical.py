@@ -273,7 +273,9 @@ class EmaPullbackTrend(Strategy):
         if any(math.isnan(safe_last(x)) for x in (f, s, t)) or math.isnan(atr) or atr <= 0:
             return []
         price = ctx.price
-        last = ctx.intraday.iloc[-1]
+        last = _last_closed(ctx.today_intraday())    # Aziz: the trigger is a closed 5-minute candle, never the
+        if last is None:                             # one still printing - on live data it flips every tick
+            return []
         near_slow = abs(last["low"] - safe_last(s)) <= 0.4 * atr or abs(price - safe_last(s)) <= 0.3 * atr
 
         up = safe_last(f) > safe_last(s) > safe_last(t) and price > safe_last(t)
@@ -300,7 +302,7 @@ class EmaPullbackTrend(Strategy):
                 f"Fast/slow/trend EMAs stacked bullishly ({safe_last(f):.2f} > "
                 f"{safe_last(s):.2f} > {safe_last(t):.2f}, {sep:.1f} ATR of "
                 f"separation); price pulled back into the {self.params['slow']}-EMA "
-                f"and printed an up bar on {rvol:.1f}x volume."
+                f"and the last closed bar was an up bar on {rvol:.1f}x volume."
             )
             return self._wrap(ctx, Side.LONG, entry, stop, targets, _conf(True), detail, f, s, t, atr)
 
@@ -312,7 +314,7 @@ class EmaPullbackTrend(Strategy):
             detail = (
                 f"EMAs stacked bearishly ({safe_last(f):.2f} < {safe_last(s):.2f} "
                 f"< {safe_last(t):.2f}, {sep:.1f} ATR of separation); price rallied "
-                f"into the {self.params['slow']}-EMA and rolled over on {rvol:.1f}x volume."
+                f"into the {self.params['slow']}-EMA and the last closed bar rolled over on {rvol:.1f}x volume."
             )
             return self._wrap(ctx, Side.SHORT, entry, stop, targets, _conf(False), detail, f, s, t, atr)
         return []

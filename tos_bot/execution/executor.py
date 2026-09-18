@@ -47,6 +47,7 @@ class _Pending:
     after_fill: Optional[Dict[str, float]] = None   # the stop and target the rest gets once the part is off
     context: Optional[Dict[str, Any]] = None        # an entry's features at the decision (research/features.py)
     submitted_at: Optional[dt.datetime] = None
+    expired: str = ""               # why the app cancelled this entry itself (a day trade not filled in time)
 
 
 class Executor:
@@ -187,7 +188,9 @@ class Executor:
         for order in working:
             play = self._play_for(order) if order.order_id not in self._pending else None
             if play is not None:
-                self._pending[order.order_id] = _Pending(order.order_id, play, "entry", qty=_remaining(order))
+                # its clock starts again from here: a day-trade entry gets entry_timeout_min more minutes
+                self._pending[order.order_id] = _Pending(order.order_id, play, "entry", qty=_remaining(order),
+                                                         submitted_at=dt.datetime.now(dt.timezone.utc))
                 adopted.append({"kind": "entry", "symbol": play.symbol, "order_id": order.order_id,
                                 "play_id": play.id, "qty": _remaining(order)})
         cancelled = self._cancel_extra_exits(working, trades)
@@ -396,19 +399,48 @@ class Executor:
             except Exception:  # noqa: BLE001
                 log.exception("paper poll failed")
 
-        # 2) reconcile tracked live orders
+        # 2) call off the day-trade entries the price has left behind
+        try:
+            self.expire_entries()
+        except Exception:  # noqa: BLE001
+            log.exception("entry time-out check failed")
+
+        # 3) reconcile tracked live orders
         for oid in list(self._pending):
             try:
                 self._on_order_update(self.broker.get_order(oid))
             except Exception:  # noqa: BLE001
                 continue
 
-        # 3) detect broker-side bracket exits (child order filled against an open trade)
+        # 4) detect broker-side bracket exits (child order filled against an open trade)
         try:
             for o in self.broker.list_orders(status="FILLED"):
                 self._maybe_close_from_bracket(o)
         except Exception:  # noqa: BLE001
             pass
+
+    def expire_entries(self, now: Optional[dt.datetime] = None) -> List[str]:
+        """Cancel the day-trade entry orders still working after ``execution.entry_timeout_min``
+        minutes. A limit the price hasn't come to by then is one the price left behind, and a fill
+        later - when the price comes back through it - is the move failing, not the setup (Aziz:
+        never chase, and never let a stale order chase for you). Swing entries keep their DAY life.
+        Returns the ids cancelled; the broker's answer books whatever part filled (_on_unfilled)."""
+        limit = float(getattr(self.cfg, "entry_timeout_min", 0) or 0)
+        if limit <= 0:
+            return []
+        now = now or dt.datetime.now(dt.timezone.utc)
+        out: List[str] = []
+        for oid, p in list(self._pending.items()):
+            if (p.kind != "entry" or p.expired or p.submitted_at is None
+                    or p.play.timeframe is not Timeframe.INTRADAY):
+                continue
+            if (now - p.submitted_at).total_seconds() / 60.0 < limit:
+                continue
+            p.expired = f"not filled within {limit:g} minutes - cancelled rather than chase the price"
+            self._cancel_quietly(oid)
+            log.warning("ENTRY TIMED OUT  %s %s order %s: %s", p.play.symbol, p.play.side.value, oid, p.expired)
+            out.append(oid)
+        return out
 
     def _on_order_update(self, res) -> None:
         p = self._pending.get(res.order_id)
@@ -454,7 +486,7 @@ class Executor:
             self._cancel_quietly(res.order_id)          # an inactive order must stay dead
         what = "is no longer known to the broker" if res.status == "UNKNOWN" else f"was {res.status.lower()}"
         part = f" after {filled:,.0f} of {p.qty:,.0f} shares filled" if filled else ""
-        reason = res.message or "no reason given"
+        reason = p.expired or res.message or "no reason given"
         msg = f"{p.play.symbol} {p.kind} order {res.order_id} {what}{part}: {reason}"
         log.warning("ORDER NOT FILLED  %s", msg)
         self.bus.publish("order.failed", kind=p.kind, order_id=res.order_id, status=res.status,

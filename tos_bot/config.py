@@ -153,6 +153,13 @@ class ExecutionCfg(_Model):
     limit_offset_bps: float = 5.0
     time_in_force: str = "DAY"
     bracket_orders: bool = True
+    entry_timeout_min: int = 10           # a day-trade entry order not filled in this many minutes is cancelled - a
+                                          # fill later, when the price comes back through it, is the move failing
+                                          # (Aziz: never chase); 0 = leave it working for the day like a swing entry
+    max_chase_r: float = 0.25             # an entry is refused once the price has run past the play's entry by more
+                                          # than this share of the distance to the stop - the reward:risk the play was
+                                          # judged on is gone; within it a limit entry is priced off the live quote so
+                                          # it fills now (0 = off)
 
 
 class ExitManagerCfg(_Model):
@@ -187,6 +194,9 @@ class AutopilotCfg(_Model):
     max_new_per_cycle: int = 1
     max_gross_exposure_pct: float = 100.0  # all positions together, as % of equity - 100 = never on margin
     min_confirmations: int = 2            # a day-trade setup must show up in this many scans in a row
+    min_minutes_to_close: int = 30        # no new day trades with fewer minutes than this to the close: Aziz keeps the
+                                          # last half hour for closing, and the exit manager flattens day trades 10
+                                          # minutes before the bell, so a late entry has no time to work (0 = off)
     # the flags Autopilot refuses. Only against_gap removed worse trades on both halves of a year's replay;
     # the others removed trades that did as well or better, so they stay visible on the board but aren't
     # skipped. The replay adds the learnable checks that prove themselves (learned skips).

@@ -570,6 +570,15 @@ shown so you can see where live would stop you.
 Every play's order card shows the **concrete order** — type, limit price, stop
 trigger, TIF and protection mode — and which venue it **routes to**.
 
+**Never chase (Aziz).** At the click — yours or Autopilot's — the live quote is
+checked against the play: once the price has run past the entry by more than
+`execution.max_chase_r` (0.25) of the distance to the stop, the reward:risk the
+play was judged on is gone and the entry is refused. Within that, a limit entry
+is priced off the quote so it fills now instead of waiting for the price to come
+back through the entry — which is the move failing. A day-trade entry still
+working after `execution.entry_timeout_min` (10) minutes is cancelled for the
+same reason; swing entries keep their DAY life.
+
 ---
 
 ## Automatic exit strategy
@@ -620,6 +629,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | **cool off** a ticker after it stops out today | on | `cooldown_after_loss` |
 | **stop for the day** once today's closed trades have lost this % of equity | 2 % | `max_daily_loss_pct` (Aziz's daily maximum loss; 0 = off) |
 | **stop for the day** once the day's realized gain has given back this % of its best | 30 % | `max_giveback_pct` (Aziz: never lose more than 30 % of what the morning made; `giveback_floor_pct` 0.25 % of equity is the smallest gain that counts; 0 = off) |
+| **no new day trades** in the last minutes of the session | 30 | `min_minutes_to_close` (Aziz keeps the last half hour for closing; the exit manager flattens day trades 10 minutes before the bell; 0 = off) |
 | require a catalyst / dry-run | off | `require_catalyst`, `dry_run` |
 
 The filters and the Strategies panel apply to Autopilot too, and it takes no

@@ -61,6 +61,7 @@ class AutoPilot:
         self.giveback_floor_pct: float = float(getattr(cfg, "giveback_floor_pct", 0.25))
         self.max_gross_exposure_pct: float = float(getattr(cfg, "max_gross_exposure_pct", 100.0))
         self.min_confirmations: int = int(getattr(cfg, "min_confirmations", 2))
+        self.min_minutes_to_close: int = int(getattr(cfg, "min_minutes_to_close", 30))
         self.skip_noise: List[str] = [str(n) for n in getattr(cfg, "skip_noise", list(NOISE_LABELS))]
         self.require_proven: bool = bool(getattr(cfg, "require_proven", True))
         self.min_replay_trades: int = int(getattr(cfg, "min_replay_trades", 30))
@@ -98,6 +99,7 @@ class AutoPilot:
             "peak_realized": self._peak_realized,
             "max_gross_exposure_pct": self.max_gross_exposure_pct,
             "min_confirmations": self.min_confirmations,
+            "min_minutes_to_close": self.min_minutes_to_close,
             "skip_noise": list(self.skip_noise),
             "require_proven": self.require_proven,
             "dry_run": self.dry_run,
@@ -117,7 +119,7 @@ class AutoPilot:
             if isinstance(d.get(k), (int, float)):
                 setattr(self, k, float(d[k]))
         for k in ("max_auto_positions", "max_auto_trades_per_day",
-                  "max_per_strategy", "max_new_per_cycle", "min_confirmations"):
+                  "max_per_strategy", "max_new_per_cycle", "min_confirmations", "min_minutes_to_close"):
             if isinstance(d.get(k), int):
                 setattr(self, k, int(d[k]))
         if isinstance(d.get("skip_noise"), list):
@@ -171,6 +173,8 @@ class AutoPilot:
             self.max_giveback_pct = max(0.0, min(100.0, float(kw["max_giveback_pct"])))
         if isinstance(kw.get("min_confirmations"), int):
             self.min_confirmations = max(1, min(10, int(kw["min_confirmations"])))
+        if isinstance(kw.get("min_minutes_to_close"), int):
+            self.min_minutes_to_close = max(0, min(120, int(kw["min_minutes_to_close"])))
         if isinstance(kw.get("skip_noise"), list):
             self.skip_noise = [str(n) for n in kw["skip_noise"] if str(n) in NOISE_LABELS]
         self._persist()
@@ -246,6 +250,7 @@ class AutoPilot:
             "daily_loss_stop": self.stopped_for_the_day,
             "max_gross_exposure_pct": round(self.max_gross_exposure_pct, 1),
             "min_confirmations": self.min_confirmations,
+            "min_minutes_to_close": self.min_minutes_to_close,
             "skip_noise": list(self.skip_noise),
             "learned_skip_noise": self._learned_skips(),
             "noise_labels": NOISE_LABELS,
@@ -473,6 +478,11 @@ class AutoPilot:
             return "noise: " + ", ".join(NOISE_LABELS.get(n, n) for n in noisy)
         if tf == "INTRADAY" and p.confirmations < self.min_confirmations:
             return f"not confirmed yet - seen in {p.confirmations} of {self.min_confirmations} scans in a row"
+        if tf == "INTRADAY" and self.min_minutes_to_close > 0:
+            left = clock.minutes_to_close()
+            if left < self.min_minutes_to_close:
+                return (f"{left:.0f} minutes to the close - a day trade needs {self.min_minutes_to_close} "
+                        "(Aziz keeps the last half hour for closing, and the exit manager flattens before the bell)")
         unproven = self._unproven(p.strategy)
         if unproven:
             return unproven

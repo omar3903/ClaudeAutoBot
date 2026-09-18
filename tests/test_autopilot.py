@@ -101,6 +101,7 @@ def _cfg(**over):
         # cap tests below isolate one cap at a time; keep these wide open
         max_per_strategy=99, max_new_per_cycle=99, cooldown_after_loss=False,
         min_confirmations=1, skip_noise=[], require_proven=False,
+        min_minutes_to_close=0,             # the clock-of-day rule has a test of its own
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -180,6 +181,21 @@ def test_autopilots_own_boxes_cap_what_the_filters_put_on_the_board():
     assert ap.play_types() == ["INTRADAY", "SWING"]
     eng.filters = SimpleNamespace(timeframes=["SWING"])                     # the filter bar still caps it too
     assert ap.play_types() == ["SWING"]
+
+
+def test_no_new_day_trades_in_the_last_minutes_before_the_close(monkeypatch):
+    from tos_bot.execution import autopilot as module
+
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(trade_types=["INTRADAY", "SWING"], min_minutes_to_close=30), bus=SILENT)
+    monkeypatch.setattr(module.clock, "minutes_to_close", lambda ts=None: 20.0)
+    day, swing = mkplay(sym="DAY"), mkplay(sym="SWG", tf=Timeframe.SWING, conf=0.7)
+    _run(ap, day, swing)
+    assert eng.approved_ids() == [swing.id]                                  # the swing trade has all week
+    assert "minutes to the close" in ap.verdict(day) and ap.status()["min_minutes_to_close"] == 30
+    ap.configure(min_minutes_to_close=0)                                     # off: the day trade goes
+    _run(ap, day)
+    assert eng.approved_ids() == [swing.id, day.id]
 
 
 def test_swing_plays_have_a_confidence_floor_of_their_own():
