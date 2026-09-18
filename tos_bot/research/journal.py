@@ -336,6 +336,32 @@ def lessons(day: Mapping[str, Any], mistakes: Sequence[Mapping[str, Any]], shado
 
 
 # ---------------------------------------------------------------- the review
+MIN_FILLS = 5                     # measured fills before the replay's cost assumption is questioned
+
+
+def execution_quality(trades: Sequence[Mapping[str, Any]], assumed_bps: float) -> Dict[str, Any]:
+    """Harris's implementation shortfall over the rolling sessions: what the fills cost against the
+    price at the decision, entries and exits apart, next to what the replay assumes a side costs.
+    A replay that charges less than the account really pays proves setups that lose money."""
+    def mean(key: str) -> Optional[float]:
+        values = [float(t[key]) for t in trades if t.get(key) is not None]
+        return round(sum(values) / len(values), 2) if values else None
+
+    entries = sum(1 for t in trades if t.get("entry_slippage_bps") is not None)
+    exits = sum(1 for t in trades if t.get("exit_slippage_bps") is not None)
+    out: Dict[str, Any] = {"entries": entries, "exits": exits, "entry_slippage_bps": mean("entry_slippage_bps"),
+                           "exit_slippage_bps": mean("exit_slippage_bps"), "spread_bps": mean("spread_bps"),
+                           "assumed_bps": round(float(assumed_bps), 2)}
+    if entries >= MIN_FILLS and exits >= MIN_FILLS:
+        worst = max(out["entry_slippage_bps"] or 0.0, out["exit_slippage_bps"] or 0.0)
+        verdict = ("more than the replay charges - raise replay.slippage_bps or its records flatter the setups"
+                   if worst > assumed_bps * 1.5 else "within what the replay charges")
+        out["note"] = (f"Fills over the last {ROLLING_SESSIONS} sessions: entries paid {out['entry_slippage_bps']:+.1f} bps "
+                       f"and exits {out['exit_slippage_bps']:+.1f} bps against the price at the decision "
+                       f"({entries} and {exits} measured) - {verdict} ({assumed_bps:g} bps a side).")
+    return out
+
+
 def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Sequence[Mapping[str, Any]],
                  rolling: Sequence[Mapping[str, Any]], replay_records: Mapping[str, Mapping[str, Any]],
                  evidence: Mapping[str, Mapping[str, Any]], regime: Optional[Mapping[str, Any]],
@@ -355,11 +381,15 @@ def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Se
     else:
         shadows = shadow_outcomes(plays, bars, day, settings, passes)
     strategies = strategy_table(live_records(rolling), replay_records, evidence, titles)
+    fills = execution_quality(rolling, settings.slippage_bps + settings.commission_bps)
+    notes = lessons(day_stats, mistakes, shadows, strategies, regime, titles, breakeven_at_r)
+    if fills.get("note"):
+        notes.append(fills["note"])
     return {
         "session": day.isoformat(), "created_at": dt.datetime.now(dt.timezone.utc).isoformat(), "regime": regime,
         "day": day_stats, "trades": trade_rows(trades), "mistakes": mistakes, "shadows": shadows,
-        "strategies": strategies, "plays_offered": len(plays),
-        "lessons": lessons(day_stats, mistakes, shadows, strategies, regime, titles, breakeven_at_r),
+        "strategies": strategies, "plays_offered": len(plays), "execution": fills,
+        "lessons": notes,
         "settings": {"skip_noise": list(skip_noise), "min_confirmations": min_confirmations,
                      "costs_bps": {"slippage": settings.slippage_bps, "commission": settings.commission_bps},
                      "rolling_sessions": ROLLING_SESSIONS},

@@ -63,7 +63,7 @@ def test_executor_refuses_to_close_a_position_held_on_another_venue():
 def test_exit_manager_only_manages_trades_on_its_own_venue():
     repo = _Repo([_trade(broker="paper")])                   # stop 98, price 90 -> would stop out
     closed = []
-    ex = SimpleNamespace(close_trade=lambda tid, reason="manual": closed.append(tid) or {"ok": True, "trade": {}},
+    ex = SimpleNamespace(close_trade=lambda tid, reason="manual", **seen: closed.append(tid) or {"ok": True, "trade": {}},
                          pending_exit_trade_ids=set)
     em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=90, ask=90, last=90),
                      cfg=CFG, bus=SILENT, venue="ibkr-live")
@@ -80,7 +80,7 @@ from tos_bot.core.models import Account, Position  # noqa: E402
 
 
 class _ClosingRepo(_Repo):
-    def close_trade(self, tid, exit_price, exit_reason=""):
+    def close_trade(self, tid, exit_price, exit_reason="", decision_price=None):
         self.t[tid].update(status="CLOSED", exit_price=exit_price, exit_reason=exit_reason)
         return dict(self.t[tid])
 
@@ -126,7 +126,7 @@ def test_exit_manager_reports_a_missing_position_once():
     events = []
     bus = SimpleNamespace(publish=lambda topic, **kw: events.append(topic))
     tries = []
-    ex = SimpleNamespace(close_trade=lambda tid, reason="manual": tries.append(tid) or
+    ex = SimpleNamespace(close_trade=lambda tid, reason="manual", **seen: tries.append(tid) or
                          {"ok": False, "not_held": True, "reason": "gone"}, pending_exit_trade_ids=set)
     em = ExitManager(_Repo([_trade()]), ex, quote_fn=lambda s: Quote(symbol=s, bid=90, ask=90, last=90),
                      cfg=CFG, bus=bus, venue="paper")

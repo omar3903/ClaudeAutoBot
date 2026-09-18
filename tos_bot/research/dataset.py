@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 
 #: the columns before the features, in order
 ROW_KEYS = ("source", "id", "run_id", "symbol", "strategy", "timeframe", "side", "entered_at", "exited_at",
-            "exit_reason", "held_out", "r", "win", "mfe_r")
+            "exit_reason", "held_out", "r", "win", "mfe_r", "entry_slippage_bps", "exit_slippage_bps", "spread_bps")
 #: the features that aren't already row keys (strategy, timeframe and side are both)
 FEATURE_COLUMNS = tuple(k for k in FEATURE_KEYS if k != "schema" and k not in ROW_KEYS)
 COLUMNS = ROW_KEYS + FEATURE_COLUMNS + ("schema",)
@@ -53,7 +53,8 @@ def live_rows(trades: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
         rows.append(_row("live", ctx, id=t["id"], run_id=None, symbol=t["symbol"], strategy=t["strategy"],
                          timeframe=t["timeframe"], side=t["side"], entered_at=t.get("entry_time"),
                          exited_at=t.get("exit_time"), exit_reason=t.get("exit_reason"), held_out=False,
-                         r=t.get("r_multiple"), mfe_r=_mfe_r(t)))
+                         r=t.get("r_multiple"), mfe_r=_mfe_r(t), entry_slippage_bps=t.get("entry_slippage_bps"),
+                         exit_slippage_bps=t.get("exit_slippage_bps"), spread_bps=t.get("spread_bps")))
     return rows
 
 

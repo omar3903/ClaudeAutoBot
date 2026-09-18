@@ -156,6 +156,9 @@ class ExecutionCfg(_Model):
     entry_timeout_min: int = 10           # a day-trade entry order not filled in this many minutes is cancelled - a
                                           # fill later, when the price comes back through it, is the move failing
                                           # (Aziz: never chase); 0 = leave it working for the day like a swing entry
+    max_spread_r: float = 0.10            # on live quotes, an entry is refused when the bid-ask spread is more than this
+                                          # share of the distance to the stop: the spread is the price of immediacy
+                                          # (Harris), paid on the way in and again on the way out (0 = off)
     max_chase_r: float = 0.25             # an entry is refused once the price has run past the play's entry by more
                                           # than this share of the distance to the stop - the reward:risk the play was
                                           # judged on is gone; within it a limit entry is priced off the live quote so

@@ -100,6 +100,10 @@ def trade_to_dict(t: Trade) -> Dict[str, Any]:
         "submitted_at": t.submitted_at.isoformat() if getattr(t, "submitted_at", None) else None,
         "entry_context": getattr(t, "entry_context", None),
         "mfe_at": t.mfe_at.isoformat() if getattr(t, "mfe_at", None) else None,
+        "decision_price": _f(getattr(t, "decision_price", None)), "spread_bps": _f(getattr(t, "spread_bps", None)),
+        "entry_slippage_bps": _f(getattr(t, "entry_slippage_bps", None)),
+        "exit_decision_price": _f(getattr(t, "exit_decision_price", None)),
+        "exit_slippage_bps": _f(getattr(t, "exit_slippage_bps", None)),
         "stop_price": _f(t.stop_price), "target_price": _f(t.target_price),
         "initial_stop_price": _f(getattr(t, "initial_stop_price", None)),
         "initial_target_price": _f(getattr(t, "initial_target_price", None)),
@@ -179,9 +183,11 @@ class Repository:
         broker_order_id: str = "", commission: float = 0.0,
         order_type: str = "LIMIT", order_session: str = "REGULAR",
         entry_context: Optional[Dict[str, Any]] = None, submitted_at: Optional[dt.datetime] = None,
+        decision: Optional[Dict[str, Any]] = None,
     ) -> str:
         """``entry_context``: the play's features at the fill (research/features.py), the row a
-        model learns from; ``submitted_at``: when the entry order went out."""
+        model learns from; ``submitted_at``: when the entry order went out; ``decision``: the quote
+        at the decision (``mid``, ``spread_bps``), which the fill is measured against."""
         tid = f"trd_{play.id.split('_', 1)[-1]}"
         now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
@@ -206,6 +212,7 @@ class Repository:
                 entry_price=fill_price,
                 entry_time=now, order_type=order_type, order_session=order_session,
                 submitted_at=_naive(submitted_at), entry_context=entry_context,
+                **_shortfall(decision, fill_price, play.side.value),
                 stop_price=None if pair_id else play.stop,
                 target_price=None if pair_id else play.primary_target,
                 target2_price=None if (pair_id or len(play.targets) < 2) else float(play.targets[1]),
@@ -262,10 +269,11 @@ class Repository:
     def close_trade(
         self, trade_id: str, exit_price: float, exit_reason: str = "manual",
         commission: float = 0.0, exit_qty: Optional[float] = None,
-        exit_time: Optional[dt.datetime] = None,
+        exit_time: Optional[dt.datetime] = None, decision_price: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """``exit_time``: when the position actually closed, for a fill learned after the fact
-        (default: now)."""
+        (default: now); ``decision_price``: the price that triggered the exit, which the fill is
+        measured against."""
         now = (exit_time.astimezone(dt.timezone.utc).replace(tzinfo=None) if exit_time and exit_time.tzinfo
                else exit_time) or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
@@ -283,6 +291,9 @@ class Repository:
             t.exit_price = exit_price
             t.exit_time = now
             t.exit_reason = exit_reason
+            if decision_price and float(decision_price) > 0:
+                t.exit_decision_price = float(decision_price)
+                t.exit_slippage_bps = round((float(decision_price) - exit_price) * sign / float(decision_price) * 1e4, 2)
             t.fees = fees
             t.realized_pl = pl
             basis = float(t.entry_price) * basis_qty
@@ -704,6 +715,18 @@ def _play_row(p: Play) -> PlayLog:
         probability=float(getattr(p, "probability", 0.5) or 0.0),
         status=p.status.value if hasattr(p.status, "value") else str(p.status),
     )
+
+
+def _shortfall(decision: Optional[Dict[str, Any]], fill_price: float, side: str) -> Dict[str, Any]:
+    """Harris's implementation shortfall at the entry: the fill against the mid of the quote the
+    decision was made on, in basis points (+ = paid)."""
+    mid = float((decision or {}).get("mid") or 0.0)
+    if mid <= 0:
+        return {}
+    sign = 1.0 if side == "LONG" else -1.0
+    spread = (decision or {}).get("spread_bps")
+    return {"decision_price": mid, "spread_bps": float(spread) if spread is not None else None,
+            "entry_slippage_bps": round((float(fill_price) - mid) * sign / mid * 1e4, 2)}
 
 
 def sim_to_dict(t: SimTradeLog) -> Dict[str, Any]:

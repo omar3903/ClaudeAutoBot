@@ -217,3 +217,25 @@ def test_the_training_set_joins_the_three_populations(repo, tmp_path):
     path = dataset.write_csv(rows, tmp_path / "set.csv")
     lines = path.read_text(encoding="utf-8").splitlines()
     assert lines[0].split(",") == list(dataset.COLUMNS) and len(lines) == len(rows) + 1
+
+
+def test_a_trade_keeps_what_its_fills_cost_against_the_price_at_the_decision(repo):
+    from tos_bot.research.journal import execution_quality
+
+    p = _play()
+    tid = repo.open_trade(p, 100.06, 10, "paper", decision={"mid": 100.0, "spread_bps": 4.0, "live": True})
+    opened = repo.get_trade(tid)
+    assert opened["decision_price"] == 100.0 and opened["spread_bps"] == 4.0
+    assert abs(opened["entry_slippage_bps"] - 6.0) < 1e-6                      # a long paid 6 bps over the mid
+    closed = repo.close_trade(tid, 103.95, exit_reason="target", decision_price=104.0)
+    assert closed["exit_decision_price"] == 104.0 and abs(closed["exit_slippage_bps"] - 4.81) < 0.01
+    plain = repo.open_trade(_play(), 50.0, 10, "paper")                        # no quote seen: nothing measured
+    assert repo.get_trade(plain)["entry_slippage_bps"] is None
+
+    row = {"entry_slippage_bps": 9.0, "exit_slippage_bps": 12.0, "spread_bps": 5.0}
+    quiet = execution_quality([row] * 3, assumed_bps=6.0)
+    assert quiet["entries"] == 3 and "note" not in quiet                       # too few fills to say anything
+    told = execution_quality([row] * 6, assumed_bps=6.0)
+    assert "more than the replay charges" in told["note"] and told["exit_slippage_bps"] == 12.0
+    fine = execution_quality([{**row, "entry_slippage_bps": 3.0, "exit_slippage_bps": 5.0}] * 6, assumed_bps=6.0)
+    assert "within what the replay charges" in fine["note"]

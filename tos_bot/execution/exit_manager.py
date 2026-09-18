@@ -107,13 +107,16 @@ class ExitManager:
         return float(px) if px else None
 
     def _close(self, tid: str, reason: str, qty: Optional[float] = None,
-               after_fill: Optional[Dict[str, float]] = None) -> Optional[Dict[str, Any]]:
-        """Send the exit - the whole position, or with ``qty`` the part taken off at the first target."""
+               after_fill: Optional[Dict[str, float]] = None, seen: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """Send the exit - the whole position, or with ``qty`` the part taken off at the first target.
+        ``seen``: the price that triggered it, which the fill is measured against."""
         tries, next_at = self._tries.get(tid, (0, 0.0))
         now = time.monotonic()
         if now < next_at:
             return None                     # the last exit didn't take - wait before sending another
         extra = {"qty": qty, "after_fill": after_fill} if qty is not None else {}
+        if seen:
+            extra["decision_price"] = float(seen)
         out = self.executor.close_trade(tid, reason=reason, **extra) or {}
         if out.get("not_held"):
             # nothing to sell: say it once; the engine's broker check removes the record once confirmed
@@ -217,19 +220,19 @@ class ExitManager:
         if work_stop:
             if (side == "LONG" and px <= float(work_stop)) or (side == "SHORT" and px >= float(work_stop)):
                 moved = init_stop is not None and abs(float(work_stop) - float(init_stop)) > 1e-6
-                return self._close(t["id"], "trailing-stop" if moved else "stop")
+                return self._close(t["id"], "trailing-stop" if moved else "stop", seen=px)
         if target:
             if (side == "LONG" and px >= float(target)) or (side == "SHORT" and px <= float(target)):
                 part = self._scale_out(t, managed, entry, sign, risk_ps)
                 if part is not None:
-                    return self._close(t["id"], "target-1", qty=part[0], after_fill=part[1])
-                return self._close(t["id"], "target")
+                    return self._close(t["id"], "target-1", qty=part[0], after_fill=part[1], seen=px)
+                return self._close(t["id"], "target", seen=px)
 
         # --- 2. time / session exits ------------------------------- #
         flat_min = float(getattr(self.cfg, "flatten_intraday_before_close_min", 10) or 0)
         if managed and t.get("timeframe") == "INTRADAY" and flat_min > 0:
             if clock.minutes_to_close() <= flat_min:
-                return self._close(t["id"], "eod-flatten")
+                return self._close(t["id"], "eod-flatten", seen=px)
 
         max_hold = int(getattr(self.cfg, "max_swing_hold_days", 0) or 0)
         if managed and max_hold > 0 and t.get("timeframe") == "SWING" and t.get("entry_time"):
@@ -237,7 +240,7 @@ class ExitManager:
                 et = dt.datetime.fromisoformat(t["entry_time"])
                 age_days = (dt.datetime.utcnow() - et.replace(tzinfo=None)).days
                 if age_days >= max_hold:
-                    return self._close(t["id"], "time-stop")
+                    return self._close(t["id"], "time-stop", seen=px)
             except Exception:  # noqa: BLE001
                 pass
 
