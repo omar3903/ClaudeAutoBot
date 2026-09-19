@@ -242,9 +242,10 @@ def test_no_fill_when_the_next_open_has_already_run_away():
     assert _replay([(101.0, 101.1, 100.9, 101.0)]) == []
 
 
-def _t(r, noise=(), confirmed=True, strategy="s"):
+def _t(r, noise=(), confirmed=True, strategy="s", entry_rule="first"):
     return SimTrade(strategy=strategy, symbol="X", side="LONG", timeframe="INTRADAY", entered_at="",
-                    exited_at="", entry=1.0, exit=1.0, r=r, exit_reason="x", noise=list(noise), confirmed=confirmed)
+                    exited_at="", entry=1.0, exit=1.0, r=r, exit_reason="x", noise=list(noise), confirmed=confirmed,
+                    entry_rule=entry_rule)
 
 
 def test_a_record_shows_win_rate_expectancy_profit_factor_and_the_worst_drawdown():
@@ -263,10 +264,48 @@ def test_the_noise_report_tells_a_check_that_removes_losers_from_one_that_remove
 
 
 def test_a_strategy_record_counts_only_the_trades_autopilot_would_have_taken():
-    trades = [_t(-1.0, ["against_trend"]), _t(1.0), _t(-1.0, confirmed=False), _t(2.0, strategy="other")]
+    on_sight = [_t(-1.0, ["against_trend"]), _t(1.0), _t(-1.0, confirmed=False), _t(2.0, strategy="other")]
+    its_way = [_t(0.5, entry_rule="second"), _t(-0.5, ["against_trend"], entry_rule="second")]
+    trades = on_sight + its_way
+    # asking for two scans in a row, Autopilot's record is the entries made after two bars - not the ones on sight
     records = strategy_records(trades, skip_noise=["against_trend"], min_confirmations=2)
-    assert records["s"]["trades"] == 1 and records["s"]["expectancy_r"] == 1.0
-    assert strategy_records(trades)["s"]["trades"] == 3
+    assert records["s"]["trades"] == 1 and records["s"]["expectancy_r"] == 0.5 and "other" not in records
+    # taking plays on sight, it is the entries on sight; and the record of every trade counts each setup once
+    assert strategy_records(trades, skip_noise=["against_trend"])["s"]["expectancy_r"] == 0.0
+    assert strategy_records(trades)["s"]["trades"] == 3 and strategy_records(trades)["other"]["trades"] == 1
+    swing = SimTrade(strategy="w", symbol="X", side="LONG", timeframe="SWING", entered_at="", exited_at="", entry=1.0,
+                     exit=1.0, r=1.0, exit_reason="x")
+    assert strategy_records([swing], min_confirmations=2)["w"]["trades"] == 1        # a swing trade has one way in
+    assert noise_report(trades)["against_trend"]["removes"] == 1                      # measured on the entries on sight
+
+
+class _LongWhileQuiet(Strategy):
+    """Shows on every bar from the fifth on: stop 1 below the close, target 2 above."""
+
+    key, kind, timeframe, title, thesis = "long_while_quiet", StrategyKind.TECHNICAL, Timeframe.INTRADAY, "Test", "t"
+
+    def generate(self, ctx):
+        today = ctx.today_intraday()
+        if today is None or len(today) < 6:
+            return []
+        entry = float(today["close"].iloc[-1])
+        play = self._mk_play(ctx, Side.LONG, entry, entry - 1.0, [entry + 2.0], 0.7, "r", "d", {}, tags=["intraday"])
+        return [play] if play else []
+
+
+def test_a_day_setup_is_also_entered_the_way_autopilot_enters_it_after_two_bars_running():
+    # the setup shows at the close of bars 5, 6, 7...: on sight it fills at bar 6's open, Autopilot's way at bar 7's
+    bars = FLAT + [(100.0, 100.3, 99.9, 100.2), (100.4, 100.6, 100.3, 100.5), (100.5, 103.0, 100.4, 102.8)]
+    trades = replay_intraday([_LongWhileQuiet()], "RPL", _session(bars), _daily(), EXACT, QUIET)
+    first = [t for t in trades if t.entry_rule == "first"]
+    second = [t for t in trades if t.entry_rule == "second"]
+    assert first[0].entry == pytest.approx(100.0) and first[0].features["confirmations"] == 1
+    assert len(second) == 1                                                   # once a session, like a settled setup
+    assert second[0].entry == pytest.approx(100.4) and second[0].features["confirmations"] == 2 and second[0].confirmed
+    assert pd.Timestamp(second[0].entered_at) > pd.Timestamp(first[0].entered_at)
+    # a setup that shows on one bar only is never entered Autopilot's way
+    once = replay_intraday([_LongAtBar()], "RPL", _session(bars), _daily(), EXACT, QUIET)
+    assert [t.entry_rule for t in once] == ["first"]
 
 
 def test_the_replay_runs_in_the_background_downloads_each_session_once_and_keeps_its_results(tmp_path):

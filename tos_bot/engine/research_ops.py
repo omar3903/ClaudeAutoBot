@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from ..core.models import Play
 from ..research.history import replay_symbols
+from ..research.in_play import in_play
 from ..research.replay import ReplaySettings
 from ..research.journal import live_records
 from ..research.weights import evidence_multiplier, pooled_odds
@@ -47,13 +48,27 @@ class ResearchOps:
         swing_sessions = cfg.replay.swing_sessions if swing_sessions is None else swing_sessions
         deep = list(dict.fromkeys(list(symbols["swing"]) + list(symbols["intraday"]) + [BENCHMARK]))
         through = schedule.last_completed_session(clock.now_ny())
+        sessions = max(5, min(120, int(sessions)))
+        wl, day_stocks = self.scanner.watchlist, int(cfg.replay.day_stocks or 0)
+        universe = list(wl.leaders(0) or symbols["swing"]) if day_stocks > 0 else []
+
+        def stocks_in_play(progress):
+            """Each stock's sessions in play, as the morning scan would have picked them (research/in_play.py)."""
+            last = clock.prev_trading_day(clock.session_date())
+            return in_play(self.md.daily_frame, universe, clock.last_n_sessions(last, sessions), hot=day_stocks,
+                           gappers=int(cfg.replay.day_gappers or 0), prefilter=cfg.scanner.prefilter,
+                           min_gap_pct=float(cfg.scanner.gapper_min_gap_pct), watch=int(cfg.scanner.gapper_symbols),
+                           progress=progress)
+
         return self.replay.start(
             strategies=self.scanner.strategies, source=self.md.source, daily_frame=self.md.deep_frame,
             prepare=lambda progress: self.md.deepen_daily(deep, through, self.scanner.con_ids(deep), progress),
             intraday_symbols=symbols["intraday"], swing_symbols=symbols["swing"],
-            sessions=max(5, min(120, int(sessions))), swing_sessions=max(20, min(1250, int(swing_sessions))),
+            sessions=sessions, swing_sessions=max(20, min(1250, int(swing_sessions))),
+            in_play=stocks_in_play if universe else None,
             settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay, cfg.risk.min_reward_risk),
-            noise=NoiseSettings.from_config(cfg.noise), con_ids=self.scanner.con_ids(symbols["intraday"]),
+            noise=NoiseSettings.from_config(cfg.noise),
+            con_ids=self.scanner.con_ids(list(symbols["intraday"]) + universe),
             market=self._regime_history, earnings=self.earnings.times if cfg.signals.enabled else None,
             pairs=self._pair_replay_inputs() if cfg.pairs.enabled else None,
             held_out_fraction=float(cfg.replay.held_out_fraction),

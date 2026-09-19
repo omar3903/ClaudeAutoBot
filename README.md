@@ -946,6 +946,32 @@ an older `config.yaml` doesn't list them):
 
 ### The replay — judged the way Chan judges a backtest
 
+**Day trades are replayed on the stocks that were in play, entered the way Autopilot enters.**
+A day-trade setup only ever sees the morning's hot list, so each past session is replayed on
+the stocks the scan would have picked *that morning* - the `replay.day_stocks` (40) hottest by
+daily heat as of the session before, plus the `replay.day_gappers` (10) biggest opening gaps
+among the watchlist (`research/in_play.py`; on a real morning it picks the scanner's own top 40,
+name for name). Replaying sixty sessions on *today's* hot list, as it did before, tests
+something else: today's names are hot because of what they have just done, which hands a
+momentum setup its own hindsight, and on most of those sessions no scan would have shown them.
+Their 5-minute candles are downloaded for those sessions only (each request brings a session and
+the four before it, what a live scan has in hand) and kept, so a later replay fetches only the
+new sessions; `day_stocks: 0` brings the old way back.
+
+Every day setup is followed twice: **entered on sight** (the record of all trades) and **entered
+after it has shown two bars in a row**, one bar later and once a session per setup - which is how
+Autopilot enters when it asks a day trade to be seen in two scans running. Autopilot's record,
+the one the proof rule reads, is built from the way in it really uses. Before, nearly every
+replayed day trade was entered on sight, so 27 of 1,466 counted and no day setup could ever
+reach the 30 trades proof asks for.
+
+What the day-trade replay still can't know: it reads 5-minute candles, so a stop and a target
+inside one candle count as the stop, fills are the next candle's open with a flat slippage, the
+spread and size of a thin stock aren't modelled, and the names the wide scan adopts mid-session
+aren't reproduced. It is good at throwing out a setup that loses; a setup it likes still has to
+show it on paper with real-time data - which is why real trades count double in the evidence
+weights and replace the replayed ones in the sizing once there are 30.
+
 **Strategies → Run replay** walks recorded candles the way the scans see them and
 follows every play the way the automatic exits would. Its settings are in
 `config/config.yaml → replay`:

@@ -92,7 +92,11 @@ function replayHTML() {
     ? `<span class="muted">${escapeHtml(rp.progress.stage)} ${rp.progress.done}/${rp.progress.total}…</span>` : "";
   const heldFrom = rp.held_out_from || {}, costs = rp.costs || {};
   const when = rp.ran_at
-    ? `Last replay ${escapeHtml(new Date(rp.ran_at).toLocaleString())}: ${rp.trade_count} simulated trades — day-trade setups over the last ${rp.sessions} sessions, swing setups over ${rp.swing_sessions}.` +
+    ? `Last replay ${escapeHtml(new Date(rp.ran_at).toLocaleString())}: ${rp.trade_count} simulated trades — day-trade setups over the last ${rp.sessions} sessions` +
+      (rp.intraday_stock_days
+        ? ` on the stocks in play each morning (${rp.intraday_stock_days} stock-days, ${rp.intraday_symbols} stocks), entered on sight and, for Autopilot's record, after two bars in a row`
+        : (rp.intraday_symbols ? ` on ${rp.intraday_symbols} stocks` : "")) +
+      `, swing setups over ${rp.swing_sessions}.` +
       (heldFrom.INTRADAY || heldFrom.SWING ? ` Held out to test on: day trades from ${escapeHtml(heldFrom.INTRADAY || "–")}, swing trades from ${escapeHtml(heldFrom.SWING || "–")}.` : "") +
       (costs.commission_bps != null ? ` Costs: ${num(costs.slippage_bps, 1)} bps slippage on market fills, ${num(costs.commission_bps, 1)} bps commission on every fill.` : "")
     : "No replay yet. Autopilot only trades a strategy once the replay has proven it.";
@@ -106,7 +110,7 @@ function replayHTML() {
   return `<div class="replay-box">
     <div class="group-title">Replay</div>
     <p class="muted">${when} A noise check earns its place when the trades it removes did worse than the ones it keeps.</p>
-    <div class="row-gap"><label title="60 gives most setups the 30+ trades a record needs, with the latest third held out">Day-trade sessions <input type="number" id="replay-sessions" min="5" max="120" step="1" value="${rp.sessions || (rp.defaults || {}).sessions || 60}"></label>
+    <div class="row-gap"><label title="Each session is replayed on the stocks that were in play that morning - the scan's hottest as of the session before, and the day's biggest gaps (replay.day_stocks, replay.day_gappers). The first run downloads their 5-minute candles, about a request a stock-day; after that only new sessions. The latest third is held out">Day-trade sessions <input type="number" id="replay-sessions" min="5" max="120" step="1" value="${rp.sessions || (rp.defaults || {}).sessions || 60}"></label>
       <label title="As far back as the long daily history goes - three years by default (replay.daily_years). The first replay downloads it for the stocks it runs on; after that it costs nothing">Swing sessions <input type="number" id="replay-swing" min="20" max="1250" step="10" value="${Math.max(rp.swing_sessions || 0, (rp.defaults || {}).swing_sessions || 250)}"></label>
       <button class="mini lockable" id="replay-run" ${rp.running ? "disabled" : ""}>${rp.running ? "Replaying…" : "Run replay"}</button> ${progress}</div>
     ${noise}
