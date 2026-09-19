@@ -276,6 +276,8 @@ class AutoPilot:
             "learned_skip_noise": self._learned_skips(),
             "noise_labels": NOISE_LABELS,
             "require_proven": self.require_proven,
+            "proof_required": self.proof_required,          # what is in force: always True in Live
+            "proof_forced": self.proof_required and not self.require_proven,
             "min_replay_trades": self.min_replay_trades,
             "min_replay_expectancy_r": self.min_replay_expectancy_r,
             "proof_p_value": self.proof_p_value,
@@ -610,9 +612,16 @@ class AutoPilot:
         gate = self._last_reason.get(p.id) or self._pre_gate(p, float(getattr(acct, "equity", 0.0) or 0.0))
         return f"won't take it: {gate}" if gate else "passes its checks - it can take it on the next pass"
 
+    @property
+    def proof_required(self) -> bool:
+        """With real money Autopilot only trades strategies the replay has proven - always. On paper
+        it is the ``require_proven`` setting: practising unproven setups there costs nothing, and
+        their trades are what the records and the learned model are built from."""
+        return True if getattr(self.engine, "mode", "paper") == "live" else self.require_proven
+
     def _unproven(self, strategy: str) -> Optional[str]:
         """Why a strategy's replayed record isn't good enough to auto-trade, if it isn't."""
-        return self.proof_missing(strategy) if self.require_proven else None
+        return self.proof_missing(strategy) if self.proof_required else None
 
     def proof_missing(self, strategy: str) -> Optional[str]:
         """Why a strategy's replayed record doesn't prove it, whether or not Autopilot asks for proof."""

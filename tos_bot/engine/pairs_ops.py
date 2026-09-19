@@ -228,7 +228,7 @@ class PairsOps:
         status = ap.status()
         if not (status["enabled"] and status["effective"] and "PAIRS" in ap.trade_types):
             return
-        if ap.require_proven and ap.proof_missing(PAIRS_KEY):
+        if ap.proof_required and ap.proof_missing(PAIRS_KEY):
             return
         if self.repo.pair_trades_opened_on(clock.session_date()) >= int(cfg.max_new_per_day):
             return

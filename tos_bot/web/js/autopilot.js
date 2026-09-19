@@ -56,6 +56,7 @@ function toggle() {
 
 function configure() {
   const ap = S.state.autopilot || {};
+  const live = S.state.mode === "live";
   openModal({
     title: "Autopilot settings",
     bodyHTML: `<div class="ap-form">
@@ -94,7 +95,7 @@ function configure() {
       <label data-term="noise">Skip plays flagged as noise</label>
       <div class="ap-noise">${Object.entries(ap.noise_labels || {}).map(([flag, label]) =>
         `<label><input type="checkbox" class="ap-noise-check" value="${escapeHtml(flag)}" ${(ap.skip_noise || []).includes(flag) ? "checked" : ""}> ${escapeHtml(label)}</label>`).join("")}</div>
-      <label><input type="checkbox" id="ap-proven" ${ap.require_proven !== false ? "checked" : ""}> Only trade strategies the replay has proven (Strategies panel)</label>
+      <label title="With real money this is always on. On paper it is your choice: unticked, Autopilot practises the unproven setups too - at a quarter of the usual risk - and every trade is recorded with the settings it was taken on."><input type="checkbox" id="ap-proven" ${ap.require_proven !== false || live ? "checked" : ""} ${live ? "disabled" : ""}> Only trade strategies the replay has proven (Strategies panel)${live ? " - always on in Live" : (ap.require_proven === false ? " - off: unproven setups trade at practice size (a quarter of the risk)" : "")}</label>
       <label title="The model learns, every night, the odds that a play pays from what happened to plays like it - live, not taken, and replayed. It only has a say while its own walk-forward test calls it usable.">The learned model
         <select id="ap-model">
           <option value="shadow" ${(ap.model_mode || "shadow") === "shadow" ? "selected" : ""}>shadow - log its odds, never act on them</option>
@@ -129,7 +130,7 @@ function configure() {
         max_daily_loss_pct: parseFloat($("#ap-dayloss").value),
         max_giveback_pct: parseFloat($("#ap-giveback").value),
         skip_noise: $$(".ap-noise-check").filter(c => c.checked).map(c => c.value),
-        require_proven: $("#ap-proven").checked,
+        ...(live ? {} : { require_proven: $("#ap-proven").checked }),      // in Live the box is locked on; the paper choice is kept
         model_mode: $("#ap-model").value,
         cooldown_after_loss: $("#ap-cooldown").checked,
         dry_run: $("#ap-dry").checked,
