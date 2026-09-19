@@ -275,6 +275,9 @@ class DailyReviewLog(Base):
     total_r: Mapped[float] = mapped_column(sa.Float, default=0.0)
     realized_pl: Mapped[float] = mapped_column(MONEY, default=0)
     mistakes: Mapped[int] = mapped_column(sa.Integer, default=0)
+    #: positions opened that session, and where the ones still open stood at the review, in R
+    opened: Mapped[int] = mapped_column(sa.Integer, default=0)
+    open_r: Mapped[float] = mapped_column(sa.Float, default=0.0)
     review: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
 
 

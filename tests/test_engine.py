@@ -740,6 +740,23 @@ def test_the_session_review_keeps_each_trade_with_what_it_was_taken_on(engine):
     assert engine.journal_state()["days"][0]["session"] == today.isoformat()
 
 
+def test_the_session_review_covers_positions_opened_and_still_open(engine, monkeypatch):
+    from tos_bot.core.models import Quote
+
+    today = clock.now_ny().date()
+    monkeypatch.setattr(clock, "session_date", lambda *a, **k: today)       # on a weekend too, today is the session reviewed
+    _open(engine, "AAPL")                                                   # entered at 100 with its stop at 95, still open
+    assert engine._review_marks(today, engine.repo.trades_opened_between(today, today)) == {}   # no price source: no mark
+    engine.md.attach(fakes.FakeGateway(["AAPL"]))
+    monkeypatch.setattr(engine.md, "quote", lambda s: Quote(symbol=s, bid=102.4, ask=102.6, last=102.5))
+    out = engine.review_session(today)
+    day, [row] = out["review"]["day"], out["review"]["opened"]
+    assert out["ok"] and (day["trades"], day["opened"], day["still_open"], day["open_r"]) == (0, 1, 1, 0.5)
+    assert (row["symbol"], row["mark"], row["open_r"], row["open_pl"]) == ("AAPL", 102.5, 0.5, 12.5)
+    listed = engine.journal_state()["days"][0]
+    assert (listed["trades"], listed["opened"], listed["open_r"]) == (0, 1, 0.5) and "1 positions opened" in out["note"]
+
+
 def test_an_entry_never_chases_the_price_past_the_play(engine, monkeypatch):
     from tos_bot.core.models import Quote
 

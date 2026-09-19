@@ -86,6 +86,32 @@ def test_the_lessons_and_the_strategies_real_record_against_the_replay():
     assert drifting["drifting"] and live_records(losing)["s"]["trades"] == 12
 
 
+def _opened(tid, symbol, *, status="OPEN", noise=(), unproven=None, r=None):
+    return {"id": tid, "symbol": symbol, "side": "LONG", "strategy": "s", "timeframe": "SWING", "broker": "paper",
+            "status": status, "entry_time": f"{DAY}T18:00:00", "entry_price": 100.0, "initial_stop_price": 98.0,
+            "stop_price": 98.0, "target_price": 106.0, "quantity": 10.0, "initial_quantity": 10.0, "r_multiple": r,
+            "realized_pl": None if r is None else 20.0 * r, "exit_reason": None if r is None else "target",
+            "play": {"rationale": "x", "evidence": {"spark": [1], "at_entry": {
+                "noise": list(noise), "confirmations": 3, "unproven": unproven}}}}
+
+
+def test_a_session_whose_entries_are_all_still_open_is_not_a_session_without_trades():
+    opened = [_opened("o1", "AAA"), _opened("o2", "BBB", noise=["against_trend"], unproven="only 3 replayed trades"),
+              _opened("o3", "CCC"), _opened("o4", "DDD", status="CLOSED", r=2.0)]
+    review = _review(trades=[], rolling=[], opened=opened, marks={"AAA": 103.0, "BBB": 99.0, "DDD": 50.0})
+    day = review["day"]
+    assert (day["trades"], day["opened"], day["still_open"], day["open_r"], day["open_pl"]) == (0, 4, 3, 1.0, 20.0)
+    rows = {row["symbol"]: row for row in review["opened"]}
+    assert [rows[s]["open_r"] for s in ("AAA", "BBB", "CCC")] == [1.5, -0.5, None]      # no price, no standing
+    assert rows["AAA"]["risk"] == 20.0 and rows["AAA"]["still_open"] and "spark" not in rows["AAA"]["evidence"]
+    assert (rows["DDD"]["still_open"], rows["DDD"]["r"], rows["DDD"]["open_r"]) == (False, 2.0, None)
+    # what an entry was taken on is judged the day it is taken
+    assert {(m["trade_id"], m["kind"]) for m in review["mistakes"]} == {("o2", "took_noise"), ("o2", "unproven_strategy")}
+    assert review["lessons"][0] == "No trades closed this session."
+    assert review["lessons"][1] == "4 positions opened this session; 3 still open, standing at +1.00R in all at the review."
+    assert _review()["opened"] == [] and _review()["day"]["opened"] == 0
+
+
 def test_the_review_is_due_for_today_after_the_close_and_for_the_session_before_until_then():
     def at(stamp):
         return dt.datetime.fromisoformat(stamp).replace(tzinfo=clock.NY)
@@ -129,7 +155,16 @@ def test_the_repository_keeps_what_the_review_needs(repo):
     assert trade["r_multiple"] == 1.0 and trade["play"]["evidence"]["at_entry"]["confirmations"] == 3
     [row] = [r for r in repo.plays_on(today) if r["id"] == play.id]
     assert row["noise"] == ["against_trend"] and row["confirmations"] == 3
-    repo.save_review(today, {"session": today.isoformat(), "day": {"trades": 1, "total_r": 1.0, "realized_pl": 10.0},
-                             "mistakes": [], "lessons": ["y"]})
+    held = Play(symbol="JRNH", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.SWING, entry=100.0, stop=99.0, targets=[102.0])
+    held.evidence["at_entry"] = {"noise": [], "confirmations": 5}
+    repo.record_play(held)
+    still = repo.open_trade(held, 100.0, 10, "paper")
+    entered = {t["id"]: t for t in repo.trades_opened_between(today, today)}
+    assert entered[tid]["status"] == "CLOSED" and entered[still]["status"] == "OPEN"
+    assert entered[still]["play"]["evidence"]["at_entry"]["confirmations"] == 5
+    repo.save_review(today, {"session": today.isoformat(), "mistakes": [], "lessons": ["y"],
+                             "day": {"trades": 1, "total_r": 1.0, "realized_pl": 10.0, "opened": 2, "open_r": 0.7}})
     assert repo.get_review(today)["lessons"] == ["y"]
-    assert any(r["session"] == today.isoformat() and r["trades"] == 1 for r in repo.list_reviews())
+    assert any(r["session"] == today.isoformat() and (r["trades"], r["opened"], r["open_r"]) == (1, 2, 0.7)
+               for r in repo.list_reviews())

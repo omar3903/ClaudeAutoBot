@@ -103,9 +103,10 @@ class JournalOps:
         cfg = self.settings.config
         day = day or review_day(clock.now_ny(), cfg.journal.review_at)
         trades = [t for t in self.repo.closed_trades_between(day, day) if not t.get("pair_id")]
+        opened = [t for t in self.repo.trades_opened_between(day, day) if not t.get("pair_id")]
         plays = self.repo.plays_on(day)
         pair_trades = self.repo.pair_trades_closed_between(day, day)
-        if not trades and not plays and not pair_trades and not self._movers_ready(day):
+        if not trades and not opened and not plays and not pair_trades and not self._movers_ready(day):
             return {"ok": False, "reason": f"Nothing was offered or traded on {day.isoformat()}."}
         first = min(clock.last_n_sessions(day, ROLLING_SESSIONS))
         ap = self.autopilot
@@ -118,7 +119,7 @@ class JournalOps:
             skip_noise=skipped,
             min_confirmations=ap.min_confirmations, passes=self._passes_checks,
             styles={k: c.style for k, c in REGISTRY.items()}, titles={k: c.title for k, c in REGISTRY.items()},
-            breakeven_at_r=float(cfg.exit_manager.breakeven_at_r))
+            breakeven_at_r=float(cfg.exit_manager.breakeven_at_r), opened=opened, marks=self._review_marks(day, opened))
         if pair_trades:
             review["pairs"] = [{k: r.get(k) for k in ("id", "pair", "side", "opened_at", "closed_at", "entry_z",
                                                    "exit_z_at", "exit_reason", "realized_pl", "r_multiple", "by")}
@@ -130,7 +131,7 @@ class JournalOps:
             earlier = (self.journal.get(day) or {}).get("movers")
             review["movers"] = self._movers(day, review, plays) or (earlier if movers_built({"movers": earlier})
                                                                     else self._movers_pending())
-            if not trades and not plays and not pair_trades and not movers_built(review):
+            if not trades and not opened and not plays and not pair_trades and not movers_built(review):
                 return {"ok": False, "reason": f"Nothing was offered or traded on {day.isoformat()}."}
             if not movers_built(review):
                 self._journal_checked, self._movers_retry_at = None, 0.0     # the journal loop adds them
@@ -147,9 +148,29 @@ class JournalOps:
                     lessons=len(review["lessons"]))
         shadows = review["shadows"]
         return {"ok": True, "review": review,
-                "note": (f"Reviewed {review['session']}: {review['day'].get('trades', 0)} closed trades, "
+                "note": (f"Reviewed {review['session']}: {review['day'].get('opened', 0)} positions opened, "
+                         f"{review['day'].get('trades', 0)} closed trades, "
                          f"{len(review['mistakes'])} things to learn from, {shadows.get('filled', 0)} plays not taken "
                          "followed to their outcome.")}
+
+    def _review_marks(self, day: dt.date, opened) -> Dict[str, float]:
+        """Where each still-open position's stock stood at the review: the session's close once its
+        daily candle is on disk, otherwise - for the session just ended - the latest price."""
+        marks: Dict[str, float] = {}
+        current = day == clock.session_date()
+        for symbol in {t["symbol"] for t in opened if t.get("status") == "OPEN"}:
+            try:
+                frame = self.md.daily_frame(symbol)
+                if frame is not None and len(frame) and (frame.index.date == day).any():
+                    marks[symbol] = float(frame["close"][frame.index.date == day].iloc[-1])
+                elif current and self.md.attached:
+                    q = self.md.quote(symbol)
+                    price = float(q.last or q.mid or 0.0)
+                    if price > 0:
+                        marks[symbol] = price
+            except Exception:  # noqa: BLE001 - a missing price leaves that row without a mark
+                log.debug("no mark for %s at the review", symbol, exc_info=True)
+        return marks
 
     def add_movers(self, day: dt.date) -> Dict[str, Any]:
         """Add the movers to a session's review written without them."""
