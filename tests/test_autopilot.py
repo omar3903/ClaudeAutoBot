@@ -308,9 +308,30 @@ def test_live_mode_paper_only_gate():
     assert ap.status()["effective"] is False
 
     eng2 = FakeEngine(mode="live")
+    eng2.records["opening_range_breakout"] = {"trades": 40, "expectancy_r": 0.20}   # real money wants proof
     p = mkplay()
     _run(AutoPilot(eng2, _cfg(allow_live=True), bus=SILENT), p)
     assert eng2.approved_ids() == [p.id]
+
+
+def test_with_real_money_proof_is_asked_for_whatever_the_setting_says():
+    paper, live = FakeEngine(), FakeEngine(mode="live")
+    terms = dict(allow_live=True, require_proven=False, min_replay_trades=30, min_replay_expectancy_r=0.05)
+    on_paper, with_money = AutoPilot(paper, _cfg(**terms), bus=SILENT), AutoPilot(live, _cfg(**terms), bus=SILENT)
+    p, q = mkplay(), mkplay()
+    _run(on_paper, p)
+    _run(with_money, q)
+    assert paper.approved_ids() == [p.id] and live.approved == []              # practice on paper; never with money
+    assert "replay" in with_money.verdict(q)
+    status = with_money.status()
+    assert status["proof_required"] and status["proof_forced"] and status["require_proven"] is False
+    assert not on_paper.status()["proof_required"] and not on_paper.status()["proof_forced"]
+
+    live.records["opening_range_breakout"] = {"trades": 40, "expectancy_r": 0.20}
+    _run(with_money, q)
+    assert live.approved_ids() == [q.id]                                        # proven: taken
+    live.mode = "paper"
+    assert not with_money.proof_required                                        # back on paper the choice applies again
 
 
 def test_dry_run_places_nothing():

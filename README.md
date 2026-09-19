@@ -751,6 +751,17 @@ trades they remove did worse on every session and on the held-out ones. Each
 entry risks no more than `risk.max_risk_per_trade_pct`, lowered to **half-Kelly**
 when the strategy's record calls for less.
 
+**Proof is always asked for with real money.** In **Live** the proven-only rule is
+in force whatever the setting says - the box in the Autopilot dialog is locked on.
+On **paper** it is your choice: untick it and Autopilot practises the unproven
+setups too, which is how the records and the learned model get their real
+trades. Either way a strategy the replay hasn't proven is sized at **practice
+size - a quarter of the usual risk** - however good its record looks: an edge
+that can't be told from luck is no reason to size up (Tharp, Aronson), and a
+setup never replayed is no reason to risk the full amount. Every trade keeps the
+settings it was taken on (`proof_required`, the floors, the caps) and whether
+its strategy was unproven, so practice trades are never mistaken for proven ones.
+
 **Faster loop while day-trading.** When Autopilot is armed with the **Intraday** filter on and
 the regular session is open, the hot list is rescanned every
 `scanner.fast_cycle_seconds` (60) between the regular cycles. The header button
@@ -908,7 +919,9 @@ is tested on simulated series whose answer is known.
   trading is never raised.
 * **Half-Kelly risk** — half of Kelly's mean ÷ variance of the strategy's R
   multiples (its real trades once there are 30, otherwise the replayed ones),
-  capped at `risk.max_risk_per_trade_pct`. It can only lower the risk.
+  capped at `risk.max_risk_per_trade_pct`. It can only lower the risk, and it
+  only counts once the replay has proven the strategy: until then the risk is a
+  quarter of the usual.
 * **Odds from the record** — the "estimated odds the edge pays" in a play's
   explanation start as the setup's own read and are blended with the win rate
   of its replayed and real trades (each real trade counting twice), 30 trades
