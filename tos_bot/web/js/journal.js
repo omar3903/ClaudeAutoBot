@@ -12,6 +12,7 @@ export function journalHTML(r) {
   return `<h4>What the bot learned</h4>
     <ul class="journal-lessons">${(r.lessons || []).map(l => `<li>${escapeHtml(l)}</li>`).join("")}</ul>
     ${mistakesHTML(r.mistakes || [])}
+    ${openedHTML(r.opened || [])}
     ${tradesHTML(r.trades || [])}
     ${pairsHTML(r.pairs || [])}
     ${shadowsHTML(r.shadows || {})}
@@ -27,19 +28,43 @@ function mistakesHTML(list) {
       <td>${escapeHtml(m.detail)}</td></tr>`).join("")}</table>`;
 }
 
+/* What a trade was taken on, in a few words - shared by the opened and the closed tables. */
+function takenOn(t) {
+  const at = (t.evidence || {}).at_entry || {}, ch = (t.evidence || {}).price_character, reg = at.market_regime || {};
+  return [
+    at.by ? `by ${escapeHtml(at.by)}` : "",
+    at.unproven ? `<span title="${escapeHtml(String(at.unproven))}">practice - strategy not proven</span>` : "",
+    at.confirmations ? `${at.confirmations} scan${at.confirmations === 1 ? "" : "s"}` : "",
+    (at.noise || []).length ? `flags: ${escapeHtml(at.noise.join(", "))}` : "no flags",
+    ch ? escapeHtml(ch.character) : "",
+    reg.regime ? `market ${escapeHtml(reg.regime)}` : "",
+  ].filter(Boolean).join(" · ");
+}
+
+/* The positions opened this session. A session whose entries are all still open has no closed trades,
+   but it isn't a session without trading: each row says where the position stood at the review. */
+function openedHTML(rows) {
+  if (!rows.length) return "";
+  return `<h4>Positions opened</h4><table class="ev-table">
+    <tr><th>Stock</th><th>Strategy</th><th>Type</th><th>In</th><th class="num">Entry</th><th class="num">Stop</th><th class="num">Target</th>
+      <th class="num">At risk</th><th class="num" title="Still open: where it stood at the review, on the session's close. Closed the same session: its result.">Standing</th><th>Taken on</th></tr>
+    ${rows.map(t => {
+      const standing = t.still_open
+        ? `<span class="${tone(t.open_r)}">${inR(t.open_r)}</span> <span class="muted">${t.open_pl == null ? "" : usd(t.open_pl)} · open</span>`
+        : `<span class="${tone(t.r)}">${inR(t.r)}</span> <span class="muted">${usd(t.pl)} · ${escapeHtml(t.exit_reason || "closed")}</span>`;
+      return `<tr><td>${escapeHtml(t.symbol)} <span class="muted">${escapeHtml(t.side)}</span></td><td>${stratLabel(t.strategy)}</td>
+        <td>${t.timeframe === "INTRADAY" ? "day" : "swing"}</td><td>${escapeHtml(fmtClock(t.entry_time))}</td>
+        <td class="num">${num(t.entry)} <span class="muted">×${num(t.quantity, 0)}</span></td><td class="num">${num(t.stop)}</td><td class="num">${num(t.target)}</td>
+        <td class="num">${t.risk == null ? "–" : usd(t.risk)}</td><td class="num">${standing}</td><td class="muted">${takenOn(t)}</td></tr>`;
+    }).join("")}</table>`;
+}
+
 function tradesHTML(rows) {
   if (!rows.length) return "";
-  return `<h4>Trades</h4><table class="ev-table">
+  return `<h4>Trades closed</h4><table class="ev-table">
     <tr><th>Stock</th><th>Strategy</th><th>In → out</th><th class="num">R</th><th class="num">Best</th><th class="num">P/L</th><th>Exit</th><th>Taken on</th></tr>
     ${rows.map(t => {
-      const at = (t.evidence || {}).at_entry || {}, ch = (t.evidence || {}).price_character, reg = at.market_regime || {};
-      const taken = [
-        at.by ? `by ${escapeHtml(at.by)}` : "",
-        at.confirmations ? `${at.confirmations} scan${at.confirmations === 1 ? "" : "s"}` : "",
-        (at.noise || []).length ? `flags: ${escapeHtml(at.noise.join(", "))}` : "no flags",
-        ch ? escapeHtml(ch.character) : "",
-        reg.regime ? `market ${escapeHtml(reg.regime)}` : "",
-      ].filter(Boolean).join(" · ");
+      const taken = takenOn(t);
       return `<tr><td>${escapeHtml(t.symbol)} <span class="muted">${escapeHtml(t.side)}</span></td><td>${stratLabel(t.strategy)}</td>
         <td>${escapeHtml(fmtClock(t.entry_time))} → ${escapeHtml(fmtClock(t.exit_time))}</td><td class="num ${tone(t.r)}">${inR(t.r)}</td><td class="num">${inR(t.mfe_r)}</td>
         <td class="num ${tone(t.pl)}">${usd(t.pl)}</td><td>${escapeHtml(t.exit_reason || "")}</td><td class="muted">${taken}</td></tr>`;

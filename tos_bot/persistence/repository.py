@@ -497,6 +497,16 @@ class Repository:
                              .order_by(Trade.exit_time)).all()
             return [{**trade_to_dict(t), "play": play_to_dict(p) if p is not None else None} for t, p in rows]
 
+    def trades_opened_between(self, first: dt.date, last: dt.date) -> List[Dict[str, Any]]:
+        """Trades opened during the New York sessions ``first`` .. ``last`` - still open or closed
+        since - oldest first, each with the play it came from."""
+        start, end = _ny_bounds(first)[0], _ny_bounds(last)[1]
+        with session_scope() as s:
+            rows = s.execute(select(Trade, PlayLog).outerjoin(PlayLog, Trade.play_id == PlayLog.id)
+                             .where(Trade.entry_time >= start, Trade.entry_time < end)
+                             .order_by(Trade.entry_time)).all()
+            return [{**trade_to_dict(t), "play": play_to_dict(p) if p is not None else None} for t, p in rows]
+
     def trades_on(self, day: dt.date) -> List[Dict[str, Any]]:
         """Trades opened or closed during the New York session ``day``, oldest first."""
         start, end = _ny_bounds(day)
@@ -593,6 +603,7 @@ class Repository:
                 session_date=day, created_at=dt.datetime.now(dt.timezone.utc).replace(tzinfo=None),
                 trades=int(stats.get("trades") or 0), total_r=float(stats.get("total_r") or 0.0),
                 realized_pl=float(stats.get("realized_pl") or 0.0), mistakes=len(review.get("mistakes") or []),
+                opened=int(stats.get("opened") or 0), open_r=float(stats.get("open_r") or 0.0),
                 review=review))
 
     def get_review(self, day: dt.date) -> Optional[Dict[str, Any]]:
@@ -606,6 +617,7 @@ class Repository:
                              .limit(limit)).scalars().all()
             return [{"session": r.session_date.isoformat(), "trades": r.trades, "total_r": r.total_r,
                      "realized_pl": _f(r.realized_pl), "mistakes": r.mistakes,
+                     "opened": int(r.opened or 0), "open_r": float(r.open_r or 0.0),
                      "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]
 
     # -------------------------------------------------------------- #

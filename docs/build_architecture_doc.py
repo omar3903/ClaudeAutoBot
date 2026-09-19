@@ -1221,7 +1221,9 @@ def build() -> str:
       '<code>pooled_odds()</code> blends a play\'s own stated odds with the record so the probability shown is '
       'calibrated, and <code>quant/sizing.py half_kelly_risk_pct()</code> can only lower the risk per trade.</p>')
     A('<p><b>Journal</b> (<code>research/journal.py</code>, <code>movers.py</code>). At 16:15 the journal loop '
-      'builds the day\'s review: every trade with its mistakes (entered against a flag, exited early, oversized), '
+      'builds the day\'s review: the positions opened that session - closed or still open, with where the open '
+      'ones stood on the close (<code>opened_rows()</code>) - every closed trade, the mistakes (entered against a '
+      'flag, exited early, oversized; an entry is judged the day it is taken), '
       'the shadow outcomes of plays that were shown but not taken, per-strategy tables, and the session\'s '
       'biggest movers with why they moved and whether the bot traded, offered or missed them. Saved to '
       '<code>daily_reviews</code> and <code>data/journal/</code>, shown on the Reports page.</p>')
@@ -1356,7 +1358,8 @@ def build() -> str:
         ("research/dataset.py", "training_rows(), write_csv()", "the training set joined from the three "
          "populations"),
         ("persistence/repository.py", "save_sim_trades(), save_shadow_trades()", "the learning tables' writers"),
-        ("research/journal.py", "build_review(), find_mistakes(), shadow_outcomes(), lessons()", "the daily review"),
+        ("research/journal.py", "build_review(), opened_rows(), find_mistakes(), shadow_outcomes(), lessons()",
+         "the daily review: positions opened, trades closed, mistakes, plays not taken, lessons"),
         ("pairs/desk.py", "PairDesk.refresh(), watch(), enter(), manage(), close()", "the pairs desk: both legs, "
          "the z-score bands, the time stop"),
         ("quant/*", "adf(), hurst(), half_life(), fit_garch11(), fit_markov_switching(), johansen(), best_band()",

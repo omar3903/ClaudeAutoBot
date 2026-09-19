@@ -1005,6 +1005,12 @@ can't see them, and the report says so.
 
 ### The bot's own trading
 
+* **the positions opened** that session, closed or not — entry, stop, target, the
+  dollars at risk, what each was taken on (and whether its strategy was a practice
+  one, not yet proven), and for the ones still open where they stood at the
+  review, in R and in money, on the session's close. A session whose entries are
+  all still open is not a session without trades: the day list says "9 opened ·
+  0 closed", and what an entry was taken on is judged the day it is taken;
 * **the trades** that closed, each with what it was taken on — noise flags, scans
   in a row, price character, the market's regime, who took it;
 * **mistakes** — a loss beyond the planned 1R, a winner of 1R or more closed at a

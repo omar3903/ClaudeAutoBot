@@ -118,6 +118,35 @@ def trade_rows(trades: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     return rows
 
 
+def opened_rows(trades: Sequence[Mapping[str, Any]], marks: Mapping[str, float]) -> List[Dict[str, Any]]:
+    """The positions opened this session and what each was taken on. For the ones still open,
+    ``marks`` (symbol -> the session's close, or the latest price) says where they stood at the
+    review, in R and in money; a position opened and closed the same session carries its result."""
+    rows = []
+    for t in trades:
+        play, risk = t.get("play") or {}, _risk_per_share(t)
+        still = t.get("status") == "OPEN"
+        entry, qty = float(t.get("entry_price") or 0.0), float(t.get("quantity") or 0.0)
+        sign = 1.0 if t.get("side") == "LONG" else -1.0
+        mark = float(marks[t["symbol"]]) if still and marks.get(t["symbol"]) else None
+        rows.append({
+            "id": t["id"], "symbol": t["symbol"], "side": t["side"], "strategy": t["strategy"],
+            "timeframe": t["timeframe"], "venue": t.get("broker"), "entry_time": t.get("entry_time"),
+            "entry": t.get("entry_price"), "quantity": t.get("initial_quantity") or t.get("quantity"),
+            "stop": t.get("initial_stop_price") or t.get("stop_price"),
+            "target": t.get("initial_target_price") or t.get("target_price"),
+            "risk": round(risk * float(t.get("initial_quantity") or qty), 2) if risk else None,
+            "still_open": still, "expected_exit_at": t.get("expected_exit_at"),
+            "mark": mark, "open_r": round(sign * (mark - entry) / risk, 2) if mark and risk else None,
+            "open_pl": round(sign * (mark - entry) * qty + float(t.get("banked_pl") or 0.0), 2) if mark else None,
+            "r": None if still else t.get("r_multiple"), "pl": None if still else t.get("realized_pl"),
+            "exit_reason": None if still else t.get("exit_reason"),
+            "entry_slippage_bps": t.get("entry_slippage_bps"), "rationale": play.get("rationale", ""),
+            "evidence": {k: v for k, v in (play.get("evidence") or {}).items() if k != "spark"},
+        })
+    return rows
+
+
 # ---------------------------------------------------------------- mistakes
 def find_mistakes(trades: Sequence[Mapping[str, Any]], *, skip_noise: Iterable[str], min_confirmations: int,
                   styles: Mapping[str, str]) -> List[Dict[str, Any]]:
@@ -367,14 +396,25 @@ def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Se
                  evidence: Mapping[str, Mapping[str, Any]], regime: Optional[Mapping[str, Any]],
                  bars: Optional[Mapping[str, pd.DataFrame]], settings: ReplaySettings, skip_noise: Sequence[str],
                  min_confirmations: int, passes: Callable[[Mapping[str, Any]], bool], styles: Mapping[str, str],
-                 titles: Mapping[str, str], breakeven_at_r: float) -> Dict[str, Any]:
+                 titles: Mapping[str, str], breakeven_at_r: float, opened: Sequence[Mapping[str, Any]] = (),
+                 marks: Optional[Mapping[str, float]] = None) -> Dict[str, Any]:
     """``bars``: the session's 5-minute candles for the plays not taken - None when they
-    couldn't be had, and those plays aren't followed."""
+    couldn't be had, and those plays aren't followed. ``opened``: the trades opened this session,
+    closed or not - a session whose entries are all still open is not a session without trades;
+    ``marks``: where the open ones' stocks stood at the review."""
     rs = [t.get("r_multiple") for t in trades]
+    entered = opened_rows(opened, marks or {})
+    standing = [row["open_r"] for row in entered if row["still_open"] and row["open_r"] is not None]
     day_stats = {**_stats(rs), "realized_pl": round(sum(float(t.get("realized_pl") or 0.0) for t in trades), 2),
                  "by_strategy": {k: _stats(t.get("r_multiple") for t in trades if t["strategy"] == k)
-                                 for k in sorted({t["strategy"] for t in trades})}}
-    mistakes = find_mistakes(trades, skip_noise=skip_noise, min_confirmations=min_confirmations, styles=styles)
+                                 for k in sorted({t["strategy"] for t in trades})},
+                 "opened": len(entered), "still_open": sum(1 for row in entered if row["still_open"]),
+                 "open_r": round(sum(standing), 2),
+                 "open_pl": round(sum(row["open_pl"] or 0.0 for row in entered if row["still_open"]), 2)}
+    # what an entry was taken on is judged the day it is taken, not only the day it closes
+    still_open = [t for t in opened if t.get("status") == "OPEN"]
+    mistakes = find_mistakes(list(trades) + still_open, skip_noise=skip_noise, min_confirmations=min_confirmations,
+                             styles=styles)
     if bars is None:
         shadows: Dict[str, Any] = {"followed": 0, "filled": 0, "summary": {"trades": 0},
                                    "note": "IB Gateway wasn't connected, so the plays not taken couldn't be followed."}
@@ -383,11 +423,16 @@ def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Se
     strategies = strategy_table(live_records(rolling), replay_records, evidence, titles)
     fills = execution_quality(rolling, settings.slippage_bps + settings.commission_bps)
     notes = lessons(day_stats, mistakes, shadows, strategies, regime, titles, breakeven_at_r)
+    if entered:
+        n, left = day_stats["opened"], day_stats["still_open"]
+        where = (f"; {left} still open, standing at {day_stats['open_r']:+.2f}R in all at the review" if standing
+                 else f"; {left} still open" if left else "")
+        notes.insert(1, f"{n} position{'s' if n != 1 else ''} opened this session{where}.")
     if fills.get("note"):
         notes.append(fills["note"])
     return {
         "session": day.isoformat(), "created_at": dt.datetime.now(dt.timezone.utc).isoformat(), "regime": regime,
-        "day": day_stats, "trades": trade_rows(trades), "mistakes": mistakes, "shadows": shadows,
+        "day": day_stats, "trades": trade_rows(trades), "opened": entered, "mistakes": mistakes, "shadows": shadows,
         "strategies": strategies, "plays_offered": len(plays), "execution": fills,
         "lessons": notes,
         "settings": {"skip_noise": list(skip_noise), "min_confirmations": min_confirmations,
