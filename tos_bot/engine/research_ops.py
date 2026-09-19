@@ -66,6 +66,7 @@ class ResearchOps:
             intraday_symbols=symbols["intraday"], swing_symbols=symbols["swing"],
             sessions=sessions, swing_sessions=max(20, min(1250, int(swing_sessions))),
             in_play=stocks_in_play if universe else None,
+            download_budget_s=60.0 * max(1, int(cfg.replay.day_download_minutes or 20)),
             settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay, cfg.risk.min_reward_risk),
             noise=NoiseSettings.from_config(cfg.noise),
             con_ids=self.scanner.con_ids(list(symbols["intraday"]) + universe),

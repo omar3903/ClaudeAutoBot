@@ -80,19 +80,24 @@ def test_a_sessions_stocks_are_picked_from_what_was_known_before_its_open():
     assert in_play(frames.get, frames, replayed, hot=0) == {}
 
 
+class _Answer(dict):
+    failed: set = set()
+
+
 class _Candles:
-    """Serves five sessions of 5-minute candles ending at ``end``; ``nothing_for`` has none at all."""
+    """Serves five sessions of 5-minute candles ending at ``end``; ``nothing_for`` has none at all;
+    ``times_out`` get no answer in time (the adapter names them in the answer's ``failed``)."""
 
     is_connected = True
 
-    def __init__(self, nothing_for=()):
-        self.requests, self.nothing_for = [], set(nothing_for)
+    def __init__(self, nothing_for=(), times_out=()):
+        self.requests, self.nothing_for, self.times_out = [], set(nothing_for), set(times_out)
 
     def history_many(self, requests, con_ids=None, end=None, rth=True):
         out = {}
         for symbol, (bar, duration) in requests.items():
             self.requests.append((symbol, end.date(), duration))
-            if symbol in self.nothing_for:
+            if symbol in self.nothing_for or symbol in self.times_out:
                 continue
             frames = []
             for day in clock.last_n_sessions(end.date(), 5):
@@ -101,7 +106,9 @@ class _Candles:
                 frames.append(pd.DataFrame({"open": c, "high": c + 0.05, "low": c - 0.05, "close": c,
                                             "volume": np.full(78, 5e5)}, index=idx))
             out[symbol] = pd.concat(frames)
-        return out
+        answer = _Answer(out)
+        answer.failed = set(requests) & self.times_out
+        return answer
 
 
 def test_candles_are_downloaded_for_the_sessions_in_play_and_the_four_before_once(tmp_path):
@@ -122,6 +129,23 @@ def test_candles_are_downloaded_for_the_sessions_in_play_and_the_four_before_onc
     assert again.requests == []                                             # on disk - and what IBKR lacked isn't asked again
     history.load_days(again, {"AAA": [SESSIONS[62]]})
     assert [(s, e) for s, e, _ in again.requests] == [("AAA", SESSIONS[62])]  # only the sessions still missing
+
+
+def test_a_request_that_timed_out_is_asked_again_and_a_run_downloads_no_longer_than_its_budget(tmp_path):
+    history = IntradayHistory(tmp_path)
+    slow = _Candles(times_out={"AAA"})
+    assert "AAA" not in history.load_days(slow, {"AAA": [SESSIONS[60]], "BBB": [SESSIONS[60]]})
+    again = _Candles()
+    history.load_days(again, {"AAA": [SESSIONS[60]], "BBB": [SESSIONS[60]]})
+    assert [s for s, _, _ in again.requests] == ["AAA"]                     # it may well have candles: asked again
+
+    source, seen = _Candles(), []
+    wanted = {"CCC": [SESSIONS[50], SESSIONS[70]], "DDD": [SESSIONS[70]]}
+    history.load_days(source, wanted, budget_s=0, progress=lambda done, total: seen.append((done, total)))
+    assert source.requests == [] and history.pending == 3 and seen == [(0, 3)]   # out of time before it began
+    bars = history.load_days(source, wanted, budget_s=600)
+    assert len(source.requests) == 3 and history.pending == 0 and set(bars) == {"CCC", "DDD"}
+    assert [end for _, end, _ in source.requests] == [SESSIONS[70], SESSIONS[70], SESSIONS[50]]   # the latest first
 
 
 def test_a_stock_is_replayed_on_its_sessions_in_play_with_the_sessions_before_to_look_back_over(tmp_path):
@@ -157,6 +181,7 @@ def test_the_runner_replays_day_trades_on_the_stocks_in_play_and_falls_back_when
     state = runner.state([], 1)
     assert started["ok"] and "in play" in started["note"]
     assert (state["intraday_symbols"], state["intraday_stock_days"]) == (2, 3)
+    assert (state["intraday_stock_days_in_play"], state["intraday_requests_pending"]) == (3, 0)
     assert state["records"]["all"]["long_at_bar"]["trades"] == 3             # one a stock-day, none on ZZZ
     assert not any(symbol == "ZZZ" for symbol, _, _ in source.requests)
 

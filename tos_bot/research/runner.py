@@ -87,7 +87,7 @@ class ReplayRunner:
               records: Optional[Mapping[str, Mapping[str, Any]]] = None,
               prepare: Optional[Callable[[Callable[[int, int], None]], Any]] = None,
               in_play: Optional[Callable[[Callable[[int, int], None]], Mapping[str, Sequence[dt.date]]]] = None,
-              ) -> Dict[str, Any]:
+              download_budget_s: Optional[float] = None) -> Dict[str, Any]:
         """``prepare``: called first, on the replay's thread, with a progress function - the engine
         downloads the long daily history there; ``in_play``: called next, the same way, for the
         sessions each stock was in play on (research/in_play.py) - day-trade setups are then
@@ -106,7 +106,8 @@ class ReplayRunner:
                 target=self._run, name="replay", daemon=True,
                 args=(list(strategies), source, daily_frame, list(intraday_symbols), list(swing_symbols),
                       sessions, swing_sessions, settings, noise, con_ids or {}, market, earnings,
-                      held_out_fraction, pairs, news, benchmark, dict(records or {}), prepare, in_play))
+                      held_out_fraction, pairs, news, benchmark, dict(records or {}), prepare, in_play,
+                      download_budget_s))
             self._thread.start()
         held = f"{held_out_fraction:.0%}"
         where = "the stocks in play each session" if in_play is not None else f"{len(intraday_symbols)} stocks"
@@ -121,7 +122,7 @@ class ReplayRunner:
 
     def _run(self, strategies, source, daily_frame, intraday_symbols, swing_symbols, sessions, swing_sessions,
              settings, noise, con_ids, market, earnings, fraction, pairs=None, news=None, benchmark=None,
-             records=None, prepare=None, in_play=None) -> None:
+             records=None, prepare=None, in_play=None, download_budget_s=None) -> None:
         started = time.monotonic()
         try:
             self._optional("the long daily history", prepare,
@@ -130,13 +131,16 @@ class ReplayRunner:
             days = {s: sorted(v) for s, v in (self._optional(
                 "the stocks in play each session", in_play,
                 lambda done, total: self._report("the stocks in play each session", done, total)) or {}).items() if v}
+            pending = 0
             if days:
                 intraday_symbols = list(days)
-                asked = dict(days)
+                report = lambda done, total: self._report("5-minute candles", done, total)   # noqa: E731
                 if benchmark:                        # the market model reads the benchmark on every replayed session
-                    asked[benchmark] = sorted(set(clock.last_n_sessions(last, sessions)) | set(days.get(benchmark, ())))
-                bars = self.history.load_days(source, asked, con_ids,
-                                              progress=lambda done, total: self._report("5-minute candles", done, total))
+                    self.history.load_days(source, {benchmark: clock.last_n_sessions(last, sessions)}, con_ids)
+                bars = self.history.load_days(source, days, con_ids, progress=report, budget_s=download_budget_s)
+                pending = self.history.pending
+                if benchmark and (held := self.history.stored(benchmark)) is not None:
+                    bars[benchmark] = held
             else:
                 wanted = intraday_symbols + ([benchmark] if benchmark and benchmark not in intraday_symbols else [])
                 bars = self.history.load(source, wanted, sessions, con_ids,
@@ -169,7 +173,9 @@ class ReplayRunner:
                 "swing_sessions": swing_sessions, "swing_symbols": len(swing_symbols),
                 "intraday_symbols": sum(1 for s in intraday_symbols if s in bars),
                 # with the stocks chosen session by session: how many stock-days the day-trade setups ran on
-                "intraday_stock_days": sum(len(v) for s, v in days.items() if s in bars) if days else None,
+                "intraday_stock_days": sum(len(j[7]) for j in jobs if j[0] == "intraday") if days else None,
+                "intraday_stock_days_in_play": sum(len(v) for v in days.values()) if days else None,
+                "intraday_requests_pending": pending,
                 "elapsed_s": round(time.monotonic() - started, 1), "held_out_from": split,
                 "costs": {"slippage_bps": settings.slippage_bps, "commission_bps": settings.commission_bps},
                 "market_regime_days": len(regime), "earnings_stocks": sum(1 for v in reports.values() if v),

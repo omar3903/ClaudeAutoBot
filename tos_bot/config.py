@@ -255,6 +255,9 @@ class ReplayCfg(_Model):
                                           # session before (research/in_play.py). 0 = the old way: today's hot
                                           # list on every session, which hands a momentum setup its own hindsight
     day_gappers: int = 10                 # ...and this many of that morning's biggest gaps among the watchlist
+    day_download_minutes: int = 20        # IBKR answers requests for past candles slowly (seconds each), so one
+                                          # replay downloads for at most this long, the latest sessions first, and
+                                          # replays the stock-days it has; the next replay goes on from there
     swing_sessions: int = 700             # swing sessions of daily candles (20-1250; as far as daily_years reaches)
     daily_years: int = 3                  # years of daily candles kept for the stocks the replay runs on, in
                                           # data/research/daily (1-5; 1 = the live store's year only). One request

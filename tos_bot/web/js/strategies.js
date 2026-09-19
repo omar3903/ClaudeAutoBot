@@ -94,7 +94,7 @@ function replayHTML() {
   const when = rp.ran_at
     ? `Last replay ${escapeHtml(new Date(rp.ran_at).toLocaleString())}: ${rp.trade_count} simulated trades — day-trade setups over the last ${rp.sessions} sessions` +
       (rp.intraday_stock_days
-        ? ` on the stocks in play each morning (${rp.intraday_stock_days} stock-days, ${rp.intraday_symbols} stocks), entered on sight and, for Autopilot's record, after two bars in a row`
+        ? ` on the stocks in play each morning (${rp.intraday_stock_days}${rp.intraday_requests_pending ? ` of ${rp.intraday_stock_days_in_play}` : ""} stock-days, ${rp.intraday_symbols} stocks${rp.intraday_requests_pending ? ` - IBKR serves past candles slowly, so ${rp.intraday_requests_pending} requests are left for the next replays` : ""}), entered on sight and, for Autopilot's record, after two bars in a row`
         : (rp.intraday_symbols ? ` on ${rp.intraday_symbols} stocks` : "")) +
       `, swing setups over ${rp.swing_sessions}.` +
       (heldFrom.INTRADAY || heldFrom.SWING ? ` Held out to test on: day trades from ${escapeHtml(heldFrom.INTRADAY || "–")}, swing trades from ${escapeHtml(heldFrom.SWING || "–")}.` : "") +

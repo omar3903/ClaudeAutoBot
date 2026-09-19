@@ -290,7 +290,20 @@ def test_a_failed_history_request_is_left_out(broker):
         raise RuntimeError("pacing violation")
 
     broker._session.ib.reqHistoricalDataAsync = pacing_violation
-    assert broker.history_many({"AAPL": ("1 day", "5 D")}) == {}
+    got = broker.history_many({"AAPL": ("1 day", "5 D")})
+    assert got == {} and got.failed == {"AAPL"}                   # it failed - not the same as IBKR having nothing
+
+
+def test_a_request_that_times_out_counts_as_failed_and_an_empty_answer_doesnt(broker):
+    async def nothing(c, **kw):
+        return []                                                  # how ib_async answers both
+
+    broker._session.ib.reqHistoricalDataAsync = nothing
+    quick = broker.history_many({"AAPL": ("5 mins", "5 D")})
+    assert quick == {} and quick.failed == set()                  # answered at once: IBKR has nothing for it
+    slow = broker.history_many({"AAPL": ("5 mins", "5 D")}, timeout=0.2)
+    assert slow == {} and slow.failed == {"AAPL"}                 # took the whole timeout: it timed out
+    assert broker.history_many({}).failed == set()
 
 
 def test_contract_details_tell_stocks_from_unknown_symbols(broker):

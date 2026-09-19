@@ -30,11 +30,15 @@ GATEWAY_WAIT_S = 900.0
 GATEWAY_POLL_S = 15.0
 #: the sessions already asked for per stock (load_days), so one IBKR has nothing for isn't asked for again
 ASKED_FILE = "_asked.json"
+#: stocks a request batch, so the download budget is looked at often and the progress line moves
+BATCH = 24
 
 
 class IntradayHistory:
     def __init__(self, directory: Path) -> None:
         self.directory = directory
+        #: candle requests the last load_days left for the next run (its download budget ran out)
+        self.pending = 0
 
     def load(self, source, symbols: Iterable[str], sessions: int, con_ids: Optional[Mapping[str, int]] = None,
              today: Optional[dt.date] = None,
@@ -64,12 +68,19 @@ class IntradayHistory:
 
     def load_days(self, source, wanted: Mapping[str, Iterable[dt.date]],
                   con_ids: Optional[Mapping[str, int]] = None, lookback: int = SESSIONS_PER_REQUEST - 1,
-                  progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, pd.DataFrame]:
+                  progress: Optional[Callable[[int, int], None]] = None,
+                  budget_s: Optional[float] = None) -> Dict[str, pd.DataFrame]:
         """Each stock's 5-minute candles for its own ``wanted`` sessions and the ``lookback``
         sessions before each (what a live scan on that day would have had in hand), downloading
         only what isn't on disk. One request brings a session and the four before it, so a stock
         in play on scattered days costs about a request a day, and a run of days far fewer.
-        A session IBKR had nothing for is asked for once and remembered, not on every replay."""
+        A session IBKR had nothing for is asked for once and remembered, not on every replay -
+        but a request that timed out is asked again next time.
+
+        IBKR answers a request for past candles far more slowly than one for the latest (measured:
+        seconds each, and some time out), so ``budget_s`` caps how long one call downloads, the
+        latest sessions first; what is left comes with the next call. ``self.pending`` says how
+        many requests that is."""
         frames = {s: self._read(s) for s in wanted}
         asked = self._asked()
         plan: Dict[dt.date, List[str]] = {}
@@ -82,21 +93,30 @@ class IntradayHistory:
                 end = max(missing)                      # a request ending here brings this session and four before
                 plan.setdefault(end, []).append(symbol)
                 missing -= set(clock.last_n_sessions(end, SESSIONS_PER_REQUEST))
-        total, done = sum(len(v) for v in plan.values()), 0
+        total, done, started = sum(len(v) for v in plan.values()), 0, time.monotonic()
+        self.pending = 0
         if progress and total:
             progress(0, total)
-        for end in sorted(plan, reverse=True):
-            symbols = plan[end]
+        batches = [(end, plan[end][i:i + BATCH]) for end in sorted(plan, reverse=True)
+                   for i in range(0, len(plan[end]), BATCH)]
+        for n, (end, symbols) in enumerate(batches):
+            if budget_s is not None and time.monotonic() - started >= budget_s:
+                self.pending = total - done
+                log.info("replay: %d of %d candle requests made in the %d minutes a run may download for - "
+                         "the rest come with the next replay", done, total, budget_s // 60)
+                break
             close = dt.datetime.combine(end, clock.regular_close_time(end))
             got = _through_gateway_drops(source, lambda: source.history_many(
                 {s: (BAR_SIZE, f"{SESSIONS_PER_REQUEST} D") for s in symbols}, con_ids,
                 end=pd.Timestamp(close, tz=NY).to_pydatetime()))
+            failed = set(getattr(got, "failed", ()))
             covered = [d.isoformat() for d in clock.last_n_sessions(end, SESSIONS_PER_REQUEST)]
             for symbol in symbols:
                 if symbol in got:
                     frames[symbol] = _merge(frames[symbol], got[symbol])
                     self._write(symbol, frames[symbol])
-                asked[symbol] = sorted(set(asked.get(symbol, ())) | set(covered))
+                if symbol not in failed:                 # answered - with candles or with nothing: don't ask again
+                    asked[symbol] = sorted(set(asked.get(symbol, ())) | set(covered))
             self._save_asked(asked)
             done += len(symbols)
             if progress:

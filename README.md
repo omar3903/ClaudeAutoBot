@@ -956,7 +956,12 @@ something else: today's names are hot because of what they have just done, which
 momentum setup its own hindsight, and on most of those sessions no scan would have shown them.
 Their 5-minute candles are downloaded for those sessions only (each request brings a session and
 the four before it, what a live scan has in hand) and kept, so a later replay fetches only the
-new sessions; `day_stocks: 0` brings the old way back.
+new sessions; `day_stocks: 0` brings the old way back. IBKR answers a request for *past* candles
+far more slowly than one for the latest - measured at seconds each, with some timing out, against
+a dozen a second - so one replay downloads for at most `replay.day_download_minutes` (20), the
+latest sessions first, replays the stock-days it has, and says how many requests are left; the
+next replays go on from there until the sixty sessions are covered. A request that timed out is
+asked again; a session IBKR really has nothing for is remembered and isn't.
 
 Every day setup is followed twice: **entered on sight** (the record of all trades) and **entered
 after it has shown two bars in a row**, one bar later and once a session per setup - which is how
