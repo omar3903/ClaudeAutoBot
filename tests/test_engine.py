@@ -283,6 +283,20 @@ def test_scans_follow_the_schedule(engine, port, monkeypatch):
     assert engine.request_scan("gappers")["ok"] and engine._scan_request == "gappers"
 
 
+# ---------------------------------------------------------------- practice size
+def test_a_strategy_the_replay_hasnt_proven_trades_at_a_quarter_of_the_risk(engine, monkeypatch):
+    cap = engine.settings.config.risk.max_risk_per_trade_pct
+    strong = [1.0, 1.0, -0.5] * 20                                              # half-Kelly would take the full risk
+    monkeypatch.setattr(engine.replay, "r_multiples", lambda key, *terms: strong)
+    assert engine.autopilot.proof_missing("vwap_reclaim")                       # never replayed: not proven
+    assert engine.strategy_risk_pct("vwap_reclaim") == 0.25 * cap
+    assert engine._entry_context(_play(), "autopilot")["settings"]["proof_required"] == engine.autopilot.proof_required
+
+    monkeypatch.setattr(engine.autopilot, "proof_missing", lambda key: None)    # once it is proven...
+    engine._risk_pct_for = None
+    assert engine.strategy_risk_pct("vwap_reclaim") == cap                      # ...its record sizes it
+
+
 # ---------------------------------------------------------------- a restart
 def _started_again(tmp_path, gateway, port, before=None):
     again = _new_engine(tmp_path, gateway, port)
@@ -730,6 +744,7 @@ def test_the_session_review_covers_positions_opened_and_still_open(engine, monke
     from tos_bot.core.models import Quote
 
     today = clock.now_ny().date()
+    monkeypatch.setattr(clock, "session_date", lambda *a, **k: today)       # on a weekend too, today is the session reviewed
     _open(engine, "AAPL")                                                   # entered at 100 with its stop at 95, still open
     assert engine._review_marks(today, engine.repo.trades_opened_between(today, today)) == {}   # no price source: no mark
     engine.md.attach(fakes.FakeGateway(["AAPL"]))

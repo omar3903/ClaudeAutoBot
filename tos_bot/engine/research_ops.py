@@ -28,6 +28,9 @@ from ..util import clock
 log = logging.getLogger(__name__)
 
 
+#: the share of the usual risk a strategy is traded with until the replay has proven it
+PRACTICE_RISK = 0.25
+
 class ResearchOps:
     # ------------------------------------------------------------------ #
     #  Strategy replay                                                   #
@@ -185,11 +188,15 @@ class ResearchOps:
     def strategy_risk_pct(self, key: str) -> Optional[float]:
         """Half-Kelly risk per trade from the strategy's record (quant/sizing.py): its real trades
         once there are enough - paper trading is the true out-of-sample test - otherwise the
-        replayed trades Autopilot would have taken. A record with no edge still leaves a quarter
-        of the usual risk for a trade taken by hand; Autopilot doesn't take those at all."""
+        replayed trades Autopilot would have taken. A strategy the replay hasn't proven
+        (autopilot.proof_missing) is traded at practice size, a quarter of the usual risk, whatever
+        its record hints at: an edge that can't be told from luck is no reason to size up (Tharp,
+        Aronson), and a setup never replayed is no reason to risk the full amount. The same
+        quarter is left for a record with no edge, for a trade taken by hand."""
         stats, ap = self.live_stats(), self.autopilot
         skipped = ap.skipped_noise()
-        records_for = (self.replay.ran_at, tuple(skipped), ap.min_confirmations, self._live_stats_at)
+        records_for = (self.replay.ran_at, tuple(skipped), ap.min_confirmations, self._live_stats_at,
+                       ap.min_replay_trades, ap.min_replay_expectancy_r, ap.proof_p_value)
         if records_for != self._risk_pct_for:                  # sized once per strategy until a record changes
             self._risk_pct, self._risk_pct_for = {}, records_for
         if key not in self._risk_pct:
@@ -197,7 +204,10 @@ class ResearchOps:
             live = stats.get(key, {}).get("r", [])
             rs = live if len(live) >= KELLY_MIN_TRADES else self.replay.r_multiples(key, *self._record_terms())
             pct = half_kelly_risk_pct(rs, cap)
-            self._risk_pct[key] = None if pct is None else max(pct, 0.25 * cap)
+            if ap.proof_missing(key):
+                self._risk_pct[key] = PRACTICE_RISK * cap
+            else:
+                self._risk_pct[key] = None if pct is None else max(pct, PRACTICE_RISK * cap)
         return self._risk_pct[key]
 
     def _entry_context(self, p: Play, operator: str) -> Dict[str, Any]:
@@ -211,7 +221,7 @@ class ResearchOps:
                 "risk_pct": self.strategy_risk_pct(p.strategy),
                 # the gates in force when it was taken, so a trade taken on looser rules is never mistaken for
                 # one the strict rules would have taken
-                "settings": {k: getattr(self.autopilot, k) for k in (
+                "settings": {"proof_required": self.autopilot.proof_required, **{k: getattr(self.autopilot, k) for k in (
                     "require_proven", "min_confidence", "min_swing_confidence", "min_reward_risk",
-                    "min_confirmations", "model_mode", "max_auto_positions", "max_auto_trades_per_day")},
+                    "min_confirmations", "model_mode", "max_auto_positions", "max_auto_trades_per_day")}},
                 "data_delayed": bool(self.md.delayed)}

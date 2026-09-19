@@ -1010,7 +1010,8 @@ def build() -> str:
       'the gates in the next table. The first failing gate is the reason shown on the dashboard.</li>'
       '<li><b>Assessment and sizing.</b> <code>engine.assess_play()</code> checks the session, the pattern-day-'
       'trader rule (live only), and calls <code>risk/position_sizing.py size_play()</code>: risk 1% of equity per '
-      'trade, lowered by the strategy\'s half-Kelly, the mid-day factor, the open-risk ceiling (4%), the per-'
+      'trade, lowered by the strategy\'s half-Kelly (a quarter of the risk until the replay has proven the '
+      'strategy), the mid-day factor, the open-risk ceiling (4%), the per-'
       'position cap (12% of equity) and the per-symbol cap (15%).</li>'
       '<li><b>Order.</b> <code>Executor.execute_play()</code> builds a limit order (5 bps through the price) and, '
       'where the broker supports it, a native bracket with the stop and target attached. An immediate fill opens '
@@ -1215,7 +1216,10 @@ def build() -> str:
       'checks are worth skipping (<code>learned_skips</code>).</p>')
     A('<p><b>Proof rule.</b> Autopilot, with <code>require_proven</code> on, refuses a strategy whose record '
       'does not show at least 30 trades averaging +0.05R with a positive held-out sample of at least 10. That is '
-      'why no swing trade was taken on 16 September: the records were negative or too thin.</p>')
+      'why no swing trade was taken on 16 September: the records were negative or too thin. In <b>Live</b> the '
+      'rule is in force whatever the setting says (<code>AutoPilot.proof_required</code>); on paper it is the '
+      'user\'s choice, so unproven setups can be practised - at a quarter of the usual risk '
+      '(<code>research_ops.PRACTICE_RISK</code>), with the settings in force kept on every trade.</p>')
     A('<p><b>Evidence weights</b> (<code>research/weights.py</code>). Each strategy gets a multiplier between '
       '0.5 and 1.5 from its pooled record (live trades count double), applied to the rank score. '
       '<code>pooled_odds()</code> blends a play\'s own stated odds with the record so the probability shown is '
