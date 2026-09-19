@@ -150,6 +150,29 @@ def test_min_stop_floor_widens_noise_tight_stops():
     assert p.reward_risk <= 8.0                                      # no more fake 10:1
 
 
+def test_a_plays_targets_come_nearest_first_however_the_setup_listed_them():
+    """The first target is the one the reward:risk is judged on and the first the exits take, so a
+    level further out than the setup's fallback multiple must not pass for it."""
+    from tos_bot.core.enums import StrategyKind, Timeframe
+    from tos_bot.strategies.base import Strategy
+
+    class _T(Strategy):
+        key, kind, timeframe = "t", StrategyKind.TECHNICAL, Timeframe.SWING
+        title, thesis = "T", "t"
+
+    idx = pd.date_range(pd.Timestamp(f"{clock.session_date()} 09:30", tz="America/New_York"), periods=30, freq="5min")
+    c = np.full(30, 100.0)
+    df = pd.DataFrame({"open": c, "high": c + 0.5, "low": c - 0.5, "close": c, "volume": np.full(30, 5e5)}, index=idx)
+    ctx = build_context("X", df, df, _quote("X", 100.0))
+    make = lambda side, stop, targets: _T()._mk_play(ctx, side, entry=100.0, stop=stop, targets=targets, confidence=0.6,
+                                                    rationale="r", detail="d", evidence={})
+    long = make(Side.LONG, 96.0, [117.0, 108.0])                    # the far level listed first
+    assert long.targets == [108.0, 117.0] and long.reward_risk == pytest.approx(2.0)
+    short = make(Side.SHORT, 104.0, [83.0, 92.0, 92.0])
+    assert short.targets == [92.0, 83.0] and short.reward_risk == pytest.approx(2.0)
+    assert make(Side.LONG, 96.0, [108.0, 99.0]).targets == [108.0]   # a "target" behind the entry is dropped
+
+
 @pytest.mark.parametrize("key", ["abcd_pattern", "bull_bear_flag", "red_to_green", "intraday_reversal", "sr_bounce"])
 def test_intraday_setups_never_crash_and_stay_framed(key):
     for i in range(40):
