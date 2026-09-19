@@ -105,3 +105,22 @@ def test_settings_round_trip_and_the_dashboard_loads(client):
     assert pairs["enabled"] and isinstance(pairs["watch"], list) and isinstance(pairs["trades"], list)
     assert client.post("/api/pairs/enter", json={"pair": "NOPE/PAIR"}).status_code == 400
     assert client.get("/api/pairs/chart", params={"pair": "NOPE/PAIR"}).json()["ok"] is False
+
+
+def test_an_open_tab_is_told_when_the_dashboards_files_have_changed(client, monkeypatch, tmp_path):
+    import importlib
+
+    server = importlib.import_module("tos_bot.server.app")        # the module, not the app the package exports
+
+    with client.websocket_connect("/ws") as ws:
+        hello = ws.receive_json()
+    assert hello["topic"] == "hello" and hello["payload"]["web_build"] == server.web_build()
+    assert "mode" in hello["payload"]                                  # the snapshot is still all there
+
+    (tmp_path / "web" / "js").mkdir(parents=True)
+    (tmp_path / "web" / "js" / "main.js").write_text("// one", encoding="utf-8")
+    monkeypatch.setattr(server, "WEB_DIR", tmp_path / "web")
+    before = server.web_build()
+    assert before == server.web_build()                                # the same files, the same stamp
+    (tmp_path / "web" / "js" / "main.js").write_text("// another script", encoding="utf-8")
+    assert server.web_build() != before                                # a tab that started on `before` reloads

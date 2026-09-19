@@ -51,7 +51,9 @@ async function loadDays() {
     <button class="mini lockable" id="reports-build" title="Build the report on the last session now (it's rebuilt if it exists)">Rebuild the last session</button>
     ${days.length ? days.map(d => `<button class="journal-day ${d.session === selected ? "active" : ""}" data-day="${escapeHtml(d.session)}">
         <b>${escapeHtml(longDate(d.session, true))}</b>
-        <span class="${tone(d.total_r)}">${d.opened ? `${d.opened} opened · ` : ""}${d.trades} closed · ${inR(d.total_r)} · ${usd(d.realized_pl)}</span>
+        ${d.opened && !d.trades
+          ? `<span class="${tone(d.open_r)}" title="Nothing closed this session; the positions opened stood here on the close">${d.opened} opened, still open · standing ${inR(d.open_r)}</span>`
+          : `<span class="${tone(d.total_r)}">${d.opened ? `${d.opened} opened · ` : ""}${d.trades} closed · ${inR(d.total_r)} · ${usd(d.realized_pl)}</span>`}
         ${d.mistakes ? `<span class="badge warn">${d.mistakes} to learn from</span>` : ""}
       </button>`).join("") : `<div class="empty">No reports yet. The first is written after the next close.</div>`}`;
   $$("#reports-side [data-day]").forEach(b => { b.onclick = () => { selected = b.dataset.day; loadDays(); }; });

@@ -1,5 +1,5 @@
 /* The live feed: engine events over the WebSocket, applied to the dashboard. */
-import { num, pct, plural, pretty, usd } from "./util.js";
+import { $, num, pct, plural, pretty, usd } from "./util.js";
 import { S, emit, refreshState, setState } from "./state.js";
 import { closeModal, drawerOpen, toast } from "./ui.js";
 import { renderCapital } from "./topbar.js";
@@ -29,7 +29,23 @@ export function connect() {
   ws.onerror = () => ws.close();
 }
 
+/* The dashboard's files as they were when this tab loaded them. After the app is updated and restarted the
+   tab reconnects but would go on running its old scripts - so when the stamp has changed it loads the new
+   ones, unless a dialog is open with something half-typed in it. */
+let webBuild = null;
+function loadNewScripts(build) {
+  if (!build) return;
+  if (webBuild === null) { webBuild = build; return; }
+  if (build === webBuild) return;
+  if ($("#modal") && !$("#modal").classList.contains("hidden")) {
+    toast("The dashboard was updated - refresh the page to load it", "warn");
+    return;
+  }
+  location.reload();
+}
+
 function handle(topic, p) {
+  if (topic === "hello") loadNewScripts(p.web_build);
   switch (topic) {
     case "hello":
     case "account.snapshot":

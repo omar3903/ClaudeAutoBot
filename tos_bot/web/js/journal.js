@@ -55,7 +55,7 @@ function openedHTML(rows) {
       return `<tr><td>${escapeHtml(t.symbol)} <span class="muted">${escapeHtml(t.side)}</span></td><td>${stratLabel(t.strategy)}</td>
         <td>${t.timeframe === "INTRADAY" ? "day" : "swing"}</td><td>${escapeHtml(fmtClock(t.entry_time))}</td>
         <td class="num">${num(t.entry)} <span class="muted">×${num(t.quantity, 0)}</span></td><td class="num">${num(t.stop)}</td><td class="num">${num(t.target)}</td>
-        <td class="num">${t.risk == null ? "–" : usd(t.risk)}</td><td class="num">${standing}</td><td class="muted">${takenOn(t)}</td></tr>`;
+        <td class="num">${t.risk == null ? "–" : usd(t.risk)}</td><td class="num nowrap">${standing}</td><td class="muted wrap">${takenOn(t)}</td></tr>`;
     }).join("")}</table>`;
 }
 

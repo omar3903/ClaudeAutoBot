@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import hashlib
 import logging
 import mimetypes
 from pathlib import Path
@@ -37,6 +38,17 @@ mimetypes.add_type("text/javascript", ".js")
 #: the dashboard is plain ES modules; a browser that reuses a cached copy of one of them after an
 #: update mixes old and new code and the page stops working, so every load re-checks each file
 NO_CACHE = {"Cache-Control": "no-cache"}
+
+
+def web_build() -> str:
+    """A stamp of the dashboard's files as they are on disk now. A tab that was open before the app was
+    updated still runs the scripts it loaded; it compares this with the stamp it started on and reloads."""
+    stamp = hashlib.sha1()
+    for path in sorted(WEB_DIR.rglob("*")):
+        if path.is_file():
+            stat = path.stat()
+            stamp.update(f"{path.relative_to(WEB_DIR).as_posix()}:{stat.st_size}:{stat.st_mtime_ns};".encode())
+    return stamp.hexdigest()[:12]
 
 
 class _FreshStaticFiles(StaticFiles):
@@ -342,7 +354,7 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
         loop = asyncio.get_running_loop()
         try:
             snap = await loop.run_in_executor(None, eng().snapshot)
-            await sock.send_json({"topic": "hello", "payload": snap})
+            await sock.send_json({"topic": "hello", "payload": {**snap, "web_build": web_build()}})
             rows = await loop.run_in_executor(None, eng().current_plays)
             await sock.send_json({"topic": "plays.updated", "payload": {"plays": rows}})
             while True:
