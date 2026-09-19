@@ -85,9 +85,14 @@ class ReplayRunner:
               news: Optional[Callable[[Sequence[str], dt.date], Mapping[str, Sequence[Mapping[str, Any]]]]] = None,
               benchmark: Optional[str] = None,
               records: Optional[Mapping[str, Mapping[str, Any]]] = None,
-              prepare: Optional[Callable[[Callable[[int, int], None]], Any]] = None) -> Dict[str, Any]:
+              prepare: Optional[Callable[[Callable[[int, int], None]], Any]] = None,
+              in_play: Optional[Callable[[Callable[[int, int], None]], Mapping[str, Sequence[dt.date]]]] = None,
+              download_budget_s: Optional[float] = None) -> Dict[str, Any]:
         """``prepare``: called first, on the replay's thread, with a progress function - the engine
-        downloads the long daily history there; ``market``: the turbulent regime's probability per day, from a model fitted before the
+        downloads the long daily history there; ``in_play``: called next, the same way, for the
+        sessions each stock was in play on (research/in_play.py) - day-trade setups are then
+        replayed on those stock-days instead of on ``intraday_symbols`` over every session, which
+        stay the fallback when it fails or finds nothing; ``market``: the turbulent regime's probability per day, from a model fitted before the
         given first day; ``earnings``: when each stock's earnings filings were accepted; ``news``:
         each stock's stored stories since a first day, for the news checks; ``benchmark``: the
         S&P 500 ETF's symbol, whose candles the market model behind those checks needs; ``records``:
@@ -101,11 +106,13 @@ class ReplayRunner:
                 target=self._run, name="replay", daemon=True,
                 args=(list(strategies), source, daily_frame, list(intraday_symbols), list(swing_symbols),
                       sessions, swing_sessions, settings, noise, con_ids or {}, market, earnings,
-                      held_out_fraction, pairs, news, benchmark, dict(records or {}), prepare))
+                      held_out_fraction, pairs, news, benchmark, dict(records or {}), prepare, in_play,
+                      download_budget_s))
             self._thread.start()
         held = f"{held_out_fraction:.0%}"
+        where = "the stocks in play each session" if in_play is not None else f"{len(intraday_symbols)} stocks"
         return {"ok": True, "note": (f"Replaying the last {sessions} sessions of day-trade setups on "
-                                     f"{len(intraday_symbols)} stocks and {swing_sessions} sessions of swing "
+                                     f"{where} and {swing_sessions} sessions of swing "
                                      f"setups on {len(swing_symbols)}, holding out the latest {held} to test "
                                      "them on. It runs in the background.")}
 
@@ -115,15 +122,29 @@ class ReplayRunner:
 
     def _run(self, strategies, source, daily_frame, intraday_symbols, swing_symbols, sessions, swing_sessions,
              settings, noise, con_ids, market, earnings, fraction, pairs=None, news=None, benchmark=None,
-             records=None, prepare=None) -> None:
+             records=None, prepare=None, in_play=None, download_budget_s=None) -> None:
         started = time.monotonic()
         try:
             self._optional("the long daily history", prepare,
                            lambda done, total: self._report("years of daily candles", done, total))
-            wanted = intraday_symbols + ([benchmark] if benchmark and benchmark not in intraday_symbols else [])
-            bars = self.history.load(source, wanted, sessions, con_ids,
-                                     progress=lambda done, total: self._report("5-minute candles", done, total))
             last = clock.prev_trading_day(clock.session_date())
+            days = {s: sorted(v) for s, v in (self._optional(
+                "the stocks in play each session", in_play,
+                lambda done, total: self._report("the stocks in play each session", done, total)) or {}).items() if v}
+            pending = 0
+            if days:
+                intraday_symbols = list(days)
+                report = lambda done, total: self._report("5-minute candles", done, total)   # noqa: E731
+                if benchmark:                        # the market model reads the benchmark on every replayed session
+                    self.history.load_days(source, {benchmark: clock.last_n_sessions(last, sessions)}, con_ids)
+                bars = self.history.load_days(source, days, con_ids, progress=report, budget_s=download_budget_s)
+                pending = self.history.pending
+                if benchmark and (held := self.history.stored(benchmark)) is not None:
+                    bars[benchmark] = held
+            else:
+                wanted = intraday_symbols + ([benchmark] if benchmark and benchmark not in intraday_symbols else [])
+                bars = self.history.load(source, wanted, sessions, con_ids,
+                                         progress=lambda done, total: self._report("5-minute candles", done, total))
             first = min(clock.last_n_sessions(last, max(sessions, swing_sessions)))
             self._report("market regime, earnings dates and news", 0, 1)
             regime = dict(self._optional("the market regime", market, first) or {})
@@ -137,7 +158,8 @@ class ReplayRunner:
             jobs = [("intraday", strategies, s, chunk, daily, settings, noise, n, regime, reports.get(s, ()),
                      stories.get(s, ()), bench_bars, bench_daily, records)
                     for s in intraday_symbols if s in bars and (daily := daily_frame(s)) is not None
-                    for chunk, n in session_chunks(bars[s], sessions, self.sessions_per_job)]
+                    for chunk, n in (day_chunks(bars[s], days[s], self.sessions_per_job) if days
+                                     else session_chunks(bars[s], sessions, self.sessions_per_job))]
             jobs += [("swing", strategies, s, None, daily, settings, noise, swing_sessions, regime, (),
                       stories.get(s, ()), None, bench_daily, records)
                      for s in swing_symbols if (daily := daily_frame(s)) is not None]
@@ -148,7 +170,12 @@ class ReplayRunner:
             trades = self._replay(jobs)
             data = {
                 "ran_at": dt.datetime.now(dt.timezone.utc).isoformat(), "sessions": sessions,
-                "swing_sessions": swing_sessions, "intraday_symbols": len(bars), "swing_symbols": len(swing_symbols),
+                "swing_sessions": swing_sessions, "swing_symbols": len(swing_symbols),
+                "intraday_symbols": sum(1 for s in intraday_symbols if s in bars),
+                # with the stocks chosen session by session: how many stock-days the day-trade setups ran on
+                "intraday_stock_days": sum(len(j[7]) for j in jobs if j[0] == "intraday") if days else None,
+                "intraday_stock_days_in_play": sum(len(v) for v in days.values()) if days else None,
+                "intraday_requests_pending": pending,
                 "elapsed_s": round(time.monotonic() - started, 1), "held_out_from": split,
                 "costs": {"slippage_bps": settings.slippage_bps, "commission_bps": settings.commission_bps},
                 "market_regime_days": len(regime), "earnings_stocks": sum(1 for v in reports.values() if v),
@@ -320,6 +347,23 @@ def session_chunks(bars: pd.DataFrame, sessions: int, size: int) -> List[Tuple[p
         first = days.index(chunk[0])
         keep = set(days[max(0, first - LOOKBACK_SESSIONS):first]) | set(chunk)
         out.append((bars[[d in keep for d in bars.index.date]], len(chunk)))
+    return out
+
+
+def day_chunks(bars: pd.DataFrame, days: Sequence[dt.date], size: int) -> List[Tuple[pd.DataFrame, Tuple[dt.date, ...]]]:
+    """Jobs for a stock replayed only on the sessions it was in play: ``size`` of those sessions a
+    job, each with the ``LOOKBACK_SESSIONS`` before it for the rolling windows. Returns (frame,
+    the sessions to replay) pairs - sessions the candles don't hold are left out."""
+    held = sorted(set(bars.index.date))
+    wanted = [d for d in sorted(days) if d in set(held)]
+    out: List[Tuple[pd.DataFrame, Tuple[dt.date, ...]]] = []
+    for start in range(0, len(wanted), max(1, size)):
+        chunk = wanted[start:start + max(1, size)]
+        keep = set(chunk)
+        for day in chunk:
+            at = held.index(day)
+            keep.update(held[max(0, at - LOOKBACK_SESSIONS):at])
+        out.append((bars[[d in keep for d in bars.index.date]], tuple(chunk)))
     return out
 
 

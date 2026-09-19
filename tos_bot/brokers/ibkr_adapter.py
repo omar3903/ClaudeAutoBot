@@ -129,6 +129,15 @@ class _IBSession:
             self._loop.call_soon_threadsafe(self._loop.stop)
 
 
+class Candles(dict):
+    """history_many's answer, symbol -> candles. ``failed``: the symbols whose request timed out or
+    errored - not the same as IBKR having nothing for them."""
+
+    def __init__(self, *args, failed=(), **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.failed = set(failed)
+
+
 class IbkrBroker(BrokerAdapter):
     name = "ibkr"
     # The ExitManager owns exits and sends real close orders. No native bracket
@@ -608,22 +617,29 @@ class IbkrBroker(BrokerAdapter):
         """Candles for many symbols at once. ``requests`` maps a symbol to
         (bar size, duration), e.g. ("1 day", "1 Y") or ("5 mins", "5 D"), ending at
         ``end`` (default: now); ``rth`` False includes the pre-market and after-hours
-        candles. Symbols IBKR has nothing for are left out of the result."""
+        candles. Symbols IBKR has nothing for are left out of the result; the ones whose request
+        timed out or failed are left out too and named in the result's ``failed`` - they may well
+        have candles, so a caller that remembers what IBKR lacks mustn't count them."""
         if not self.is_connected:
             raise AuthError("IBKR not connected")
         if not requests:
-            return {}
+            return Candles()
         con_ids = con_ids or {}
+        failed: set = set()
 
         async def one(ib, gate: asyncio.Semaphore, symbol: str, bar: str, duration: str):
             async with gate:
+                asked_at = time.monotonic()
                 try:
                     bars = await ib.reqHistoricalDataAsync(
                         self._contract_for_history(symbol, con_ids.get(symbol)), endDateTime=end or "",
                         durationStr=duration, barSizeSetting=bar, whatToShow="TRADES", useRTH=rth,
                         formatDate=2, keepUpToDate=False, timeout=timeout)
                 except Exception:  # noqa: BLE001
+                    failed.add(symbol)
                     return symbol, None
+                if not bars and time.monotonic() - asked_at >= timeout - 0.5:
+                    failed.add(symbol)                   # ib_async answers a timeout with an empty list
                 return symbol, _bars_to_df(bars) if bars else None
 
         async def run(ib):
@@ -631,7 +647,8 @@ class IbkrBroker(BrokerAdapter):
             return await asyncio.gather(*(one(ib, gate, s, bar, dur) for s, (bar, dur) in requests.items()))
 
         budget = timeout * (len(requests) / self.HISTORY_CONCURRENCY + 1) + 30
-        return {s: f for s, f in self._session.run_coro(run, timeout=budget) if f is not None and len(f)}
+        got = self._session.run_coro(run, timeout=budget)
+        return Candles({s: f for s, f in got if f is not None and len(f)}, failed=failed)
 
     def get_fills(self, symbol: Optional[str] = None, timeout: float = 15.0) -> List[Fill]:
         """This session's executions on the account (IBKR keeps the current day's), oldest first.

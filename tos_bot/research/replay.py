@@ -31,6 +31,20 @@ Chan's rules for a backtest worth believing (*Quantitative Trading*, ch. 3):
   published - the news checks see, at each bar, the stories out by then and the S&P 500
   ETF's candles up to then (as far back as the app has been storing headlines).
 
+**Two ways in, for a day trade.** A setup is followed from the bar it first shows
+(``entry_rule`` "first": the record of every trade, and Autopilot's when it takes a
+play on sight) and, separately, from the bar after it has shown twice in a row
+("second": how Autopilot enters when it asks a day trade to be seen in two scans
+running - one bar later, at another price, and only once a session per setup, the
+way the board settles a setup it has acted on). Autopilot's record is built from
+the way in it really uses; before, nearly every replayed trade was entered on
+sight, so almost none counted towards a day setup's proof.
+
+**Which stocks.** Day trades are for stocks in play. The runner replays each past
+session on the stocks that were in play *that morning* (research/in_play.py), not
+on today's hot list - which is hot because of what it has just done, and hands a
+momentum setup its own hindsight.
+
 What it can't know: a fill is assumed at the next bar's open (and skipped when
 that open has already run away from the entry), a stop and a target in the same
 bar count as the stop, and slippage is a flat fraction of price.
@@ -116,6 +130,8 @@ class SimTrade:
     exit_reason: str
     noise: List[str] = field(default_factory=list)
     confirmed: bool = True                # the setup had also shown up on the bar before
+    entry_rule: str = "first"             # first: entered the bar the setup showed; second: a day trade entered
+                                          # only once it had shown two bars running - Autopilot's way in
     mfe_r: float = 0.0                    # the best it got, in R, before it closed
     scaled: bool = False                  # part of it was taken off at the first target
     features: Dict[str, Any] = field(default_factory=dict)   # the play at the signal (research/features.py)
@@ -135,6 +151,7 @@ class _Position:
     noise: List[str]
     confirmed: bool
     best: float
+    entry_rule: str = "first"
     bars_held: int = 0
     fraction: float = 1.0                 # of the position still on
     banked_r: float = 0.0                 # in R of the whole position, from the part taken off
@@ -151,12 +168,14 @@ class _Position:
 # ---------------------------------------------------------------- day trades
 def replay_intraday(strategies: Sequence[Strategy], symbol: str, bars: pd.DataFrame, daily: pd.DataFrame,
                     settings: ReplaySettings = ReplaySettings(), noise: NoiseSettings = NoiseSettings(),
-                    sessions: Optional[int] = None, market: Optional[Mapping[dt.date, float]] = None,
+                    sessions: Any = None, market: Optional[Mapping[dt.date, float]] = None,
                     earnings: Sequence[str] = (), news: Sequence[Mapping[str, Any]] = (),
                     benchmark_bars: Optional[pd.DataFrame] = None,
                     benchmark_daily: Optional[pd.DataFrame] = None,
                     records: Optional[Mapping[str, Mapping[str, Any]]] = None) -> List[SimTrade]:
     """``bars``: 5-minute candles over several sessions; ``daily``: completed daily candles;
+    ``sessions``: how many of the latest sessions in ``bars`` to replay, or the very sessions (dates) -
+    the days the stock was in play; the other sessions in ``bars`` are only looked back over;
     ``records``: each strategy's pooled record (research/weights.py pooled_odds), so the plays state
     the same calibrated odds they state live;
     ``market``: the probability of the turbulent regime for each day, known before it opened;
@@ -169,7 +188,12 @@ def replay_intraday(strategies: Sequence[Strategy], symbol: str, bars: pd.DataFr
     stories = _stories(news)
     trades: List[SimTrade] = []
     drift = drift_per_bar(bars, intraday=True)
-    for day in days[-sessions:] if sessions else days:
+    if sessions and not isinstance(sessions, int):
+        chosen = set(sessions)
+        replayed = [d for d in days if d in chosen]
+    else:
+        replayed = days[-sessions:] if sessions else days
+    for day in replayed:
         session = bars[bars.index.date == day]
         prior_daily = daily[daily.index.date < day].tail(LIVE_DAILY_BARS)
         if not day_trades or len(prior_daily) < 20 or len(session) < settings.warmup_bars + 2:
@@ -190,6 +214,8 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
                     records: Optional[Mapping[str, Mapping[str, Any]]] = None, drift: float = 0.0) -> List[SimTrade]:
     trades: List[SimTrade] = []
     open_positions: Dict[str, _Position] = {}
+    waited: Dict[str, _Position] = {}               # the same setups, entered Autopilot's way (entry_rule "second")
+    settled: set = set()                            # (strategy, side) already entered that way this session
     seen_before: set = set()
     records = {k: dict(v) for k, v in (records or {}).items()}
     shared = session_series(history, strategies)
@@ -217,16 +243,29 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
                 if position is not None:
                     position.drift_per_bar = drift
                     open_positions[strategy.key] = position
+            setup = (strategy.key, play.side)
+            if setup in seen_before and setup not in settled and strategy.key not in waited:
+                # seen on two bars running: the entry Autopilot makes when it asks for confirmation
+                position = _enter(strategy.key, play, flags, True, next_at, float(next_bar["open"]),
+                                  settings.max_entry_drift_atr * ctx.intraday_atr, settings,
+                                  features=play_features(play, now=ctx.now, market=ctx.market, noise=flags,
+                                                         confirmations=2, activity=activity))
+                if position is not None:
+                    position.drift_per_bar, position.entry_rule = drift, "second"
+                    waited[strategy.key] = position
+                    settled.add(setup)
         seen_before = {(s.key, p.side) for s, p, _ in signals_now}
 
         flatten = next_at + BAR >= flatten_at
-        for key, position in list(open_positions.items()):
-            done = _step(position, next_bar, next_at + BAR, settings, "eod-flatten" if flatten else None)
-            if done is not None:
-                trades.append(done)
-                del open_positions[key]
+        for book in (open_positions, waited):
+            for key, position in list(book.items()):
+                done = _step(position, next_bar, next_at + BAR, settings, "eod-flatten" if flatten else None)
+                if done is not None:
+                    trades.append(done)
+                    del book[key]
     last_at, last = session.index[-1] + BAR, session.iloc[-1]
-    trades += [_close(p, float(last["close"]), last_at, "eod-flatten", settings) for p in open_positions.values()]
+    trades += [_close(p, float(last["close"]), last_at, "eod-flatten", settings)
+               for book in (open_positions, waited) for p in book.values()]
     return trades
 
 
@@ -475,7 +514,7 @@ def _close(position: _Position, price: float, at: pd.Timestamp, reason: str, set
                     timeframe=play.timeframe.value, entered_at=position.entered_at.isoformat(),
                     exited_at=at.isoformat(), entry=round(position.entry, 4), exit=round(price, 4),
                     r=round(position.banked_r + rest, 3), exit_reason=reason,
-                    noise=list(position.noise), confirmed=position.confirmed,
+                    noise=list(position.noise), confirmed=position.confirmed, entry_rule=position.entry_rule,
                     mfe_r=round(max(0.0, (position.best - position.entry) * position.sign / position.risk), 3),
                     scaled=position.scaled, features=dict(position.features),
                     drift_r=round(drift / position.risk, 4), cost_r=round(paid / position.risk, 4))
@@ -535,6 +574,12 @@ def summarize(trades: Iterable[SimTrade]) -> Dict[str, Any]:
     }
 
 
+def on_sight(trades: Iterable[SimTrade]) -> List[SimTrade]:
+    """The trades entered the bar their setup first showed - one per setup, the base every record of
+    all trades and every noise verdict is measured on (the "second" entries are the same setups again)."""
+    return [t for t in trades if t.entry_rule == "first"]
+
+
 def flagged(trade: SimTrade, check: str) -> bool:
     if check == "unconfirmed":
         return trade.timeframe == Timeframe.INTRADAY.value and not trade.confirmed
@@ -543,7 +588,9 @@ def flagged(trade: SimTrade, check: str) -> bool:
 
 def noise_report(trades: Sequence[SimTrade], split: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, Dict[str, Any]]:
     """For each check: the trades it removes and how they did against the ones it keeps -
-    over every session, and over the held-out sessions alone when ``split`` says which."""
+    over every session, and over the held-out sessions alone when ``split`` says which. Measured on
+    the entries made on sight: one trade per setup."""
+    trades = on_sight(trades)
     late = [t for t in trades if held_out(t, split)] if split else []
 
     def measure(test) -> Dict[str, Any]:
@@ -595,13 +642,17 @@ def _compare(removed: Sequence[SimTrade], kept: Sequence[SimTrade]) -> Dict[str,
 def taken(trades: Sequence[SimTrade], skip_noise: Iterable[str] = (), min_confirmations: int = 1,
           min_reward_risk: float = 0.0, confidence_floors: Optional[Mapping[str, float]] = None) -> List[SimTrade]:
     """The trades Autopilot would actually have taken: none with a skipped noise flag, day trades
-    confirmed when it asks for that, and - through the features the replay keeps on a trade - none
-    under its reward:risk floor or under the confidence floor of its timeframe."""
+    entered its way - after two bars running when it asks for confirmation (entry_rule "second"), on
+    sight when it doesn't - and, through the features the replay keeps on a trade, none under its
+    reward:risk floor or under the confidence floor of its timeframe."""
     skip = set(skip_noise)
     floors = dict(confidence_floors or {})
+    day_rule = "second" if min_confirmations > 1 else "first"
 
     def passes(t: SimTrade) -> bool:
-        if skip.intersection(t.noise) or (min_confirmations > 1 and flagged(t, "unconfirmed")):
+        if skip.intersection(t.noise):
+            return False
+        if t.entry_rule != (day_rule if t.timeframe == Timeframe.INTRADAY.value else "first"):
             return False
         f = t.features or {}
         rr, conf = f.get("reward_risk"), f.get("confidence")

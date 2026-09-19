@@ -1209,6 +1209,15 @@ def build() -> str:
       'and 1 bp commission each way, the same exit rules as the exit manager (including scale-out), news flags '
       'from the stored headlines, and the market regime as it was known that day. The latest third of sessions '
       'is <b>held out</b>: a strategy must also work on data it was not tuned on.</p>')
+    A('<p><b>Which stocks, and which way in.</b> Day-trade setups only ever see the morning\'s hot list, so each '
+      'past session is replayed on the stocks the scan would have picked <i>that morning</i> '
+      '(<code>research/in_play.py</code>: the 40 hottest by daily heat as of the session before, plus the 10 '
+      'biggest opening gaps) - not on today\'s hot list, which is hot because of what it has just done and hands '
+      'a momentum setup its own hindsight. Each day setup is followed twice: entered on sight '
+      '(<code>entry_rule</code> first - the record of all trades) and entered once it has shown two bars in a row '
+      '(second - how Autopilot enters when it asks for two scans running); Autopilot\'s record, the one the '
+      'proof rule reads, uses the way in it really uses. The replay reads 5-minute candles with flat costs: it '
+      'is good at throwing out a setup that loses, and a setup it likes still has to show it on paper.</p>')
     A('<p><b>Runner</b> (<code>research/runner.py</code>). Splits the work into jobs (one stock, or ten sessions '
       'of one stock for day trades), runs them on a <code>ProcessPoolExecutor</code> with every core but two, '
       'and merges the simulated trades into per-strategy records: trade count, win rate, expectancy in R, '
@@ -1353,6 +1362,10 @@ def build() -> str:
          "(fresh account, settled connection, grace, two misses)"),
         ("persistence/repository.py", "open_trade(), reduce_trade(), close_trade(), trade_record(), pnl_summary()",
          "the trade ledger and its R multiples"),
+        ("research/in_play.py", "metrics_history(), in_play()", "the day-trade replay's stocks: each past session's "
+         "hottest by daily heat as of the session before, and its biggest gaps - the morning scan, point in time"),
+        ("research/history.py", "IntradayHistory.load(), load_days()", "5-minute candles kept on disk; load_days "
+         "fetches only a stock's sessions in play and the four before each"),
         ("research/replay.py", "replay_intraday(), replay_swing(), summarize(), learned_skips()", "the backtest "
          "and its records"),
         ("research/runner.py", "ReplayRunner.start(), replay_job(), session_chunks()", "the parallel replay"),
