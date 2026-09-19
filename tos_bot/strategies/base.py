@@ -338,6 +338,11 @@ class Strategy:
 
         max_move = entry * self.MAX_TARGET_PCT.get(self.timeframe.value, 0.4)
         targets = [min(t, entry + max_move) if side is Side.LONG else max(t, entry - max_move) for t in targets]
+        # the nearest target comes first, however the setup listed them: it is the one the reward:risk is
+        # judged on, and the first the exits take. A level further out than the setup's fallback multiple
+        # would otherwise pass for the first target and flatter the play
+        ahead = {t for t in targets if (t > entry if side is Side.LONG else t < entry)}
+        targets = sorted(ahead, reverse=side is Side.SHORT)
         if abs(targets[0] - entry) / entry < self.MIN_TARGET_PCT:
             return None
         rr = abs(targets[0] - entry) / abs(entry - stop)
