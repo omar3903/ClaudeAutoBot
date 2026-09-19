@@ -186,6 +186,8 @@ tr.row-overdue{box-shadow:inset 3px 0 0 var(--short)}
 .kv span:nth-child(even){text-align:right; font-variant-numeric:tabular-nums}
 .ev-table{width:100%; margin:8px 0; font-size:12px}
 .ev-table td{padding:3px 6px; border-bottom:1px solid var(--line)}
+.ev-table td.wrap{white-space:normal; min-width:220px}
+.ev-table td.nowrap{white-space:nowrap}
 .order-card{border:1px solid var(--accent); border-radius:var(--radius); padding:12px; margin:12px 0; background:var(--order-bg)}
 .order-card h4{margin:0 0 8px}
 .confirm-row{display:flex; gap:8px; margin-top:12px}

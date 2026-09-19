@@ -429,6 +429,9 @@ The app is built to be left running:
   needs a current quote. With today's watchlist on disk the full scan isn't repeated either; open
   positions and their resting stop and target orders are found again from the trade records and the
   order tags.
+* **An open dashboard tab updates itself.** After the app is updated and restarted, a tab that was already
+  open reconnects - and would go on running the scripts it loaded before. The server stamps the dashboard's
+  files in its first message; a tab that started on another stamp reloads (or, with a dialog open, asks you to).
 * **Days on end** - candles and quotes nothing has asked for in half an hour are let go, the log
   rotates at 5 MB, and the scans, the reports, Autopilot's daily counts and the pairs roll over by date.
 * **Sleep.** While the app runs it asks Windows not to go to sleep (the screen can still turn off);
