@@ -9,7 +9,8 @@ const GLOSSARY = {
   intraday: ["Intraday (day trade)", "Opened and closed in the same session - held minutes to hours and flattened before the close. Under $25k, a live margin account gets 3 day trades per 5 sessions (the PDT rule)."],
   swing: ["Swing", "Held for days to a few weeks to catch a bigger move. It carries overnight gap risk, but doesn't use up day trades."],
   ext: ["Extended hours", "Can also be entered pre-market (4:00-9:30) or after hours (16:00-20:00), with limit orders only. Thinner trading means wider spreads."],
-  autopilot: ["Autopilot", "A bright robot means Autopilot will take this entry on its next pass; a dim one means it already has. Exits are automatic either way."],
+  autopilot: ["Autopilot", "A green bar at the left of a play and a bright robot: Autopilot would take it on its next pass - it passes every check and a cap has room for it. An amber bar: it passes the checks but a cap is full (the day's entries, the open positions, the day / swing slots, the setup's own) - hover the robot for which. A dim robot: it has already acted on it. Exits are automatic either way."],
+  last: ["Price", "The latest price the app holds for the stock - its last quote, or the close of its latest 5-minute candle - and how far that is past the entry in R (risk units). An entry is refused once the price has run more than 0.25R past it (execution.max_chase_r): the reward:risk the play was judged on is gone, so beyond that it's amber. The scans keep it current in the session; Refresh fetches it now for every play and position. On delayed data it's about 15 minutes old."],
   executed: ["Executed", "An order has gone out for this play. It won't be sent twice - the position is under Open positions."],
   hide_done: ["Hide executed", "Only changes this view: plays you've already sent drop out of the table. What the bot scans for isn't affected."],
   symbol: ["Symbol", "The ticker and its sector. Hover a row for the reasoning; click it for the numbers and the order."],
@@ -25,7 +26,7 @@ const GLOSSARY = {
   qty: ["Quantity", "Shares sized so a stop-out loses about your per-trade risk budget, capped by buying power."],
   risk: ["$ Risk", "What you lose if the stop is hit: quantity × |entry − stop|, before slippage."],
   score: ["Score", "The rank: what the play should make per dollar risked (its odds times the reward, less the odds it fails), times the setup's weight and the evidence weight from its record, plus a small bump for unusual volume, a gap (day trades) and enough range. Weights only reorder plays; they don't change a play."],
-  mark: ["Mark", "The broker's current price for the position."],
+  mark: ["Mark", "The current price for the position: the one the exit manager acts on (it fetches one about every 20 seconds), or the broker's own mark when it has none. Refresh fetches it now."],
   unrealized: ["Unrealized", "This record's open profit or loss at the current mark: (mark − entry) × its shares. The broker's figure for all the shares it holds of the stock is in the trade record."],
   order_for: ["For", "entry: opens a position for a play.\nexit: closes an open position.\nbracket stop / target: attached to an entry.\nplaced outside the app: by hand or by another program - listed, but the app never changes or cancels it."],
   order_status: ["Status", "accepted, not live yet: the broker holds it but hasn't sent it to the exchange - a regular-hours order placed before the open waits for 9:30, a stop waits for its price.\nworking: live at the exchange, waiting to fill.\npart filled: some shares are done, the rest are still working."],
@@ -60,6 +61,12 @@ function termContent(el) {
     if (!s) return [pretty(el.dataset.key), "A trading setup. Open Strategies for the full playbook."];
     const how = `${s.timeframe === "INTRADAY" ? "Day trade" : "Swing"} · ${s.kind.toLowerCase()} · ${s.enabled ? `on, weight ${s.weight}` : "switched off"}`;
     return [s.title, `${s.thesis}\n\n${how}`];
+  }
+  if (k === "autopilot" && el.dataset.waiting) {
+    const [title, text] = GLOSSARY.autopilot;
+    return [title, `Waiting: ${el.dataset.waiting}.
+
+${text}`];
   }
   return GLOSSARY[k] || null;
 }

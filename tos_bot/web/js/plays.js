@@ -53,16 +53,29 @@ function signalMark(p) {
   return `<span class="badge sig-mark ${delta > 0 ? "good" : delta < 0 ? "bad" : ""}" title="Signals ${delta > 0 ? "+" : ""}${delta.toFixed(3)}: ${escapeHtml(ev.signal_reasons)}">signal</span>`;
 }
 
+/* The latest price the app holds for the stock, and how far it has run from the entry in R - an entry is
+   refused a quarter of an R past it (execution.max_chase_r). The time it's from is in the tooltip. */
+function priceCell(p) {
+  if (p.last_price == null) return `<td class="num muted" title="No price yet - Refresh fetches one">–</td>`;
+  const risk = Math.abs(p.entry - p.stop), sign = p.side === "SHORT" ? -1 : 1;
+  const r = risk ? sign * (p.last_price - p.entry) / risk : null;
+  const at = p.last_at ? new Date(p.last_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  const tip = `${at ? `As of ${at}` : ""}${(S.state.data || {}).delayed ? " (delayed data)" : ""}${r == null ? "" : `. ${Math.abs(r).toFixed(2)}R ${r >= 0 ? "past" : "short of"} the entry`}`;
+  const cls = r == null ? "" : r > 0.25 ? "warn-text" : "muted";
+  return `<td class="num" title="${escapeHtml(tip)}">${num(p.last_price)}${r == null ? "" : ` <span class="small ${cls}">${r >= 0 ? "+" : ""}${r.toFixed(1)}R</span>`}</td>`;
+}
+
 function playRow(p) {
   const tr = document.createElement("tr");
   const done = isDone(p), ap = p.autopilot || {};
   tr.dataset.id = p.id;
   tr.classList.toggle("selected", p.id === S.selected);
   tr.classList.toggle("done", done);
-  tr.classList.toggle("ap-eligible", !!ap.eligible && !done);
+  tr.classList.toggle("ap-eligible", !!ap.eligible && !ap.waiting && !done);
+  tr.classList.toggle("ap-waiting", !!ap.eligible && !!ap.waiting && !done);
   const apMark = ap.acted
     ? '<span class="ap-badge acted" data-term="autopilot">🤖</span>'
-    : (ap.eligible && !done ? '<span class="ap-badge" data-term="autopilot">🤖</span>' : "");
+    : (ap.eligible && !done ? `<span class="ap-badge${ap.waiting ? " waiting" : ""}" data-term="autopilot"${ap.waiting ? ` data-waiting="${escapeHtml(ap.waiting)}"` : ""}>🤖</span>` : "");
   const last = done
     ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
     : `<span class="info-dot">i</span>`;
@@ -72,6 +85,7 @@ function playRow(p) {
     <td>${stratLabel(p.strategy)}</td>
     <td class="tf">${tfLabel(p.timeframe)}</td>
     <td class="num">${num(p.entry)}</td>
+    ${priceCell(p)}
     <td class="num">${num(p.stop)}</td>
     <td class="num">${num((p.targets || [])[0])}</td>
     <td class="num">${num(p.reward_risk, 1)}</td>

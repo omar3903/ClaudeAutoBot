@@ -156,3 +156,36 @@ def test_the_research_store_keeps_years_of_candles_for_the_stocks_the_replay_run
 
     plain = MarketData(DailyBarStore(tmp_path / "bars"))                        # no research store: the live year
     assert plain.deepen_daily(["AAA"], through) == 0 and len(plain.deep_frame("AAA")) == len(md.daily_frame("AAA"))
+
+
+# ---------------------------------------------------------------- the latest price, for the dashboard
+def test_the_latest_price_is_the_newer_of_the_quote_and_the_candles_and_says_when_its_from(tmp_path):
+    import datetime as dt
+
+    from tos_bot.data.market_data import quote_from_price
+
+    gateway, md = fakes.FakeGateway(delayed=True), MarketData(DailyBarStore(tmp_path))
+    md.attach(gateway)
+    assert md.last_seen("AAA") is None                                          # nothing fetched: nothing to show
+    q = md.quote("AAA")
+    frame = gateway.history_many({"AAA": ("1 min", "1800 S")})["AAA"]
+    price, at, age = md.last_seen("AAA")
+    assert price == q.last and at == frame.index[-1].to_pydatetime() and 0 <= age < 5   # the candle's time, not now
+    assert len(gateway.requests) == 2                                           # reading it asks the broker nothing
+
+    old = dt.datetime(2020, 1, 2, 15, 0, tzinfo=dt.timezone.utc)
+    md._quotes["AAA"] = (md._quotes["AAA"][0], quote_from_price("AAA", 1.0, ts=old))
+    md.intraday(["AAA"])
+    assert md.last_seen("AAA")[0] == pytest.approx(float(md._intraday["AAA"][1]["close"].iloc[-1]))  # the newer one
+
+
+def test_refresh_fetches_every_price_in_one_batch_and_keeps_to_the_limit(tmp_path):
+    gateway, md = fakes.FakeGateway(["AAA", "BBB", "CCC"], delayed=True), MarketData(DailyBarStore(tmp_path))
+    md.attach(gateway)
+    assert md.refresh_prices([]) == 0 and gateway.requests == []
+    assert md.refresh_prices(["AAA", "BBB", "AAA", "NOPE"]) == 2               # a symbol with no candles is left out
+    assert sorted(s for s, _, _ in gateway.requests) == ["AAA", "BBB", "NOPE"]
+    assert {bar for _, bar, _ in gateway.requests} == {"1 min"}
+    assert md.last_seen("BBB") is not None and md.last_seen("NOPE") is None
+    gateway.requests.clear()
+    assert md.refresh_prices(["AAA", "BBB", "CCC"], limit=2) == 2 and len(gateway.requests) == 2

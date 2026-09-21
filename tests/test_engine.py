@@ -1042,3 +1042,37 @@ def test_the_review_judges_a_play_on_autopilots_checks_not_on_its_type_boxes(eng
     assert not engine._passes_checks(row) and engine._passes_checks({**row, "confirmations": 2})
     swing = {**row, "timeframe": "SWING", "confidence": ap.min_swing_confidence}
     assert engine._passes_checks(swing) and not engine._passes_checks({**swing, "confidence": ap.min_swing_confidence - 0.01})
+
+
+# ---------------------------------------------------------------- market prices on the dashboard
+def test_each_play_carries_the_latest_price_the_app_holds_and_when_its_from(engine):
+    p = _play("AAPL")
+    engine.md.attach(fakes.FakeGateway(["AAPL"], delayed=True))
+    row = engine._decorate(p)
+    assert row["last_price"] is None and row["last_at"] is None                 # nothing fetched yet
+    engine.md.quote("AAPL")
+    row = engine._decorate(p)
+    assert row["last_price"] == engine.md.last_seen("AAPL")[0] and row["last_at"].startswith("20")
+
+
+def test_refresh_prices_the_plays_and_the_positions_and_sends_the_plays_out_again(engine, monkeypatch):
+    p = _play("MSFT")
+    engine.board.replace([p])
+    engine.md.attach(fakes.FakeGateway(["AAPL", "MSFT"], delayed=True))
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAPL", quantity=10, avg_price=100.0, market_price=100.0)]
+    asked, sent = [], []
+    real = engine.md.refresh_prices
+    monkeypatch.setattr(engine.md, "refresh_prices", lambda symbols, con_ids=None: asked.append(list(symbols))
+                        or real(symbols, con_ids))
+    monkeypatch.setattr(engine, "_publish_plays", lambda: sent.append(True))
+    assert engine.refresh_prices() == 2
+    assert asked == [["AAPL", "MSFT"]] and sent == [True]                      # the position first, one batch
+    price, at, _ = engine.md.last_seen("AAPL")
+    [pos] = engine.snapshot()["positions"]
+    assert pos["market_price"] == round(price, 4) and pos["price_at"] == at.isoformat()   # the app's fresher mark
+    assert pos["unrealized_pl"] == round((price - 100.0) * 10, 2)
+
+    engine.APP_MARK_S = -1.0                                                    # a price that has aged: the broker's mark
+    [pos] = engine.snapshot()["positions"]
+    assert (pos["market_price"], pos["price_at"], pos["unrealized_pl"]) == (100.0, None, 0.0)

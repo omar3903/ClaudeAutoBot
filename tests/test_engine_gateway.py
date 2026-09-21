@@ -66,6 +66,14 @@ def test_refresh_connects_at_once_when_the_gateway_came_up_after_the_app(engine,
     assert engine.refresh_account_now()["note"] == "Account, positions and orders re-read."
 
 
+def test_refresh_fetches_the_prices_too_and_says_how_many(engine, port, monkeypatch):
+    _connect(engine, port)
+    asked = []
+    monkeypatch.setattr(engine, "refresh_prices", lambda: asked.append(True) or 7)
+    out = engine.refresh_account_now()
+    assert out["ok"] and asked == [True] and out["note"] == "Account, positions and orders re-read, and 7 prices fetched."
+
+
 def test_refresh_says_when_ibkr_doesnt_answer(engine, port, gateway, monkeypatch):
     from tos_bot.brokers.base import BrokerError
 

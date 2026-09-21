@@ -782,7 +782,12 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 The filters and the Strategies panel apply to Autopilot too, and it takes no
 entries while the app is quitting. It still passes every other check — session
 validity, position sizing, the PDT guard, the $2,000 live floor. Valuation plays
-are never auto-traded. Eligible plays get a **🤖** marker.
+are never auto-traded. Eligible plays get a **🤖** marker and a coloured bar at
+the left of the row: **green** — Autopilot would take it on its next pass (it
+passes every check and a cap has room); **amber** — it passes the checks but a
+cap is full (the day's entries, the open positions, the day / swing slots, or
+the setup's own), and hovering the robot says which. A dim robot means it has
+already acted on the play.
 
 **Proof, noise and size.** A day-trade setup must show up in `min_confirmations`
 (2) scans in a row, and plays carrying a flag in `skip_noise` are skipped. With
@@ -908,9 +913,15 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 * **Long / Short / Intraday / Swing** and **Sectors** — what the bot scans for
   and may trade.
 * **Strategies** — switch setups on or off and weight them.
-* **◐** — light / dark theme.  **↻ Refresh** — re-pull account, positions and fills; when IB Gateway
-  came up after the app, it connects at once instead of waiting for the background retry. The button spins
-  until the answer is in and then says what happened, so there is no need to press it again.
+* **◐** — light / dark theme.  **↻ Refresh** — re-pull account, positions and fills, and fetch a fresh
+  price for every play on the board and every position held (one batched request of one-minute candles,
+  the positions first). When IB Gateway came up after the app, it connects at once instead of waiting for
+  the background retry. The button spins until the answer is in and then says what happened, so there is
+  no need to press it again.
+* **Price** (plays table) — the latest price the app holds for the stock and how far it is past the entry
+  in R; amber beyond `execution.max_chase_r` (0.25R), where an entry is refused. The tooltip says when the
+  price is from. The positions' **Mark** is the app's own price when it fetched one in the last two minutes
+  (the one the exit manager acts on), otherwise the broker's mark, which IBKR updates only every few minutes.
 * **Trading capital** — how much of the account the bot may use.
 * **Autopilot** + **⚙** — hands-off entry and its caps.
 * **Reset paper** (simulator only) — reset the balance.

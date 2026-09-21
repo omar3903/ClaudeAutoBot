@@ -1281,7 +1281,8 @@ def build() -> str:
         ("/api/trades, /api/trades/{id}/close | managed | record, /api/trades/close-all", "GET/POST",
          "trade lists, close_position(), set_trade_managed(), trade_record(), close_all_positions()"),
         ("/api/positions/untracked/{symbol}/close", "POST", "close_untracked()"),
-        ("/api/orders, /api/pnl, /api/account/refresh", "GET/POST", "active_orders(), pnl, refresh_account_now()"),
+        ("/api/orders, /api/pnl, /api/account/refresh", "GET/POST", "active_orders(), pnl, refresh_account_now() "
+         "(which also calls refresh_prices())"),
         ("/api/autopilot, /api/filters, /api/strategies[/{key}|/reset]", "GET/POST",
          "set_autopilot(), set_filters(), set_strategy(), reset_strategies()"),
         ("/api/scan, /api/settings, /api/watchlist", "GET/POST", "request_scan(kind), set_scan_settings(), "
@@ -1359,6 +1360,12 @@ def build() -> str:
         ("execution/autopilot.py", "kind_slots(), _kind_full(), settings_changed()", "Autopilot's positions and daily "
          "entries divide between day and swing trades the way the trading capital's slider does; a settings change "
          "hands back the plays it had refused for the day"),
+        ("execution/autopilot.py", "decorate_play(), _waiting_for()", "the play's bar: green when Autopilot would take "
+         "it on its next pass, amber (with the cap's reason) when it passes the checks but a cap is full"),
+        ("data/market_data.py", "last_seen(), refresh_prices()", "the newest price the app holds and when it's from, "
+         "with no broker request; one batched fetch of one-minute candles for every play and position"),
+        ("engine/engine.py", "refresh_prices(), _marks()", "Refresh prices the board and the positions; a position's "
+         "mark is the app's own price when fetched in the last APP_MARK_S (120 s), else the broker's"),
         ("execution/exit_manager.py", "stop_locked(), intraday_time_stop", "a day trade past its setup's window whose "
          "stop isn't at break-even is closed (time-stop); the replay's _step does the same"),
         ("engine/engine.py", "_settle_short()", "a record over the broker's count because an app exit filled in part "

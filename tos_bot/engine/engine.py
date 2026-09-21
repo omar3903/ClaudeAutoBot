@@ -1284,6 +1284,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self.executor.sync_open_orders()
             except Exception:  # noqa: BLE001
                 log.debug("order sync failed", exc_info=True)
+        priced = self.refresh_prices() if read else 0
         state = self.snapshot()
         self._publish("account.snapshot", state=state)
         if read and connected_now:
@@ -1294,7 +1295,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return {"ok": True, "state": state, "connected": False, "warn": True,
                     "note": f"Re-read {venue_label(self._venue)}. IB Gateway isn't reachable yet: {why}"}
         if read:
-            return {"ok": True, "state": state, "connected": True, "note": "Account, positions and orders re-read."}
+            return {"ok": True, "state": state, "connected": True,
+                    "note": "Account, positions and orders re-read" + (f", and {priced} prices fetched." if priced else ".")}
         if self.connections.connected:
             reason = "IBKR didn't answer in time - keeping the last snapshot; the app tries again by itself."
         elif self.connections.blockers:
@@ -1727,7 +1729,39 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def _decorate(self, p: Play) -> Dict[str, Any]:
         row = p.to_row()
         row["executable_hint"] = p.suggested_qty > 0 and self._armed
+        seen = self.md.last_seen(p.symbol)
+        row["last_price"], row["last_at"] = (round(seen[0], 4), seen[1].isoformat()) if seen else (None, None)
         return self.autopilot.decorate_play(row)
+
+    #: a price the app fetched this recently is newer than the broker's portfolio mark, which IBKR updates
+    #: every few minutes; the exit manager keeps every open position's this fresh
+    APP_MARK_S = 120.0
+
+    def refresh_prices(self) -> int:
+        """A fresh price for every play on the board and every open position, in one batched request -
+        the dashboard's Refresh. The plays go out again with them. Returns how many came back."""
+        if not self.md.attached:
+            return 0
+        plays = [p.symbol for p in self.board.ranked()[:self.BOARD_ROWS] if p.status not in _ACTED_ON]
+        held = [p.symbol for p in (self._account.positions if self._account else [])]
+        held += [t["symbol"] for t in self._positions_here()]
+        symbols = list(dict.fromkeys(held + plays))                  # the positions first, should the list be cut
+        try:
+            n = self.md.refresh_prices(symbols, self.scanner.con_ids(symbols))
+        except Exception as e:  # noqa: BLE001
+            log.warning("prices couldn't be refreshed: %s", e)
+            return 0
+        self._publish_plays()
+        return n
+
+    def _marks(self) -> Dict[str, Tuple[float, str]]:
+        """The app's own price for each stock held, where it's fresher than the broker's mark."""
+        out: Dict[str, Tuple[float, str]] = {}
+        for pos in (self._account.positions if self._account else []):
+            seen = self.md.last_seen(pos.symbol)
+            if seen is not None and seen[2] <= self.APP_MARK_S:
+                out[pos.symbol] = (seen[0], seen[1].isoformat())
+        return out
 
     def _venue_state(self) -> Dict[str, Any]:
         plan = plan_venue(self.mode, self.paper_platform)
@@ -1769,7 +1803,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             "quit": self._quit_status(),
             "capital": self.capital_state(),
             "account": views.account(acc, cfg.account, paper=self.mode == "paper") if acc else None,
-            "positions": views.positions(acc),
+            "positions": views.positions(acc, self._marks()),
             "untracked": self.untracked_positions(),
             "mismatches": self.position_check.mismatches,
             "day_trades_5d": self.repo.count_day_trades(5),
