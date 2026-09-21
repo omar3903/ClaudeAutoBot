@@ -19,7 +19,7 @@ import datetime as dt
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..brokers.base import DONE_STATUSES, BrokerAdapter, BrokerError
 from ..brokers.venues import venue_label
@@ -52,6 +52,8 @@ class _Pending:
     decision: Optional[Dict[str, Any]] = None       # an entry: the quote at the decision (mid, spread_bps)
     decision_price: Optional[float] = None          # an exit: the price that triggered it
     adopted: bool = False           # left working by an earlier run: when it was really sent isn't known
+    first_fill_at: Optional[float] = None   # an entry: when (monotonic) the broker first reported part of it filled
+    cancel_at: float = 0.0          # when (monotonic) the app last asked the broker to cancel it
 
 
 class Executor(ProtectiveStops):
@@ -59,6 +61,8 @@ class Executor(ProtectiveStops):
     LOST_AFTER_POLLS = 5
     #: after the broker (re)connects - IB Gateway's nightly restart - its order list takes a while to reload
     RESYNC_GRACE_S = 60.0
+    #: seconds after which a cancel the app sent for an entry that is still working is sent again
+    CANCEL_AGAIN_S = 30.0
 
     def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS,
                  venue: Optional[str] = None) -> None:
@@ -74,6 +78,9 @@ class Executor(ProtectiveStops):
         self.scale_out: bool = False
         #: the exit manager's settings - how a position scales out decides the shares a resting target covers
         self.exit_cfg: Any = None
+        #: told the play id of an entry that ended with nothing bought - Autopilot hands back the day's slot
+        #: it took. Set once by the engine; a rebind keeps it
+        self.on_entry_unfilled: Optional[Callable[[str], Any]] = None
         self._init_stops()
 
     def rebind(self, broker: BrokerAdapter, venue: Optional[str] = None) -> None:
@@ -302,10 +309,12 @@ class Executor(ProtectiveStops):
                     "order_id": res.order_id, "order_type": ot, "order_session": osess,
                     "bracket_mode": plan.get("bracket_mode")}
 
-        # otherwise track it; sync_open_orders() will pick up the fill
+        # otherwise track it; sync_open_orders() will pick up the fill. The play log says it went out
+        # before the sync loop can hear how it ended, so the ending is never overwritten by this
         p = _Pending(res.order_id, play, "entry", qty=qty)
         p.order_type, p.order_session = ot, osess
         p.context, p.submitted_at, p.decision = context, submitted_at, decision
+        self._note(play, PlayStatus.SUBMITTED)
         self._pending[res.order_id] = p
         return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id,
                 "order_type": ot, "order_session": osess,
@@ -512,26 +521,45 @@ class Executor(ProtectiveStops):
         except Exception:  # noqa: BLE001
             pass
 
-    def expire_entries(self, now: Optional[dt.datetime] = None) -> List[str]:
-        """Cancel the day-trade entry orders still working after ``execution.entry_timeout_min``
-        minutes. A limit the price hasn't come to by then is one the price left behind, and a fill
-        later - when the price comes back through it - is the move failing, not the setup (Aziz:
-        never chase, and never let a stale order chase for you). Swing entries keep their DAY life.
-        Returns the ids cancelled; the broker's answer books whatever part filled (_on_unfilled)."""
+    def expire_entries(self, now: Optional[dt.datetime] = None, mono: Optional[float] = None) -> List[str]:
+        """Call off the entry orders that shouldn't keep working:
+
+        * a day-trade entry still working after ``execution.entry_timeout_min`` minutes. A limit the
+          price hasn't come to by then is one the price left behind, and a fill later - when the price
+          comes back through it - is the move failing, not the setup (Aziz: never chase, and never let
+          a stale order chase for you). Swing entries keep their DAY life;
+        * any entry that filled in part ``execution.partial_entry_wait_s`` seconds ago and is still
+          working. Until an order is done the shares it bought have no record, so no stop at the broker;
+          cancelling the rest books them and the stop goes on in the same pass. Pair legs are the desk's.
+
+        A cancel that doesn't take is sent again every ``CANCEL_AGAIN_S``. Returns the ids called off;
+        the broker's answer books whatever part filled (_on_unfilled)."""
         limit = float(getattr(self.cfg, "entry_timeout_min", 0) or 0)
-        if limit <= 0:
-            return []
+        wait = float(getattr(self.cfg, "partial_entry_wait_s", 0) or 0)
         now = now or dt.datetime.now(dt.timezone.utc)
+        mono = time.monotonic() if mono is None else mono
         out: List[str] = []
         for oid, p in list(self._pending.items()):
-            if (p.kind != "entry" or p.expired or p.submitted_at is None
-                    or p.play.timeframe is not Timeframe.INTRADAY):
+            if p.kind != "entry":
                 continue
-            if (now - p.submitted_at).total_seconds() / 60.0 < limit:
+            if p.expired:
+                if p.cancel_at and mono - p.cancel_at >= self.CANCEL_AGAIN_S:
+                    p.cancel_at = mono
+                    self._cancel_quietly(oid)           # still working: the first cancel didn't take
                 continue
-            p.expired = f"not filled within {limit:g} minutes - cancelled rather than chase the price"
+            if wait > 0 and p.first_fill_at is not None and mono - p.first_fill_at >= wait and not _pair_leg(p.play):
+                p.expired = (f"filled in part and not complete {wait:g} seconds later - the rest is cancelled so "
+                             "the shares bought get their stop at the broker")
+                label = "ENTRY CUT SHORT"
+            elif (limit > 0 and p.submitted_at is not None and p.play.timeframe is Timeframe.INTRADAY
+                  and (now - p.submitted_at).total_seconds() / 60.0 >= limit):
+                p.expired = f"not filled within {limit:g} minutes - cancelled rather than chase the price"
+                label = "ENTRY TIMED OUT"
+            else:
+                continue
+            p.cancel_at = mono
             self._cancel_quietly(oid)
-            log.warning("ENTRY TIMED OUT  %s %s order %s: %s", p.play.symbol, p.play.side.value, oid, p.expired)
+            log.warning("%s  %s %s order %s: %s", label, p.play.symbol, p.play.side.value, oid, p.expired)
             out.append(oid)
         return out
 
@@ -547,8 +575,11 @@ class Executor(ProtectiveStops):
                 return
         elif res.status not in DONE_STATUSES:
             p.unseen = 0
+            if p.kind == "entry" and p.first_fill_at is None and float(res.filled_qty or 0.0) > 0:
+                p.first_fill_at = time.monotonic()      # part of it is bought: expire_entries cuts it short if it stalls
             return
-        self._pending.pop(res.order_id, None)
+        if self._pending.pop(res.order_id, None) is None:
+            return                                      # another pass (the Refresh button's) has just handled it
         if res.status == "FILLED":
             self._on_filled(p, res)
         else:
@@ -570,23 +601,51 @@ class Executor(ProtectiveStops):
         cancelled, expired - or no longer knows it. What did fill is booked and the
         reason is published; the exit manager sends an exit again."""
         filled = float(res.filled_qty or 0.0)
+        reason = p.expired or res.message or "no reason given"
         if p.kind == "entry":
             if filled > 0:
                 px = res.avg_fill_price or (res.fills[-1].price if res.fills else p.play.entry)
                 self._open_trade(p.play, px, filled, res.order_id, p.order_type, p.order_session,
                                  context=p.context, submitted_at=p.submitted_at, decision=p.decision)
             else:
-                p.play.status = PlayStatus.CANCELED if res.status in ("CANCELED", "EXPIRED") else PlayStatus.ERROR
+                self._note(p.play, PlayStatus.CANCELED if res.status in ("CANCELED", "EXPIRED") else PlayStatus.ERROR,
+                           {"status": res.status, "reason": reason,
+                            "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")})
+                # bought nothing for certain: the broker ended it and says none filled. A lost order
+                # (UNKNOWN) may have filled while the app wasn't looking, so it keeps its slot
+                if res.status in ("CANCELED", "EXPIRED", "REJECTED") and not res.fills:
+                    self._entry_unfilled(p.play.id)
         if res.status == "REJECTED":
             self._cancel_quietly(res.order_id)          # an inactive order must stay dead
         what = "is no longer known to the broker" if res.status == "UNKNOWN" else f"was {res.status.lower()}"
         part = f" after {filled:,.0f} of {p.qty:,.0f} shares filled" if filled else ""
-        reason = p.expired or res.message or "no reason given"
         msg = f"{p.play.symbol} {p.kind} order {res.order_id} {what}{part}: {reason}"
         log.warning("ORDER NOT FILLED  %s", msg)
         self.bus.publish("order.failed", kind=p.kind, order_id=res.order_id, status=res.status,
-                         symbol=p.play.symbol, trade_id=p.trade_id, filled_qty=filled,
+                         symbol=p.play.symbol, trade_id=p.trade_id,
+                         play_id=p.play.id if p.kind == "entry" else None, filled_qty=filled,
                          reason=reason, msg=msg)
+
+    def _entry_unfilled(self, play_id: str) -> None:
+        hook = self.on_entry_unfilled
+        if hook is None:
+            return
+        try:
+            hook(play_id)
+        except Exception:  # noqa: BLE001 - never let it stop the order sync
+            log.exception("handing back the entry slot of %s failed", play_id)
+
+    def _note(self, play: Play, status: PlayStatus, outcome: Optional[Dict[str, Any]] = None) -> None:
+        """What became of a play that was sent, in memory and in the play log - its status (and why)
+        only: who decided and when stay as they were, and a play that became a trade stays FILLED."""
+        play.status = status
+        settle = getattr(self.repo, "settle_play", None)
+        if not callable(settle):
+            return
+        try:
+            settle(play.id, status.value, outcome)
+        except Exception:  # noqa: BLE001 - the order handling goes on either way
+            log.debug("could not save what became of %s", play.id, exc_info=True)
 
     def _broker_resyncing(self) -> bool:
         since = float(getattr(self.broker, "connected_since", 0.0) or 0.0)
@@ -664,7 +723,12 @@ def _play_from_row(row: dict) -> Play:
                 entry=float(row["entry"] or 0), stop=float(row["stop"] or 0),
                 targets=[float(x) for x in (row.get("targets") or [])],
                 confidence=float(row.get("confidence") or 0.5), sector=row.get("sector") or "",
-                id=row["id"], status=PlayStatus.SUBMITTED)
+                tags=list(row.get("tags") or []), id=row["id"], status=PlayStatus.SUBMITTED)
+
+
+def _pair_leg(play: Play) -> bool:
+    """One leg of a pair trade - the pairs desk works its entry, not the executor's rules."""
+    return bool(getattr(play, "pair_id", None)) or "pair-leg" in (getattr(play, "tags", None) or [])
 
 
 def _remaining(o: OrderResult) -> float:

@@ -164,6 +164,10 @@ class ExecutionCfg(_Model):
     entry_timeout_min: int = 10           # a day-trade entry order not filled in this many minutes is cancelled - a
                                           # fill later, when the price comes back through it, is the move failing
                                           # (Aziz: never chase); 0 = leave it working for the day like a swing entry
+    partial_entry_wait_s: float = 30.0    # an entry (day or swing) that filled in part this many seconds ago and is
+                                          # still working has the rest cancelled: until the order is done the shares
+                                          # bought have no record, so no stop at the broker; the cancel books them and
+                                          # the stop goes on in the same pass (0 = wait for the order to finish)
     max_spread_r: float = 0.10            # on live quotes, an entry is refused when the bid-ask spread is more than this
                                           # share of the distance to the stop: the spread is the price of immediacy
                                           # (Harris), paid on the way in and again on the way out (0 = off)

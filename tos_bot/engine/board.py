@@ -61,6 +61,11 @@ class PlayBoard:
     def plays(self) -> Dict[str, Play]:
         return dict(self._plays)
 
+    def holds(self, p: Play) -> bool:
+        """``p`` itself is on the board - a scan's play replace() took, not one it left out."""
+        with self._lock:
+            return self._plays.get(p.id) is p
+
     def ranked(self) -> List[Play]:
         return sorted(self._plays.values(), key=lambda p: p.score, reverse=True)
 

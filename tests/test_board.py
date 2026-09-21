@@ -82,3 +82,16 @@ def test_only_this_sessions_unexpired_plays_come_back_but_a_settled_setup_stays_
     assert board.restore([stale, old, done, fresh], now=now) == 1 and list(board.plays) == [fresh.id]
     board.replace([_play("AAA"), _play("CCC")], scanned={"AAA", "CCC"}, now=now)
     assert sorted(p.symbol for p in board.plays.values()) == ["AAA", "DDD"]     # the dismissed one isn't offered again
+
+
+def test_the_board_says_which_of_a_scans_plays_it_took():
+    board = PlayBoard()
+    first = _play()
+    board.replace([first])
+    again, other = _play(), _play("BBB")
+    board.replace([again, other])
+    assert board.holds(again) and board.holds(other) and not board.holds(first)   # the newest sighting holds its id
+    board.get(again.id).status = PlayStatus.SUBMITTED
+    late = _play()
+    board.replace([late, other])
+    assert not board.holds(late) and board.holds(other)                   # acted on: this session's sighting is left out
