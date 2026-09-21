@@ -282,3 +282,47 @@ def test_stopping_a_quit_calls_off_the_exits_it_sent_and_the_stops_go_back():
     ex.sync_open_orders()                                                       # the exit is gone...
     assert ex.pending_exit_trade_ids() == set() and len(ex.protective_stops()) == 1   # ...and a stop rests again
     assert [s.quantity for s in broker.stops()] == [10, 10]
+
+
+def test_a_broker_holding_fewer_shares_than_the_record_still_gets_a_stop_for_what_it_holds():
+    broker, _, ex, heard = _setup(positions={"AAA": 6})                        # the record says ten
+    ex.SHARES_RETRY_S = 0.0
+    ex.sync_open_orders()
+    assert broker.stops() == []                                                # at first: a fill still landing?
+    ex._short_since["t1"] -= ex.SHORT_SHARES_GRACE_S                           # ...no - it has stayed short
+    ex.sync_open_orders()
+    (stop,) = broker.stops()
+    assert (stop.quantity, stop.stop_price, stop.oca_group) == (6, 98.0, "")   # a stop alone, for the six it holds
+    assert ex.short_covers() == {"t1": 6.0} and "stop.short" in [t for t, _ in heard]
+    ex.sync_open_orders()
+    assert len(broker.stops()) == 1 and broker.stops()[0].quantity == 6        # never sized back up to the record
+
+    broker.positions["AAA"] = 8                                                # two more turn up
+    ex.sync_open_orders()
+    assert ex.protective_stops()[0]["qty"] == 8.0 and ex.short_covers() == {"t1": 8.0}
+
+
+def test_once_the_broker_holds_the_whole_position_the_stop_goes_back_to_covering_it_all():
+    broker, _, ex, _ = _setup(positions={"AAA": 6})
+    ex.SHARES_RETRY_S = 0.0
+    ex.sync_open_orders()
+    ex._short_since["t1"] -= ex.SHORT_SHARES_GRACE_S
+    ex.sync_open_orders()
+    first = ex.protective_stops()[0]["order_id"]
+    broker.positions["AAA"] = 10
+    ex.sync_open_orders()
+    assert first in broker.cancelled and ex.short_covers() == {}
+    assert broker.stops()[-1].quantity == 10
+
+
+def test_a_stop_for_shares_the_broker_no_longer_holds_is_cancelled():
+    broker, _, ex, _ = _setup(positions={"AAA": 6})
+    ex.SHARES_RETRY_S = 0.0
+    ex.sync_open_orders()
+    ex._short_since["t1"] -= ex.SHORT_SHARES_GRACE_S
+    ex.sync_open_orders()
+    stop = ex.protective_stops()[0]["order_id"]
+    broker.positions.pop("AAA")                                                # sold by hand in TWS
+    ex.sync_open_orders()
+    assert stop in broker.cancelled and ex.protective_stops() == [] and ex.short_covers() == {}
+

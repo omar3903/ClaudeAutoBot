@@ -108,8 +108,43 @@ def test_a_stop_hit_books_minus_one_r_and_a_bar_touching_both_counts_as_the_stop
 
 
 def test_an_open_day_trade_is_flattened_before_the_close():
-    [t] = _replay([(100.0, 100.1, 99.9, 100.0)] + [(100.5, 100.6, 100.4, 100.5)] * 3)
+    import dataclasses
+
+    no_time_stop = dataclasses.replace(EXACT, intraday_time_stop=False)      # the flatten alone
+    [t] = replay_intraday([_LongAtBar()], "RPL", _session(FLAT + [(100.0, 100.1, 99.9, 100.0)]
+                                                          + [(100.5, 100.6, 100.4, 100.5)] * 3),
+                          _daily(), no_time_stop, QUIET)
     assert t.exit_reason == "eod-flatten" and t.r == 0.5 and t.exited_at.startswith(f"{DAY}T15:50")
+
+
+class _LongHeld(_LongAtBar):
+    """The same play, stated to take up to half an hour: six 5-minute bars."""
+
+    key = "long_held"
+    expected_hold = (15.0, 30.0)
+
+
+def test_a_day_trade_that_isnt_working_is_closed_once_its_window_has_passed():
+    # the signal at 100 (bar 5), filled at bar 6's open; then it drifts sideways, never near its target
+    drift = [(100.0, 100.3, 99.6, 100.1)] * 12
+    [t] = replay_intraday([_LongHeld()], "RPL", _session(FLAT + drift), _daily(), EXACT, QUIET)
+    assert t.exit_reason == "time-stop"
+    held = (pd.Timestamp(t.exited_at) - pd.Timestamp(t.entered_at)).total_seconds() / 60.0
+    assert held == 30.0 and t.r == pytest.approx(0.1)                        # its half hour, at the bar's close
+
+
+def test_a_day_trade_that_is_working_keeps_its_trail_past_its_window():
+    import dataclasses
+
+    # +1.5R early moves its stop past the entry (break-even at 1R); then it idles well past its half hour
+    working = [(100.0, 101.5, 100.0, 101.2)] + [(101.2, 101.4, 101.1, 101.2)] * 20
+    settings = dataclasses.replace(EXACT, breakeven_at_r=1.0, breakeven_lock_r=0.2)
+    [t] = replay_intraday([_LongHeld()], "RPL", _session(FLAT + working), _daily(), settings, QUIET)
+    assert t.exit_reason == "eod-flatten"                                     # held on: it can't lose any more
+    off = dataclasses.replace(EXACT, intraday_time_stop=False)
+    [idle] = replay_intraday([_LongHeld()], "RPL", _session(FLAT + [(100.0, 100.3, 99.6, 100.1)] * 12), _daily(),
+                             off, QUIET)
+    assert idle.exit_reason == "eod-flatten"                                  # switched off: the flatten as before
 
 
 def _spy(day_prices):

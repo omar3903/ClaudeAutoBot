@@ -1359,6 +1359,10 @@ def build() -> str:
         ("execution/autopilot.py", "kind_slots(), _kind_full(), settings_changed()", "Autopilot's positions and daily "
          "entries divide between day and swing trades the way the trading capital's slider does; a settings change "
          "hands back the plays it had refused for the day"),
+        ("execution/exit_manager.py", "stop_locked(), intraday_time_stop", "a day trade past its setup's window whose "
+         "stop isn't at break-even is closed (time-stop); the replay's _step does the same"),
+        ("execution/protective_stops.py", "_keep_short_cover(), short_covers()", "a broker holding fewer shares than "
+         "the record for 20 s gets a stop for the shares it holds, resized as they change, the pair once it holds them all"),
         ("engine/engine.py", "_replay_after_full_scan()", "the morning full scan finishing starts the day's replay "
          "(replay.daily): once a session, remembered across a restart"),
         ("persistence/repository.py", "open_trade(), close_trade() - entry_latency_s / exit_latency_s", "the seconds "

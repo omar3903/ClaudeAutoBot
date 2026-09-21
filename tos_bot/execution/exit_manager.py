@@ -6,7 +6,9 @@ For each OPEN trade it:
      first target of a play that has a second, takes ``scale_out_pct`` of it off, moves
      the stop to break-even and lets the rest run to the second target (Aziz: sell
      half at the target and bring the stop to the entry);
-  3. flattens INTRADAY trades a few minutes before the (holiday-aware) close;
+  3. closes an INTRADAY trade that isn't working once its setup's own window has passed
+     (``intraday_time_stop``: the play's longest expected hold, its stop not yet at break-even),
+     and flattens every INTRADAY trade a few minutes before the (holiday-aware) close;
   4. closes SWING trades held longer than ``max_swing_hold_days``;
   5. ratchets the protective stop:
         - to break-even (+ a small buffer) once the trade is +``breakeven_at_r`` R
@@ -58,6 +60,14 @@ def scale_out_plan(t: Dict[str, Any], cfg) -> Optional[Tuple[float, Dict[str, fl
     lock_r = float(getattr(cfg, "scale_out_lock_r", 0.0) or 0.0)
     buf = entry * float(getattr(cfg, "breakeven_buffer_bps", 5) or 0) / 1e4
     return part, {"stop_price": round(entry + sign * (lock_r * risk_ps + buf), 4), "target_price": float(target2)}
+
+
+def stop_locked(side: str, stop: Any, entry: float) -> bool:
+    """Whether a trade's stop has reached break-even or better - it can no longer lose, and it is
+    "working": the exit manager moves it there once the trade has gone far enough its way."""
+    if not stop or not entry:
+        return False
+    return float(stop) >= entry if side == "LONG" else float(stop) <= entry
 
 
 class ExitManager:
@@ -214,8 +224,14 @@ class ExitManager:
         hwm = max(hwm, px) if side == "LONG" else min(hwm, px)
         self.repo.update_trade_risk(t["id"], hwm_price=hwm, mae=mae, mfe=mfe)
 
-        # --- 0. expected-exit overwatch (informational, never closes) ----- #
-        if (t.get("time_status") == "overdue" and not t.get("overdue_notified")
+        managed = bool(t.get("managed_exit", True))
+        overdue = t.get("time_status") == "overdue"
+        # a day trade past its window that isn't working is closed below (2.); say so rather than "review it"
+        timing_out = (overdue and managed and t.get("timeframe") == "INTRADAY"
+                      and bool(getattr(self.cfg, "intraday_time_stop", False)) and not stop_locked(side, work_stop, entry))
+
+        # --- 0. expected-exit overwatch ------------------------------------ #
+        if (overdue and not t.get("overdue_notified")
                 and t["id"] not in self._overdue_seen):
             self._overdue_seen.add(t["id"])
             self.repo.note_overdue(t["id"])
@@ -225,11 +241,10 @@ class ExitManager:
                 held=t.get("held_label"), winning=bool(winning),
                 msg=(f"{sym} {side} is past its expected exit "
                      f"({t.get('held_label')} held, {r_now:+.1f}R now) - "
-                     f"{'let it run or take the gain' if winning else 'review it'}."),
+                     + ("its window has passed without it working, so it is being closed." if timing_out
+                        else "let it run or take the gain." if winning else "review it.")),
             )
             log.info("OVERDUE %s %s: %s held, %.1fR", sym, side, t.get("held_label"), r_now)
-
-        managed = bool(t.get("managed_exit", True))
 
         # --- 1. hard exits ------------------------------------------- #
         if work_stop:
@@ -246,6 +261,11 @@ class ExitManager:
                 return self._close(t["id"], "target", seen=px)
 
         # --- 2. time / session exits ------------------------------- #
+        if timing_out:
+            # Aziz: a day trade that hasn't moved in its time is wrong - its setup's window has passed, and
+            # it only holds a slot and capital a fresh setup could use. One that is working (its stop at
+            # break-even or better) keeps its trail until the flatten
+            return self._close(t["id"], "time-stop", seen=px)
         flat_min = float(getattr(self.cfg, "flatten_intraday_before_close_min", 10) or 0)
         if managed and t.get("timeframe") == "INTRADAY" and flat_min > 0:
             if clock.minutes_to_close() <= flat_min:

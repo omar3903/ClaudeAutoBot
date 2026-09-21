@@ -95,6 +95,7 @@ class ReplaySettings:
     trail_start_r: float = 2.0
     trail_lock_ratio: float = 0.5
     flatten_before_close_min: int = 10
+    intraday_time_stop: bool = True       # a day trade past its play's longest hold, not yet at break-even, is closed
     max_swing_hold_days: int = 10
     scale_out_pct: float = 50.0           # at the first target of a play with two, this much comes off...
     scale_out_lock_r: float = 0.0         # ...and the stop goes to the entry plus this R; the rest runs to the second
@@ -112,6 +113,7 @@ class ReplaySettings:
                    trail_start_r=float(cfg.trail_start_r), trail_lock_ratio=float(cfg.trail_lock_ratio),
                    flatten_before_close_min=int(cfg.flatten_intraday_before_close_min),
                    max_swing_hold_days=int(cfg.max_swing_hold_days) or 10,
+                   intraday_time_stop=bool(getattr(cfg, "intraday_time_stop", True)),
                    scale_out_pct=float(getattr(cfg, "scale_out_pct", 0.0) or 0.0),
                    scale_out_lock_r=float(getattr(cfg, "scale_out_lock_r", 0.0) or 0.0), **extra)
 
@@ -259,7 +261,8 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
         flatten = next_at + BAR >= flatten_at
         for book in (open_positions, waited):
             for key, position in list(book.items()):
-                done = _step(position, next_bar, next_at + BAR, settings, "eod-flatten" if flatten else None)
+                done = _step(position, next_bar, next_at + BAR, settings, "eod-flatten" if flatten else None,
+                             time_limit_bars=_time_limit_bars(position.play, settings))
                 if done is not None:
                     trades.append(done)
                     del book[key]
@@ -461,10 +464,20 @@ def _enter(key: str, play: Play, flags: List[str], confirmed: bool, at: pd.Times
                      features=dict(features or {}), cost=abs(fill - open_price))
 
 
+def _time_limit_bars(play: Play, settings: ReplaySettings) -> Optional[int]:
+    """The 5-minute bars a day trade may be held before the day-trade time stop looks at it: the
+    play's longest expected hold (or twice its typical one), the way the live record's overwatch is set."""
+    if not settings.intraday_time_stop or play.timeframe is not Timeframe.INTRADAY:
+        return None
+    minutes = float(play.expected_hold_max or 0.0) or 2.0 * float(play.expected_hold_typical or 0.0)
+    return int(np.ceil(minutes / 5.0)) if minutes > 0 else None
+
+
 def _step(position: _Position, bar: pd.Series, bar_end: pd.Timestamp, settings: ReplaySettings,
-          force_exit: Optional[str] = None) -> Optional[SimTrade]:
+          force_exit: Optional[str] = None, time_limit_bars: Optional[int] = None) -> Optional[SimTrade]:
     """Move a position through one bar: its stop first, then its target, then
-    tighten the stop the way the exit manager would."""
+    tighten the stop the way the exit manager would. ``time_limit_bars``: the day-trade time stop -
+    held that long and its stop not yet at break-even, it is closed at the bar's close."""
     o, h, low, c = (float(bar[k]) for k in ("open", "high", "low", "close"))
     long = position.sign > 0
     position.bars_held += 1
@@ -495,7 +508,12 @@ def _step(position: _Position, bar: pd.Series, bar_end: pd.Timestamp, settings: 
         _tighten(position, position.entry + position.sign * settings.breakeven_lock_r * position.risk)
     if settings.trail_start_r > 0 and best_r >= settings.trail_start_r:
         _tighten(position, position.entry + position.sign * best_r * settings.trail_lock_ratio * position.risk)
-    return _close(position, c, bar_end, force_exit, settings) if force_exit else None
+    if force_exit:
+        return _close(position, c, bar_end, force_exit, settings)
+    locked = position.stop >= position.entry if long else position.stop <= position.entry
+    if time_limit_bars is not None and position.bars_held >= time_limit_bars and not locked:
+        return _close(position, c, bar_end, "time-stop", settings)
+    return None
 
 
 def _tighten(position: _Position, stop: float) -> None:
