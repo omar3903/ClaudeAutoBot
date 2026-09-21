@@ -392,6 +392,8 @@ class AutoPilot:
             "model": self._model_card(),
             "open_auto_positions": open_auto,
             "auto_trades_today": self._count_today,
+            "sent_today": self._sent_today,
+            "sent_ceiling": self.SENT_CEILING * self.max_auto_trades_per_day,
             "slots": self._slots_card(),
             "mode": getattr(self.engine, "mode", "paper"),
             "allow_live": bool(getattr(self.cfg, "allow_live", False)),
@@ -929,6 +931,9 @@ class AutoPilot:
         opens = cached[1]
         if self._count_today >= self.max_auto_trades_per_day:
             return f"the day's {self.max_auto_trades_per_day} auto entries are used"
+        if self._sent_today >= self.SENT_CEILING * self.max_auto_trades_per_day:
+            return (f"{self._sent_today} entry orders sent today, counting the ones that bought nothing - "
+                    f"{self.SENT_CEILING} times the daily cap")
         if len(opens) >= self.max_auto_positions:
             return f"all {self.max_auto_positions} auto positions are taken"
         full = self._kind_full(timeframe, opens)

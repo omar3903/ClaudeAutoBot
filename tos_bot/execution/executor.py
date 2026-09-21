@@ -53,6 +53,8 @@ class _Pending:
     decision_price: Optional[float] = None          # an exit: the price that triggered it
     adopted: bool = False           # left working by an earlier run: when it was really sent isn't known
     first_fill_at: Optional[float] = None   # an entry: when (monotonic) the broker first reported part of it filled
+    filled_seen: float = 0.0        # an entry: the most the broker has reported filled while it worked...
+    avg_seen: float = 0.0           # ...and at what average price
     cancel_at: float = 0.0          # when (monotonic) the app last asked the broker to cancel it
 
 
@@ -575,8 +577,10 @@ class Executor(ProtectiveStops):
                 return
         elif res.status not in DONE_STATUSES:
             p.unseen = 0
-            if p.kind == "entry" and p.first_fill_at is None and float(res.filled_qty or 0.0) > 0:
-                p.first_fill_at = time.monotonic()      # part of it is bought: expire_entries cuts it short if it stalls
+            if p.kind == "entry" and float(res.filled_qty or 0.0) > p.filled_seen:
+                p.filled_seen, p.avg_seen = float(res.filled_qty), float(res.avg_fill_price or p.avg_seen)
+                if p.first_fill_at is None:
+                    p.first_fill_at = time.monotonic()  # part of it is bought: expire_entries cuts it short if it stalls
             return
         if self._pending.pop(res.order_id, None) is None:
             return                                      # another pass (the Refresh button's) has just handled it
@@ -602,9 +606,11 @@ class Executor(ProtectiveStops):
         reason is published; the exit manager sends an exit again."""
         filled = float(res.filled_qty or 0.0)
         reason = p.expired or res.message or "no reason given"
+        if p.kind == "entry" and res.status == "UNKNOWN" and p.filled_seen > filled and not _pair_leg(p.play):
+            filled = p.filled_seen      # lost track of: it bought at least what was seen, and those shares need a stop
         if p.kind == "entry":
             if filled > 0:
-                px = res.avg_fill_price or (res.fills[-1].price if res.fills else p.play.entry)
+                px = res.avg_fill_price or (res.fills[-1].price if res.fills else (p.avg_seen or p.play.entry))
                 self._open_trade(p.play, px, filled, res.order_id, p.order_type, p.order_session,
                                  context=p.context, submitted_at=p.submitted_at, decision=p.decision)
             else:

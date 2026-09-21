@@ -36,7 +36,8 @@ export function renderAutopilot() {
   btn.classList.toggle("on", enabled && eff);
   btn.classList.toggle("armed-paper", enabled && !eff);       // wants to run but paper-gated in live
   const split = splitSlots();
-  const caps = `${ap.open_auto_positions ?? 0}/${ap.max_auto_positions ?? 0} open${split.text ? ` (${split.text})` : ""} · ${ap.auto_trades_today ?? 0}/${ap.max_auto_trades_per_day ?? 0} today`;
+  const caps = `${ap.open_auto_positions ?? 0}/${ap.max_auto_positions ?? 0} open${split.text ? ` (${split.text})` : ""} · ${ap.auto_trades_today ?? 0}/${ap.max_auto_trades_per_day ?? 0} today`
+    + ((ap.sent_today ?? 0) > (ap.auto_trades_today ?? 0) ? ` (${ap.sent_today}/${ap.sent_ceiling} orders sent)` : "");
   const stopped = !ap.daily_loss_stop ? ""
     : (ap.realized_today || 0) < 0 ? ` Stopped for the day: today's closed trades have lost ${Math.abs(ap.realized_today || 0).toFixed(0)}, past the ${ap.max_daily_loss_pct}% daily limit.`
     : ` Stopped for the day: today's realized gain fell from ${(ap.peak_realized || 0).toFixed(0)} to ${(ap.realized_today || 0).toFixed(0)}, giving back more than ${ap.max_giveback_pct}% of it.`;

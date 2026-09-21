@@ -865,3 +865,17 @@ def test_orders_sent_stop_at_twice_the_daily_cap_even_when_none_of_them_bought_a
     last = mkplay(sym="S9")
     _run(ap, last)
     assert len(eng.approved) == 4 and "4 entry orders sent today" in ap.verdict(last)
+    ap._room_cache = None
+    bar = ap.decorate_play(_row("INTRADAY"))["autopilot"]                  # the play's bar says so too: amber, not green
+    assert bar["eligible"] and "4 entry orders sent today" in bar["waiting"]
+    assert (ap.status()["sent_today"], ap.status()["sent_ceiling"], ap.status()["auto_trades_today"]) == (4, 4, 0)
+
+
+def test_a_new_session_starts_the_slots_and_the_orders_sent_afresh():
+    eng, ap = _two_a_day()
+    play = mkplay(sym="AAA")
+    _run(ap, play)
+    ap._sent_today = 4
+    ap._day = "2000-01-03"                                                  # the session has turned over
+    assert not ap.entry_unfilled(play.id)                                   # yesterday's entry hands back nothing today
+    assert (ap._count_today, ap._sent_today, ap._counted) == (0, 0, {})

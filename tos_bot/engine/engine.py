@@ -285,12 +285,14 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         log.info("engine stopped")
 
     def _save_runtime(self) -> None:
-        payload: Dict[str, Any] = {
-            "mode": self.mode, "paper_platform": self.paper_platform, "filters": self.filters.as_dict(),
-            "strategies": self.strategy_overrides, "capital": self.capital,
-            "capital_split": {"day_pct": self.day_trade_pct}, "scan": self.scan_settings.as_dict(), "autopilot": self.autopilot.to_runtime(),
-        }
+        # read and written under one lock: a save that read the state earlier can't land last
         with self._runtime_lock:
+            payload: Dict[str, Any] = {
+                "mode": self.mode, "paper_platform": self.paper_platform, "filters": self.filters.as_dict(),
+                "strategies": self.strategy_overrides, "capital": self.capital,
+                "capital_split": {"day_pct": self.day_trade_pct}, "scan": self.scan_settings.as_dict(),
+                "autopilot": self.autopilot.to_runtime(),
+            }
             if self.quit_state:
                 payload["quit"] = self.quit_state
             self.runtime.write(payload)

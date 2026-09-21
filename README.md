@@ -658,7 +658,8 @@ bought have no trade record, so no stop at the broker. An entry (day or swing)
 that filled in part `execution.partial_entry_wait_s` (30) seconds ago and is
 still working has the rest cancelled: the broker's answer books what was bought
 and the stop goes on in the same pass. Pair legs are left to the pairs desk. A
-cancel that doesn't take is sent again every 30 seconds.
+cancel that doesn't take is sent again every 30 seconds, and if IBKR loses track
+of the order, the shares it was seen to buy are booked all the same.
 
 **What became of each sent play** is saved to the play log with the reason -
 `CANCELED` (timed out, cancelled, or refused by IBKR, which reports refusals as
@@ -786,7 +787,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | minimum strategy confidence, swing trades | 0.5 | `min_swing_confidence` (the swing setups state flat 0.55–0.58 confidences; the replay's proof is their real gate) |
 | minimum reward : risk | 2.0 | `min_reward_risk` (Aziz Rule 5) |
 | concurrent open auto positions | 2 | `max_auto_positions` - divided between day and swing trades by the day / swing split of the trading capital; Autopilot counts the positions it opened before a restart too |
-| auto trades per session | 3 | `max_auto_trades_per_day` - an entry that ends with nothing bought (timed out, cancelled, refused) hands its slot back, once; one the broker lost keeps it, as it may have filled. The setup itself isn't offered again that day. No more than twice this many entry orders go out in a day, whatever happened to them |
+| auto trades per session | 3 | `max_auto_trades_per_day` - an entry that ends with nothing bought (timed out, cancelled, refused) hands its slot back, once; one the broker lost keeps it, as it may have filled. The setup itself isn't offered again that day. No more than twice this many entry orders go out in a day, whatever happened to them (the play's bar turns amber and says so; the Autopilot button's tooltip shows the orders sent) |
 | aggregate open auto $-risk | 4 % of equity | `max_open_risk_pct` |
 | concurrent auto trades from **one** strategy | 2 | `max_per_strategy` |
 | new auto entries **per scan cycle** | 1 | `max_new_per_cycle` - a cycle is a scan of the market (5 minutes for swing trades, the 60-second fast cycle for day trades), not the 15-second re-check of the board |

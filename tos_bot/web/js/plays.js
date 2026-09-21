@@ -135,10 +135,9 @@ function detailHTML(a) {
     : "OFF — you must close this manually";
   const executed = a.already_executed || isDone(p);
   const confirmBlock = executed
-    ? `<div class="reasons">${p.status === "ERROR" ? "⚠ last attempt errored — dismiss and rescan" : "✓ Already executed" + (p.trade_id ? ` — trade <code>${escapeHtml(p.trade_id)}</code>` : "")}</div>
+    ? `<div class="reasons">${p.status === "ERROR" ? "⚠ the order errored — the setup isn't offered again today" : "✓ Already executed" + (p.trade_id ? ` — trade <code>${escapeHtml(p.trade_id)}</code>` : "")}</div>
        <div class="confirm-row">
          ${p.trade_id ? `<button id="btn-goto-trade">Show trade record</button>` : ""}
-         <button class="ghost" id="btn-reject">Dismiss</button>
        </div>`
     : `${a.reasons && a.reasons.length ? `<div class="reasons">⚠ ${a.reasons.map(escapeHtml).join("<br>")}</div>` : ""}
        <div class="confirm-row">
@@ -262,7 +261,8 @@ async function approve(id) {
 }
 
 async function reject(id) {
-  await post(`/api/plays/${id}/reject`);
+  const r = await post(`/api/plays/${id}/reject`);
+  if (r && r.ok === false) { toast("Not dismissed: " + (r.reason || "refused"), "bad"); return; }
   S.plays = S.plays.filter(p => p.id !== id);
   renderPlays();
   $("#detail-body").classList.add("hidden");

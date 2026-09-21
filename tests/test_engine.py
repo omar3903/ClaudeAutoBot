@@ -1145,3 +1145,10 @@ def test_a_play_already_sent_cant_be_dismissed_and_one_never_logged_is_logged_wh
     q.status = PlayStatus.SUBMITTED
     out = engine.reject_play(q.id)
     assert not out["ok"] and "already gone out" in out["reason"] and q.status is PlayStatus.SUBMITTED
+
+    gone = _play("TSLA")                                                    # off the board, its row says it was sent
+    engine.repo.record_play(gone)
+    engine.repo.set_play_status(gone.id, "SUBMITTED", "autopilot")
+    assert not engine.reject_play(gone.id)["ok"]
+    assert (engine.repo.get_play(gone.id)["status"], engine.repo.get_play(gone.id)["decided_by"]) == ("SUBMITTED",
+                                                                                                    "autopilot")

@@ -323,7 +323,7 @@ def test_the_shares_of_a_part_filled_entry_get_their_stop_once_the_stalled_rest_
                                       filled_qty=4, avg_fill_price=100.0)
     ex.sync_open_orders()
     assert broker.stops() == []                                           # four shares bought, no record yet
-    ex.expire_entries(mono=ex._pending["1"].first_fill_at + ex.cfg.partial_entry_wait_s)
+    assert ex.expire_entries(mono=ex._pending["1"].first_fill_at + ex.cfg.partial_entry_wait_s) == ["1"]
     broker.reports["1"] = OrderResult(order_id="1", status="CANCELED", symbol="AAA", submitted_qty=10,
                                       filled_qty=4, avg_fill_price=100.0)
     ex.sync_open_orders()                                                 # booked, and protected in the same pass

@@ -9,7 +9,7 @@ A play is marked CANCELED when all of these hold:
 
 * the log says it was sent (ACCEPTED, SUBMITTED or WORKING) and no trade was booked from it;
 * the order audit shows its entry order went out - an ok PLACE for the play - and as a DAY order;
-* that order's session is over (after 20:00 ET for today's), so it can't still be working.
+* the session that order went out in is over (after 20:00 ET for today's), so it can't still be working.
 
 Who decided and when stay as they were. The one case it can't tell apart: an entry that filled while the
 app was off has no trade either, and its shares show as untracked on the dashboard - look there before
@@ -67,8 +67,8 @@ def main() -> int:
             if any(str((a.request if isinstance(a.request, dict) else {}).get("tif", "")).upper() != "DAY"
                    for a in sent):
                 continue                                 # a good-till-cancelled order may still be working
-            created = (r.created_at or dt.datetime.min).replace(tzinfo=dt.timezone.utc)
-            session = clock.session_date(created)
+            sent_at = max(a.ts for a in sent).replace(tzinfo=dt.timezone.utc)   # the order's, not the play's
+            session = clock.session_date(sent_at)
             if session > over:
                 continue
             found += 1
