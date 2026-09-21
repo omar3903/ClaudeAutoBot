@@ -214,7 +214,8 @@ class Repository:
                 broker=broker, status="OPEN", quantity=fill_qty, initial_quantity=fill_qty,
                 entry_price=fill_price,
                 entry_time=now, order_type=order_type, order_session=order_session,
-                submitted_at=_naive(submitted_at), entry_latency_s=_took(submitted_at, now),
+                submitted_at=_naive(submitted_at),
+                entry_latency_s=None if broker == SIMULATOR else _took(submitted_at, now),
                 entry_context=entry_context,
                 **_shortfall(decision, fill_price, play.side.value),
                 stop_price=None if pair_id else play.stop,
@@ -298,7 +299,7 @@ class Repository:
             t.exit_price = exit_price
             t.exit_time = now
             t.exit_reason = exit_reason
-            if submitted_at is not None:
+            if submitted_at is not None and (t.broker or SIMULATOR) != SIMULATOR:
                 t.exit_submitted_at = _naive(submitted_at)
                 t.exit_latency_s = _took(submitted_at, now)
             if decision_price and float(decision_price) > 0:
@@ -785,6 +786,10 @@ def _naive_iso(stamp: Any) -> Optional[dt.datetime]:
         return None
     return _naive(d)
 
+
+#: the in-app simulator's venue: it fills an order the moment it gets it, so it keeps no fill time - its
+#: seconds would say nothing about how long an order takes, and pull every typical figure toward zero
+SIMULATOR = "paper"
 
 def _took(sent: Optional[dt.datetime], filled: dt.datetime) -> Optional[float]:
     """Seconds from an order going out to its fill - None when the send time isn't known."""

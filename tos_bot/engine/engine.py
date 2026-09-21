@@ -1111,6 +1111,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._publish("trades.removed", trades=removed, venue=venue, venue_label=venue_label(venue))
 
         removed_ids = {r["id"] for r in removed} | {c["id"] for c in closed}
+        if account_age_s <= self.position_check.FRESH_ACCOUNT_S and connection_age_s >= self.position_check.SETTLE_S:
+            self._settle_short([t for t in mine if t["id"] not in removed_ids], held)
         new = self.position_check.share_counts(
             venue, venue_label(venue), [t for t in mine if t["id"] not in removed_ids], held=held,
             in_flight=self.executor.symbols_in_flight(),
@@ -1143,6 +1145,63 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             elif self.repo.delete_trade(t["id"]):
                 removed.append(row)
         return closed, removed
+
+    def _settle_short(self, trades: List[Mapping[str, Any]], held: Mapping[str, float]) -> List[Dict[str, Any]]:
+        """A record holding more shares than the broker, the same way round, because an exit the app sent
+        filled in part before it was called off - "Stop quitting", an exit cancelled - and the app stopped
+        before it heard: the part that filled is booked, from the broker's fills tagged with that trade's
+        own exit orders, at their prices. Only fills of its ``exit:`` orders, never more than the record
+        is over by, never while an exit for it is still working (the executor books those), and only for a
+        symbol with one record. A stop or target filling is booked by its own watcher. Returns what it booked."""
+        get = getattr(self._broker, "get_fills", None)
+        if not callable(get) or self.executor is None:
+            return []
+        busy, flying = self.executor.pending_exit_trade_ids(), self.executor.symbols_in_flight()
+        per_symbol: Dict[str, int] = {}
+        for t in trades:
+            per_symbol[t["symbol"]] = per_symbol.get(t["symbol"], 0) + 1
+        booked: List[Dict[str, Any]] = []
+        for t in trades:
+            sym, tid = t["symbol"], t["id"]
+            if t.get("pair_id") or tid in busy or sym in flying or per_symbol[sym] != 1:
+                continue
+            record, sign = abs(float(t.get("quantity") or 0.0)), (1.0 if t["side"] == "LONG" else -1.0)
+            now_held = float(held.get(sym, 0.0)) * sign                       # positive: held the trade's way round
+            short = record - now_held
+            if not (0.0 < now_held < record) or short <= 1e-9:
+                continue
+            seen = self.__dict__.setdefault("_short_checked", {})
+            if seen.get(tid) == (record, now_held):
+                continue                                 # looked already: the fills don't explain it (sold in TWS, say)
+            seen[tid] = (record, now_held)
+            try:
+                fills = [f for f in get(sym) if getattr(f, "tag", "") == f"exit:{tid}"
+                         and (f.side is Side.SHORT) == (t["side"] == "LONG")]
+            except Exception:  # noqa: BLE001 - the broker couldn't say: nothing is booked
+                continue
+            # the shares its record already took off were booked when they filled: the rest of the fills weren't
+            done = max(0.0, abs(float(t.get("initial_quantity") or record)) - record)
+            left, qty, value = done, 0.0, 0.0
+            for f in sorted(fills, key=lambda f: f.ts):
+                take = float(f.quantity)
+                if left > 0:
+                    skip = min(left, take)
+                    left, take = left - skip, take - skip
+                take = min(take, short - qty)
+                if take > 0:
+                    qty, value = qty + take, value + take * float(f.price)
+            if qty <= 1e-9:
+                continue
+            price = round(value / qty, 6)
+            out = self.repo.reduce_trade(tid, qty, price, exit_reason="exit")
+            if not out:
+                continue
+            booked.append({"id": tid, "symbol": sym, "qty": qty, "price": price})
+            log.warning("booked %s shares of %s sold by an exit that was called off after filling in part (@ %.4f) - "
+                        "the record now matches the %s shares held", f"{qty:,.0f}", sym, price, f"{abs(now_held):,.0f}")
+            self._publish("trade.reduced", trade=out, reason="an exit that filled in part, booked from the broker's fills",
+                          qty=qty, price=price)
+        return booked
 
     def _exit_fill(self, t: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         """What closed a position outside the app, from the broker's executions: the exit-side fills

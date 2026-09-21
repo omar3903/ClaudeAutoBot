@@ -706,6 +706,15 @@ So a position with no stop at the broker is marked **no stop at the broker yet**
 Positions tab, and once that has lasted 90 seconds the log and the dashboard say so, with the reason,
 and again every five minutes until it's fixed.
 
+**An exit called off after filling in part is booked.** Quitting and then pressing *Stop quitting*, or
+cancelling an exit, can call off an exit order that has already sold part of the position. The app books
+that part when the broker reports the cancelled order - unless it stops first. So the position check also
+books it from the broker's executions: when a record holds more shares than the broker, the same way round,
+the fills tagged with that trade's own exit orders (`exit:<trade>`) are booked at their prices - never more
+than the record is over by, never while an exit for it is still working, only for a symbol with one record.
+The counts then agree, and the stop and target go back at the broker for what's left. A difference its own
+fills don't explain (shares sold by hand in TWS) is left alone and reported, as before.
+
 The Open orders panel lists them as **stop** and **target** with their trade. The
 simulator keeps its own bracket and gets no such orders.
 

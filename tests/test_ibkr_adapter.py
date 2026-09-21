@@ -548,3 +548,20 @@ def test_a_resting_target_joins_the_stops_one_cancels_all_group(broker):
                                                                                                "tgt:trd_1")
     broker.place_order(OrderRequest(symbol="AAPL", side=Side.LONG, quantity=5, order_type=OrderType.LIMIT, limit_price=100.0))
     assert not getattr(broker._session.ib.placed[-1][1], "ocaGroup", "")       # an ordinary order is in no group
+
+
+def test_each_fill_carries_the_tag_of_the_order_it_filled(broker):
+    import datetime as dt
+
+    execution = SimpleNamespace(orderId=7, execId="x.1", side="SLD", shares=40.0, price=12.5, orderRef="exit:trd_1",
+                                time=dt.datetime(2026, 9, 3, 15, 0, tzinfo=dt.timezone.utc))
+    item = SimpleNamespace(execution=execution, contract=SimpleNamespace(symbol="AAPL"),
+                           commissionReport=SimpleNamespace(commission=1.0))
+
+    async def executions(wanted):
+        return [item]
+
+    broker._session.ib.reqExecutionsAsync = executions
+    [fill] = broker.get_fills("AAPL")
+    assert (fill.tag, fill.quantity, fill.price, fill.side) == ("exit:trd_1", 40.0, 12.5, Side.SHORT)
+

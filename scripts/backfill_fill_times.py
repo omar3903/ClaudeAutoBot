@@ -13,6 +13,8 @@ The seconds come from what the database already holds:
   position closed to the close. A stop or target resting at the broker has none - it waited for the
   price, not for the broker - and neither does a trade closed some other way.
 
+Trades on the in-app simulator are left out: it fills an order the moment it gets it.
+
 Only empty values are filled, so it is safe to run again. The app may keep running meanwhile; its new
 trades get the seconds as they are booked.
 """
@@ -30,6 +32,10 @@ from sqlalchemy import select  # noqa: E402
 
 from tos_bot.persistence.db import init_db, session_scope  # noqa: E402
 from tos_bot.persistence.models_orm import OrderAudit, Trade  # noqa: E402
+
+
+#: the in-app simulator's venue - it fills an order the moment it gets it, so it has no fill time to learn from
+SIMULATOR = "paper"
 
 
 def _tag(row: OrderAudit) -> str:
@@ -59,6 +65,8 @@ def main() -> int:
             if tag:
                 placed.setdefault(tag, []).append(row)
         for t in trades:
+            if (t.broker or "paper") == SIMULATOR:
+                continue                                 # the simulator fills at once: its seconds say nothing
             if t.entry_latency_s is None:
                 first = (placed.get(t.play_id or "") or [None])[0]
                 sent = min((x for x in (t.submitted_at, first.ts if first else None) if x is not None), default=None)

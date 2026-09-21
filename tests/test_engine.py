@@ -748,6 +748,61 @@ def test_a_position_closed_outside_the_app_is_booked_from_the_brokers_fills(engi
     assert engine.snapshot()["mismatches"] == []
 
 
+def test_an_exit_called_off_after_filling_in_part_is_booked_from_its_tagged_fills(engine):
+    import datetime as dt
+
+    from tos_bot.core.models import Fill
+
+    tid = _open(engine, "AAPL", qty=10)                                     # entered at 100
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAPL", quantity=6, avg_price=100.0, market_price=101.0)]
+    now, asked = dt.datetime.now(dt.timezone.utc), []
+
+    def fills(symbol=None):
+        asked.append(symbol)
+        return [Fill(order_id="e1", symbol="AAPL", side=Side.SHORT, quantity=3, price=104.0, ts=now, tag=f"exit:{tid}"),
+                Fill(order_id="e1", symbol="AAPL", side=Side.SHORT, quantity=1, price=106.0, ts=now, tag=f"exit:{tid}"),
+                Fill(order_id="tws", symbol="AAPL", side=Side.SHORT, quantity=5, price=90.0, ts=now),       # not the app's
+                Fill(order_id="x9", symbol="AAPL", side=Side.SHORT, quantity=2, price=80.0, ts=now, tag="exit:trd_other"),
+                Fill(order_id="in", symbol="AAPL", side=Side.LONG, quantity=10, price=100.0, ts=now, tag=f"play_{tid}")]
+
+    engine._broker.get_fills = fills
+    engine._reconcile_open_trades()
+    t = engine.repo.get_trade(tid)
+    assert (t["status"], t["quantity"], t["initial_quantity"]) == ("OPEN", 6, 10)
+    assert t["banked_pl"] == pytest.approx(3 * 4.0 + 1 * 6.0)                # its own exit's four shares, at their prices
+    engine._reconcile_open_trades()
+    assert engine.repo.get_trade(tid)["quantity"] == 6                      # booked once: the counts agree now
+
+
+def test_a_record_over_the_broker_for_a_reason_its_own_fills_dont_explain_is_left_alone(engine):
+    import datetime as dt
+
+    from tos_bot.core.models import Fill
+
+    tid = _open(engine, "AAPL", qty=10)
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAPL", quantity=6, avg_price=100.0, market_price=101.0)]
+    now, asked = dt.datetime.now(dt.timezone.utc), []
+    engine._broker.get_fills = lambda symbol=None: asked.append(symbol) or [
+        Fill(order_id="tws", symbol="AAPL", side=Side.SHORT, quantity=4, price=90.0, ts=now)]    # sold by hand in TWS
+    engine._reconcile_open_trades()
+    engine._reconcile_open_trades()
+    assert engine.repo.get_trade(tid)["quantity"] == 10 and len(asked) == 1  # untouched, and the broker asked once
+    assert engine.snapshot()["mismatches"]                                  # still reported for the owner to look at
+
+    other = _open(engine, "MSFT", qty=10)                                   # an exit for it still working: its own booking
+    engine._account.positions.append(Position(symbol="MSFT", quantity=6, avg_price=100.0, market_price=101.0))
+    engine.executor.pending_exit_trade_ids = lambda: {other}
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="e2", symbol="MSFT", side=Side.SHORT, quantity=4, price=104.0, ts=now, tag=f"exit:{other}")]
+    engine._refresh_account = lambda *a, **k: True
+    engine._reconcile_open_trades()
+    assert engine.repo.get_trade(other)["quantity"] == 10
+
+
 def test_shares_without_a_record_are_listed_and_can_be_exited(engine):
     _open(engine, "MSFT", qty=5)
     engine._refresh_account()
