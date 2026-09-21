@@ -225,6 +225,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._scan_running: Optional[Dict[str, Any]] = None
         self._last_scans: Dict[str, Dict[str, Any]] = {}
         self._gappers_session: Optional[dt.date] = None      # the session the gap check last ran for
+        self._replay_session: Optional[dt.date] = None       # the session the daily replay was started for
         self._last_cycle_at = float("-inf")
         self._last_fast_at = float("-inf")
         self._last_plays_at = float("-inf")
@@ -837,6 +838,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._scan_retry_at = 0.0
             if kind == "full":
                 self._last_cycle_at = float("-inf")     # in the session, a cycle follows straight away
+                self._replay_after_full_scan()
             else:
                 self._last_fast_at = mono
                 if kind == "cycle":
@@ -872,6 +874,26 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 log.exception("autopilot pass failed")
         self._publish_plays()                              # after the pass: each play carries Autopilot's verdict on it
         self._note_changes(changes)
+
+    def _replay_after_full_scan(self) -> None:
+        """The morning's full scan has just built today's watchlist - replay the strategies on it now
+        (replay.daily). It is the one moment in the day when that is free: the watchlist is fresh, the
+        market is still an hour off, and the replay wants the Gateway for the candles it downloads.
+        Once a session, never while one is already running, and never while quitting. A failure is the
+        replay's own to report - it only ever refreshes records, and nothing waits on it."""
+        if not bool(getattr(self.settings.config.replay, "daily", False)) or self.quit_state:
+            return
+        session = clock.session_date()
+        if self._replay_session == session or self.replay.running:
+            return
+        self._replay_session = session                  # attempted: it doesn't try again today either way
+        self._day_changed()
+        out = self.start_replay()
+        if out.get("ok"):
+            log.info("the day's replay started by itself after the full scan: %s", out.get("note", ""))
+        else:
+            log.warning("the day's replay didn't start: %s", out.get("reason", ""))
+        self._publish("replay.started", auto=True, **{k: out[k] for k in ("ok", "note", "reason") if k in out})
 
     def _scan_failed(self, kind: str, reason: str) -> None:
         self._scan_retry_at = time.monotonic() + self.SCAN_RETRY_S

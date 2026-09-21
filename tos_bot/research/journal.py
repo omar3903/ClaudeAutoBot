@@ -376,11 +376,24 @@ def execution_quality(trades: Sequence[Mapping[str, Any]], assumed_bps: float) -
         values = [float(t[key]) for t in trades if t.get(key) is not None]
         return round(sum(values) / len(values), 2) if values else None
 
+    def seconds(key: str) -> Optional[float]:
+        values = sorted(float(t[key]) for t in trades if t.get(key) is not None)
+        return round(values[len(values) // 2], 2) if values else None      # the middle one: a single slow fill can't skew it
+
     entries = sum(1 for t in trades if t.get("entry_slippage_bps") is not None)
     exits = sum(1 for t in trades if t.get("exit_slippage_bps") is not None)
     out: Dict[str, Any] = {"entries": entries, "exits": exits, "entry_slippage_bps": mean("entry_slippage_bps"),
                            "exit_slippage_bps": mean("exit_slippage_bps"), "spread_bps": mean("spread_bps"),
-                           "assumed_bps": round(float(assumed_bps), 2)}
+                           "assumed_bps": round(float(assumed_bps), 2),
+                           # how long the broker took to fill, typically, in seconds
+                           "entry_latency_s": seconds("entry_latency_s"), "exit_latency_s": seconds("exit_latency_s"),
+                           "slowest_entry_s": max((float(t["entry_latency_s"]) for t in trades
+                                                   if t.get("entry_latency_s") is not None), default=None)}
+    if out["entry_latency_s"] is not None:
+        out["latency_note"] = (f"Orders filled in {out['entry_latency_s']:.1f}s typically going in"
+                               + (f" and {out['exit_latency_s']:.1f}s coming out" if out["exit_latency_s"] is not None else "")
+                               + (f" (slowest entry {out['slowest_entry_s']:.0f}s)" if out["slowest_entry_s"] else "")
+                               + ". A stop or target resting at the broker isn't counted - it waits for the price.")
     if entries >= MIN_FILLS and exits >= MIN_FILLS:
         worst = max(out["entry_slippage_bps"] or 0.0, out["exit_slippage_bps"] or 0.0)
         verdict = ("more than the replay charges - raise replay.slippage_bps or its records flatter the setups"
@@ -423,6 +436,8 @@ def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Se
     strategies = strategy_table(live_records(rolling), replay_records, evidence, titles)
     fills = execution_quality(rolling, settings.slippage_bps + settings.commission_bps)
     notes = lessons(day_stats, mistakes, shadows, strategies, regime, titles, breakeven_at_r)
+    if fills.get("latency_note"):
+        notes.append(fills["latency_note"])
     if entered:
         n, left = day_stats["opened"], day_stats["still_open"]
         where = (f"; {left} still open, standing at {day_stats['open_r']:+.2f}R in all at the review" if standing

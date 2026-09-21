@@ -284,6 +284,45 @@ def test_scans_follow_the_schedule(engine, port, monkeypatch):
     assert engine.request_scan("gappers")["ok"] and engine._scan_request == "gappers"
 
 
+def test_the_days_replay_starts_itself_after_the_morning_scan_and_only_once(engine, port, monkeypatch):
+    _connect(engine, port)
+    started = []
+    monkeypatch.setattr(engine, "start_replay", lambda *a, **k: started.append(1) or {"ok": True, "note": "n"})
+    engine.settings.config.replay.daily = True
+
+    engine._run_scan("full")
+    assert started == [1] and engine._replay_session == clock.session_date()
+    engine._run_scan("full")
+    assert started == [1]                                                   # once a session, however often it scans
+    engine._run_scan("cycle")
+    assert started == [1]                                                   # and only after the full scan
+
+    engine._replay_session = None
+    engine.replay._thread = None
+    monkeypatch.setattr(type(engine.replay), "running", property(lambda self: True))
+    engine._run_scan("full")
+    assert started == [1]                                                   # not while one is already running
+    monkeypatch.setattr(type(engine.replay), "running", property(lambda self: False))
+    engine._replay_session, engine.quit_state = None, {"by": "operator"}
+    engine._run_scan("full")
+    assert started == [1]                                                   # nor while the app is quitting
+    engine.quit_state = None
+    engine.settings.config.replay.daily = False
+    engine._replay_session = None
+    engine._run_scan("full")
+    assert started == [1]                                                   # switched off in config.yaml
+
+
+def test_the_session_the_daily_replay_ran_for_survives_a_restart(engine, tmp_path, gateway, port):
+    engine._replay_session = clock.session_date()
+    engine.stop()
+    again = _started_again(tmp_path, gateway, port)
+    try:
+        assert again._replay_session == clock.session_date()
+    finally:
+        again.stop()
+
+
 # ---------------------------------------------------------------- the split, and changes made while it runs
 def test_entries_still_working_count_in_their_kinds_share_of_the_capital(engine, port):
     _connect(engine, port)

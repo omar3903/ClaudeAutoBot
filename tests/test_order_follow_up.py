@@ -318,3 +318,45 @@ def test_a_partial_exit_reduces_the_record_when_it_fills():
     t = repo.get_trade("t1")
     assert t["status"] == "OPEN" and t["quantity"] == 6 and t["banked_pl"] == 40.0
     assert (t["stop_price"], t["target_price"]) == (100.05, 120.0) and not ex.pending_exit_trade_ids()
+
+
+def test_how_long_each_order_took_to_fill_is_kept(repo):
+    """Entry and exit both: from the order going out to the fill coming back. A stop or target
+    resting at the broker has none - it waits for the price, not for the broker."""
+    import datetime as dt
+
+    from tos_bot.core.enums import Side, StrategyKind, Timeframe
+    from tos_bot.core.models import Play
+
+    play = Play(symbol="LAT", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=100.0, stop=99.0, targets=[102.0])
+    repo.record_play(play)
+    sent = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=6)
+    tid = repo.open_trade(play, 100.0, 10, "paper", submitted_at=sent)
+    opened = repo.trade_record(tid)["trade"]
+    assert 5.5 <= opened["entry_latency_s"] <= 8.0 and opened["submitted_at"]
+
+    repo.close_trade(tid, 101.0, exit_reason="target", submitted_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=2))
+    closed = repo.trade_record(tid)["trade"]
+    assert 1.5 <= closed["exit_latency_s"] <= 4.0 and closed["exit_submitted_at"]
+
+    play2 = Play(symbol="RST", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                 timeframe=Timeframe.SWING, entry=10.0, stop=9.0, targets=[12.0])
+    repo.record_play(play2)
+    rid = repo.open_trade(play2, 10.0, 5, "paper")                      # no send time known
+    repo.close_trade(rid, 12.0, exit_reason="target")                   # a target that rested at the broker
+    rested = repo.trade_record(rid)["trade"]
+    assert rested["entry_latency_s"] is None and rested["exit_latency_s"] is None
+
+
+def test_an_exit_the_app_sends_records_how_long_the_broker_took(repo):
+    from tos_bot.research.journal import execution_quality
+
+    trades = [{"entry_latency_s": 2.0, "exit_latency_s": 1.0, "entry_slippage_bps": 1.0, "exit_slippage_bps": 1.0},
+              {"entry_latency_s": 30.0, "exit_latency_s": 3.0},
+              {"entry_latency_s": 4.0, "exit_latency_s": 2.0}]
+    out = execution_quality(trades, assumed_bps=6.0)
+    assert out["entry_latency_s"] == 4.0 and out["exit_latency_s"] == 2.0   # the middle one, not the average
+    assert out["slowest_entry_s"] == 30.0 and "filled in 4.0s" in out["latency_note"]
+    assert execution_quality([{"r": 1.0}], assumed_bps=6.0).get("latency_note") is None
+

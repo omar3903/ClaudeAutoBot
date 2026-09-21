@@ -80,7 +80,7 @@ from tos_bot.core.models import Account, Position  # noqa: E402
 
 
 class _ClosingRepo(_Repo):
-    def close_trade(self, tid, exit_price, exit_reason="", decision_price=None):
+    def close_trade(self, tid, exit_price, exit_reason="", decision_price=None, submitted_at=None):
         self.t[tid].update(status="CLOSED", exit_price=exit_price, exit_reason=exit_reason)
         return dict(self.t[tid])
 

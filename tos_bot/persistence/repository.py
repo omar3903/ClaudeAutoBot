@@ -98,6 +98,9 @@ def trade_to_dict(t: Trade) -> Dict[str, Any]:
         "order_type": getattr(t, "order_type", None),
         "order_session": getattr(t, "order_session", None),
         "submitted_at": t.submitted_at.isoformat() if getattr(t, "submitted_at", None) else None,
+        "exit_submitted_at": (t.exit_submitted_at.isoformat() if getattr(t, "exit_submitted_at", None) else None),
+        "entry_latency_s": _f(getattr(t, "entry_latency_s", None)),
+        "exit_latency_s": _f(getattr(t, "exit_latency_s", None)),
         "entry_context": getattr(t, "entry_context", None),
         "mfe_at": t.mfe_at.isoformat() if getattr(t, "mfe_at", None) else None,
         "decision_price": _f(getattr(t, "decision_price", None)), "spread_bps": _f(getattr(t, "spread_bps", None)),
@@ -211,7 +214,8 @@ class Repository:
                 broker=broker, status="OPEN", quantity=fill_qty, initial_quantity=fill_qty,
                 entry_price=fill_price,
                 entry_time=now, order_type=order_type, order_session=order_session,
-                submitted_at=_naive(submitted_at), entry_context=entry_context,
+                submitted_at=_naive(submitted_at), entry_latency_s=_took(submitted_at, now),
+                entry_context=entry_context,
                 **_shortfall(decision, fill_price, play.side.value),
                 stop_price=None if pair_id else play.stop,
                 target_price=None if pair_id else play.primary_target,
@@ -270,10 +274,13 @@ class Repository:
         self, trade_id: str, exit_price: float, exit_reason: str = "manual",
         commission: float = 0.0, exit_qty: Optional[float] = None,
         exit_time: Optional[dt.datetime] = None, decision_price: Optional[float] = None,
+        submitted_at: Optional[dt.datetime] = None,
     ) -> Optional[Dict[str, Any]]:
         """``exit_time``: when the position actually closed, for a fill learned after the fact
         (default: now); ``decision_price``: the price that triggered the exit, which the fill is
-        measured against."""
+        measured against; ``submitted_at``: when the app's exit order went out, so the seconds it
+        took to fill are kept (a stop or target resting at the broker has none - it waits for the
+        price, not for the broker)."""
         now = (exit_time.astimezone(dt.timezone.utc).replace(tzinfo=None) if exit_time and exit_time.tzinfo
                else exit_time) or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
@@ -291,6 +298,9 @@ class Repository:
             t.exit_price = exit_price
             t.exit_time = now
             t.exit_reason = exit_reason
+            if submitted_at is not None:
+                t.exit_submitted_at = _naive(submitted_at)
+                t.exit_latency_s = _took(submitted_at, now)
             if decision_price and float(decision_price) > 0:
                 t.exit_decision_price = float(decision_price)
                 t.exit_slippage_bps = round((float(decision_price) - exit_price) * sign / float(decision_price) * 1e4, 2)
@@ -771,6 +781,14 @@ def _naive_iso(stamp: Any) -> Optional[dt.datetime]:
     except ValueError:
         return None
     return _naive(d)
+
+
+def _took(sent: Optional[dt.datetime], filled: dt.datetime) -> Optional[float]:
+    """Seconds from an order going out to its fill - None when the send time isn't known."""
+    if sent is None:
+        return None
+    gone = _naive(sent)
+    return round(max(0.0, (filled - gone).total_seconds()), 3) if gone else None
 
 
 def _naive(d: Optional[dt.datetime]) -> Optional[dt.datetime]:

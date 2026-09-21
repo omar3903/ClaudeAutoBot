@@ -42,9 +42,11 @@ DAY, SWING = "INTRADAY", "SWING"
 KINDS = (DAY, SWING)
 
 
+MODEL_MODES = ("shadow", "gate", "size")
+
+
 def kind_of(timeframe: Any) -> str:
     return DAY if str(getattr(timeframe, "value", timeframe) or "").upper() == DAY else SWING
-MODEL_MODES = ("shadow", "gate", "size")
 
 
 def _mode(value: Any) -> str:
