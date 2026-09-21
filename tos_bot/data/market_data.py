@@ -53,11 +53,20 @@ class PriceSource(Protocol):
     def get_quote(self, symbol: str) -> Quote: ...
 
 
-def quote_from_price(symbol: str, last: float, volume: float = 0.0) -> Quote:
-    """A quote with an estimated spread, for when only a last price is known."""
+def quote_from_price(symbol: str, last: float, volume: float = 0.0, ts: Optional[dt.datetime] = None) -> Quote:
+    """A quote with an estimated spread, for when only a last price is known. ``ts``: when the price is
+    from (a candle's time) - now when not given."""
     spread = max(0.01, last * 0.0005)
+    extra = {"ts": ts} if ts is not None else {}
     return Quote(symbol=symbol, bid=round(last - spread, 2), ask=round(last + spread, 2),
-                 last=round(last, 4), volume=volume)
+                 last=round(last, 4), volume=volume, **extra)
+
+
+def _candle_time(frame: pd.DataFrame) -> dt.datetime:
+    """When the last candle of ``frame`` is from, as an aware datetime."""
+    at = frame.index[-1]
+    at = at.to_pydatetime() if hasattr(at, "to_pydatetime") else at
+    return at if at.tzinfo else at.replace(tzinfo=dt.timezone.utc)
 
 
 class MarketData:
@@ -267,6 +276,8 @@ class MarketData:
             try:
                 q = src.get_quote(symbol)
                 if q.last or q.bid or q.ask:
+                    with self._lock:
+                        self._quotes[symbol] = (time.monotonic(), q)     # kept for last_seen - never served stale
                     return q
             except Exception as e:  # noqa: BLE001
                 log.debug("quote for %s failed: %s", symbol, e)
@@ -278,7 +289,47 @@ class MarketData:
         if frame is None or not len(frame):
             raise RuntimeError(f"no price for {symbol}")
         last = frame.iloc[-1]
-        q = quote_from_price(symbol, float(last["close"]), float(last["volume"]))
+        q = quote_from_price(symbol, float(last["close"]), float(last["volume"]), ts=_candle_time(frame))
         with self._lock:
             self._quotes[symbol] = (now, q)
         return q
+
+    # ---- the latest price, and when it's from ---------------------------- #
+    def last_seen(self, symbol: str) -> Optional[Tuple[float, dt.datetime, float]]:
+        """The newest price the app holds for ``symbol`` - its latest quote or the close of its latest
+        5-minute candle, whichever is from later - as (price, when it's from, how many seconds ago it was
+        fetched). None when it holds neither. Asks nothing of the broker."""
+        now, best = time.monotonic(), None
+        hit = self._quotes.get(symbol)
+        if hit is not None:
+            q = hit[1]
+            price = float(q.last or q.mid or 0.0)
+            if price > 0:
+                best = (price, q.ts if q.ts.tzinfo else q.ts.replace(tzinfo=dt.timezone.utc), now - hit[0])
+        bars = self._intraday.get(symbol)
+        if bars is not None and bars[1] is not None and len(bars[1]):
+            at = _candle_time(bars[1])
+            if best is None or at > best[1]:
+                best = (float(bars[1]["close"].iloc[-1]), at, now - bars[0])
+        return best
+
+    def refresh_prices(self, symbols: Sequence[str], con_ids: Optional[Mapping[str, int]] = None,
+                       limit: int = 120) -> int:
+        """Fetch a fresh price for each of ``symbols`` now - the close of its latest one-minute candle,
+        in one batch (a snapshot quote each would take a request apiece) - for the dashboard's Refresh.
+        The first ``limit`` only. Returns how many came back."""
+        wanted = list(dict.fromkeys(symbols))[:limit]
+        if not wanted:
+            return 0
+        got = self.source.history_many({s: ("1 min", "1800 S") for s in wanted}, con_ids)
+        now = time.monotonic()
+        fresh = {}
+        for symbol, frame in got.items():
+            if frame is None or not len(frame):
+                continue
+            last = frame.iloc[-1]
+            fresh[symbol] = (now, quote_from_price(symbol, float(last["close"]), float(last["volume"]),
+                                                   ts=_candle_time(frame)))
+        with self._lock:
+            self._quotes.update(fresh)
+        return len(fresh)

@@ -827,9 +827,37 @@ class AutoPilot:
             and not self._unproven(row.get("strategy", ""))
             and not self.stopped_for_the_day
         )
+        waiting = self._waiting_for(str(row.get("timeframe") or ""), str(row.get("strategy") or "")) if will else None
         row["autopilot"] = {
             "eligible": bool(will),
+            # it passes Autopilot's checks, but a cap has no room for it right now
+            "waiting": waiting,
             "acted": pid in self._acted,
             "reason": self._last_reason.get(pid, ""),
         }
         return row
+
+    #: seconds the caps are read once for a whole board of plays
+    ROOM_CACHE_S = 2.0
+
+    def _waiting_for(self, timeframe: str, strategy: str) -> Optional[str]:
+        """Which cap keeps Autopilot from taking a play that passes its checks, right now: the day's
+        entries, the open positions, the day / swing slots, the setup's own. None when there is room."""
+        now = time.monotonic()
+        cached = getattr(self, "_room_cache", None)
+        if cached is None or now - cached[0] > self.ROOM_CACHE_S:
+            opens = self._open_auto_trades() + self._working_auto_entries()
+            cached = (now, opens)
+            self._room_cache = cached
+        opens = cached[1]
+        if self._count_today >= self.max_auto_trades_per_day:
+            return f"the day's {self.max_auto_trades_per_day} auto entries are used"
+        if len(opens) >= self.max_auto_positions:
+            return f"all {self.max_auto_positions} auto positions are taken"
+        full = self._kind_full(timeframe, opens)
+        if full:
+            return full
+        same = sum(1 for t in opens if t.get("strategy") == strategy)
+        if same >= self.max_per_strategy:
+            return f"already holding {same} of this setup (max {self.max_per_strategy})"
+        return None

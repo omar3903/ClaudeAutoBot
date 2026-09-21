@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from ..brokers.venues import plan_venue
 from ..core.models import Account
@@ -34,10 +34,18 @@ def account(acc: Account, cfg: Any, paper: bool) -> Dict[str, Any]:
             "paper_start_cash": cfg.paper_start_cash, "pdt_threshold": cfg.pdt_equity_threshold}
 
 
-def positions(acc: Optional[Account]) -> List[Dict[str, Any]]:
-    return [{"symbol": p.symbol, "qty": p.quantity, "avg_price": round(p.avg_price, 4),
-             "market_price": round(p.market_price, 4), "unrealized_pl": round(p.unrealized_pl, 2)}
-            for p in (acc.positions if acc else [])]
+def positions(acc: Optional[Account], marks: Optional[Mapping[str, Tuple[float, str]]] = None) -> List[Dict[str, Any]]:
+    """The positions the broker holds. ``marks``: the app's own fresher price per stock (the one the exit
+    manager acts on), with when it's from - used over the broker's mark, which IBKR updates only every
+    few minutes."""
+    out = []
+    for p in (acc.positions if acc else []):
+        mark = (marks or {}).get(p.symbol)
+        price, at = mark if mark else (p.market_price, None)
+        unrealized = (price - p.avg_price) * p.quantity if mark else p.unrealized_pl
+        out.append({"symbol": p.symbol, "qty": p.quantity, "avg_price": round(p.avg_price, 4),
+                    "market_price": round(price, 4), "price_at": at, "unrealized_pl": round(unrealized, 2)})
+    return out
 
 
 def connection_pill(mode: str, paper_platform: str, conns: Connections) -> Dict[str, str]:

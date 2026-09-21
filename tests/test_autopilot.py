@@ -746,3 +746,32 @@ def test_a_daily_loss_limit_that_is_raised_stops_saying_stopped():
     _run(ap, mkplay(sym="BBB"))
     assert not ap.status()["daily_loss_stop"] and len(eng.approved) == 1
 
+
+# ---------------------------------------------------------------- the play's bar: would take it now, or waiting
+def _row(tf, strategy="opening_range_breakout"):
+    return {"id": f"row_{tf}", "timeframe": tf, "confidence": 0.9, "reward_risk": 3, "kind": "TECHNICAL",
+            "status": "PROPOSED", "noise": [], "confirmations": 5, "strategy": strategy}
+
+
+def test_a_play_that_passes_but_finds_its_cap_full_says_what_it_waits_for():
+    eng, ap = _split_pilot(70.0)
+    free = ap.decorate_play(_row("SWING"))["autopilot"]
+    assert free["eligible"] and free["waiting"] is None                          # green: it would go on the next pass
+    _run(ap, *[mkplay(sym=f"S{i}", tf=Timeframe.SWING) for i in range(3)])
+    ap._room_cache = None
+    swing = ap.decorate_play(_row("SWING"))["autopilot"]
+    assert swing["eligible"] and "swing trades hold 3 of the 3 positions" in swing["waiting"]
+    assert ap.decorate_play(_row("INTRADAY"))["autopilot"]["waiting"] is None  # the day trades' room is still there
+
+    ap.max_per_strategy = 3
+    ap._room_cache = None
+    assert "already holding 3 of this setup" in ap.decorate_play(_row("INTRADAY"))["autopilot"]["waiting"]
+    ap.max_auto_positions = 3
+    ap._room_cache = None
+    assert "all 3 auto positions are taken" in ap.decorate_play(_row("INTRADAY"))["autopilot"]["waiting"]
+    ap._count_today = ap.max_auto_trades_per_day
+    assert "auto entries are used" in ap.decorate_play(_row("INTRADAY"))["autopilot"]["waiting"]
+
+    ap.enabled = False                                                           # not taking it at all: no bar
+    off = ap.decorate_play(_row("INTRADAY"))["autopilot"]
+    assert not off["eligible"] and off["waiting"] is None
