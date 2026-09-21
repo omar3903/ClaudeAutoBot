@@ -32,6 +32,11 @@ def _trade(**kw):
 class _Repo:
     def __init__(self, trades):
         self.t = {x["id"]: dict(x) for x in trades}
+        self.settled = []                        # (play id, status, outcome) - what became of each sent play
+
+    def settle_play(self, play_id, status, outcome=None):
+        self.settled.append((play_id, status, outcome))
+        return True
 
     def open_trades(self):
         return [dict(x) for x in self.t.values() if x["status"] == "OPEN"]
@@ -390,3 +395,126 @@ def test_an_entry_taken_back_after_a_restart_has_no_fill_time():
     Executor._on_filled(ex, _Pending("o2", play, "entry", qty=5, submitted_at=now), res)
     assert seen == [None, now]
 
+
+# ---------------------------------------------------------------- an entry that bought nothing, and one that stalled
+def _entry(ex, symbol="AAA", timeframe=Timeframe.INTRADAY, **kw):
+    play = Play(symbol=symbol, side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=timeframe, entry=100.0, stop=98.0, targets=[104.0], **kw)
+    play.suggested_qty = 10
+    assert ex.execute_play(play, Account(account_id="DU"), plan=PLAN)["status"] == "SUBMITTED"
+    return play
+
+
+def test_an_entry_that_bought_nothing_is_told_once_and_the_play_log_says_why():
+    broker, repo, heard, handed = _Broker(), _Repo([]), [], []
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    ex.on_entry_unfilled = handed.append
+    play = _entry(ex)
+    assert repo.settled == [(play.id, "SUBMITTED", None)]                  # saved before the sync can hear the end
+    broker.reports["1"] = OrderResult(order_id="1", status="CANCELED", symbol="AAA", submitted_qty=10,
+                                      message="not filled within 10 minutes")
+    report = broker.get_order("1")
+    class _HeardTwice:
+        """The report the Refresh button's pass reads at the same moment as the sync loop's: the other pass
+        runs between this one's look at the order and its claim on it."""
+
+        def __init__(self, r):
+            self._r, self._inside = r, False
+
+        def __getattr__(self, name):
+            return getattr(self._r, name)
+
+        @property
+        def status(self):
+            if not self._inside:
+                self._inside = True
+                ex._on_order_update(self)
+            return self._r.status
+
+    ex._on_order_update(_HeardTwice(report))
+    ex._on_order_update(report)
+    ex.sync_open_orders()
+    assert handed == [play.id]                                             # once
+    failed = [p for topic, p in heard if topic == "order.failed"]
+    assert len(failed) == 1 and failed[0]["play_id"] == play.id
+    (pid, status, outcome), = repo.settled[1:]
+    assert (pid, status, outcome["status"]) == (play.id, "CANCELED", "CANCELED") and "10 minutes" in outcome["reason"]
+
+    refused = _entry(ex, "BBB")                                             # refused by the broker: also nothing bought
+    broker.reports["2"] = OrderResult(order_id="2", status="REJECTED", symbol="BBB", submitted_qty=10)
+    ex.sync_open_orders()
+    assert handed == [play.id, refused.id] and repo.settled[-1][1] == "ERROR"
+
+
+def test_an_entry_that_may_have_bought_something_keeps_its_slot():
+    broker, repo, handed = _Broker(), _Repo([]), []
+    ex = _executor(broker, repo)
+    ex.on_entry_unfilled = handed.append
+    _entry(ex)
+    broker.reports["1"] = OrderResult(order_id="1", status="CANCELED", symbol="AAA", submitted_qty=10,
+                                      filled_qty=4, avg_fill_price=100.0)
+    ex.sync_open_orders()                                                  # part of it filled: a trade, not a miss
+    assert handed == [] and [t["quantity"] for t in repo.open_trades()] == [4.0]
+
+    from tos_bot.core.models import Fill
+
+    _entry(ex, "DDD")                                                      # the broker's count says 0, a fill says not
+    broker.reports["2"] = OrderResult(order_id="2", status="CANCELED", symbol="DDD", submitted_qty=10,
+                                      fills=[Fill(order_id="2", symbol="DDD", side=Side.LONG, quantity=3, price=100.0)])
+    ex.sync_open_orders()
+    assert handed == []
+    broker.reports.clear()
+
+    _entry(ex, "BBB")                                                      # lost: it may have filled unseen
+    broker.reports["3"] = OrderResult(order_id="3", status="UNKNOWN", symbol="BBB", submitted_qty=10)
+    for _ in range(ex.LOST_AFTER_POLLS):
+        ex.sync_open_orders()
+    assert ex.working_entries() == [] and handed == [] and repo.settled[-1][1] == "ERROR"
+
+
+def test_a_part_filled_entry_that_stalls_has_the_rest_cancelled_so_its_shares_are_booked():
+    import time
+
+    broker, repo = _Broker(), _Repo([])
+    ex = _executor(broker, repo)
+    swing = _entry(ex, timeframe=Timeframe.SWING)                           # a swing entry too: no time-out of its own
+    leg = _entry(ex, "BBB", tags=["pair-leg"])                             # the pairs desk works its own legs
+    for oid, sym in (("1", "AAA"), ("2", "BBB")):
+        broker.reports[oid] = OrderResult(order_id=oid, status="WORKING", symbol=sym, submitted_qty=10,
+                                          filled_qty=4, avg_fill_price=100.01)
+    ex.sync_open_orders()
+    first = ex._pending["1"].first_fill_at
+    assert first is not None and repo.open_trades() == [] and broker.cancelled == []
+    wait = ex.cfg.partial_entry_wait_s
+    assert ex.expire_entries(mono=first + wait - 1) == []                  # still inside the wait
+    assert ex.expire_entries(mono=first + wait) == ["1"] and broker.cancelled == ["1"]
+    assert ex.expire_entries(mono=first + wait + 1) == [] and broker.cancelled == ["1"]    # asked once...
+    ex.expire_entries(mono=first + wait + ex.CANCEL_AGAIN_S)
+    assert broker.cancelled == ["1", "1"]                                  # ...and again when it hasn't taken
+    assert "filled in part" in ex._pending["1"].expired
+
+    broker.reports["1"] = OrderResult(order_id="1", status="CANCELED", symbol="AAA", submitted_qty=10,
+                                      filled_qty=6, avg_fill_price=100.02)
+    ex.sync_open_orders()
+    assert [(t["symbol"], t["quantity"]) for t in repo.open_trades()] == [("AAA", 6.0)]  # what was bought by the end
+    assert swing.status.value == "FILLED" and [w["symbol"] for w in ex.working_entries()] == ["BBB"]
+    assert leg.status.value == "SUBMITTED"
+
+    ex.cfg = ex.cfg.model_copy(update={"partial_entry_wait_s": 0})         # switched off: wait for the order
+    _entry(ex, "CCC")
+    broker.reports["3"] = OrderResult(order_id="3", status="WORKING", symbol="CCC", submitted_qty=10, filled_qty=4)
+    ex.sync_open_orders()
+    assert ex.expire_entries(mono=time.monotonic() + 3600) == []
+
+
+def test_a_part_filled_entry_the_broker_loses_track_of_books_what_it_was_seen_to_buy():
+    broker, repo = _Broker(), _Repo([])
+    ex = _executor(broker, repo)
+    _entry(ex)
+    broker.reports["1"] = OrderResult(order_id="1", status="WORKING", symbol="AAA", submitted_qty=10,
+                                      filled_qty=4, avg_fill_price=100.03)
+    ex.sync_open_orders()
+    broker.reports["1"] = OrderResult(order_id="1", status="UNKNOWN", symbol="AAA", submitted_qty=10)
+    for _ in range(ex.LOST_AFTER_POLLS):                                   # e.g. a Gateway restart mid-cancel
+        ex.sync_open_orders()
+    assert [(t["quantity"], t["entry_price"]) for t in repo.open_trades()] == [(4.0, 100.03)]   # so they get a stop

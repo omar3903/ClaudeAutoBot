@@ -24,6 +24,7 @@ It holds no broker or DB handles of its own; it drives the engine.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -93,6 +94,11 @@ class AutoPilot:
         #: a size of zero, a last look that failed) - settings_changed() hands them back to the next pass
         self._refused: set[str] = set()
         self._count_by_kind: Dict[str, int] = {}   # today's entries, day trades and swing trades apart
+        #: the entries counted today, by play id, with their kind: one that ends with nothing bought hands
+        #: its slot back (entry_unfilled), once
+        self._counted: Dict[str, str] = {}
+        self._sent_today: int = 0               # entry orders sent today - never handed back (see SENT_CEILING)
+        self._count_lock = threading.Lock()     # the counts change on the scan thread and the order sync's
         self._auto_trade_ids: set[str] = set()  # trades this pilot opened (this session)
         self._auto_play_ids: set[str] = set()   # plays it sent entries for - a late fill carries only this
         self._day: str = ""
@@ -131,9 +137,13 @@ class AutoPilot:
             "model_min_p": self.model_min_p,
             "dry_run": self.dry_run,
             "day": self._day,
-            "count_today": self._count_today,
-            "count_today_by_kind": dict(self._count_by_kind),
+            **self._counts_saved(),
         }
+
+    def _counts_saved(self) -> Dict[str, Any]:
+        with self._count_lock:
+            return {"count_today": self._count_today, "count_today_by_kind": dict(self._count_by_kind),
+                    "counted_today": dict(self._counted), "sent_today": self._sent_today}
 
     def load_runtime(self, d: Dict[str, Any]) -> None:
         if not isinstance(d, dict):
@@ -168,6 +178,11 @@ class AutoPilot:
             by_kind = d.get("count_today_by_kind")
             self._count_by_kind = ({k: int(v) for k, v in by_kind.items() if k in KINDS}
                                    if isinstance(by_kind, dict) else {})
+            counted = d.get("counted_today")
+            self._counted = ({str(k): v for k, v in counted.items() if v in KINDS}
+                             if isinstance(counted, dict) else {})
+            sent = d.get("sent_today")
+            self._sent_today = int(sent) if isinstance(sent, int) else self._count_today
             self._peak_realized = float(d.get("peak_realized", 0.0) or 0.0)
 
     # ------------------------------------------------------------------ #
@@ -225,9 +240,14 @@ class AutoPilot:
     def _roll_day(self) -> None:
         today = clock.session_date().isoformat()
         if today != self._day:
-            self._day = today
-            self._count_today = 0
-            self._count_by_kind = {}
+            with self._count_lock:
+                if today == self._day:
+                    return                      # another thread has just rolled it
+                self._day = today
+                self._count_today = 0
+                self._count_by_kind = {}
+                self._counted = {}
+                self._sent_today = 0
             self._peak_realized = 0.0
             self._acted.clear()
             self._refused.clear()
@@ -372,6 +392,8 @@ class AutoPilot:
             "model": self._model_card(),
             "open_auto_positions": open_auto,
             "auto_trades_today": self._count_today,
+            "sent_today": self._sent_today,
+            "sent_ceiling": self.SENT_CEILING * self.max_auto_trades_per_day,
             "slots": self._slots_card(),
             "mode": getattr(self.engine, "mode", "paper"),
             "allow_live": bool(getattr(self.cfg, "allow_live", False)),
@@ -408,6 +430,48 @@ class AutoPilot:
                 continue
             if row and row.get("decided_by") == "autopilot":
                 self._auto_play_ids.add(pid)
+
+    #: entry orders sent in a day, as a multiple of the day's entries, after which no more go out - the
+    #: slots handed back by entries that bought nothing would otherwise let a broker refusing every order
+    #: (they come back cancelled) or a run of entries timing out turn the cap into an order a minute
+    SENT_CEILING = 2
+
+    def entry_unfilled(self, play_id: str) -> bool:
+        """An entry Autopilot sent ended with nothing bought - timed out, cancelled, refused: the day's
+        slot it took comes back, once. The setup itself isn't offered again today (never chase). Called
+        by the executor, from the order sync; says whether a slot came back."""
+        self._roll_day()
+        if not self._release(play_id):
+            return False                        # not one it counted today, or already handed back
+        self._auto_play_ids.discard(play_id)
+        self._room_cache = None
+        log.info("autopilot: the entry for %s bought nothing - its slot is back (%d/%d today)",
+                 play_id, self._count_today, self.max_auto_trades_per_day)
+        try:
+            self._persist()
+            self.publish_status()
+        except Exception:  # noqa: BLE001
+            log.debug("saving the handed-back slot failed", exc_info=True)
+        return True
+
+    def _reserve(self, play_id: str, kind: str) -> None:
+        with self._count_lock:
+            self._count_today += 1
+            self._count_by_kind[kind] = int(self._count_by_kind.get(kind, 0)) + 1
+            self._counted[play_id] = kind
+
+    def _release(self, play_id: str) -> bool:
+        with self._count_lock:
+            kind = self._counted.pop(play_id, None)
+            if kind is None:
+                return False
+            self._count_today = max(0, self._count_today - 1)
+            left = int(self._count_by_kind.get(kind, 0)) - 1
+            if left > 0:
+                self._count_by_kind[kind] = left
+            else:
+                self._count_by_kind.pop(kind, None)
+            return True
 
     def _working_auto_entries(self) -> List[Dict[str, Any]]:
         """Auto entries sent but not filled yet - they count against every cap."""
@@ -488,6 +552,10 @@ class AutoPilot:
             if self._count_today >= self.max_auto_trades_per_day:
                 self._last_reason[p.id] = f"daily auto-trade cap ({self.max_auto_trades_per_day}) reached"
                 continue
+            if self._sent_today >= self.SENT_CEILING * self.max_auto_trades_per_day:
+                self._last_reason[p.id] = (f"{self._sent_today} entry orders sent today - {self.SENT_CEILING} times "
+                                           "the daily cap, counting the ones that bought nothing; no more today")
+                continue
             opens = self._open_auto_trades() + self._working_auto_entries()   # orders still working count too
             if len(opens) >= self.max_auto_positions:
                 self._last_reason[p.id] = f"max concurrent auto positions ({self.max_auto_positions}) reached"
@@ -542,11 +610,20 @@ class AutoPilot:
                          p.side.value, p.symbol, pre["order_preview"]["qty"], est_risk)
                 continue
 
-            out = self.engine.approve_play(p.id, operator="autopilot")
+            # the slot is taken before the order goes out: the order sync can hear it ended - and hand the
+            # slot back - before approve_play returns. Saved first, so a crash errs on a slot taken
+            self._reserve(p.id, kind_of(p.timeframe.value))
+            self._persist()
+            try:
+                out = self.engine.approve_play(p.id, operator="autopilot")
+            except Exception:
+                # the order may be out already: it keeps its slot and is Autopilot's to count
+                self._sent_today += 1
+                self._auto_play_ids.add(p.id)
+                self._persist()
+                raise
             if out.get("ok"):
-                self._count_today += 1
-                kind = kind_of(p.timeframe.value)
-                self._count_by_kind[kind] = int(self._count_by_kind.get(kind, 0)) + 1
+                self._sent_today += 1
                 taken += 1
                 self._entries_at.append(time.monotonic())
                 self._auto_play_ids.add(p.id)
@@ -567,6 +644,8 @@ class AutoPilot:
                             p.side.value, p.symbol, pre["order_preview"]["qty"], tid,
                             est_risk, self._count_today, self.max_auto_trades_per_day)
             else:
+                self._release(p.id)                   # nothing went out
+                self._persist()
                 self._refused.add(p.id)
                 self._last_reason[p.id] = out.get("reason", "execution failed")
                 self.bus.publish("autopilot.skipped", play_id=p.id, symbol=p.symbol,
@@ -852,6 +931,9 @@ class AutoPilot:
         opens = cached[1]
         if self._count_today >= self.max_auto_trades_per_day:
             return f"the day's {self.max_auto_trades_per_day} auto entries are used"
+        if self._sent_today >= self.SENT_CEILING * self.max_auto_trades_per_day:
+            return (f"{self._sent_today} entry orders sent today, counting the ones that bought nothing - "
+                    f"{self.SENT_CEILING} times the daily cap")
         if len(opens) >= self.max_auto_positions:
             return f"all {self.max_auto_positions} auto positions are taken"
         full = self._kind_full(timeframe, opens)

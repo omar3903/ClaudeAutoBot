@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from tos_bot.core.enums import AssetClass, Side, StrategyKind, Timeframe
 from tos_bot.core.models import Account, Play, Position
 from tos_bot.execution.autopilot import AutoPilot
@@ -775,3 +777,105 @@ def test_a_play_that_passes_but_finds_its_cap_full_says_what_it_waits_for():
     ap.enabled = False                                                           # not taking it at all: no bar
     off = ap.decorate_play(_row("INTRADAY"))["autopilot"]
     assert not off["eligible"] and off["waiting"] is None
+
+
+# ---------------------------------------------------------------- an entry that bought nothing hands its slot back
+def _two_a_day(**over):
+    eng = FakeEngine()
+    eng.fill_later = True                                                   # the entries stay working
+    return eng, AutoPilot(eng, _cfg(max_auto_trades_per_day=2, max_auto_positions=9, **over), bus=SILENT)
+
+
+def test_an_entry_that_bought_nothing_hands_its_days_slot_back_once():
+    eng, ap = _two_a_day()
+    first, second, third = mkplay(sym="AAA"), mkplay(sym="BBB"), mkplay(sym="CCC")
+    _run(ap, first, second, third)
+    assert eng.approved_ids() == [first.id, second.id]                     # the day's two
+    eng.working = [w for w in eng.working if w["play_id"] != first.id]      # the first timed out, nothing bought
+    assert ap.entry_unfilled(first.id) and ap.status()["auto_trades_today"] == 1
+    assert not ap.entry_unfilled(first.id)                                  # once
+    assert not ap.entry_unfilled("play_by_hand") and ap.status()["auto_trades_today"] == 1
+    assert ap.to_runtime()["count_today_by_kind"] == {"INTRADAY": 1}        # its kind's count comes back too
+    _run(ap, first, third)
+    assert eng.approved_ids() == [first.id, second.id, third.id]           # the slot went to a new setup, not a chase
+
+
+def test_the_slots_that_can_come_back_survive_a_restart_but_not_the_night():
+    import datetime as dt
+
+    from tos_bot.util import clock
+
+    eng, ap = _two_a_day()
+    play = mkplay(sym="AAA")
+    _run(ap, play)
+    saved = ap.to_runtime()
+    assert saved["counted_today"] == {play.id: "INTRADAY"} and saved["sent_today"] == 1
+    again = AutoPilot(eng, _cfg(max_auto_trades_per_day=2, max_auto_positions=9), bus=SILENT)
+    again.load_runtime(saved)
+    assert again.entry_unfilled(play.id) and again.status()["auto_trades_today"] == 0
+    assert again.to_runtime()["sent_today"] == 1                            # an order went out all the same
+
+    tomorrow = AutoPilot(eng, _cfg(), bus=SILENT)
+    tomorrow.load_runtime({**saved, "day": (clock.session_date() - dt.timedelta(days=1)).isoformat()})
+    assert not tomorrow.entry_unfilled(play.id)
+    damaged = AutoPilot(eng, _cfg(), bus=SILENT)
+    damaged.load_runtime({**saved, "counted_today": ["not", "a", "map"], "sent_today": "x"})
+    assert damaged._counted == {} and damaged._sent_today == damaged._count_today
+
+
+def test_an_entry_that_ends_before_approve_returns_still_hands_its_slot_back():
+    class _Quick(FakeEngine):
+        """The order sync hears the broker cancel it while approve_play is still busy."""
+
+        def approve_play(self, pid, operator="operator"):
+            out = super().approve_play(pid, operator)
+            ap.entry_unfilled(pid)
+            return out
+
+    eng = _Quick()
+    eng.fill_later = True
+    ap = AutoPilot(eng, _cfg(max_auto_trades_per_day=2, max_auto_positions=9), bus=SILENT)
+    _run(ap, mkplay(sym="AAA"))
+    assert len(eng.approved) == 1 and ap.status()["auto_trades_today"] == 0 and ap._sent_today == 1
+
+
+def test_an_approve_that_fails_takes_no_slot_and_one_that_crashes_keeps_it():
+    eng, ap = _two_a_day()
+    eng.approve_play = lambda pid, operator="operator": {"ok": False, "reason": "size rounds to zero"}
+    _run(ap, mkplay(sym="AAA"))
+    assert ap.status()["auto_trades_today"] == 0 and ap._counted == {} and ap._sent_today == 0
+
+    def crash(pid, operator="operator"):
+        raise RuntimeError("the database went away after the order was sent")
+
+    eng.approve_play = crash
+    play = mkplay(sym="BBB")
+    with pytest.raises(RuntimeError):
+        _run(ap, play)
+    assert ap.status()["auto_trades_today"] == 1 and play.id in ap._auto_play_ids   # the order may be out
+
+
+def test_orders_sent_stop_at_twice_the_daily_cap_even_when_none_of_them_bought_anything():
+    eng, ap = _two_a_day()
+    for i in range(4):
+        play = mkplay(sym=f"S{i}")
+        _run(ap, play)
+        eng.working.clear()
+        assert ap.entry_unfilled(play.id)                                   # refused by the broker, every one
+    last = mkplay(sym="S9")
+    _run(ap, last)
+    assert len(eng.approved) == 4 and "4 entry orders sent today" in ap.verdict(last)
+    ap._room_cache = None
+    bar = ap.decorate_play(_row("INTRADAY"))["autopilot"]                  # the play's bar says so too: amber, not green
+    assert bar["eligible"] and "4 entry orders sent today" in bar["waiting"]
+    assert (ap.status()["sent_today"], ap.status()["sent_ceiling"], ap.status()["auto_trades_today"]) == (4, 4, 0)
+
+
+def test_a_new_session_starts_the_slots_and_the_orders_sent_afresh():
+    eng, ap = _two_a_day()
+    play = mkplay(sym="AAA")
+    _run(ap, play)
+    ap._sent_today = 4
+    ap._day = "2000-01-03"                                                  # the session has turned over
+    assert not ap.entry_unfilled(play.id)                                   # yesterday's entry hands back nothing today
+    assert (ap._count_today, ap._sent_today, ap._counted) == (0, 0, {})

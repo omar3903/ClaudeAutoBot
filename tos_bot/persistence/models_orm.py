@@ -3,7 +3,7 @@
 Tables
 ------
 scan_runs          one row per scan (full scan, cycle or fast cycle)
-play_logs          EVERY proposed play (accepted or not) - the audit of ideas
+play_logs          every play the board took (accepted or not) and what became of it - the audit of ideas
 trades             an executed position's full lifecycle + realised P/L
 fills              individual executions attached to a trade
 account_snapshots  periodic equity / cash / buying-power / day-trade count

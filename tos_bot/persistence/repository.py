@@ -147,7 +147,11 @@ class Repository:
     # -------------------------------------------------------------- #
     #  Scans + plays                                                #
     # -------------------------------------------------------------- #
-    def record_scan(self, result, keep_rejected: bool = True, top_n: int = 60) -> None:
+    def record_scan(self, result, keep_rejected: bool = True, top_n: int = 60,
+                    plays: Optional[List[Play]] = None) -> None:
+        """The scan, and its plays: ``plays`` when given (the ones the board took - a setup already
+        acted on this session isn't offered again, so it isn't logged again), else all of them. A play
+        whose row says it was decided - sent, filled, dismissed - keeps that row as it is."""
         with session_scope() as s:
             s.merge(ScanRun(
                 id=result.run_id, kind=result.kind, started_at=_naive(result.started_at),
@@ -157,8 +161,11 @@ class Repository:
                 hot={"symbols": result.hot}, n_errors=len(result.errors),
                 elapsed_s=result.elapsed_s,
             ))
-            plays = result.plays if keep_rejected else result.plays[:top_n]
-            for p in plays:
+            chosen = list(result.plays if plays is None else plays)
+            for p in (chosen if keep_rejected else chosen[:top_n]):
+                row = s.get(PlayLog, p.id)
+                if row is not None and row.status != "PROPOSED":
+                    continue
                 s.merge(_play_row(p))
 
     def record_play(self, play: Play) -> None:
@@ -169,6 +176,19 @@ class Repository:
         with session_scope() as s:
             row = s.get(PlayLog, play_id)
             return play_to_dict(row) if row else None
+
+    def settle_play(self, play_id: str, status: str, outcome: Optional[Dict[str, Any]] = None) -> bool:
+        """What became of a play that was sent: its status, and ``outcome`` (the broker's word and the
+        reason) kept in its evidence. Who decided and when stay as they were - Autopilot knows its own
+        entries by them after a restart - and a play that became a trade stays FILLED."""
+        with session_scope() as s:
+            row = s.get(PlayLog, play_id)
+            if row is None or row.status == "FILLED":
+                return False
+            row.status = status
+            if outcome:
+                row.evidence = {**(row.evidence or {}), "entry_outcome": dict(outcome)}
+            return True
 
     def set_play_status(self, play_id: str, status: str, decided_by: str = "") -> None:
         with session_scope() as s:

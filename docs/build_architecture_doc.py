@@ -1005,7 +1005,8 @@ def build() -> str:
       '<li><b>Score.</b> <code>rank_score()</code> = expected value in R units times the strategy weight, plus '
       'small bumps for unusual volume, a gap and enough range.</li>'
       '<li><b>Board.</b> <code>PlayBoard.replace()</code> keeps the top 80, notes what joined and left, and '
-      'publishes <code>plays.updated</code>. Every new play is logged to <code>play_logs</code>.</li>'
+      'publishes <code>plays.updated</code>. The plays it took are logged to <code>play_logs</code> - not a '
+      'setup already acted on this session, and never over a row that was sent, filled or dismissed.</li>'
       '<li><b>Autopilot.</b> <code>AutoPilot.consider()</code> walks the board highest score first and applies '
       'the gates in the next table. The first failing gate is the reason shown on the dashboard.</li>'
       '<li><b>Assessment and sizing.</b> <code>engine.assess_play()</code> checks the session, the pattern-day-'
@@ -1052,7 +1053,9 @@ def build() -> str:
          "risk.*, max_gross_exposure_pct"),
         ("the last look", "at the live quote: refused when the spread is over 0.10R of the risk or the price has "
          "run 0.25R past the entry; within that the limit is priced off the quote; a day-trade entry unfilled "
-         "after 10 minutes is cancelled", "execution.max_spread_r, max_chase_r, entry_timeout_min"),
+         "after 10 minutes is cancelled; any entry filled in part 30 seconds ago and still working has the rest "
+         "cancelled, so the shares bought get their record and stop", "execution.max_spread_r, max_chase_r, "
+         "entry_timeout_min, partial_entry_wait_s"),
     ]))
     A(fig_states())
 
@@ -1141,8 +1144,9 @@ def build() -> str:
     A(table(["Table", "One row is", "Written by"], [
         ("scan_runs", "one scan (full, gappers, cycle, fast, plays) with its timings and counts",
          "engine._run_scan -> repo.record_scan"),
-        ("play_logs", "one play shown on the board, with its decision (approved, rejected, expired, auto)",
-         "repo.record_play / set_play_status"),
+        ("play_logs", "one play shown on the board, with its decision (approved, rejected, auto) and what became "
+         "of it once sent (SUBMITTED, FILLED, CANCELED/ERROR with evidence.entry_outcome)",
+         "repo.record_scan / record_play / set_play_status / settle_play"),
         ("trades", "one position from entry to exit, including partial exits (banked_pl), the R multiple, the "
          "play's features at the decision (entry_context) and what the fills cost: decision_price, spread_bps, "
          "entry_slippage_bps, exit_decision_price, exit_slippage_bps",
@@ -1366,6 +1370,13 @@ def build() -> str:
          "with no broker request; one batched fetch of one-minute candles for every play and position"),
         ("engine/engine.py", "refresh_prices(), _marks()", "Refresh prices the board and the positions; a position's "
          "mark is the app's own price when fetched in the last APP_MARK_S (120 s), else the broker's"),
+        ("execution/executor.py", "expire_entries(), _on_unfilled(), on_entry_unfilled", "calls off a day entry "
+         "unfilled after 10 minutes and any entry part-filled 30 s ago (the rest cancelled, the part booked); an "
+         "entry that bought nothing is saved CANCELED/ERROR with why (_note -> repo.settle_play) and Autopilot is "
+         "told; the claim on a finished order is its pop from _pending, so two sync passes never book it twice"),
+        ("execution/autopilot.py", "entry_unfilled(), _reserve(), _release(), SENT_CEILING", "a day's entry slot is "
+         "taken before the order goes out and handed back, once, when it bought nothing (not when the broker lost "
+         "it); the ids that can come back persist as counted_today; at most twice the cap in orders a day"),
         ("execution/exit_manager.py", "stop_locked(), intraday_time_stop", "a day trade past its setup's window whose "
          "stop isn't at break-even is closed (time-stop); the replay's _step does the same"),
         ("engine/engine.py", "_settle_short()", "a record over the broker's count because an app exit filled in part "

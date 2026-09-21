@@ -1076,3 +1076,79 @@ def test_refresh_prices_the_plays_and_the_positions_and_sends_the_plays_out_agai
     engine.APP_MARK_S = -1.0                                                    # a price that has aged: the broker's mark
     [pos] = engine.snapshot()["positions"]
     assert (pos["market_price"], pos["price_at"], pos["unrealized_pl"]) == (100.0, None, 0.0)
+
+
+# ---------------------------------------------------------------- what became of a play, in the play log
+def test_the_executor_tells_autopilot_about_an_entry_that_bought_nothing_even_after_a_switch(engine):
+    assert engine.executor.on_entry_unfilled == engine.autopilot.entry_unfilled
+    engine.executor.rebind(engine._broker, venue=engine._venue)
+    assert engine.executor.on_entry_unfilled == engine.autopilot.entry_unfilled
+
+
+def test_what_became_of_a_sent_play_is_saved_without_losing_who_sent_it(engine):
+    from tos_bot.scanner.scanner import ScanResult
+
+    p = _play("AAPL")
+    engine.repo.record_play(p)
+    engine.repo.set_play_status(p.id, "SUBMITTED", "autopilot")
+    assert engine.repo.settle_play(p.id, "CANCELED", {"status": "CANCELED", "reason": "not filled within 10 minutes"})
+    row = engine.repo.get_play(p.id)
+    assert (row["status"], row["decided_by"]) == ("CANCELED", "autopilot")
+    assert row["evidence"]["entry_outcome"]["reason"] == "not filled within 10 minutes"
+
+    copy = _play("AAPL")                                                    # a scan's stale copy of the same play
+    copy.id = p.id
+    engine.repo.record_scan(ScanResult(kind="cycle", plays=[copy]), plays=[copy])
+    assert engine.repo.get_play(p.id)["status"] == "CANCELED"              # doesn't undo what happened
+
+    q = _play("MSFT")
+    q.suggested_qty = 5
+    engine.repo.record_play(q)
+    engine.repo.open_trade(q, 100.0, 5, "paper")
+    assert not engine.repo.settle_play(q.id, "CANCELED") and engine.repo.get_play(q.id)["status"] == "FILLED"
+    assert not engine.repo.settle_play("play_nothing", "CANCELED")
+
+
+def test_a_setup_already_acted_on_isnt_logged_again_when_a_scan_sees_it(engine, monkeypatch):
+    from tos_bot.core.enums import PlayStatus
+    from tos_bot.scanner.scanner import ScanResult
+
+    engine.autopilot.enabled = False
+    found = []
+
+    def cycle(fast=False):
+        found.append(_play("AAPL"))
+        return ScanResult(kind="cycle", symbols=["AAPL"], plays=[found[-1]])
+
+    monkeypatch.setattr(engine.scanner, "run_cycle", cycle)
+    engine._run_scan("cycle")
+    engine._run_scan("cycle")                                               # the same setup again: one play, confirmed
+    pid = found[0].id
+    assert found[1].id == pid and engine.repo.get_play(pid)["confirmations"] == 2
+    engine.board.get(pid).status = PlayStatus.SUBMITTED                     # sent...
+    engine.repo.set_play_status(pid, "SUBMITTED", "autopilot")
+    engine._run_scan("cycle")                                               # ...and seen again: not offered, not logged
+    assert found[2].id != pid and engine.repo.get_play(found[2].id) is None
+    assert engine.repo.get_play(pid)["status"] == "SUBMITTED"
+
+
+def test_a_play_already_sent_cant_be_dismissed_and_one_never_logged_is_logged_when_it_is(engine):
+    from tos_bot.core.enums import PlayStatus
+
+    p = _play("AAPL")
+    engine.board.replace([p])                                               # found by a quick re-check: no row yet
+    assert engine.repo.get_play(p.id) is None
+    assert engine.reject_play(p.id)["ok"] and engine.repo.get_play(p.id)["status"] == "REJECTED"
+
+    q = _play("MSFT")
+    engine.board.replace([q])
+    q.status = PlayStatus.SUBMITTED
+    out = engine.reject_play(q.id)
+    assert not out["ok"] and "already gone out" in out["reason"] and q.status is PlayStatus.SUBMITTED
+
+    gone = _play("TSLA")                                                    # off the board, its row says it was sent
+    engine.repo.record_play(gone)
+    engine.repo.set_play_status(gone.id, "SUBMITTED", "autopilot")
+    assert not engine.reject_play(gone.id)["ok"]
+    assert (engine.repo.get_play(gone.id)["status"], engine.repo.get_play(gone.id)["decided_by"]) == ("SUBMITTED",
+                                                                                                    "autopilot")

@@ -120,6 +120,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self.repo = Repository()
         data_dir = data_dir or DATA_DIR
         self.runtime = RuntimeFile(runtime_path or RUNTIME_PATH)
+        self._runtime_lock = threading.Lock()      # the scan, sync and web threads all save it
         saved = self.runtime.read()
 
         years = max(1, min(5, int(self.settings.config.replay.daily_years or 1)))
@@ -284,14 +285,17 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         log.info("engine stopped")
 
     def _save_runtime(self) -> None:
-        payload: Dict[str, Any] = {
-            "mode": self.mode, "paper_platform": self.paper_platform, "filters": self.filters.as_dict(),
-            "strategies": self.strategy_overrides, "capital": self.capital,
-            "capital_split": {"day_pct": self.day_trade_pct}, "scan": self.scan_settings.as_dict(), "autopilot": self.autopilot.to_runtime(),
-        }
-        if self.quit_state:
-            payload["quit"] = self.quit_state
-        self.runtime.write(payload)
+        # read and written under one lock: a save that read the state earlier can't land last
+        with self._runtime_lock:
+            payload: Dict[str, Any] = {
+                "mode": self.mode, "paper_platform": self.paper_platform, "filters": self.filters.as_dict(),
+                "strategies": self.strategy_overrides, "capital": self.capital,
+                "capital_split": {"day_pct": self.day_trade_pct}, "scan": self.scan_settings.as_dict(),
+                "autopilot": self.autopilot.to_runtime(),
+            }
+            if self.quit_state:
+                payload["quit"] = self.quit_state
+            self.runtime.write(payload)
 
     # ------------------------------------------------------------------ #
     #  Where orders go                                                   #
@@ -325,6 +329,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self.executor = Executor(broker, self.repo, cfg.execution, bus=BUS, venue=venue)
             self.executor.scale_out = 0.0 < float(getattr(cfg.exit_manager, "scale_out_pct", 0.0) or 0.0) < 100.0
             self.executor.exit_cfg = cfg.exit_manager
+            self.executor.on_entry_unfilled = self.autopilot.entry_unfilled
         else:
             self.executor.rebind(broker, venue=venue)
         adopted = self.executor.adopt_working_orders()          # before any exit can be sent twice
@@ -871,7 +876,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._day_changed()
         if not quick:
             try:
-                self.repo.record_scan(result, keep_rejected=self.settings.config.database.record_rejected_plays)
+                held = [p for p in result.plays if self.board.holds(p)]      # not the setups already acted on
+                self.repo.record_scan(result, keep_rejected=self.settings.config.database.record_rejected_plays,
+                                      plays=held)
             except Exception:  # noqa: BLE001
                 log.exception("could not save the scan")
         if not quick:
@@ -1408,7 +1415,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 return {"ok": False, "reason": f"execution error: {e}"}
             if not out.get("ok"):
                 p.status = PlayStatus.PROPOSED            # let them try again once the reason clears
-            self.repo.set_play_status(p.id, p.status.value, operator)
+                self.repo.set_play_status(p.id, p.status.value, operator)
+            # sent: the executor has saved it SUBMITTED (or the fill FILLED) - and the sync loop may already
+            # have saved how it ended, which a write here would overwrite
             self._publish("play.decided", play_id=p.id, decision="approved", result=out, play=self._decorate(p))
             self._refresh_account()
             self._day_changed(now=True)                   # a restart mustn't offer this setup again today
@@ -1513,8 +1522,15 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def reject_play(self, play_id: str, operator: str = "operator") -> Dict[str, Any]:
         p = self.board.get(play_id)
+        row = self.repo.get_play(play_id)
+        sent = (p is not None and p.status in _ACTED_ON) or (
+            row is not None and row.get("status") in {s.value for s in _ACTED_ON})
+        if sent:
+            return {"ok": False, "reason": "an order has already gone out for this play - it can't be dismissed"}
         if p:
             p.status = PlayStatus.REJECTED
+            if row is None:
+                self.repo.record_play(p)                  # found by a quick re-check, which isn't logged
         self.repo.set_play_status(play_id, PlayStatus.REJECTED.value, operator)
         self._day_changed(now=True)
         self._publish("play.decided", play_id=play_id, decision="rejected")

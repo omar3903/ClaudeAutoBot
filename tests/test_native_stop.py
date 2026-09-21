@@ -306,3 +306,26 @@ def test_a_position_without_a_stop_at_the_broker_is_reported_and_reported_again(
     ex.sync_open_orders()
     assert len(broker.stops()) == 1 and ex.unprotected() == []
 
+
+def test_the_shares_of_a_part_filled_entry_get_their_stop_once_the_stalled_rest_is_cancelled():
+    from test_order_follow_up import PLAN
+    from tos_bot.core.enums import StrategyKind, Timeframe
+    from tos_bot.core.models import Account, Play
+
+    broker, repo = _StopBroker({"AAA": 4}), _Repo([])
+    ex = _executor(broker, repo)
+    ex.STAND_DOWN_S = ex.STAND_DOWN_POLL_S = 0.0
+    play = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=100.0, stop=98.0, targets=[104.0])
+    play.suggested_qty = 10
+    ex.execute_play(play, Account(account_id="DU"), plan=PLAN)
+    broker.reports["1"] = OrderResult(order_id="1", status="WORKING", symbol="AAA", submitted_qty=10,
+                                      filled_qty=4, avg_fill_price=100.0)
+    ex.sync_open_orders()
+    assert broker.stops() == []                                           # four shares bought, no record yet
+    assert ex.expire_entries(mono=ex._pending["1"].first_fill_at + ex.cfg.partial_entry_wait_s) == ["1"]
+    broker.reports["1"] = OrderResult(order_id="1", status="CANCELED", symbol="AAA", submitted_qty=10,
+                                      filled_qty=4, avg_fill_price=100.0)
+    ex.sync_open_orders()                                                 # booked, and protected in the same pass
+    [stop] = broker.stops()
+    assert (stop.quantity, stop.stop_price, stop.side) == (4.0, 98.0, Side.SHORT)
