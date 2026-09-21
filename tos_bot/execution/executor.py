@@ -51,6 +51,7 @@ class _Pending:
     expired: str = ""               # why the app cancelled this entry itself (a day trade not filled in time)
     decision: Optional[Dict[str, Any]] = None       # an entry: the quote at the decision (mid, spread_bps)
     decision_price: Optional[float] = None          # an exit: the price that triggered it
+    adopted: bool = False           # left working by an earlier run: when it was really sent isn't known
 
 
 class Executor(ProtectiveStops):
@@ -140,7 +141,8 @@ class Executor(ProtectiveStops):
         """Entry orders sent but not filled yet. Anything that limits positions has
         to count these too, or a slow fill gets doubled up."""
         return [{"order_id": oid, "play_id": p.play.id, "symbol": p.play.symbol,
-                 "strategy": p.play.strategy, "qty": p.qty, "notional": p.play.entry * p.qty,
+                 "strategy": p.play.strategy, "timeframe": p.play.timeframe.value,
+                 "qty": p.qty, "notional": p.play.entry * p.qty,
                  "risk": abs(p.play.entry - p.play.stop) * p.qty}
                 for oid, p in list(self._pending.items()) if p.kind == "entry"]
 
@@ -199,7 +201,7 @@ class Executor(ProtectiveStops):
             if play is not None:
                 # its clock starts again from here: a day-trade entry gets entry_timeout_min more minutes
                 self._pending[order.order_id] = _Pending(order.order_id, play, "entry", qty=_remaining(order),
-                                                         submitted_at=dt.datetime.now(dt.timezone.utc))
+                                                         submitted_at=dt.datetime.now(dt.timezone.utc), adopted=True)
                 adopted.append({"kind": "entry", "symbol": play.symbol, "order_id": order.order_id,
                                 "play_id": play.id, "qty": _remaining(order)})
         cancelled = self._cancel_extra_exits(working, trades)
@@ -374,6 +376,7 @@ class Executor(ProtectiveStops):
                                                f"{t['symbol']} shares held - no exit sent."}
         req = build_exit_order(t["symbol"], t["side"], qty,
                                limit_price=limit_price, cfg=self.cfg, tag=f"exit:{trade_id}")
+        sent_at = dt.datetime.now(dt.timezone.utc)
         try:
             res = self.broker.place_order(req)
         except BrokerError as e:
@@ -384,18 +387,18 @@ class Executor(ProtectiveStops):
         if res.status == "FILLED" or res.filled_qty > 0:
             px = res.avg_fill_price or (res.fills[-1].price if res.fills else limit_price)
             out, closed = self._book_exit(t["symbol"], trade_id, float(px), res.filled_qty or qty, reason,
-                                          partial, after_fill, decision_price)
+                                          partial, after_fill, decision_price, submitted_at=sent_at)
             return {"ok": True, "status": "FILLED", "trade": out, "reduced": not closed}
 
         self._pending[res.order_id] = _Pending(res.order_id, Play(**_min_play(t)), "exit",
                                                trade_id=trade_id, qty=qty, reason=reason,
                                                partial=partial, after_fill=after_fill,
-                                               decision_price=decision_price)
+                                               decision_price=decision_price, submitted_at=sent_at)
         return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id}
 
     def _book_exit(self, symbol: str, trade_id: str, price: float, qty: float, reason: str,
                    partial: bool = False, after_fill: Optional[Dict[str, float]] = None,
-                   decision_price: Optional[float] = None):
+                   decision_price: Optional[float] = None, submitted_at: Optional[dt.datetime] = None):
         """Book an exit fill: the whole position closes the record, part of it (the scale-out)
         reduces it. Returns (the record, whether it is now closed)."""
         if partial:
@@ -406,6 +409,8 @@ class Executor(ProtectiveStops):
                 return out, False
         else:
             seen = {"decision_price": float(decision_price)} if decision_price else {}
+            if submitted_at is not None:
+                seen["submitted_at"] = submitted_at          # an exit the app sent: how long it took to fill
             out = self.repo.close_trade(trade_id, float(price), exit_reason=reason, **seen)
         self._open_by_symbol.pop(symbol, None)
         self.bus.publish("trade.closed", trade=out, reason=reason)
@@ -552,12 +557,13 @@ class Executor(ProtectiveStops):
     def _on_filled(self, p: _Pending, res) -> None:
         px = res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0)
         if p.kind == "entry":
+            # an adopted entry's clock restarted at the restart (for its time-out) - it isn't when it went out
             self._open_trade(p.play, px, res.filled_qty or p.qty, res.order_id,
-                             p.order_type, p.order_session, context=p.context, submitted_at=p.submitted_at,
-                             decision=p.decision)
+                             p.order_type, p.order_session, context=p.context,
+                             submitted_at=None if p.adopted else p.submitted_at, decision=p.decision)
         else:
             self._book_exit(res.symbol, p.trade_id, float(px), res.filled_qty or p.qty, p.reason or "order",
-                            p.partial, p.after_fill, p.decision_price)
+                            p.partial, p.after_fill, p.decision_price, submitted_at=p.submitted_at)
 
     def _on_unfilled(self, p: _Pending, res) -> None:
         """The broker finished an order without filling all of it - rejected,

@@ -8,6 +8,14 @@ export const tone = v => v == null ? "" : v > 0 ? "gain" : v < 0 ? "loss" : "";
 export const pctOf = v => v == null ? "–" : `${Math.round(v * 100)}%`;
 const SEVERITY = { high: "bad", medium: "warn", info: "" };
 
+function executionHTML(x) {
+  if (!x || x.entry_latency_s == null) return "";
+  const s = v => v == null ? "–" : `${num(v, 1)}s`;
+  return `<h4>How the orders filled</h4><p class="muted">Typically ${s(x.entry_latency_s)} from the order going out to the fill coming back
+    on the way in${x.exit_latency_s == null ? "" : `, ${s(x.exit_latency_s)} on the way out`}${x.slowest_entry_s ? ` (slowest entry ${num(x.slowest_entry_s, 0)}s)` : ""}.
+    A stop or target resting at the broker isn't counted - it waits for the price, not for the broker.</p>`;
+}
+
 export function journalHTML(r) {
   return `<h4>What the bot learned</h4>
     <ul class="journal-lessons">${(r.lessons || []).map(l => `<li>${escapeHtml(l)}</li>`).join("")}</ul>
@@ -16,7 +24,8 @@ export function journalHTML(r) {
     ${tradesHTML(r.trades || [])}
     ${pairsHTML(r.pairs || [])}
     ${shadowsHTML(r.shadows || {})}
-    ${strategiesHTML(r.strategies || [])}`;
+    ${strategiesHTML(r.strategies || [])}
+    ${executionHTML(r.execution)}`;
 }
 
 function mistakesHTML(list) {

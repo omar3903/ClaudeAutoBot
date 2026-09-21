@@ -11,6 +11,7 @@ So the engine saves, as the day goes:
 
 * the plays on the board and the setups settled this session (engine/board.py),
 * what the gap check saw before the open, and the session it ran for,
+* the session the daily replay was started for, so a restart doesn't start it again,
 * when the last wide scan finished, and the last scans' summaries,
 
 and picks them up when it starts. Only the current session's state returns; a
@@ -104,6 +105,7 @@ class DayStateOps:
                 "plays": plays, "settled": settled,
                 "premarket": dict(self.scanner.premarket) if gap_session else {},
                 "gappers_session": gap_session.isoformat() if gap_session else None,
+                "replay_session": self._replay_session.isoformat() if self._replay_session else None,
                 "last_wide_done": self._last_wide_done.isoformat() if self._last_wide_done else None,
                 "last_scans": dict(self._last_scans),
             })
@@ -122,6 +124,8 @@ class DayStateOps:
                             "the filters or strategies changed while the app was off")
             self._size_plays([p for p in self.board.plays.values() if p.status is PlayStatus.PROPOSED])
 
+            if saved.get("replay_session") == clock.session_date().isoformat():
+                self._replay_session = clock.session_date()   # this session's replay has already been started
             if saved.get("gappers_session") == now.date().isoformat():
                 self._gappers_session = now.date()
                 self.scanner.premarket = dict(saved.get("premarket") or {})

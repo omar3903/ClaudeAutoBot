@@ -127,6 +127,8 @@ main{display:flex; flex:1; min-height:0}
 .split-ctl{display:flex; gap:6px; align-items:center; padding:2px 8px; border:1px solid var(--line); border-radius:8px; background:var(--bg3)}
 .split-ctl input[type=range]{width:90px; accent-color:var(--accent)}
 .split-ctl b{font-size:11px; white-space:nowrap}
+#split-warn{cursor:help; white-space:nowrap}
+.warn-text{color:var(--warn)}
 
 /* ---- plays table ---- */
 .table-wrap{flex:1; overflow:auto; position:relative}

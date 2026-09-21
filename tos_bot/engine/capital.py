@@ -94,7 +94,10 @@ def state(acc: Account, venue: str, label: str, limit: Optional[float], invested
         size = effective * share_of(kind, day_pct)
         used = float((by_kind or {}).get(kind, 0.0)) / rate if rate else 0.0
         return {"pct": round(100 * share_of(kind, day_pct), 1), "limit": round(size, 2), "invested": round(used, 2),
-                "available": round(max(0.0, min(size - used, effective - held)), 2)}
+                "available": round(max(0.0, min(size - used, effective - held)), 2),
+                # held beyond its share - the slider moved, or the prices did. Nothing is sold for it; the
+                # kind just takes no new entries until it is back under
+                "over": round(max(0.0, used - size), 2)}
     return {"venue": venue, "venue_label": label, "currency": worth["currency"], "usd_per_base": rate,
             "limit": limit, "account_value": value, "effective": round(effective, 2),
             "invested": round(held, 2), "available": round(max(0.0, effective - held), 2),

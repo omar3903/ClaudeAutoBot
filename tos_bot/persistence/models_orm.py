@@ -120,6 +120,13 @@ class Trade(Base):
     #: (research/features.py) - the row a model learns from, next to the outcome below
     submitted_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
     entry_context: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
+    #: seconds from the order going out to the fill coming back - the entry's, and the app's own exit's.
+    #: A marketable order's is the broker's speed; a limit's includes the time it rested for its price
+    #: (the daily review tells the two apart). A stop or target resting at the broker has none, nor an
+    #: entry taken back after a restart, whose send time isn't known
+    entry_latency_s: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
+    exit_submitted_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
+    exit_latency_s: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
     #: working protective levels - the exit manager moves these
     stop_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)
     target_price: Mapped[Optional[float]] = mapped_column(MONEY, nullable=True)

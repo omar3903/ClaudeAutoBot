@@ -7,6 +7,7 @@ only so each concern reads on its own. Nothing here is instantiated by itself.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Iterable, Optional
 
 from ..brokers.venues import venue_label
@@ -16,12 +17,24 @@ from . import capital
 from .support import _ACTED_ON
 
 
+log = logging.getLogger(__name__)
+
 class CapitalOps:
     # ------------------------------------------------------------------ #
     #  Trading capital                                                   #
     # ------------------------------------------------------------------ #
     def _invested_usd(self) -> float:
         return capital.invested_usd(self._account, self._positions_here())
+
+    def _held_by_kind(self) -> Dict[str, float]:
+        """Dollars each kind of trade holds on this account: its open positions at the broker's marks and
+        its entry orders still working. On IBKR every entry works for a moment before it is booked, and a
+        swing limit can rest all day - leave those out and entries sent close together each see the same
+        room and together overrun the kind's share."""
+        held = capital.invested_by_kind(self._account, self._positions_here())
+        for w in self.working_entries():
+            held[capital.kind_of(w.get("timeframe"))] += float(w.get("notional") or 0.0)
+        return held
 
     def sizing_account(self, timeframe: Any = None) -> Optional[Account]:
         """The account as position sizing sees it - see capital.py. With a ``timeframe`` (a day trade or a
@@ -30,17 +43,16 @@ class CapitalOps:
         share = 1.0 if timeframe is None else capital.share_of(capital.kind_of(timeframe), self.effective_day_pct())
         if acc is None or (not limit and share >= 1.0):
             return acc
-        trades = self._positions_here()
-        held = capital.invested_by_kind(acc, trades)
+        held = self._held_by_kind()
         return capital.sizing_account(acc, limit, sum(held.values()), share=share,
                                       invested_in_kind=held[capital.kind_of(timeframe)] if timeframe is not None else 0.0)
 
     def capital_state(self) -> Optional[Dict[str, Any]]:
         if self._account is None:
             return None
+        held = self._held_by_kind()
         state = capital.state(self._account, self._venue, venue_label(self._venue), self.capital.get(self._venue),
-                              self._invested_usd(), self.effective_day_pct(),
-                              capital.invested_by_kind(self._account, self._positions_here()))
+                              sum(held.values()), self.effective_day_pct(), held)
         state["split"].update(on=self._both_kinds(), set_pct=self.day_trade_pct)
         return state
 
@@ -65,13 +77,25 @@ class CapitalOps:
             return {"ok": False, "reason": str(e)}
         self.day_trade_pct = value
         self._save_runtime()
-        self._resize_plays()
+        log.info("day/swing split set to %g / %g", value, 100 - value)
+        self._settings_changed()
         state = self.capital_state()
         self._publish("capital.updated", capital=state)
         note = f"Day trades may now hold up to {value:g}% of the trading capital at once, swing trades {100 - value:g}%."
         if not self._both_kinds():
             note += " It applies while Intraday and Swing are both switched on."
+        note += self._over_share_note(state)
         return {"ok": True, "capital": state, "note": note}
+
+    def _over_share_note(self, state: Optional[Dict[str, Any]]) -> str:
+        """Said once, when a change leaves a kind of trade holding more than its share."""
+        split = (state or {}).get("split") or {}
+        if not split.get("on"):
+            return ""
+        over = [(name, split[key]) for key, name in (("day", "Day"), ("swing", "Swing")) if (split.get(key) or {}).get("over")]
+        return "".join(f" {name} trades hold {capital.money(part['over'], state['currency'])} more than that share - "
+                       "nothing is sold for it; they take no new entries until they are back under it."
+                       for name, part in over)
 
     def set_capital(self, amount: Any = None) -> Dict[str, Any]:
         """How much of the account on the current platform the bot may use, in the
@@ -100,10 +124,11 @@ class CapitalOps:
             note = (f"The bot will use {capital.money(value, currency)} of the "
                     f"{capital.money(worth['equity'], currency)} in {label}. Position sizes now use this amount.")
         self._save_runtime()
-        self._resize_plays()
+        log.info("trading capital on %s: %s", venue, self.capital.get(venue) or "the whole account")
+        self._settings_changed()
         state = self.capital_state()
         self._publish("capital.updated", capital=state)
-        return {"ok": True, "capital": state, "note": note}
+        return {"ok": True, "capital": state, "note": note + self._over_share_note(state)}
 
     def _resize_plays(self) -> None:
         self._size_plays([p for p in self.board.plays.values() if p.status not in _ACTED_ON])

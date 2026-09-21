@@ -9,6 +9,7 @@ import datetime as dt
 import os
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -281,6 +282,164 @@ def test_scans_follow_the_schedule(engine, port, monkeypatch):
     assert engine._gappers_session == session and set(engine.board.plays) == before
     assert engine.scan_status()["last_gappers"]["kind"] == "gappers" and engine._due_scan() != "gappers"
     assert engine.request_scan("gappers")["ok"] and engine._scan_request == "gappers"
+
+
+def test_the_days_replay_starts_itself_after_the_morning_scan_and_only_once(engine, port, monkeypatch):
+    _connect(engine, port)
+    started = []
+    monkeypatch.setattr(engine, "start_replay", lambda *a, **k: started.append(1) or {"ok": True, "note": "n"})
+    engine.settings.config.replay.daily = True
+
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: True)
+    engine._run_scan("full")
+    assert started == []                                                    # not while the session is open
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: False)
+    engine._run_scan("full")
+    assert started == [1] and engine._replay_session == clock.session_date()
+    engine._run_scan("full")
+    assert started == [1]                                                   # once a session, however often it scans
+    engine._run_scan("cycle")
+    assert started == [1]                                                   # and only after the full scan
+
+    engine._replay_session = None
+    engine.replay._thread = None
+    monkeypatch.setattr(type(engine.replay), "running", property(lambda self: True))
+    engine._run_scan("full")
+    assert started == [1]                                                   # not while one is already running
+    monkeypatch.setattr(type(engine.replay), "running", property(lambda self: False))
+    engine._replay_session, engine.quit_state = None, {"by": "operator"}
+    engine._run_scan("full")
+    assert started == [1]                                                   # nor while the app is quitting
+    engine.quit_state = None
+    engine.settings.config.replay.daily = False
+    engine._replay_session = None
+    engine._run_scan("full")
+    assert started == [1]                                                   # switched off in config.yaml
+
+
+def test_a_replay_that_couldnt_start_is_tried_again_and_never_stops_the_scans(engine, port, monkeypatch):
+    _connect(engine, port)
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: False)
+    engine.settings.config.replay.daily = True
+    monkeypatch.setattr(engine, "start_replay", lambda *a, **k: {"ok": False, "reason": "not connected"})
+    engine._run_scan("full")
+    assert engine._replay_session is None                                   # refused: not done for the day
+
+    def gateway_dropped(*a, **k):
+        raise RuntimeError("IB Gateway isn't connected")
+
+    monkeypatch.setattr(engine, "start_replay", gateway_dropped)
+    engine._run_scan("full")                                                # raises inside - the scan still completes
+    assert engine.scan_status()["last_full"]["kind"] == "full"
+
+    # the scan loop itself keeps going whatever one pass throws
+    passes = []
+
+    def one_bad_pass():
+        passes.append(1)
+        if len(passes) == 1:
+            raise RuntimeError("boom")
+        engine._stop.set()
+
+    monkeypatch.setattr(engine, "_due_scan", one_bad_pass)
+    monkeypatch.setattr(engine._stop, "wait", lambda *a, **k: None)
+    monkeypatch.setattr(engine._scan_wake, "wait", lambda *a, **k: None)
+    engine._scan_loop()
+    assert passes == [1, 1]
+
+
+def test_the_session_the_daily_replay_ran_for_survives_a_restart(engine, tmp_path, gateway, port):
+    engine._replay_session = clock.session_date()
+    engine.stop()
+    again = _started_again(tmp_path, gateway, port)
+    try:
+        assert again._replay_session == clock.session_date()
+    finally:
+        again.stop()
+
+
+# ---------------------------------------------------------------- the split, and changes made while it runs
+def test_entries_still_working_count_in_their_kinds_share_of_the_capital(engine, port):
+    _connect(engine, port)
+    engine.set_filters(timeframes=["INTRADAY", "SWING"])
+    engine.set_capital_split(50)
+    room = lambda kind: engine.sizing_account(kind).raw["capital_room"]          # noqa: E731
+    before = {k: room(k) for k in ("INTRADAY", "SWING")}
+    engine.executor.working_entries = lambda: [{"symbol": "AAPL", "timeframe": "SWING", "notional": 7_000.0,
+                                                "play_id": "p", "strategy": "s", "qty": 70, "risk": 100.0}]
+    assert room("SWING") == pytest.approx(before["SWING"] - 7_000.0)             # sent a moment ago: it has its room
+    assert room("INTRADAY") == pytest.approx(before["INTRADAY"])                 # the day trades' share is untouched
+    split = engine.capital_state()["split"]
+    assert split["swing"]["invested"] > 0 and split["swing"]["over"] == 0 and split["day"]["invested"] == 0
+
+
+def test_a_kind_over_its_share_says_so_and_takes_nothing_new(engine, port):
+    _connect(engine, port)
+    engine.set_filters(timeframes=["INTRADAY", "SWING"])
+    engine.set_capital_split(50)
+    half = engine.capital_state()["split"]["swing"]["limit"]
+    engine.executor.working_entries = lambda: [{"symbol": "AAPL", "timeframe": "SWING", "notional": half * 0.8,
+                                                "play_id": "p", "strategy": "s", "qty": 1, "risk": 1.0}]
+    out = engine.set_capital_split(90)                                           # swing's share shrinks under what it holds
+    swing = out["capital"]["split"]["swing"]
+    assert swing["over"] > 0 and swing["available"] == 0 and "more than that share" in out["note"]
+    play = _play("MSFT")                                                         # a swing play
+    engine.board.replace([play], None)
+    pre = engine.assess_play(play.id)
+    assert not pre["can_execute"] and any("swing trades already hold their 10% share" in r for r in pre["reasons"])
+
+
+def test_pairs_are_held_to_the_swing_share_only_while_the_split_is_on(engine, port, monkeypatch):
+    _connect(engine, port)
+    sent = []
+    monkeypatch.setattr(engine.pairs, "model", lambda pid: SimpleNamespace(first="AAPL", second="MSFT"))
+    monkeypatch.setattr(engine.pairs, "enter", lambda pid, **k: sent.append(k["buying_power"]) or {"ok": True})
+    monkeypatch.setattr(engine, "_quotes", lambda symbols: {s: 100.0 for s in symbols})
+
+    engine.set_filters(timeframes=["INTRADAY"])                             # Swing box off: the split is off
+    engine.set_capital_split(70)
+    assert engine.effective_day_pct() == 100.0
+    assert engine.enter_pair("AAPL/MSFT")["ok"] and sent[-1] > 0            # sized on the whole capital, not refused
+
+    engine.set_filters(timeframes=["INTRADAY", "SWING"])                    # the split is on: swing gets 30%
+    whole = sent[-1]
+    assert engine.enter_pair("AAPL/MSFT")["ok"] and 0 < sent[-1] <= whole * 0.3 + 1
+    engine.set_capital_split(100)                                           # ...and none at 100% day
+    out = engine.enter_pair("AAPL/MSFT")
+    assert not out["ok"] and "share of it" in out["reason"] and len(sent) == 2
+
+
+def test_every_change_made_while_it_runs_reaches_autopilot_at_once(engine, port, monkeypatch):
+    _connect(engine, port)
+    heard = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **payload: heard.append(topic))
+    refused = _play("AAPL")
+    engine.board.replace([refused], None)
+
+    def changed_by(change):
+        engine.autopilot._acted.add(refused.id)
+        engine.autopilot._refused.add(refused.id)
+        engine.autopilot._last_reason[refused.id] = "no room"
+        engine._last_plays_at = time.monotonic()
+        heard.clear()
+        assert change()["ok"]
+        assert refused.id not in engine.autopilot._acted and not engine.autopilot._last_reason, change
+        assert "plays.updated" in heard and engine._last_plays_at == float("-inf"), change   # judged again at once
+        return heard
+
+    changed_by(lambda: engine.set_capital_split(40))
+    changed_by(lambda: engine.set_capital(5_000))
+    changed_by(lambda: engine.set_filters(timeframes=["SWING"]))
+    changed_by(lambda: engine.set_filters(timeframes=["INTRADAY", "SWING"]))
+    changed_by(lambda: engine.set_autopilot(max_auto_positions=4))
+    changed_by(lambda: engine.set_strategy("vwap_reclaim", enabled=False))
+    # Autopilot's state goes to the dashboard with each of them
+    published = []
+    engine.autopilot.bus = SimpleNamespace(publish=lambda topic, **payload: published.append((topic, payload)))
+    engine.set_capital_split(70)
+    [(topic, state)] = [x for x in published if x[0] == "autopilot.config"]
+    assert state["slots"]["day_pct"] == 70.0 and state["slots"]["SWING"]["max"] + state["slots"]["INTRADAY"]["max"] == 4
+    assert engine._entry_context(refused, "autopilot")["settings"]["day_trade_pct"] == 70.0
 
 
 # ---------------------------------------------------------------- practice size

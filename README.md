@@ -353,6 +353,13 @@ the plays table) are the bot's instructions, not just a view:
   widening one rebuilds the lists (a quick full scan on the candles already
   stored). At least one side and one timeframe stay on. **Hide executed** is the
   one view-only checkbox (remembered per browser).
+- **Every change made while the app runs reaches Autopilot at once** - the day / swing slider, the
+  trading capital, the filter boxes, the strategies, Autopilot's own settings, a switch of account,
+  a finished replay. Its gates always read the settings as they are; on a change the plays it had
+  refused for the day are handed back to it, the plays are sized again, the dashboard gets
+  Autopilot's state and its verdict on every play, and the quick re-check of the board is pulled
+  forward so the next pass is seconds away. A change never places an order by itself: entries stay
+  in a scan's own pass. (Settings that live only in `config.yaml` still need a restart.)
 
 The **Strategies** button opens the playbook: an on/off switch and a **weight**
 (0.1–3) per setup, grouped into day-trade, swing and valuation. Switching a setup
@@ -591,6 +598,15 @@ use — click it to set an amount, or **Use the whole account** to clear it.
   trade that doesn't fit what's left of its share is made smaller. With only one of the two
   filters on, that kind gets all of it. Risk per trade is still measured against the whole
   trading capital, and with no trading capital set the whole account is split the same way.
+- **Autopilot's positions follow the same split.** At 70% / 30% with ten positions allowed, day
+  trades may hold seven of them and swing trades three, and the day's entries divide the same way
+  (a kind with a share keeps at least one slot). Without this the kind that fires first - swing
+  setups, before the open and after 15:30 - took every slot and left the other kind's capital
+  idle. The Autopilot button says "day 0/7 - swing 3/3", and the dashboard warns when a share is
+  kept for a kind Autopilot isn't taking (unticked in its settings, or its filter box off) and when
+  a kind holds more than its share: nothing is sold for that, it just takes no new entries until it
+  is back under. Entry orders still working count in their kind's share, so entries sent close
+  together can't each see the same room and overrun it.
 
 ---
 
@@ -722,7 +738,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | minimum strategy confidence, day trades | 0.5 | `min_confidence` (the replay found higher stated confidence went with worse trades) |
 | minimum strategy confidence, swing trades | 0.5 | `min_swing_confidence` (the swing setups state flat 0.55–0.58 confidences; the replay's proof is their real gate) |
 | minimum reward : risk | 2.0 | `min_reward_risk` (Aziz Rule 5) |
-| concurrent open auto positions | 2 | `max_auto_positions` |
+| concurrent open auto positions | 2 | `max_auto_positions` - divided between day and swing trades by the day / swing split of the trading capital; Autopilot counts the positions it opened before a restart too |
 | auto trades per session | 3 | `max_auto_trades_per_day` |
 | aggregate open auto $-risk | 4 % of equity | `max_open_risk_pct` |
 | concurrent auto trades from **one** strategy | 2 | `max_per_strategy` |
@@ -946,6 +962,17 @@ an older `config.yaml` doesn't list them):
 
 ### The replay — judged the way Chan judges a backtest
 
+**It runs itself every morning** (`replay.daily`, on by default). The moment the 08:30 full scan has
+built the day's watchlist, the replay starts on it — an hour before the open, when the watchlist is
+fresh and the Gateway is free for the candles it downloads. So the records, the proof rule, the
+half-Kelly sizes and the learned model are current for the session without anyone being awake for
+it; each morning also fetches another 20 minutes of past candles until the sixty sessions are
+covered. Once a session, never while a replay is already running or the app is quitting, and the
+session it ran for is remembered so a restart doesn't start a second one. A full scan *during*
+the session — a cold start at lunchtime, a widened filter — doesn't trigger it: the replay's
+downloads would be taking the Gateway from the cycles that need it, so it waits for the morning. **Run replay** in the
+Strategies panel still works whenever you want it.
+
 **Day trades are replayed on the stocks that were in play, entered the way Autopilot enters.**
 A day-trade setup only ever sees the morning's hot list, so each past session is replayed on
 the stocks the scan would have picked *that morning* - the `replay.day_stocks` (40) hottest by
@@ -1069,6 +1096,13 @@ can't see them, and the report says so.
   it, so every check is tested on live plays every day;
 * **each strategy's real record** over the last 20 sessions against its replay,
   flagged when it falls more than 0.3R a trade short;
+* **how the orders filled** — the seconds from an order going out to the fill coming back, typically
+  and at worst, going in and coming out. Every trade keeps its own (`entry_latency_s`,
+  `exit_latency_s`), so the training set can learn from how long a fill took, and a broker or a
+  venue that gets slower shows up as a number rather than a feeling. The review measures the broker
+  on fills within 60 s; a limit entry that rested longer was waiting for its price, and is counted
+  apart. A stop or target resting at the broker has no such time, nor an entry taken back after a
+  restart (when it really went out isn't known);
 * **lessons**, in plain sentences. **Rebuild the last session** writes it again on demand
   (the movers are kept, and rebuilt once the session's candles are in).
 

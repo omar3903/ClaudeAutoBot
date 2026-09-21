@@ -73,7 +73,7 @@ from ..strategies.registry import REGISTRY, build_strategies, strategy_catalog
 from ..util import clock
 from ..util.logging_setup import setup_logging
 from ..util.net import port_is_open
-from . import views
+from . import capital, views
 from .board import PlayBoard
 from .day_state import DayStateOps
 from .research_ops import ResearchOps
@@ -225,6 +225,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._scan_running: Optional[Dict[str, Any]] = None
         self._last_scans: Dict[str, Dict[str, Any]] = {}
         self._gappers_session: Optional[dt.date] = None      # the session the gap check last ran for
+        self._replay_session: Optional[dt.date] = None       # the session the daily replay was started for
         self._last_cycle_at = float("-inf")
         self._last_fast_at = float("-inf")
         self._last_plays_at = float("-inf")
@@ -326,7 +327,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self.executor.exit_cfg = cfg.exit_manager
         else:
             self.executor.rebind(broker, venue=venue)
-        self.executor.adopt_working_orders()          # before any exit can be sent twice
+        adopted = self.executor.adopt_working_orders()          # before any exit can be sent twice
+        self.autopilot.recognise_entries([a["play_id"] for a in adopted or () if a.get("kind") == "entry"])
         self.exit_manager = ExitManager(self.repo, self.executor, quote_fn=self.md.quote,
                                         cfg=cfg.exit_manager, bus=BUS, venue=venue)
         self.position_check.reset()
@@ -520,6 +522,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._refresh_account()
         self._check_arm()
         self._scan_retry_at = 0.0
+        self._settings_changed()                           # another account: other positions, caps and proof rule
         log.warning("routing changed by %s: mode %s -> %s, paper platform %s, orders -> %s",
                     operator, prev_mode, self.mode, self.paper_platform, self._venue)
         self._publish("broker.switched", mode=self.mode, prev=prev_mode, state=self.snapshot())
@@ -676,10 +679,15 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def _scan_loop(self) -> None:
         self._stop.wait(2.0)
         while not self._stop.is_set():
-            kind = self._due_scan()
-            if kind:
-                self._run_scan(kind)
-            self._save_day()
+            # every other loop guards its body; this one must too - if it stops, no scan runs and Autopilot
+            # never takes another entry, with nothing on the dashboard to say so
+            try:
+                kind = self._due_scan()
+                if kind:
+                    self._run_scan(kind)
+                self._save_day()
+            except Exception:  # noqa: BLE001
+                log.exception("scan loop pass failed")
             self._scan_wake.wait(5.0)
             self._scan_wake.clear()
 
@@ -764,6 +772,23 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return "plays"
         return None
 
+    def _settings_changed(self) -> None:
+        """Called by everything that changes a setting while the app runs - the day/swing split, the
+        trading capital, the filters, the strategies, Autopilot's own settings, where orders go, a new
+        replay. Autopilot reads every setting afresh on each pass, so its *decisions* already follow;
+        this makes the rest follow at once: plays it had refused for the day are handed back, the plays
+        are sized again, the dashboard gets the plays (with Autopilot's verdict on each) and Autopilot's
+        state, and the quick re-check of the board is pulled forward so the next pass isn't up to a
+        cycle away. It enters nothing itself: entries stay on the scan thread, in a scan's own pass -
+        a web thread placing orders would race it."""
+        self.autopilot.settings_changed()
+        self._risk_pct_for = None                          # the half-Kelly shares follow Autopilot's terms
+        self._size_plays([p for p in self.board.plays.values() if p.status not in _ACTED_ON])
+        self._publish_plays()
+        self.autopilot.publish_status()
+        self._last_plays_at = float("-inf")
+        self._scan_wake.set()
+
     def _queue_scan(self, kind: str) -> None:
         with self._scan_lock:
             if self._scan_request != "full":           # a queued full scan covers a cycle too
@@ -819,6 +844,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._scan_retry_at = 0.0
             if kind == "full":
                 self._last_cycle_at = float("-inf")     # in the session, a cycle follows straight away
+                try:
+                    self._replay_after_full_scan()
+                except Exception:  # noqa: BLE001 - the Gateway can drop between its checks; the scan goes on
+                    log.exception("the day's replay couldn't be started")
             else:
                 self._last_fast_at = mono
                 if kind == "cycle":
@@ -845,7 +874,6 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self.repo.record_scan(result, keep_rejected=self.settings.config.database.record_rejected_plays)
             except Exception:  # noqa: BLE001
                 log.exception("could not save the scan")
-        self._publish_plays()
         if not quick:
             self._publish("watchlist.updated", **self.watchlist_state())
         if not self.quit_state:
@@ -853,7 +881,34 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self.autopilot.consider(self.board.plays)
             except Exception:  # noqa: BLE001
                 log.exception("autopilot pass failed")
+        self._publish_plays()                              # after the pass: each play carries Autopilot's verdict on it
         self._note_changes(changes)
+
+    def _replay_after_full_scan(self) -> None:
+        """The morning's full scan has just built today's watchlist - replay the strategies on it now
+        (replay.daily). It is the one moment in the day when that is free: the watchlist is fresh, the
+        market is still an hour off, and the replay wants the Gateway for the candles it downloads.
+        Once a session, never while one is already running, and never while quitting. A failure is the
+        replay's own to report - it only ever refreshes records, and nothing waits on it."""
+        if not bool(getattr(self.settings.config.replay, "daily", False)) or self.quit_state:
+            return
+        session = clock.session_date()
+        if self._replay_session == session or self.replay.running:
+            return
+        if clock.is_market_open():
+            # the morning scan is an hour before the open, which is the point of doing it then. A full scan
+            # during the session (a fresh start, a widened filter) must not hand the replay's downloads the
+            # Gateway while the cycles need it - it waits for the next morning.
+            return
+        out = self.start_replay()
+        if out.get("ok"):
+            self._replay_session = session              # done for today - a restart won't start it again
+            self._day_changed()
+            log.info("the day's replay started by itself after the full scan: %s", out.get("note", ""))
+        else:
+            # not marked done: the next full scan before the open (a restart, say) tries again
+            log.warning("the day's replay didn't start: %s", out.get("reason", ""))
+        self._publish("replay.started", auto=True, **{k: out[k] for k in ("ok", "note", "reason") if k in out})
 
     def _scan_failed(self, kind: str, reason: str) -> None:
         self._scan_retry_at = time.monotonic() + self.SCAN_RETRY_S
@@ -1227,6 +1282,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         elif p.suggested_qty <= 0:
             reasons.append(f"{p.symbol} already takes up the {cfg.risk.max_symbol_pct_of_equity:.0f}% of equity "
                            "allowed in one stock" if "max exposure per stock" in sizing.caps_hit
+                           else self._no_room_reason(p) if "trading capital" in sizing.caps_hit
                            else "position size rounds to zero for this risk budget")
         if p.reward_risk < cfg.risk.min_reward_risk and p.kind.value != "FUNDAMENTAL":
             reasons.append(f"reward:risk {p.reward_risk:.1f} below minimum")
@@ -1296,6 +1352,18 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._refresh_account()
             self._day_changed(now=True)                   # a restart mustn't offer this setup again today
             return {"ok": out.get("ok", False), **out}
+
+    def _no_room_reason(self, p: Play) -> str:
+        """Why a play sized to nothing under the trading capital: its kind's share is full, or all of it is."""
+        state = self.capital_state() or {}
+        split = state.get("split") or {}
+        if split.get("on"):
+            kind = "day" if capital.kind_of(p.timeframe) == capital.DAY else "swing"
+            part = split.get(kind) or {}
+            if part.get("available", 1.0) <= 0 < state.get("available", 0.0):
+                return (f"{kind} trades already hold their {part.get('pct', 0):g}% share of the trading capital "
+                        "(the day / swing split) - no room for another")
+        return "the trading capital is fully invested - no room for another position"
 
     def _score_plays(self, plays) -> None:
         """The learned model's odds on each fresh play (research/model.py), kept in its evidence so
@@ -1459,6 +1527,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return {"ok": False, "reason": locked}
         want_on = kw.get("enabled")
         st = self.autopilot.configure(**kw)
+        self._settings_changed()
         note = ""
         if want_on and self.mode == "live" and not st["allow_live"]:
             note = ("Autopilot will NOT place live orders: set  autopilot.allow_live: true  in "
@@ -1528,7 +1597,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if set(new.timeframes) != set(cur.timeframes):             # the day/swing split turns on or off with them
             self._size_plays([p for p in self.board.plays.values() if p.status not in _ACTED_ON])
             self._publish("capital.updated", capital=self.capital_state())
-        self._publish_plays()
+        self._settings_changed()                           # Autopilot's types and the split follow the filters
         self._publish("filters.updated", filters=new.as_dict())
         # narrowing just trims the board; widening needs a scan to find the new plays
         widened = bool(set(new.sides) - set(cur.sides) or set(new.timeframes) - set(cur.timeframes)
@@ -1588,7 +1657,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._save_runtime()
         active = {s.key for s in self.scanner.strategies}
         self._note_changes(self.board.drop(lambda p: p.strategy in active, "its strategy was switched off"))
-        self._publish_plays()
+        self._settings_changed()
         self._publish("strategies.updated", strategies=self.strategy_state())
         if rescan:
             self._queue_scan(rescan)

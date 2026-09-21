@@ -1356,6 +1356,16 @@ def build() -> str:
         ("brokers/ibkr_adapter.py", "IbkrBroker (get_account, history_many, place_bracket, get_fills, "
          "news_headlines)", "everything IBKR, on one asyncio loop thread with timeouts"),
         ("brokers/paper_adapter.py", "PaperBroker.place_order(), poll()", "the simulator's fills on real prices"),
+        ("execution/autopilot.py", "kind_slots(), _kind_full(), settings_changed()", "Autopilot's positions and daily "
+         "entries divide between day and swing trades the way the trading capital's slider does; a settings change "
+         "hands back the plays it had refused for the day"),
+        ("engine/engine.py", "_replay_after_full_scan()", "the morning full scan finishing starts the day's replay "
+         "(replay.daily): once a session, remembered across a restart"),
+        ("persistence/repository.py", "open_trade(), close_trade() - entry_latency_s / exit_latency_s", "the seconds "
+         "from an order going out to its fill coming back, kept per trade for the training set and the daily review"),
+        ("engine/engine.py", "_settings_changed()", "called by every live setter (split, capital, filters, strategies, "
+         "Autopilot, account switch, a finished replay): re-sizes and republishes the plays, publishes Autopilot's "
+         "state, pulls the board re-check forward - and never places an order itself"),
         ("engine/day_state.py", "DayStateOps._save_day(), _restore_day()", "saves the board and the scans' state as "
          "the day goes; start() picks up the current session's, never a price"),
         ("engine/reconcile.py", "PositionCheck.gone(), share_counts()", "when a missing position counts as gone "

@@ -255,6 +255,10 @@ class ReplayCfg(_Model):
                                           # session before (research/in_play.py). 0 = the old way: today's hot
                                           # list on every session, which hands a momentum setup its own hindsight
     day_gappers: int = 10                 # ...and this many of that morning's biggest gaps among the watchlist
+    daily: bool = True                    # run the replay by itself once a day, as soon as the morning's full
+                                          # scan has built the watchlist it runs on (about 08:30 ET, an hour
+                                          # before the open): the records, the proof rule and the learned model
+                                          # are then current for the session without anyone being awake for it
     day_download_minutes: int = 20        # IBKR answers requests for past candles slowly (seconds each), so one
                                           # replay downloads for at most this long, the latest sessions first, and
                                           # replays the stock-days it has; the next replay goes on from there

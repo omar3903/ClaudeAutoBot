@@ -336,10 +336,10 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     @app.post("/api/settings")
     def set_scan_settings(body: dict):
         b = body or {}
-        return _result(eng().set_scan_settings(
-            premarket_time=b.get("premarket_time"), gapper_time=b.get("gapper_time"),
-            cycle_minutes=b.get("cycle_minutes"),
-            hot_list_size=b.get("hot_list_size"), sector_queue_size=b.get("sector_queue_size")))
+        # every field of the Settings drawer: the wide scan's four were left out, so changing them did nothing
+        keys = ("premarket_time", "gapper_time", "cycle_minutes", "hot_list_size", "sector_queue_size",
+                "wide_minutes", "wide_stocks", "movers", "yesterday_movers")
+        return _result(eng().set_scan_settings(**{k: b.get(k) for k in keys}))
 
     @app.get("/api/watchlist")
     def watchlist():
