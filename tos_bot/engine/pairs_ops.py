@@ -186,7 +186,7 @@ class PairsOps:
             model = self.pairs.model(pair_id)
             if model is None:
                 return {"ok": False, "reason": f"{pair_id} isn't on the pairs watch list."}
-            sizing = self.sizing_account(capital.SWING) or acc
+            sizing = self.sizing_account(capital.SWING if self._both_kinds() else None) or acc
             holding = ({t["symbol"] for t in self._open_trades()} | {w["symbol"] for w in self.working_entries()}
                        | {p.symbol for p in acc.positions if abs(p.quantity) > 1e-9})
             cap = float(cfg.risk.max_risk_per_trade_pct)
@@ -196,8 +196,8 @@ class PairsOps:
             room = (getattr(sizing, "raw", None) or {}).get("capital_room")
             if room is not None and float(room) <= 0:
                 # a cap of nothing reads as "no cap" to the pair sizing - so say no here
-                return {"ok": False, "reason": "Swing trades - a pair is one - already hold their share of the "
-                                               "trading capital, so there is no room for this pair."}
+                return {"ok": False, "reason": "No room left for this pair in the trading capital - swing "
+                                               "trades (a pair is one) already hold their share of it."}
             if room is not None:
                 buying_power = min(buying_power, max(0.0, float(room)))
             out = attempt(self.pairs.enter,
@@ -236,7 +236,9 @@ class PairsOps:
             return
         if self.repo.pair_trades_opened_on(clock.session_date()) >= int(cfg.max_new_per_day):
             return
-        acc = self.sizing_account(capital.SWING)
+        # a pair is a swing trade while the day / swing split is on; with one of the two filter boxes off
+        # the split is off, and a pair isn't held to a share it can't have
+        acc = self.sizing_account(capital.SWING if self._both_kinds() else None)
         if acc is None or (acc.equity and self.gross_exposure() > acc.equity * ap.max_gross_exposure_pct / 100.0):
             return
         room = (getattr(acc, "raw", None) or {}).get("capital_room")

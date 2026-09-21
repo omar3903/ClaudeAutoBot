@@ -709,6 +709,19 @@ def test_after_a_restart_autopilot_still_knows_the_positions_it_opened():
     assert eng.approved == [] and "swing trades hold 3 of the 3" in ap.verdict(swing)    # its share is full already
 
 
+def test_entries_an_earlier_run_left_working_count_against_its_caps_again():
+    eng, ap = _split_pilot(70.0, max_auto_positions=2)
+    eng.working = [{"order_id": "o1", "play_id": "play_mine", "symbol": "AAA", "strategy": "s", "timeframe": "SWING",
+                    "qty": 10, "risk": 100.0},
+                   {"order_id": "o2", "play_id": "play_hand", "symbol": "BBB", "strategy": "s", "timeframe": "SWING",
+                    "qty": 10, "risk": 100.0}]
+    eng.repo.get_play = lambda pid: {"play_mine": {"decided_by": "autopilot"}, "play_hand": {"decided_by": "operator"}}.get(pid)
+    assert ap._working_auto_entries() == []                                  # a fresh run knows neither
+    ap.recognise_entries(["play_mine", "play_hand", "play_gone"])
+    assert [w["play_id"] for w in ap._working_auto_entries()] == ["play_mine"]
+    assert ap.status()["slots"]["SWING"]["open"] == 1
+
+
 def test_a_play_refused_for_the_day_gets_another_look_when_a_setting_changes():
     eng, ap = _split_pilot(70.0)
     eng.can_execute = False                                                    # no room in its share, say

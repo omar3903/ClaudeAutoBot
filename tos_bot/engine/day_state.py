@@ -124,8 +124,8 @@ class DayStateOps:
                             "the filters or strategies changed while the app was off")
             self._size_plays([p for p in self.board.plays.values() if p.status is PlayStatus.PROPOSED])
 
-            if saved.get("replay_session") == now.date().isoformat():
-                self._replay_session = now.date()       # today's replay has already been started once
+            if saved.get("replay_session") == clock.session_date().isoformat():
+                self._replay_session = clock.session_date()   # this session's replay has already been started
             if saved.get("gappers_session") == now.date().isoformat():
                 self._gappers_session = now.date()
                 self.scanner.premarket = dict(saved.get("premarket") or {})

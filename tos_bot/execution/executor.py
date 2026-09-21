@@ -51,6 +51,7 @@ class _Pending:
     expired: str = ""               # why the app cancelled this entry itself (a day trade not filled in time)
     decision: Optional[Dict[str, Any]] = None       # an entry: the quote at the decision (mid, spread_bps)
     decision_price: Optional[float] = None          # an exit: the price that triggered it
+    adopted: bool = False           # left working by an earlier run: when it was really sent isn't known
 
 
 class Executor(ProtectiveStops):
@@ -200,7 +201,7 @@ class Executor(ProtectiveStops):
             if play is not None:
                 # its clock starts again from here: a day-trade entry gets entry_timeout_min more minutes
                 self._pending[order.order_id] = _Pending(order.order_id, play, "entry", qty=_remaining(order),
-                                                         submitted_at=dt.datetime.now(dt.timezone.utc))
+                                                         submitted_at=dt.datetime.now(dt.timezone.utc), adopted=True)
                 adopted.append({"kind": "entry", "symbol": play.symbol, "order_id": order.order_id,
                                 "play_id": play.id, "qty": _remaining(order)})
         cancelled = self._cancel_extra_exits(working, trades)
@@ -556,9 +557,10 @@ class Executor(ProtectiveStops):
     def _on_filled(self, p: _Pending, res) -> None:
         px = res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0)
         if p.kind == "entry":
+            # an adopted entry's clock restarted at the restart (for its time-out) - it isn't when it went out
             self._open_trade(p.play, px, res.filled_qty or p.qty, res.order_id,
-                             p.order_type, p.order_session, context=p.context, submitted_at=p.submitted_at,
-                             decision=p.decision)
+                             p.order_type, p.order_session, context=p.context,
+                             submitted_at=None if p.adopted else p.submitted_at, decision=p.decision)
         else:
             self._book_exit(res.symbol, p.trade_id, float(px), res.filled_qty or p.qty, p.reason or "order",
                             p.partial, p.after_fill, p.decision_price, submitted_at=p.submitted_at)

@@ -139,7 +139,7 @@ def play_to_dict(p: PlayLog) -> Dict[str, Any]:
         "explanation": p.explanation, "evidence": p.evidence, "tags": p.tags,
         "noise": list(getattr(p, "noise", None) or []), "confirmations": int(getattr(p, "confirmations", None) or 1),
         "probability": _f(getattr(p, "probability", None)),
-        "status": p.status,
+        "status": p.status, "decided_by": getattr(p, "decided_by", None),
     }
 
 

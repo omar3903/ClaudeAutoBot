@@ -354,9 +354,31 @@ def test_an_exit_the_app_sends_records_how_long_the_broker_took(repo):
 
     trades = [{"entry_latency_s": 2.0, "exit_latency_s": 1.0, "entry_slippage_bps": 1.0, "exit_slippage_bps": 1.0},
               {"entry_latency_s": 30.0, "exit_latency_s": 3.0},
-              {"entry_latency_s": 4.0, "exit_latency_s": 2.0}]
+              {"entry_latency_s": 4.0, "exit_latency_s": 2.0},
+              {"entry_latency_s": 16_500.0}]                                  # a swing limit that rested for its price
     out = execution_quality(trades, assumed_bps=6.0)
     assert out["entry_latency_s"] == 4.0 and out["exit_latency_s"] == 2.0   # the middle one, not the average
     assert out["slowest_entry_s"] == 30.0 and "filled in 4.0s" in out["latency_note"]
+    assert out["rested_entries"] == 1 and "1 limit entry rested longer" in out["latency_note"]
     assert execution_quality([{"r": 1.0}], assumed_bps=6.0).get("latency_note") is None
+
+
+def test_an_entry_taken_back_after_a_restart_has_no_fill_time():
+    """Its clock restarted at the restart (for its time-out); that isn't when it went out."""
+    from tos_bot.execution.executor import _Pending
+    from tos_bot.core.enums import Side, StrategyKind, Timeframe
+    from tos_bot.core.models import Play
+    import datetime as dt
+
+    seen = []
+    ex = SimpleNamespace(_open_trade=lambda *a, **k: seen.append(k.get("submitted_at")))
+    from tos_bot.execution.executor import Executor
+
+    play = Play(symbol="ADP", side=Side.LONG, strategy="s", kind=StrategyKind.TECHNICAL, timeframe=Timeframe.SWING,
+                entry=10.0, stop=9.0, targets=[12.0])
+    now = dt.datetime.now(dt.timezone.utc)
+    res = SimpleNamespace(avg_fill_price=10.0, fills=[], filled_qty=5, order_id="o1", symbol="ADP")
+    Executor._on_filled(ex, _Pending("o1", play, "entry", qty=5, submitted_at=now, adopted=True), res)
+    Executor._on_filled(ex, _Pending("o2", play, "entry", qty=5, submitted_at=now), res)
+    assert seen == [None, now]
 

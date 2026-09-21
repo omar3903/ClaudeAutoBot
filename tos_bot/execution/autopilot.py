@@ -398,6 +398,17 @@ class AutoPilot:
                 mine.append(t)
         return mine
 
+    def recognise_entries(self, play_ids: List[str]) -> None:
+        """Entry orders an earlier run of the app left working, taken back after a restart: the ones
+        Autopilot sent are its own again, so every cap counts them - a swing limit can rest all day."""
+        for pid in play_ids:
+            try:
+                row = self.engine.repo.get_play(pid)
+            except Exception:  # noqa: BLE001
+                continue
+            if row and row.get("decided_by") == "autopilot":
+                self._auto_play_ids.add(pid)
+
     def _working_auto_entries(self) -> List[Dict[str, Any]]:
         """Auto entries sent but not filled yet - they count against every cap."""
         return [w for w in self.engine.working_entries() if w["play_id"] in self._auto_play_ids]

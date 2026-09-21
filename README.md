@@ -968,7 +968,9 @@ fresh and the Gateway is free for the candles it downloads. So the records, the 
 half-Kelly sizes and the learned model are current for the session without anyone being awake for
 it; each morning also fetches another 20 minutes of past candles until the sixty sessions are
 covered. Once a session, never while a replay is already running or the app is quitting, and the
-session it ran for is remembered so a restart doesn't start a second one. **Run replay** in the
+session it ran for is remembered so a restart doesn't start a second one. A full scan *during*
+the session — a cold start at lunchtime, a widened filter — doesn't trigger it: the replay's
+downloads would be taking the Gateway from the cycles that need it, so it waits for the morning. **Run replay** in the
 Strategies panel still works whenever you want it.
 
 **Day trades are replayed on the stocks that were in play, entered the way Autopilot enters.**
@@ -1097,8 +1099,10 @@ can't see them, and the report says so.
 * **how the orders filled** — the seconds from an order going out to the fill coming back, typically
   and at worst, going in and coming out. Every trade keeps its own (`entry_latency_s`,
   `exit_latency_s`), so the training set can learn from how long a fill took, and a broker or a
-  venue that gets slower shows up as a number rather than a feeling. A stop or target resting at the
-  broker isn't counted — it waits for the price, not for the broker;
+  venue that gets slower shows up as a number rather than a feeling. The review measures the broker
+  on fills within 60 s; a limit entry that rested longer was waiting for its price, and is counted
+  apart. A stop or target resting at the broker has no such time, nor an entry taken back after a
+  restart (when it really went out isn't known);
 * **lessons**, in plain sentences. **Rebuild the last session** writes it again on demand
   (the movers are kept, and rebuilt once the session's candles are in).
 

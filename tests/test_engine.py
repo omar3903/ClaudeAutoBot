@@ -290,6 +290,10 @@ def test_the_days_replay_starts_itself_after_the_morning_scan_and_only_once(engi
     monkeypatch.setattr(engine, "start_replay", lambda *a, **k: started.append(1) or {"ok": True, "note": "n"})
     engine.settings.config.replay.daily = True
 
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: True)
+    engine._run_scan("full")
+    assert started == []                                                    # not while the session is open
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: False)
     engine._run_scan("full")
     assert started == [1] and engine._replay_session == clock.session_date()
     engine._run_scan("full")
@@ -311,6 +315,37 @@ def test_the_days_replay_starts_itself_after_the_morning_scan_and_only_once(engi
     engine._replay_session = None
     engine._run_scan("full")
     assert started == [1]                                                   # switched off in config.yaml
+
+
+def test_a_replay_that_couldnt_start_is_tried_again_and_never_stops_the_scans(engine, port, monkeypatch):
+    _connect(engine, port)
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: False)
+    engine.settings.config.replay.daily = True
+    monkeypatch.setattr(engine, "start_replay", lambda *a, **k: {"ok": False, "reason": "not connected"})
+    engine._run_scan("full")
+    assert engine._replay_session is None                                   # refused: not done for the day
+
+    def gateway_dropped(*a, **k):
+        raise RuntimeError("IB Gateway isn't connected")
+
+    monkeypatch.setattr(engine, "start_replay", gateway_dropped)
+    engine._run_scan("full")                                                # raises inside - the scan still completes
+    assert engine.scan_status()["last_full"]["kind"] == "full"
+
+    # the scan loop itself keeps going whatever one pass throws
+    passes = []
+
+    def one_bad_pass():
+        passes.append(1)
+        if len(passes) == 1:
+            raise RuntimeError("boom")
+        engine._stop.set()
+
+    monkeypatch.setattr(engine, "_due_scan", one_bad_pass)
+    monkeypatch.setattr(engine._stop, "wait", lambda *a, **k: None)
+    monkeypatch.setattr(engine._scan_wake, "wait", lambda *a, **k: None)
+    engine._scan_loop()
+    assert passes == [1, 1]
 
 
 def test_the_session_the_daily_replay_ran_for_survives_a_restart(engine, tmp_path, gateway, port):
@@ -352,6 +387,26 @@ def test_a_kind_over_its_share_says_so_and_takes_nothing_new(engine, port):
     engine.board.replace([play], None)
     pre = engine.assess_play(play.id)
     assert not pre["can_execute"] and any("swing trades already hold their 10% share" in r for r in pre["reasons"])
+
+
+def test_pairs_are_held_to_the_swing_share_only_while_the_split_is_on(engine, port, monkeypatch):
+    _connect(engine, port)
+    sent = []
+    monkeypatch.setattr(engine.pairs, "model", lambda pid: SimpleNamespace(first="AAPL", second="MSFT"))
+    monkeypatch.setattr(engine.pairs, "enter", lambda pid, **k: sent.append(k["buying_power"]) or {"ok": True})
+    monkeypatch.setattr(engine, "_quotes", lambda symbols: {s: 100.0 for s in symbols})
+
+    engine.set_filters(timeframes=["INTRADAY"])                             # Swing box off: the split is off
+    engine.set_capital_split(70)
+    assert engine.effective_day_pct() == 100.0
+    assert engine.enter_pair("AAPL/MSFT")["ok"] and sent[-1] > 0            # sized on the whole capital, not refused
+
+    engine.set_filters(timeframes=["INTRADAY", "SWING"])                    # the split is on: swing gets 30%
+    whole = sent[-1]
+    assert engine.enter_pair("AAPL/MSFT")["ok"] and 0 < sent[-1] <= whole * 0.3 + 1
+    engine.set_capital_split(100)                                           # ...and none at 100% day
+    out = engine.enter_pair("AAPL/MSFT")
+    assert not out["ok"] and "share of it" in out["reason"] and len(sent) == 2
 
 
 def test_every_change_made_while_it_runs_reaches_autopilot_at_once(engine, port, monkeypatch):

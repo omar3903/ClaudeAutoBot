@@ -120,9 +120,10 @@ class Trade(Base):
     #: (research/features.py) - the row a model learns from, next to the outcome below
     submitted_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
     entry_context: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
-    #: how long the broker took to fill, in seconds: from the order going out to the fill coming back.
-    #: The entry's, and the app's own exit's (a stop or target resting at the broker has no such time -
-    #: it waits for the price, and its seconds would say nothing about execution)
+    #: seconds from the order going out to the fill coming back - the entry's, and the app's own exit's.
+    #: A marketable order's is the broker's speed; a limit's includes the time it rested for its price
+    #: (the daily review tells the two apart). A stop or target resting at the broker has none, nor an
+    #: entry taken back after a restart, whose send time isn't known
     entry_latency_s: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)
     exit_submitted_at: Mapped[Optional[dt.datetime]] = mapped_column(sa.DateTime, nullable=True)
     exit_latency_s: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)

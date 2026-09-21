@@ -327,7 +327,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self.executor.exit_cfg = cfg.exit_manager
         else:
             self.executor.rebind(broker, venue=venue)
-        self.executor.adopt_working_orders()          # before any exit can be sent twice
+        adopted = self.executor.adopt_working_orders()          # before any exit can be sent twice
+        self.autopilot.recognise_entries([a["play_id"] for a in adopted or () if a.get("kind") == "entry"])
         self.exit_manager = ExitManager(self.repo, self.executor, quote_fn=self.md.quote,
                                         cfg=cfg.exit_manager, bus=BUS, venue=venue)
         self.position_check.reset()
@@ -678,10 +679,15 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def _scan_loop(self) -> None:
         self._stop.wait(2.0)
         while not self._stop.is_set():
-            kind = self._due_scan()
-            if kind:
-                self._run_scan(kind)
-            self._save_day()
+            # every other loop guards its body; this one must too - if it stops, no scan runs and Autopilot
+            # never takes another entry, with nothing on the dashboard to say so
+            try:
+                kind = self._due_scan()
+                if kind:
+                    self._run_scan(kind)
+                self._save_day()
+            except Exception:  # noqa: BLE001
+                log.exception("scan loop pass failed")
             self._scan_wake.wait(5.0)
             self._scan_wake.clear()
 
@@ -838,7 +844,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._scan_retry_at = 0.0
             if kind == "full":
                 self._last_cycle_at = float("-inf")     # in the session, a cycle follows straight away
-                self._replay_after_full_scan()
+                try:
+                    self._replay_after_full_scan()
+                except Exception:  # noqa: BLE001 - the Gateway can drop between its checks; the scan goes on
+                    log.exception("the day's replay couldn't be started")
             else:
                 self._last_fast_at = mono
                 if kind == "cycle":
@@ -886,12 +895,18 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         session = clock.session_date()
         if self._replay_session == session or self.replay.running:
             return
-        self._replay_session = session                  # attempted: it doesn't try again today either way
-        self._day_changed()
+        if clock.is_market_open():
+            # the morning scan is an hour before the open, which is the point of doing it then. A full scan
+            # during the session (a fresh start, a widened filter) must not hand the replay's downloads the
+            # Gateway while the cycles need it - it waits for the next morning.
+            return
         out = self.start_replay()
         if out.get("ok"):
+            self._replay_session = session              # done for today - a restart won't start it again
+            self._day_changed()
             log.info("the day's replay started by itself after the full scan: %s", out.get("note", ""))
         else:
+            # not marked done: the next full scan before the open (a restart, say) tries again
             log.warning("the day's replay didn't start: %s", out.get("reason", ""))
         self._publish("replay.started", auto=True, **{k: out[k] for k in ("ok", "note", "reason") if k in out})
 

@@ -368,6 +368,10 @@ def lessons(day: Mapping[str, Any], mistakes: Sequence[Mapping[str, Any]], shado
 MIN_FILLS = 5                     # measured fills before the replay's cost assumption is questioned
 
 
+#: a fill slower than this was a limit waiting for its price, not the broker taking its time - the
+#: review's "how the orders filled" measures the broker (the trade keeps its own seconds either way)
+BROKER_FILL_S = 60.0
+
 def execution_quality(trades: Sequence[Mapping[str, Any]], assumed_bps: float) -> Dict[str, Any]:
     """Harris's implementation shortfall over the rolling sessions: what the fills cost against the
     price at the decision, entries and exits apart, next to what the replay assumes a side costs.
@@ -376,8 +380,12 @@ def execution_quality(trades: Sequence[Mapping[str, Any]], assumed_bps: float) -
         values = [float(t[key]) for t in trades if t.get(key) is not None]
         return round(sum(values) / len(values), 2) if values else None
 
+    def fills(key: str) -> List[float]:
+        """The fills that measure the broker: a limit that rested longer was waiting for the price."""
+        return [float(t[key]) for t in trades if t.get(key) is not None and float(t[key]) <= BROKER_FILL_S]
+
     def seconds(key: str) -> Optional[float]:
-        values = sorted(float(t[key]) for t in trades if t.get(key) is not None)
+        values = sorted(fills(key))
         return round(values[len(values) // 2], 2) if values else None      # the middle one: a single slow fill can't skew it
 
     entries = sum(1 for t in trades if t.get("entry_slippage_bps") is not None)
@@ -387,12 +395,15 @@ def execution_quality(trades: Sequence[Mapping[str, Any]], assumed_bps: float) -
                            "assumed_bps": round(float(assumed_bps), 2),
                            # how long the broker took to fill, typically, in seconds
                            "entry_latency_s": seconds("entry_latency_s"), "exit_latency_s": seconds("exit_latency_s"),
-                           "slowest_entry_s": max((float(t["entry_latency_s"]) for t in trades
-                                                   if t.get("entry_latency_s") is not None), default=None)}
+                           "slowest_entry_s": max(fills("entry_latency_s"), default=None),
+                           "rested_entries": sum(1 for t in trades if t.get("entry_latency_s") is not None
+                                                 and float(t["entry_latency_s"]) > BROKER_FILL_S)}
     if out["entry_latency_s"] is not None:
         out["latency_note"] = (f"Orders filled in {out['entry_latency_s']:.1f}s typically going in"
                                + (f" and {out['exit_latency_s']:.1f}s coming out" if out["exit_latency_s"] is not None else "")
                                + (f" (slowest entry {out['slowest_entry_s']:.0f}s)" if out["slowest_entry_s"] else "")
+                               + (f"; {out['rested_entries']} limit entr{'y' if out['rested_entries'] == 1 else 'ies'} "
+                                  f"rested longer than {BROKER_FILL_S:.0f}s, waiting for the price" if out["rested_entries"] else "")
                                + ". A stop or target resting at the broker isn't counted - it waits for the price.")
     if entries >= MIN_FILLS and exits >= MIN_FILLS:
         worst = max(out["entry_slippage_bps"] or 0.0, out["exit_slippage_bps"] or 0.0)
