@@ -1,9 +1,30 @@
 /* Autopilot: hands-off entry. Exits are automatic either way. */
-import { $, $$, escapeHtml, post } from "./util.js";
+import { $, $$, escapeHtml, money, post } from "./util.js";
 import { S, emit, on } from "./state.js";
 import { openModal, toast } from "./ui.js";
 
 const typeName = t => ({ INTRADAY: "day", SWING: "swing", PAIRS: "pairs" })[t] || String(t).toLowerCase();
+
+/* The day / swing split as Autopilot lives it: the positions and the day's entries each kind has of its
+   share ("day 0/7 · swing 3/3"), and what the owner should know - a share kept for a kind Autopilot isn't
+   taking, a kind holding more than its share. Empty while the split is off (one of the two filter boxes off). */
+export function splitSlots() {
+  const ap = S.state.autopilot || {}, slots = ap.slots, split = (S.state.capital || {}).split || {};
+  if (!slots || !split.on) return { text: "", warnings: [] };
+  const kinds = [["INTRADAY", "day", split.day || {}], ["SWING", "swing", split.swing || {}]];
+  const text = kinds.map(([k, name]) => `${name} ${slots[k].open}/${slots[k].max}`).join(" · ");
+  const c = S.state.capital || {}, warnings = [];
+  for (const [k, name, part] of kinds) {
+    const s = slots[k];
+    if (part.pct > 0 && !s.taking && ap.enabled)
+      warnings.push(`${part.pct}% of the trading capital and ${s.max} of ${ap.max_auto_positions} positions are kept for ${name} trades, which Autopilot isn't taking - ${(ap.own_trade_types || []).includes(k) ? `the ${name === "day" ? "Intraday" : "Swing"} box above the plays is off` : `${name} trades are unticked in its settings (⚙)`}. Tick them, or move the slider.`);
+    if (part.over > 0)
+      warnings.push(`${name} trades hold ${money(part.over, c.currency)} more than their ${part.pct}% share. Nothing is sold for it; they take no new entries until they are back under it.`);
+    else if (s.open > s.max)
+      warnings.push(`${name} trades hold ${s.open} positions and their share is ${s.max}: no new ${name} entries until some close.`);
+  }
+  return { text, warnings };
+}
 
 export function renderAutopilot() {
   const ap = S.state.autopilot || {}, scan = S.state.scan || {};
@@ -14,14 +35,15 @@ export function renderAutopilot() {
   btn.textContent = enabled ? `Autopilot: ${types || "on"}${ap.dry_run ? " · dry" : ""}${ap.daily_loss_stop ? " · stopped today" : fast ? ` ⚡${secs}s` : ""}` : "Autopilot: off";
   btn.classList.toggle("on", enabled && eff);
   btn.classList.toggle("armed-paper", enabled && !eff);       // wants to run but paper-gated in live
-  const caps = `${ap.open_auto_positions ?? 0}/${ap.max_auto_positions ?? 0} open · ${ap.auto_trades_today ?? 0}/${ap.max_auto_trades_per_day ?? 0} today`;
+  const split = splitSlots();
+  const caps = `${ap.open_auto_positions ?? 0}/${ap.max_auto_positions ?? 0} open${split.text ? ` (${split.text})` : ""} · ${ap.auto_trades_today ?? 0}/${ap.max_auto_trades_per_day ?? 0} today`;
   const stopped = !ap.daily_loss_stop ? ""
     : (ap.realized_today || 0) < 0 ? ` Stopped for the day: today's closed trades have lost ${Math.abs(ap.realized_today || 0).toFixed(0)}, past the ${ap.max_daily_loss_pct}% daily limit.`
     : ` Stopped for the day: today's realized gain fell from ${(ap.peak_realized || 0).toFixed(0)} to ${(ap.realized_today || 0).toFixed(0)}, giving back more than ${ap.max_giveback_pct}% of it.`;
   const cadence = fast ? ` The hot list is rescanned every ~${secs}s while the session is open.`
     : enabled && eff ? ` The hot list and buffers are rescanned every ${mins} min, and the hot list every ~${secs}s once the session opens.` : "";
   btn.title = enabled
-    ? (eff ? `Autopilot is taking entries: ${types || "?"}, ≥ ${ap.min_reward_risk}:1, ≥ conf ${ap.min_confidence}. ${caps}.${stopped}${cadence} Exits are automatic. Click to turn off.`
+    ? (eff ? `Autopilot is taking entries: ${types || "?"}, ≥ ${ap.min_reward_risk}:1, ≥ conf ${ap.min_confidence}. ${caps}.${split.warnings.length ? " ⚠ " + split.warnings.join(" ") : ""}${stopped}${cadence} Exits are automatic. Click to turn off.`
       : (ap.blocked_note || "Autopilot is on but not routing (paper-only gate). Click to turn off."))
     : "Hands-off entry is OFF — you click every entry. Exits are automatic regardless. Click to turn on.";
   $("#autopilot-ctl").classList.toggle("live-warn", enabled && !eff);
@@ -69,6 +91,7 @@ function configure() {
       <p class="muted small">The <b>Intraday</b> / <b>Swing</b> boxes above the plays say what is scanned and shown; these say what
         Autopilot may take of it. Untick day trades here to keep day plays on the board for the review without trading them.
         Taking now: <b>${(ap.trade_types || []).map(typeName).join(", ") || "none"}</b>.</p>
+      ${(() => { const sp = splitSlots(); return sp.text ? `<p class="muted small">Positions follow the day / swing split of the trading capital (the slider above the plays): <b>${escapeHtml(sp.text)}</b> of ${ap.max_auto_positions ?? 0}, and the day's entries the same way.</p>${sp.warnings.map(w => `<p class="small warn-text">⚠ ${escapeHtml(w)}</p>`).join("")}` : ""; })()}
       <label>Minimum confidence, day trades <b id="ap-conf-v">${ap.min_confidence ?? 0.5}</b></label>
       <input type="range" id="ap-conf" min="0.4" max="0.9" step="0.01" value="${ap.min_confidence ?? 0.5}">
       <label title="Swing setups state flat, modest confidences (0.55-0.58); the replay's proof is their real gate, so this only keeps out the weakest">Minimum confidence, swing trades <b id="ap-sconf-v">${ap.min_swing_confidence ?? 0.5}</b></label>
@@ -146,6 +169,8 @@ function configure() {
 export function initAutopilot() {
   on("state", renderAutopilot);
   on("scan", renderAutopilot);
+  on("filters", renderAutopilot);                 // what it takes follows the filter boxes,
+  on("capital", renderAutopilot);                 // and its slots the day / swing split
   $("#ap-toggle").onclick = toggle;
   $("#ap-cfg").onclick = configure;
 }

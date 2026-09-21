@@ -81,6 +81,7 @@ class ResearchOps:
         the shadows, so a model can learn from all three (research/dataset.py)."""
         run_id = self.repo.save_sim_trades(str(data.get("ran_at") or ""), trades, data.get("held_out_from"))
         log.info("replay run %s: %d simulated trades kept", run_id, len(trades))
+        self._settings_changed()                           # new records: proof, sizes and verdicts follow at once
 
     def _news_history(self, symbols: Sequence[str], first_day: dt.date) -> Dict[str, List[Dict[str, Any]]]:
         """Each stock's stored stories since ``first_day`` - as far back as the app has been reading
@@ -237,7 +238,11 @@ class ResearchOps:
                 "risk_pct": self.strategy_risk_pct(p.strategy),
                 # the gates in force when it was taken, so a trade taken on looser rules is never mistaken for
                 # one the strict rules would have taken
-                "settings": {"proof_required": self.autopilot.proof_required, **{k: getattr(self.autopilot, k) for k in (
+                "settings": {"proof_required": self.autopilot.proof_required,
+                             # the split and the filters in force: what each kind of trade was allowed to hold
+                             "day_trade_pct": self.day_trade_pct, "split_on": self._both_kinds(),
+                             "timeframes": list(self.filters.timeframes),
+                             **{k: getattr(self.autopilot, k) for k in (
                     "require_proven", "min_confidence", "min_swing_confidence", "min_reward_risk",
                     "min_confirmations", "model_mode", "max_auto_positions", "max_auto_trades_per_day")}},
                 "data_delayed": bool(self.md.delayed)}

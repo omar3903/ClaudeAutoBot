@@ -3,6 +3,7 @@
 import { $, $$, SECTOR_SHORT, api, escapeHtml, money, post, store } from "./util.js";
 import { S, emit, on } from "./state.js";
 import { openModal, toast } from "./ui.js";
+import { splitSlots } from "./autopilot.js";
 
 const BOXES = {
   "f-long": ["sides", "LONG"], "f-short": ["sides", "SHORT"],
@@ -37,7 +38,13 @@ function syncPairs() {
 }
 
 async function changePairs(box) {
-  const r = await post("/api/autopilot", { trade_types: ["INTRADAY", "SWING", ...(box.checked ? ["PAIRS"] : [])] });
+  // Autopilot's own day / swing boxes stay as they are: only PAIRS comes or goes. (It used to send day and
+  // swing along, which silently ticked a kind the owner had unticked in Autopilot's settings.)
+  const ap = S.state.autopilot || {};
+  const own = (ap.own_trade_types || ap.trade_types || []).filter(t => t !== "PAIRS");
+  const types = [...own, ...(box.checked ? ["PAIRS"] : [])];
+  if (!types.length) { toast("Autopilot would take nothing at all - tick day or swing trades in its settings (⚙) first.", "bad"); syncPairs(); return; }
+  const r = await post("/api/autopilot", { trade_types: types });
   if (!r.ok || !r.autopilot) { toast("Pairs not changed: " + (r.reason || "update failed"), "bad"); syncPairs(); return; }
   S.state.autopilot = r.autopilot;
   emit("autopilot");
@@ -51,6 +58,10 @@ function renderSplit() {
   const kinds = (S.state.filters || {}).timeframes || [], sp = (S.state.capital || {}).split;
   const both = kinds.includes("INTRADAY") && kinds.includes("SWING");
   $("#split-ctl").classList.toggle("hidden", !both || !sp);
+  const warn = $("#split-warn"), notes = both && sp ? splitSlots() : { text: "", warnings: [] };
+  warn.classList.toggle("hidden", !notes.warnings.length);
+  warn.textContent = notes.warnings.length ? `⚠ ${notes.text}` : "";
+  warn.title = notes.warnings.join("\n\n");
   if (!both || !sp || splitDragging) return;
   const pct = sp.set_pct ?? sp.day_pct;
   $("#split-range").value = pct;
@@ -118,6 +129,7 @@ export function initFilters() {
   on("state", renderSplit);
   on("state", syncPairs);
   on("autopilot", syncPairs);
+  on("autopilot", renderSplit);
   $("#f-pairs").onchange = e => changePairs(e.target);
   on("filters", renderSplit);
   on("capital", renderSplit);

@@ -88,6 +88,9 @@ def test_scan_watchlist_approve_close(client):
 def test_settings_round_trip_and_the_dashboard_loads(client):
     r = client.post("/api/settings", json={"cycle_minutes": 4, "hot_list_size": 30}).json()
     assert r["ok"] and r["scan"]["settings"]["cycle_minutes"] == 4
+    wide = client.post("/api/settings", json={"wide_minutes": 45, "wide_stocks": 500, "movers": 4,
+                                              "yesterday_movers": 6}).json()["scan"]["settings"]
+    assert (wide["wide_minutes"], wide["wide_stocks"], wide["movers"], wide["yesterday_movers"]) == (45, 500, 4, 6)
     assert client.post("/api/settings", json={"premarket_time": "10:00"}).status_code == 400
     assert client.get("/").status_code == 200
     main = client.get("/static/js/main.js")

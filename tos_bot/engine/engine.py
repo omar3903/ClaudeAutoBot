@@ -73,7 +73,7 @@ from ..strategies.registry import REGISTRY, build_strategies, strategy_catalog
 from ..util import clock
 from ..util.logging_setup import setup_logging
 from ..util.net import port_is_open
-from . import views
+from . import capital, views
 from .board import PlayBoard
 from .day_state import DayStateOps
 from .research_ops import ResearchOps
@@ -520,6 +520,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._refresh_account()
         self._check_arm()
         self._scan_retry_at = 0.0
+        self._settings_changed()                           # another account: other positions, caps and proof rule
         log.warning("routing changed by %s: mode %s -> %s, paper platform %s, orders -> %s",
                     operator, prev_mode, self.mode, self.paper_platform, self._venue)
         self._publish("broker.switched", mode=self.mode, prev=prev_mode, state=self.snapshot())
@@ -764,6 +765,23 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return "plays"
         return None
 
+    def _settings_changed(self) -> None:
+        """Called by everything that changes a setting while the app runs - the day/swing split, the
+        trading capital, the filters, the strategies, Autopilot's own settings, where orders go, a new
+        replay. Autopilot reads every setting afresh on each pass, so its *decisions* already follow;
+        this makes the rest follow at once: plays it had refused for the day are handed back, the plays
+        are sized again, the dashboard gets the plays (with Autopilot's verdict on each) and Autopilot's
+        state, and the quick re-check of the board is pulled forward so the next pass isn't up to a
+        cycle away. It enters nothing itself: entries stay on the scan thread, in a scan's own pass -
+        a web thread placing orders would race it."""
+        self.autopilot.settings_changed()
+        self._risk_pct_for = None                          # the half-Kelly shares follow Autopilot's terms
+        self._size_plays([p for p in self.board.plays.values() if p.status not in _ACTED_ON])
+        self._publish_plays()
+        self.autopilot.publish_status()
+        self._last_plays_at = float("-inf")
+        self._scan_wake.set()
+
     def _queue_scan(self, kind: str) -> None:
         with self._scan_lock:
             if self._scan_request != "full":           # a queued full scan covers a cycle too
@@ -845,7 +863,6 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self.repo.record_scan(result, keep_rejected=self.settings.config.database.record_rejected_plays)
             except Exception:  # noqa: BLE001
                 log.exception("could not save the scan")
-        self._publish_plays()
         if not quick:
             self._publish("watchlist.updated", **self.watchlist_state())
         if not self.quit_state:
@@ -853,6 +870,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self.autopilot.consider(self.board.plays)
             except Exception:  # noqa: BLE001
                 log.exception("autopilot pass failed")
+        self._publish_plays()                              # after the pass: each play carries Autopilot's verdict on it
         self._note_changes(changes)
 
     def _scan_failed(self, kind: str, reason: str) -> None:
@@ -1227,6 +1245,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         elif p.suggested_qty <= 0:
             reasons.append(f"{p.symbol} already takes up the {cfg.risk.max_symbol_pct_of_equity:.0f}% of equity "
                            "allowed in one stock" if "max exposure per stock" in sizing.caps_hit
+                           else self._no_room_reason(p) if "trading capital" in sizing.caps_hit
                            else "position size rounds to zero for this risk budget")
         if p.reward_risk < cfg.risk.min_reward_risk and p.kind.value != "FUNDAMENTAL":
             reasons.append(f"reward:risk {p.reward_risk:.1f} below minimum")
@@ -1296,6 +1315,18 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._refresh_account()
             self._day_changed(now=True)                   # a restart mustn't offer this setup again today
             return {"ok": out.get("ok", False), **out}
+
+    def _no_room_reason(self, p: Play) -> str:
+        """Why a play sized to nothing under the trading capital: its kind's share is full, or all of it is."""
+        state = self.capital_state() or {}
+        split = state.get("split") or {}
+        if split.get("on"):
+            kind = "day" if capital.kind_of(p.timeframe) == capital.DAY else "swing"
+            part = split.get(kind) or {}
+            if part.get("available", 1.0) <= 0 < state.get("available", 0.0):
+                return (f"{kind} trades already hold their {part.get('pct', 0):g}% share of the trading capital "
+                        "(the day / swing split) - no room for another")
+        return "the trading capital is fully invested - no room for another position"
 
     def _score_plays(self, plays) -> None:
         """The learned model's odds on each fresh play (research/model.py), kept in its evidence so
@@ -1459,6 +1490,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return {"ok": False, "reason": locked}
         want_on = kw.get("enabled")
         st = self.autopilot.configure(**kw)
+        self._settings_changed()
         note = ""
         if want_on and self.mode == "live" and not st["allow_live"]:
             note = ("Autopilot will NOT place live orders: set  autopilot.allow_live: true  in "
@@ -1528,7 +1560,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if set(new.timeframes) != set(cur.timeframes):             # the day/swing split turns on or off with them
             self._size_plays([p for p in self.board.plays.values() if p.status not in _ACTED_ON])
             self._publish("capital.updated", capital=self.capital_state())
-        self._publish_plays()
+        self._settings_changed()                           # Autopilot's types and the split follow the filters
         self._publish("filters.updated", filters=new.as_dict())
         # narrowing just trims the board; widening needs a scan to find the new plays
         widened = bool(set(new.sides) - set(cur.sides) or set(new.timeframes) - set(cur.timeframes)
@@ -1588,7 +1620,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._save_runtime()
         active = {s.key for s in self.scanner.strategies}
         self._note_changes(self.board.drop(lambda p: p.strategy in active, "its strategy was switched off"))
-        self._publish_plays()
+        self._settings_changed()
         self._publish("strategies.updated", strategies=self.strategy_state())
         if rescan:
             self._queue_scan(rescan)

@@ -74,12 +74,14 @@ class FakeEngine:
         pl = self._plays.get(pid)
         if self.fill_later:
             self.working.append({"order_id": f"o_{pid}", "play_id": pid, "symbol": pl.symbol,
-                                 "strategy": pl.strategy, "qty": 10, "risk": self.est_risk})
+                                 "strategy": pl.strategy, "timeframe": pl.timeframe.value, "qty": 10,
+                                 "risk": self.est_risk})
             return {"ok": True, "status": "WORKING"}
         # an open position whose $-risk equals est_risk (entry 100, stop 80, x10)
         self.repo._open.append({
             "id": tid, "symbol": getattr(pl, "symbol", "X"),
             "strategy": getattr(pl, "strategy", "opening_range_breakout"),
+            "timeframe": getattr(getattr(pl, "timeframe", None), "value", "INTRADAY"),
             "entry_price": 100.0,
             "initial_stop_price": 100.0 - self.est_risk / 10.0, "quantity": 10,
         })
@@ -625,3 +627,109 @@ def test_no_entries_while_prices_cannot_be_read():
     state["why"] = ""                                                          # the other session logged out
     _run(ap, p)
     assert eng.approved_ids() == [p.id]
+
+
+# ---------------------------------------------------------------- the day / swing split
+def _split_pilot(day_pct=70.0, **over):
+    eng = FakeEngine()
+    eng.effective_day_pct = lambda: day_pct
+    cfg = dict(trade_types=["INTRADAY", "SWING"], max_auto_positions=10, max_auto_trades_per_day=10,
+               min_swing_confidence=0.5)
+    cfg.update(over)
+    return eng, AutoPilot(eng, _cfg(**cfg), bus=SILENT)
+
+
+def test_the_slots_divide_the_way_the_trading_capital_does():
+    _, ap = _split_pilot(70.0)
+    assert ap.kind_slots(10) == {"INTRADAY": 7, "SWING": 3}
+    assert ap.kind_slots(3) == {"INTRADAY": 2, "SWING": 1}
+    assert ap.kind_slots(2) == {"INTRADAY": 1, "SWING": 1}                     # a kind with a share keeps a slot
+    assert ap.kind_slots(1) == {"INTRADAY": 1, "SWING": 1}                     # one slot: whichever comes first
+    assert ap.kind_slots(0) == {"INTRADAY": 0, "SWING": 0}
+    ap.engine.effective_day_pct = lambda: 95.0
+    assert ap.kind_slots(10) == {"INTRADAY": 9, "SWING": 1}
+    ap.engine.effective_day_pct = lambda: 100.0                                # one filter box off: no split
+    assert ap.kind_slots(10) == {"INTRADAY": 10, "SWING": 0}
+    ap.engine.effective_day_pct = lambda: 0.0
+    assert ap.kind_slots(10) == {"INTRADAY": 0, "SWING": 10}
+    assert AutoPilot(FakeEngine(), _cfg(), bus=SILENT).kind_slots(10) is None  # an engine that doesn't say: no split
+
+
+def test_swing_trades_cant_take_the_slots_the_split_keeps_for_day_trades():
+    eng, ap = _split_pilot(70.0)
+    swings = [mkplay(sym=f"S{i}", tf=Timeframe.SWING) for i in range(6)]
+    days = [mkplay(sym=f"D{i}") for i in range(3)]
+    _run(ap, *swings)
+    assert len(eng.approved) == 3                                              # three of ten, not six
+    assert "swing trades hold 3 of the 3 positions" in ap.verdict(swings[-1]) and "70% / 30%" in ap.verdict(swings[-1])
+    _run(ap, *swings, *days)
+    taken = {eng._plays[pid].symbol for pid in eng.approved_ids()}
+    assert {"D0", "D1", "D2"} <= taken and len(eng.approved) == 6              # the day trades still had their room
+    card = ap.status()["slots"]
+    assert (card["SWING"]["open"], card["SWING"]["max"], card["INTRADAY"]["open"], card["INTRADAY"]["max"]) == (3, 3, 3, 7)
+    assert card["SWING"]["taking"] and card["INTRADAY"]["taking"] and card["day_pct"] == 70.0
+
+
+def test_a_days_entries_divide_the_same_way_and_the_count_survives_a_restart():
+    eng, ap = _split_pilot(50.0, max_auto_positions=20, max_auto_trades_per_day=4)
+    _run(ap, *[mkplay(sym=f"S{i}", tf=Timeframe.SWING) for i in range(4)])
+    assert len(eng.approved) == 2                                              # two of the day's four entries
+    saved = ap.to_runtime()
+    assert saved["count_today_by_kind"] == {"SWING": 2}
+    again = AutoPilot(eng, _cfg(trade_types=["INTRADAY", "SWING"], max_auto_positions=20, max_auto_trades_per_day=4),
+                      bus=SILENT)
+    again.load_runtime(saved)
+    late = mkplay(sym="S9", tf=Timeframe.SWING)
+    _run(again, late)
+    assert len(eng.approved) == 2 and "2 of the 2 entries a day" in again.verdict(late)
+    again.load_runtime({**saved, "count_today_by_kind": "nonsense"})           # an older or damaged file
+    assert again._count_by_kind == {}
+
+
+def test_without_both_kinds_switched_on_nothing_is_divided():
+    eng, ap = _split_pilot(0.0)                                                # the Intraday filter box is off
+    _run(ap, *[mkplay(sym=f"S{i}", tf=Timeframe.SWING) for i in range(6)])
+    assert len(eng.approved) == 6
+
+
+def test_after_a_restart_autopilot_still_knows_the_positions_it_opened():
+    eng, ap = _split_pilot(70.0)
+    eng._venue = "ibkr-paper"
+    mine = {"strategy": "s", "timeframe": "SWING", "entry_price": 100.0, "initial_stop_price": 95.0, "quantity": 10,
+            "broker": "ibkr-paper", "entry_context": {"by": "autopilot"}}
+    eng.repo._open = [{**mine, "id": "t1", "symbol": "AAA"}, {**mine, "id": "t2", "symbol": "BBB"},
+                      {**mine, "id": "t3", "symbol": "CCC"},
+                      {**mine, "id": "t4", "symbol": "DDD", "entry_context": {"by": "operator"}},     # taken by hand
+                      {**mine, "id": "t5", "symbol": "EEE", "pair_id": "p1"},                          # the pair desk's
+                      {**mine, "id": "t6", "symbol": "FFF", "broker": "paper"}]                        # another account
+    assert [t["id"] for t in ap._open_auto_trades()] == ["t1", "t2", "t3"]
+    assert ap.status()["open_auto_positions"] == 3 and ap.status()["slots"]["SWING"]["open"] == 3
+    swing = mkplay(sym="NEW", tf=Timeframe.SWING)
+    _run(ap, swing)
+    assert eng.approved == [] and "swing trades hold 3 of the 3" in ap.verdict(swing)    # its share is full already
+
+
+def test_a_play_refused_for_the_day_gets_another_look_when_a_setting_changes():
+    eng, ap = _split_pilot(70.0)
+    eng.can_execute = False                                                    # no room in its share, say
+    refused, entered = mkplay(sym="REF", tf=Timeframe.SWING), mkplay(sym="ENT")
+    _run(ap, refused)
+    eng.can_execute = True
+    _run(ap, refused, entered)
+    assert eng.approved_ids() == [entered.id]                                  # refused once: handled for the day
+    ap.settings_changed()                                                      # the slider moved, the capital was raised...
+    assert ap.verdict(refused).startswith("passes its checks")
+    _run(ap, refused, entered)
+    assert eng.approved_ids() == [entered.id, refused.id]                      # ...judged again; what it entered isn't
+
+
+def test_a_daily_loss_limit_that_is_raised_stops_saying_stopped():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=1.0), bus=SILENT)
+    ap._realized_today = lambda: -2_000.0
+    _run(ap, mkplay())
+    assert ap.status()["daily_loss_stop"] and eng.approved == []
+    ap.configure(max_daily_loss_pct=5.0)
+    _run(ap, mkplay(sym="BBB"))
+    assert not ap.status()["daily_loss_stop"] and len(eng.approved) == 1
+

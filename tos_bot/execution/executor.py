@@ -140,7 +140,8 @@ class Executor(ProtectiveStops):
         """Entry orders sent but not filled yet. Anything that limits positions has
         to count these too, or a slow fill gets doubled up."""
         return [{"order_id": oid, "play_id": p.play.id, "symbol": p.play.symbol,
-                 "strategy": p.play.strategy, "qty": p.qty, "notional": p.play.entry * p.qty,
+                 "strategy": p.play.strategy, "timeframe": p.play.timeframe.value,
+                 "qty": p.qty, "notional": p.play.entry * p.qty,
                  "risk": abs(p.play.entry - p.play.stop) * p.qty}
                 for oid, p in list(self._pending.items()) if p.kind == "entry"]
 

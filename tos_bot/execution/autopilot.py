@@ -36,6 +36,14 @@ log = logging.getLogger(__name__)
 
 #: what Autopilot can be told to take: day trades, swing trades, pairs (pairs/desk.py)
 TRADE_TYPES = ("INTRADAY", "SWING", "PAIRS")
+#: the two kinds the trading capital is split between (engine/capital.py says the same: a day trade is
+#: INTRADAY, everything held overnight is a swing trade)
+DAY, SWING = "INTRADAY", "SWING"
+KINDS = (DAY, SWING)
+
+
+def kind_of(timeframe: Any) -> str:
+    return DAY if str(getattr(timeframe, "value", timeframe) or "").upper() == DAY else SWING
 MODEL_MODES = ("shadow", "gate", "size")
 
 
@@ -79,6 +87,10 @@ class AutoPilot:
         self.dry_run: bool = bool(cfg.dry_run)
 
         self._acted: set[str] = set()          # play ids already handled
+        #: the handled ids that were refusals a change of settings could lift (no room in the capital share,
+        #: a size of zero, a last look that failed) - settings_changed() hands them back to the next pass
+        self._refused: set[str] = set()
+        self._count_by_kind: Dict[str, int] = {}   # today's entries, day trades and swing trades apart
         self._auto_trade_ids: set[str] = set()  # trades this pilot opened (this session)
         self._auto_play_ids: set[str] = set()   # plays it sent entries for - a late fill carries only this
         self._day: str = ""
@@ -118,6 +130,7 @@ class AutoPilot:
             "dry_run": self.dry_run,
             "day": self._day,
             "count_today": self._count_today,
+            "count_today_by_kind": dict(self._count_by_kind),
         }
 
     def load_runtime(self, d: Dict[str, Any]) -> None:
@@ -150,6 +163,9 @@ class AutoPilot:
         if d.get("day") == clock.session_date().isoformat():
             self._day = d["day"]
             self._count_today = int(d.get("count_today", 0))
+            by_kind = d.get("count_today_by_kind")
+            self._count_by_kind = ({k: int(v) for k, v in by_kind.items() if k in KINDS}
+                                   if isinstance(by_kind, dict) else {})
             self._peak_realized = float(d.get("peak_realized", 0.0) or 0.0)
 
     # ------------------------------------------------------------------ #
@@ -209,8 +225,25 @@ class AutoPilot:
         if today != self._day:
             self._day = today
             self._count_today = 0
+            self._count_by_kind = {}
             self._peak_realized = 0.0
             self._acted.clear()
+            self._refused.clear()
+            self._last_reason.clear()
+
+    def settings_changed(self) -> None:
+        """Something changed while the app runs - the day/swing split, the trading capital, the filters,
+        the strategies, Autopilot's own settings, the account orders go to. Every gate reads its setting
+        afresh on each pass; what would not follow by itself is a play already refused for the day and
+        the reason shown for it. Both are dropped here, so the next pass judges the board on the settings
+        as they are now. Plays it entered stay handled. It never enters anything itself."""
+        self._acted -= self._refused
+        self._refused.clear()
+        self._last_reason.clear()
+
+    def publish_status(self) -> None:
+        """Tell the dashboard what Autopilot is set to and holds - without saving or logging anything."""
+        self.bus.publish("autopilot.config", **self.status())
 
     def _live_ok(self) -> bool:
         """Real orders only when the config file explicitly allows it."""
@@ -241,6 +274,57 @@ class AutoPilot:
 
     def effective_trade_types(self) -> List[str]:
         return self.play_types() + (["PAIRS"] if "PAIRS" in self.trade_types else [])
+
+    # ---- the day / swing split ------------------------------------------ #
+    def day_share(self) -> Optional[float]:
+        """The day-trade share of the trading capital in force, in percent (engine.effective_day_pct) -
+        None when the engine doesn't say, and then nothing is divided."""
+        share = getattr(self.engine, "effective_day_pct", None)
+        if not callable(share):
+            return None
+        try:
+            return max(0.0, min(100.0, float(share())))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def kind_slots(self, total: int) -> Optional[Dict[str, int]]:
+        """``total`` slots - open positions, or entries in a day - divided between day trades and swing
+        trades the way the trading capital is: at 70 / 30, seven and three of ten. A kind with a share
+        keeps at least one slot, a kind with none gets none, and the two never add up to more than
+        ``total``. The split is the owner's statement of how much of the account each kind of trading
+        gets; without this, the kind that fires first (swing setups, before the open and after 15:30)
+        took every slot and left the other kind's capital idle."""
+        pct = self.day_share()
+        if pct is None:
+            return None
+        total = max(0, int(total))
+        if pct >= 100.0:
+            return {DAY: total, SWING: 0}
+        if pct <= 0.0:
+            return {DAY: 0, SWING: total}
+        if total <= 1:
+            return {DAY: total, SWING: total}                 # one slot: whichever kind comes first has it
+        day = min(total - 1, max(1, int(total * pct / 100.0 + 0.5)))
+        return {DAY: day, SWING: total - day}
+
+    def _held_by_kind(self, opens: Optional[List[Dict[str, Any]]] = None) -> Dict[str, int]:
+        """Autopilot's open positions and working entries, day trades and swing trades apart."""
+        rows = self._open_auto_trades() + self._working_auto_entries() if opens is None else opens
+        held = {DAY: 0, SWING: 0}
+        for t in rows:
+            held[kind_of(t.get("timeframe"))] += 1
+        return held
+
+    def _slots_card(self) -> Optional[Dict[str, Any]]:
+        """The split as the dashboard shows it: per kind, the positions held of the slots it has, today's
+        entries of its daily share, and whether Autopilot takes that kind at all right now."""
+        positions, entries = self.kind_slots(self.max_auto_positions), self.kind_slots(self.max_auto_trades_per_day)
+        if positions is None or entries is None:
+            return None
+        held, taking = self._held_by_kind(), set(self.play_types())
+        return {"day_pct": self.day_share(),
+                **{kind: {"open": held[kind], "max": positions[kind], "today": int(self._count_by_kind.get(kind, 0)),
+                          "max_today": entries[kind], "taking": kind in taking} for kind in KINDS}}
 
     # ------------------------------------------------------------------ #
     def status(self) -> Dict[str, Any]:
@@ -286,6 +370,7 @@ class AutoPilot:
             "model": self._model_card(),
             "open_auto_positions": open_auto,
             "auto_trades_today": self._count_today,
+            "slots": self._slots_card(),
             "mode": getattr(self.engine, "mode", "paper"),
             "allow_live": bool(getattr(self.cfg, "allow_live", False)),
             "blocked_note": blocked,
@@ -293,11 +378,23 @@ class AutoPilot:
 
     # ------------------------------------------------------------------ #
     def _open_auto_trades(self) -> List[Dict[str, Any]]:
+        """The open trades Autopilot entered, on the account orders go to. The ids it remembers cover
+        this run; after a restart the trade's own record says who took it (``entry_context.by``) -
+        otherwise every cap would start from nothing with its positions still open. Pair legs are the
+        pair desk's."""
         try:
             opens = self.engine.repo.open_trades()
         except Exception:  # noqa: BLE001
             return []
-        return [t for t in opens if t["id"] in self._auto_trade_ids or t.get("play_id") in self._auto_play_ids]
+        venue = getattr(self.engine, "_venue", None)
+        mine = []
+        for t in opens:
+            if t.get("pair_id") or (venue is not None and (t.get("broker") or "paper") != venue):
+                continue
+            taken_by = (t.get("entry_context") or {}).get("by") if isinstance(t.get("entry_context"), dict) else None
+            if t["id"] in self._auto_trade_ids or t.get("play_id") in self._auto_play_ids or taken_by == "autopilot":
+                mine.append(t)
+        return mine
 
     def _working_auto_entries(self) -> List[Dict[str, Any]]:
         """Auto entries sent but not filled yet - they count against every cap."""
@@ -347,6 +444,8 @@ class AutoPilot:
         taken = 0                              # new entries opened this cycle
 
         stopped = self.daily_loss_reason(equity)
+        if not stopped:
+            self._loss_stop_day = ""               # the limit was raised or switched off: it isn't stopped any more
         if stopped:
             if self._loss_stop_day != self._day:
                 self._loss_stop_day = self._day
@@ -380,6 +479,10 @@ class AutoPilot:
             if len(opens) >= self.max_auto_positions:
                 self._last_reason[p.id] = f"max concurrent auto positions ({self.max_auto_positions}) reached"
                 continue
+            full = self._kind_full(p.timeframe.value, opens)
+            if full:
+                self._last_reason[p.id] = full
+                continue
             same_strat = sum(1 for t in opens if t.get("strategy") == p.strategy)
             if same_strat >= self.max_per_strategy:
                 self._last_reason[p.id] = (f"already holding {same_strat} auto "
@@ -398,6 +501,7 @@ class AutoPilot:
                 self.bus.publish("autopilot.skipped", play_id=p.id, symbol=p.symbol,
                                  strategy=p.strategy, reason=reason)
                 self._acted.add(p.id)
+                self._refused.add(p.id)               # a change of settings may make it executable
                 continue
 
             est_risk = float(pre["order_preview"].get("est_risk", 0.0) or 0.0)
@@ -428,6 +532,8 @@ class AutoPilot:
             out = self.engine.approve_play(p.id, operator="autopilot")
             if out.get("ok"):
                 self._count_today += 1
+                kind = kind_of(p.timeframe.value)
+                self._count_by_kind[kind] = int(self._count_by_kind.get(kind, 0)) + 1
                 taken += 1
                 self._entries_at.append(time.monotonic())
                 self._auto_play_ids.add(p.id)
@@ -448,11 +554,31 @@ class AutoPilot:
                             p.side.value, p.symbol, pre["order_preview"]["qty"], tid,
                             est_risk, self._count_today, self.max_auto_trades_per_day)
             else:
+                self._refused.add(p.id)
                 self._last_reason[p.id] = out.get("reason", "execution failed")
                 self.bus.publish("autopilot.skipped", play_id=p.id, symbol=p.symbol,
                                  strategy=p.strategy, reason=self._last_reason[p.id])
 
         return actions
+
+    def _kind_full(self, timeframe: str, opens: List[Dict[str, Any]]) -> Optional[str]:
+        """Why this kind of trade has no slot left under the day/swing split, if it hasn't: its share of
+        the open positions, then of the day's entries."""
+        kind, pct = kind_of(timeframe), self.day_share()
+        positions, entries = self.kind_slots(self.max_auto_positions), self.kind_slots(self.max_auto_trades_per_day)
+        if pct is None or positions is None or entries is None:
+            return None
+        name = "day" if kind == DAY else "swing"
+        share = f"{pct:g}% / {100 - pct:g}% day / swing split of the trading capital"
+        held = self._held_by_kind(opens)[kind]
+        if held >= positions[kind]:
+            return (f"{name} trades hold {held} of the {positions[kind]} positions the {share} gives them "
+                    f"(of {self.max_auto_positions})")
+        today = int(self._count_by_kind.get(kind, 0))
+        if today >= entries[kind]:
+            return (f"{name} trades have made {today} of the {entries[kind]} entries a day the {share} gives them "
+                    f"(of {self.max_auto_trades_per_day})")
+        return None
 
     def _pace_wait(self, timeframe: str, taken: int) -> Optional[float]:
         """Seconds until the per-cycle cap lets another entry through, or None when it does now. A

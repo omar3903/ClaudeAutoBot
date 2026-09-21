@@ -9,6 +9,7 @@ import datetime as dt
 import os
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -281,6 +282,70 @@ def test_scans_follow_the_schedule(engine, port, monkeypatch):
     assert engine._gappers_session == session and set(engine.board.plays) == before
     assert engine.scan_status()["last_gappers"]["kind"] == "gappers" and engine._due_scan() != "gappers"
     assert engine.request_scan("gappers")["ok"] and engine._scan_request == "gappers"
+
+
+# ---------------------------------------------------------------- the split, and changes made while it runs
+def test_entries_still_working_count_in_their_kinds_share_of_the_capital(engine, port):
+    _connect(engine, port)
+    engine.set_filters(timeframes=["INTRADAY", "SWING"])
+    engine.set_capital_split(50)
+    room = lambda kind: engine.sizing_account(kind).raw["capital_room"]          # noqa: E731
+    before = {k: room(k) for k in ("INTRADAY", "SWING")}
+    engine.executor.working_entries = lambda: [{"symbol": "AAPL", "timeframe": "SWING", "notional": 7_000.0,
+                                                "play_id": "p", "strategy": "s", "qty": 70, "risk": 100.0}]
+    assert room("SWING") == pytest.approx(before["SWING"] - 7_000.0)             # sent a moment ago: it has its room
+    assert room("INTRADAY") == pytest.approx(before["INTRADAY"])                 # the day trades' share is untouched
+    split = engine.capital_state()["split"]
+    assert split["swing"]["invested"] > 0 and split["swing"]["over"] == 0 and split["day"]["invested"] == 0
+
+
+def test_a_kind_over_its_share_says_so_and_takes_nothing_new(engine, port):
+    _connect(engine, port)
+    engine.set_filters(timeframes=["INTRADAY", "SWING"])
+    engine.set_capital_split(50)
+    half = engine.capital_state()["split"]["swing"]["limit"]
+    engine.executor.working_entries = lambda: [{"symbol": "AAPL", "timeframe": "SWING", "notional": half * 0.8,
+                                                "play_id": "p", "strategy": "s", "qty": 1, "risk": 1.0}]
+    out = engine.set_capital_split(90)                                           # swing's share shrinks under what it holds
+    swing = out["capital"]["split"]["swing"]
+    assert swing["over"] > 0 and swing["available"] == 0 and "more than that share" in out["note"]
+    play = _play("MSFT")                                                         # a swing play
+    engine.board.replace([play], None)
+    pre = engine.assess_play(play.id)
+    assert not pre["can_execute"] and any("swing trades already hold their 10% share" in r for r in pre["reasons"])
+
+
+def test_every_change_made_while_it_runs_reaches_autopilot_at_once(engine, port, monkeypatch):
+    _connect(engine, port)
+    heard = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **payload: heard.append(topic))
+    refused = _play("AAPL")
+    engine.board.replace([refused], None)
+
+    def changed_by(change):
+        engine.autopilot._acted.add(refused.id)
+        engine.autopilot._refused.add(refused.id)
+        engine.autopilot._last_reason[refused.id] = "no room"
+        engine._last_plays_at = time.monotonic()
+        heard.clear()
+        assert change()["ok"]
+        assert refused.id not in engine.autopilot._acted and not engine.autopilot._last_reason, change
+        assert "plays.updated" in heard and engine._last_plays_at == float("-inf"), change   # judged again at once
+        return heard
+
+    changed_by(lambda: engine.set_capital_split(40))
+    changed_by(lambda: engine.set_capital(5_000))
+    changed_by(lambda: engine.set_filters(timeframes=["SWING"]))
+    changed_by(lambda: engine.set_filters(timeframes=["INTRADAY", "SWING"]))
+    changed_by(lambda: engine.set_autopilot(max_auto_positions=4))
+    changed_by(lambda: engine.set_strategy("vwap_reclaim", enabled=False))
+    # Autopilot's state goes to the dashboard with each of them
+    published = []
+    engine.autopilot.bus = SimpleNamespace(publish=lambda topic, **payload: published.append((topic, payload)))
+    engine.set_capital_split(70)
+    [(topic, state)] = [x for x in published if x[0] == "autopilot.config"]
+    assert state["slots"]["day_pct"] == 70.0 and state["slots"]["SWING"]["max"] + state["slots"]["INTRADAY"]["max"] == 4
+    assert engine._entry_context(refused, "autopilot")["settings"]["day_trade_pct"] == 70.0
 
 
 # ---------------------------------------------------------------- practice size

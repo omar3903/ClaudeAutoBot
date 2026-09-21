@@ -194,6 +194,10 @@ class PairsOps:
             pct = min(cap, kelly) if kelly is not None else cap
             buying_power = float(sizing.buying_power or sizing.equity)
             room = (getattr(sizing, "raw", None) or {}).get("capital_room")
+            if room is not None and float(room) <= 0:
+                # a cap of nothing reads as "no cap" to the pair sizing - so say no here
+                return {"ok": False, "reason": "Swing trades - a pair is one - already hold their share of the "
+                                               "trading capital, so there is no room for this pair."}
             if room is not None:
                 buying_power = min(buying_power, max(0.0, float(room)))
             out = attempt(self.pairs.enter,
@@ -235,6 +239,9 @@ class PairsOps:
         acc = self.sizing_account(capital.SWING)
         if acc is None or (acc.equity and self.gross_exposure() > acc.equity * ap.max_gross_exposure_pct / 100.0):
             return
+        room = (getattr(acc, "raw", None) or {}).get("capital_room")
+        if room is not None and float(room) <= 0:
+            return                                          # swing trades already hold their share of the capital
         rows = [r for r in self.pairs.watch(self.md.daily_frame, prices) if r["signal"] and r["live"]]
         for row in sorted(rows, key=lambda r: abs(r["z"] or 0.0) - r["entry_z"], reverse=True):
             if ap.dry_run:
