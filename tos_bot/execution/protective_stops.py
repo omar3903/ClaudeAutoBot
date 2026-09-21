@@ -96,9 +96,9 @@ class ProtectiveStops:
     STAND_DOWN_S, STAND_DOWN_POLL_S = 3.0, 0.25
     #: seconds before a stop that couldn't be placed, or was lost, is tried again
     STOP_RETRY_S = 30.0
-    #: a broker showing fewer shares than the record for this long isn't a fill still landing in pieces: the
-    #: shares it does hold get a stop of their own rather than none at all (see _place_stop)
-    SHORT_SHARES_GRACE_S = 20.0
+    #: a position with no stop at the broker for this long is reported, and again every UNPROTECTED_REPEAT_S
+    UNPROTECTED_WARN_S = 90.0
+    UNPROTECTED_REPEAT_S = 300.0
     #: ...and when the broker's share count is only catching up with a fill that arrived in pieces
     SHARES_RETRY_S = 5.0
     #: seconds before a target that couldn't be placed, or was lost, is tried again
@@ -112,10 +112,9 @@ class ProtectiveStops:
         self._stop_retry: Dict[str, float] = {}
         self._target_retry: Dict[str, float] = {}
         self._stop_notes: Dict[str, str] = {}
+        self._bare_since: Dict[str, float] = {}      # when each position was first seen with no stop at the broker
+        self._bare_warned: Dict[str, float] = {}
         self._plain: set = set()          # trades whose one-cancels-all pair the broker refused: a stop alone
-        #: trades whose broker position is smaller than the record: a stop alone rests for the shares held
-        self._short: Dict[str, float] = {}
-        self._short_since: Dict[str, float] = {}   # when a trade was first seen short of its record
         self._group_seq = getattr(self, "_group_seq", 0)
         self._swept_at = 0.0
 
@@ -181,9 +180,6 @@ class ProtectiveStops:
             for tid in [k for k in book if k not in open_ids]:
                 # the record closed some other way (by hand in TWS, by the position check): nothing may outlive it
                 self._cancel_quietly(book.pop(tid).order_id)
-        for book in (self._short, self._short_since):
-            for tid in [k for k in book if k not in open_ids]:
-                del book[tid]
         exiting, now, working, placed = self.pending_exit_trade_ids(), time.monotonic(), None, False
         for t in trades:
             tid, qty, price = t["id"], abs(float(t.get("quantity") or 0.0)), self._record_stop(t)
@@ -200,19 +196,47 @@ class ProtectiveStops:
                 self._place_stop(t, qty, price, working)
                 placed = True
                 continue
-            if tid in self._short:
-                placed = self._keep_short_cover(t, st, qty, price, now) or placed
-                continue
             if self._pair_is_wrong(t, now):
                 self._target_retry[tid] = now + self.TARGET_RETRY_S     # one try per while, whatever comes of it
                 placed = self._rebuild(t) or placed
                 continue
             if abs(st.qty - qty) > 1e-9 or (abs(st.price - price) >= tick(price) and now - st.moved_at >= self.STOP_MOVE_S):
                 self._move_stop(st, qty, price)
+        self._watch_unprotected(trades, exiting, now)
         if now - self._swept_at >= self.SWEEP_S:
             self._swept_at = now
             # a list read before this pass placed or cancelled anything is stale: read the broker's orders again
             self._sweep_stops(open_ids, working if working is not None and not placed else self._working_at_broker())
+
+    def _watch_unprotected(self, trades: List[Dict[str, Any]], exiting: set, now: float) -> None:
+        """Say so - in the log and on the dashboard, and again every few minutes - when a position has
+        had no stop at the broker for a while. It places nothing: the reason is always one where an
+        order would be unsafe or impossible (the broker shows no shares, or fewer than the record; its
+        orders couldn't be read; it refused the stop), and while the app runs its exit manager still
+        watches the price and sends the exit itself. What it can't do is protect it while the app is off."""
+        bare = set()
+        for t in trades:
+            tid = t["id"]
+            if tid in exiting or tid in self._stops or not abs(float(t.get("quantity") or 0.0)) or not self._record_stop(t):
+                continue
+            bare.add(tid)
+            since = self._bare_since.setdefault(tid, now)
+            if (self._broker_resyncing() or now - since < self.UNPROTECTED_WARN_S
+                    or now - self._bare_warned.get(tid, float("-inf")) < self.UNPROTECTED_REPEAT_S):
+                continue
+            self._bare_warned[tid] = now
+            minutes = (now - since) / 60.0
+            reason = self._stop_notes.get(tid) or f"{t['symbol']}: the broker hasn't taken one yet"
+            log.warning("NO STOP AT THE BROKER  %s has had none for %.1f min - %s. The app still watches the price "
+                        "and exits it itself while it runs", t["symbol"], minutes, reason)
+            self.bus.publish("stop.missing", trade_id=tid, symbol=t["symbol"], minutes=round(minutes, 1), reason=reason)
+        for book in (self._bare_since, self._bare_warned):
+            for tid in [k for k in book if k not in bare]:
+                del book[tid]
+
+    def unprotected(self) -> List[str]:
+        """The open trades with no stop at the broker right now (after the first pass has looked)."""
+        return sorted(self._bare_since)
 
     def _pair_is_wrong(self, t: Dict[str, Any], now: float) -> bool:
         """Whether what rests for a trade has the wrong *shape* - something a price move can't fix:
@@ -277,27 +301,13 @@ class ProtectiveStops:
             return
         held = self._held_quantity(symbol)
         long = t["side"] == "LONG"
-        plan = self._target_plan(t)
         if held is not None and ((held > 0) != long or abs(held) < qty - 1e-9):
             # never rest an order the account can't cover - triggered, it would open a position the other way
-            same_way = (held > 0) == long and abs(held) > 0
-            since = self._short_since.setdefault(tid, time.monotonic())
-            if not same_way or time.monotonic() - since < self.SHORT_SHARES_GRACE_S:
-                self._note_once(tid, f"{symbol}: no stop placed - the broker shows {held:,.0f} shares, the record {qty:,.0f}")
-                # a fill still landing in pieces: look again soon
-                self._stop_retry[tid] = time.monotonic() + (self.SHARES_RETRY_S if same_way else self.STOP_RETRY_S)
-                return
-            # fewer shares than the record, and not a fill landing: the shares the broker does hold get a stop
-            # of their own - a stop alone, sized to them, and the app works the target - rather than nothing
-            qty, plan = abs(held), None
-            self._short[tid] = qty
-            log.warning("PROTECTIVE STOP  %s: the broker holds %s shares and the record %s - protecting the %s it holds",
-                        symbol, f"{held:,.0f}", f"{abs(float(t.get('quantity') or 0.0)):,.0f}", f"{qty:,.0f}")
-            self.bus.publish("stop.short", trade_id=tid, symbol=symbol, held=qty,
-                             record=abs(float(t.get("quantity") or 0.0)))
-        else:
-            self._short_since.pop(tid, None)
-            self._short.pop(tid, None)
+            self._note_once(tid, f"{symbol}: no stop placed - the broker shows {held:,.0f} shares, the record {qty:,.0f}")
+            arriving = (held > 0) == long and abs(held) > 0            # a fill still landing in pieces: look again soon
+            self._stop_retry[tid] = time.monotonic() + (self.SHARES_RETRY_S if arriving else self.STOP_RETRY_S)
+            return
+        plan = self._target_plan(t)
         self._group_seq += 1                             # a group's name is never used twice: a finished one can't take orders
         group = f"oca:{tid}:{int(time.time())}:{self._group_seq}" if plan else ""
         exit_side = Side.SHORT if long else Side.LONG
@@ -354,36 +364,6 @@ class ProtectiveStops:
             return False
         self._place_stop(fresh, qty, price, working)
         return True
-
-    def _keep_short_cover(self, t: Dict[str, Any], st: _Stop, qty: float, price: float, now: float) -> bool:
-        """Keep a stop sized to the shares the broker holds in step with them. Once the broker holds the
-        whole record again, the proper pair replaces it; once it holds none, the stop goes - triggered, it
-        would open a position the other way. Returns whether anything was placed."""
-        held = self._held_quantity(t["symbol"])
-        if held is None:
-            return False                                 # the broker can't say: leave what rests as it is
-        long = t["side"] == "LONG"
-        cover = abs(held) if (held > 0) == long else 0.0
-        if cover >= qty - 1e-9:
-            self._short.pop(t["id"], None)
-            self._short_since.pop(t["id"], None)
-            log.info("PROTECTIVE STOP  %s: the broker holds the whole position again - the stop and target pair "
-                     "replaces the stop for part of it", t["symbol"])
-            return self._rebuild(t)
-        if cover <= 0:
-            self._short.pop(t["id"], None)
-            self._drop_resting(t["id"])
-            self._note_once(t["id"], f"{t['symbol']}: the broker holds none of this position any more - its stop is "
-                                     "cancelled, as it would open a position the other way")
-            return False
-        self._short[t["id"]] = cover
-        if abs(st.qty - cover) > 1e-9 or (abs(st.price - price) >= tick(price) and now - st.moved_at >= self.STOP_MOVE_S):
-            self._move_stop(st, cover, price)
-        return False
-
-    def short_covers(self) -> Dict[str, float]:
-        """Trades whose stop covers only the shares the broker holds, fewer than the record: id -> shares."""
-        return dict(self._short)
 
     def _move_stop(self, st: _Stop, qty: float, price: float) -> bool:
         """Change the resting stop's shares and trigger. A broker that can't modify an order has

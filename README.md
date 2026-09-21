@@ -697,14 +697,14 @@ the target to the broker. A plain stop left by an earlier version is stood down 
 replaced by the pair. If IBKR refuses the pair, the trade gets a stop alone and the
 app works its target itself, as before.
 
-**Every position gets its exit orders - even when the broker's count differs from the record.** The
-stop waits until the broker shows the shares it protects (never an order the account can't cover:
-triggered, it would open a position the other way), which during a fill landing in pieces is a few
-seconds. If the broker still holds *fewer* shares than the record after 20 seconds (part sold by hand
-in TWS, say), those shares get a stop of their own - a stop alone, sized to them, with the app working
-the target - kept in step as the count changes, and replaced by the full stop-and-target pair once the
-broker holds the whole position again. If it holds none, the stop is cancelled. A position with no
-stop at the broker is marked **no stop at the broker yet** in amber on the Positions tab.
+**A position without a stop at the broker is never silent.** A stop is only ever rested for shares
+the broker shows - triggered, one for shares it doesn't hold would open a position the other way - so
+during a fill landing in pieces it waits a few seconds, and if the broker's count and the record
+disagree (part sold by hand in TWS, say) it waits for them to agree. Meanwhile the app's exit
+manager still watches the price and sends the exit itself; what nothing covers is the app being off.
+So a position with no stop at the broker is marked **no stop at the broker yet** in amber on the
+Positions tab, and once that has lasted 90 seconds the log and the dashboard say so, with the reason,
+and again every five minutes until it's fixed.
 
 The Open orders panel lists them as **stop** and **target** with their trade. The
 simulator keeps its own bracket and gets no such orders.

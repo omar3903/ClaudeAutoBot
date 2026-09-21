@@ -63,7 +63,7 @@ import pandas as pd
 from ..core.enums import Side, StrategyKind, Timeframe
 from ..core.models import Play
 from ..data.market_data import quote_from_price
-from ..scanner.evaluator import with_today
+from ..scanner.evaluator import hold_from_half_life, with_today
 from ..scanner.filters import expected_r
 from ..scanner.heat import daily_metrics, intraday_metrics
 from .features import play_features
@@ -337,7 +337,8 @@ def shadow_trade(play: Play, session: pd.DataFrame, seen_at: pd.Timestamp,
     if position is None:
         return None
     for at, bar in after.iterrows():
-        done = _step(position, bar, at + BAR, settings, "eod-flatten" if at + BAR >= flatten_at else None)
+        done = _step(position, bar, at + BAR, settings, "eod-flatten" if at + BAR >= flatten_at else None,
+                     time_limit_bars=_time_limit_bars(play, settings))
         if done is not None:
             return done
     return _close(position, float(after["close"].iloc[-1]), after.index[-1] + BAR, "eod-flatten", settings)
@@ -439,6 +440,7 @@ def _signals(strategies: Sequence[Strategy], ctx: StrategyContext, noise: NoiseS
             if play.reward_risk < min_reward_risk:
                 continue
             flags = context_flags(play, ctx, strategy.style, noise)
+            hold_from_half_life(play, ctx, strategy.style)          # the hold live gives it: the time stop's window
             play.evidence["expected_r"] = round(expected_r(play, ctx.daily_atr), 3)
             if play.evidence["expected_r"] < noise.min_expected_r:
                 flags.append("low_expected_value")

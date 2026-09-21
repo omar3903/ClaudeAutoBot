@@ -126,13 +126,10 @@ function exitCell(t, parked) {
   const atBroker = (t.broker || "").startsWith("ibkr");
   const target = ((S.orders || {}).orders || []).find(o => o.purpose === "target" && o.trade_id === t.id);
   const tgt = target ? ` · <span title="A limit order rests at the broker at the target, in one group with the stop: when one fills the broker shrinks the other, so they can never both fill for the whole position">target ${num(target.limit_price)} ×${num(target.qty, 0)}</span>` : "";
-  const partial = stop && stop.qty != null && Math.abs(stop.qty) < Math.abs(t.quantity) - 1e-9;
   return stop
-    ? (partial
-      ? `<span class="badge warn" title="The broker holds fewer shares than this record, so the stop covers the shares it holds. The app works the target itself; once the broker holds the whole position the stop and target pair goes back">stop ${num(stop.stop_price)} ×${num(stop.qty, 0)} of ${num(Math.abs(t.quantity), 0)}</span> at the broker${late}`
-      : `<span title="A good-till-cancelled stop order rests at the broker for these shares - it protects the position even while the app is closed">stop ${num(stop.stop_price)}</span>${tgt} at the broker${late}`)
+    ? `<span title="A good-till-cancelled stop order rests at the broker for these shares - it protects the position even while the app is closed">stop ${num(stop.stop_price)}</span>${tgt} at the broker${late}`
     : atBroker
-      ? `<span class="badge warn" title="No stop order rests at the broker for this position yet: the app watches the price and sends the exit itself, but only while it's running. It places one as soon as the broker's share count matches - see the log for why it hasn't">no stop at the broker yet</span>${late}`
+      ? `<span class="badge warn" title="No stop order rests at the broker for this position: the app watches the price and sends the exit itself, but only while it's running. It places one as soon as it safely can - an order is never rested for shares the broker doesn't show. The log says why it hasn't">no stop at the broker yet</span>${late}`
       : `<span title="No stop order rests at the broker: the app watches the price and sends the exit itself">stop watched by the app</span>${late}`;
 }
 

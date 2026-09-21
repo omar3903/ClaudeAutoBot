@@ -137,8 +137,8 @@ function handle(topic, p) {
     case "target.placed":
       toast(`${p.symbol}: target order resting at the broker @ ${num(p.limit_price)} for ${num(p.qty, 0)} shares - one fill shrinks the other`, "good");
       break;
-    case "stop.short":
-      toast(`${p.symbol}: the broker holds ${num(p.held, 0)} shares and the record ${num(p.record, 0)} - a stop protects the ${num(p.held, 0)} it holds`, "warn");
+    case "stop.missing":
+      toast(`⚠ ${p.symbol} has had no stop at the broker for ${num(p.minutes, 1)} min - ${p.reason}. The app still exits it itself while it runs.`, "bad");
       break;
     case "stop.lost":
       toast(`⚠ ${p.symbol}: the stop order at the broker is gone (${p.reason}) - placing it again`, "bad");

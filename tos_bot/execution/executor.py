@@ -655,7 +655,11 @@ def _min_play(t: dict) -> dict:
 
 
 def _play_from_row(row: dict) -> Play:
-    return Play(symbol=row["symbol"], side=Side(row["side"]), strategy=row["strategy"],
+    from ..research.journal import held_for          # the hold its time stop runs on, from the play log
+
+    typical, longest = held_for(row)
+    return Play(expected_hold_typical=typical, expected_hold_max=longest,
+                symbol=row["symbol"], side=Side(row["side"]), strategy=row["strategy"],
                 kind=StrategyKind(row["kind"]), timeframe=Timeframe(row["timeframe"]),
                 entry=float(row["entry"] or 0), stop=float(row["stop"] or 0),
                 targets=[float(x) for x in (row.get("targets") or [])],

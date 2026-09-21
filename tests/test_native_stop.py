@@ -284,45 +284,25 @@ def test_stopping_a_quit_calls_off_the_exits_it_sent_and_the_stops_go_back():
     assert [s.quantity for s in broker.stops()] == [10, 10]
 
 
-def test_a_broker_holding_fewer_shares_than_the_record_still_gets_a_stop_for_what_it_holds():
-    broker, _, ex, heard = _setup(positions={"AAA": 6})                        # the record says ten
-    ex.SHARES_RETRY_S = 0.0
+def test_a_position_without_a_stop_at_the_broker_is_reported_and_reported_again():
+    broker, _, ex, heard = _setup(positions={})                                 # the broker shows no shares
+    ex.STOP_RETRY_S = 0.0
     ex.sync_open_orders()
-    assert broker.stops() == []                                                # at first: a fill still landing?
-    ex._short_since["t1"] -= ex.SHORT_SHARES_GRACE_S                           # ...no - it has stayed short
+    assert broker.stops() == [] and ex.unprotected() == ["t1"]
+    assert "stop.missing" not in [t for t, _ in heard]                         # not straight away
+    ex._bare_since["t1"] -= ex.UNPROTECTED_WARN_S
     ex.sync_open_orders()
-    (stop,) = broker.stops()
-    assert (stop.quantity, stop.stop_price, stop.oca_group) == (6, 98.0, "")   # a stop alone, for the six it holds
-    assert ex.short_covers() == {"t1": 6.0} and "stop.short" in [t for t, _ in heard]
+    missing = [p for t, p in heard if t == "stop.missing"]
+    assert len(missing) == 1 and missing[0]["symbol"] == "AAA" and "no stop placed" in missing[0]["reason"]
     ex.sync_open_orders()
-    assert len(broker.stops()) == 1 and broker.stops()[0].quantity == 6        # never sized back up to the record
+    assert len([t for t, _ in heard if t == "stop.missing"]) == 1                # not on every pass
+    ex._bare_warned["t1"] -= ex.UNPROTECTED_REPEAT_S
+    ex.sync_open_orders()
+    assert len([t for t, _ in heard if t == "stop.missing"]) == 2                # but again a few minutes on
+    assert broker.orders == []                                                 # and it never places anything itself
 
-    broker.positions["AAA"] = 8                                                # two more turn up
+    broker.positions["AAA"] = 10                                               # the shares show up
+    ex._stop_retry.clear()
     ex.sync_open_orders()
-    assert ex.protective_stops()[0]["qty"] == 8.0 and ex.short_covers() == {"t1": 8.0}
-
-
-def test_once_the_broker_holds_the_whole_position_the_stop_goes_back_to_covering_it_all():
-    broker, _, ex, _ = _setup(positions={"AAA": 6})
-    ex.SHARES_RETRY_S = 0.0
-    ex.sync_open_orders()
-    ex._short_since["t1"] -= ex.SHORT_SHARES_GRACE_S
-    ex.sync_open_orders()
-    first = ex.protective_stops()[0]["order_id"]
-    broker.positions["AAA"] = 10
-    ex.sync_open_orders()
-    assert first in broker.cancelled and ex.short_covers() == {}
-    assert broker.stops()[-1].quantity == 10
-
-
-def test_a_stop_for_shares_the_broker_no_longer_holds_is_cancelled():
-    broker, _, ex, _ = _setup(positions={"AAA": 6})
-    ex.SHARES_RETRY_S = 0.0
-    ex.sync_open_orders()
-    ex._short_since["t1"] -= ex.SHORT_SHARES_GRACE_S
-    ex.sync_open_orders()
-    stop = ex.protective_stops()[0]["order_id"]
-    broker.positions.pop("AAA")                                                # sold by hand in TWS
-    ex.sync_open_orders()
-    assert stop in broker.cancelled and ex.protective_stops() == [] and ex.short_covers() == {}
+    assert len(broker.stops()) == 1 and ex.unprotected() == []
 

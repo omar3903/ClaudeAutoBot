@@ -732,7 +732,10 @@ def _play_row(p: Play) -> PlayLog:
         timeframe=p.timeframe.value, entry=p.entry, stop=p.stop, targets=p.targets,
         reward_risk=p.reward_risk, confidence=p.confidence, score=p.score,
         suggested_qty=p.suggested_qty, dollar_risk=p.dollar_risk, notional=p.notional,
-        rationale=p.rationale[:400], explanation=p.explanation, evidence=p.evidence,
+        rationale=p.rationale[:400], explanation=p.explanation,
+        # the hold goes with it: a play rebuilt from this row keeps the window its time stop runs on
+        evidence={**(p.evidence or {}), "expected_hold": [float(p.expected_hold_typical or 0.0),
+                                                          float(p.expected_hold_max or 0.0)]},
         tags=p.tags, noise=list(p.noise), confirmations=int(p.confirmations),
         probability=float(getattr(p, "probability", 0.5) or 0.0),
         status=p.status.value if hasattr(p.status, "value") else str(p.status),

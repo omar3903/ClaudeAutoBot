@@ -435,3 +435,29 @@ def test_the_replay_prepares_its_long_history_first_and_runs_on_without_it_if_th
         runner.wait(60)
         assert runner.state([], 1)["ran_at"]
     assert calls == ["prepared"]
+
+
+def test_the_replay_times_out_on_the_hold_live_gives_the_play(monkeypatch):
+    """Live, a reversal setup's hold comes from its price's half-life (scanner/evaluator.py); the replay
+    applies the same helper, so its time stop runs on the same window."""
+    from tos_bot.research import replay as replay_module
+
+    def ten_minutes(play, ctx, style):
+        play.expected_hold_typical, play.expected_hold_max = 5.0, 10.0
+
+    monkeypatch.setattr(replay_module, "hold_from_half_life", ten_minutes)
+    [t] = replay_intraday([_LongHeld()], "RPL", _session(FLAT + [(100.0, 100.3, 99.6, 100.1)] * 12), _daily(), EXACT, QUIET)
+    held = (pd.Timestamp(t.exited_at) - pd.Timestamp(t.entered_at)).total_seconds() / 60.0
+    assert t.exit_reason == "time-stop" and held == 10.0                      # not the class's half hour
+
+
+def test_a_play_not_taken_is_followed_with_the_time_stop_too():
+    from tos_bot.core.models import Play
+    from tos_bot.research.replay import shadow_trade
+
+    play = Play(symbol="RPL", side=Side.LONG, strategy="s", kind=StrategyKind.TECHNICAL, timeframe=Timeframe.INTRADAY,
+                entry=100.0, stop=99.0, targets=[102.0], expected_hold_typical=15.0, expected_hold_max=30.0)
+    session = _session(FLAT + [(100.0, 100.3, 99.6, 100.1)] * 12)
+    t = shadow_trade(play, session, session.index[5], EXACT)
+    assert t is not None and t.exit_reason == "time-stop"
+
