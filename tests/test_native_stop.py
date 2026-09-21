@@ -282,3 +282,27 @@ def test_stopping_a_quit_calls_off_the_exits_it_sent_and_the_stops_go_back():
     ex.sync_open_orders()                                                       # the exit is gone...
     assert ex.pending_exit_trade_ids() == set() and len(ex.protective_stops()) == 1   # ...and a stop rests again
     assert [s.quantity for s in broker.stops()] == [10, 10]
+
+
+def test_a_position_without_a_stop_at_the_broker_is_reported_and_reported_again():
+    broker, _, ex, heard = _setup(positions={})                                 # the broker shows no shares
+    ex.STOP_RETRY_S = 0.0
+    ex.sync_open_orders()
+    assert broker.stops() == [] and ex.unprotected() == ["t1"]
+    assert "stop.missing" not in [t for t, _ in heard]                         # not straight away
+    ex._bare_since["t1"] -= ex.UNPROTECTED_WARN_S
+    ex.sync_open_orders()
+    missing = [p for t, p in heard if t == "stop.missing"]
+    assert len(missing) == 1 and missing[0]["symbol"] == "AAA" and "no stop placed" in missing[0]["reason"]
+    ex.sync_open_orders()
+    assert len([t for t, _ in heard if t == "stop.missing"]) == 1                # not on every pass
+    ex._bare_warned["t1"] -= ex.UNPROTECTED_REPEAT_S
+    ex.sync_open_orders()
+    assert len([t for t, _ in heard if t == "stop.missing"]) == 2                # but again a few minutes on
+    assert broker.orders == []                                                 # and it never places anything itself
+
+    broker.positions["AAA"] = 10                                               # the shares show up
+    ex._stop_retry.clear()
+    ex.sync_open_orders()
+    assert len(broker.stops()) == 1 and ex.unprotected() == []
+

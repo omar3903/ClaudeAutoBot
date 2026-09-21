@@ -129,6 +129,9 @@ class Fill:
     price: float
     ts: datetime = field(default_factory=_utcnow)
     commission: float = 0.0
+    #: the order's tag (IBKR's orderRef) - ``exit:<trade>`` for an exit the app sent, so a fill can be
+    #: put down to the trade it belongs to; empty when the broker doesn't say
+    tag: str = ""
 
 
 @dataclass

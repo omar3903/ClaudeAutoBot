@@ -181,6 +181,11 @@ class ExitManagerCfg(_Model):
     trail_start_r: float = 2.0            # begin trailing past this R  (0 = off)
     trail_lock_ratio: float = 0.5
     flatten_intraday_before_close_min: int = 10
+    intraday_time_stop: bool = True       # a day trade past its setup's own window (the play's longest expected
+                                          # hold) that isn't working - its stop not yet at break-even - is closed
+                                          # then, not left to the close: its reason to be held has run out, and it
+                                          # holds a slot and capital a fresh setup could use. One that is working
+                                          # keeps its trailing stop until the flatten. The replay does the same
     max_swing_hold_days: int = 10
     scale_out_pct: float = 50.0           # at the first target of a play with two, take this % off (0 = exit all there)
     scale_out_lock_r: float = 0.0         # ...and move the stop to the entry plus this R (Aziz: break-even)

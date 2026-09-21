@@ -687,7 +687,8 @@ class IbkrBroker(BrokerAdapter):
                             symbol=contract.symbol,
                             side=Side.LONG if str(getattr(execution, "side", "")).upper().startswith("B") else Side.SHORT,
                             quantity=shares, price=float(execution.price), ts=when,
-                            commission=commission if commission == commission else 0.0))
+                            commission=commission if commission == commission else 0.0,
+                            tag=str(getattr(execution, "orderRef", "") or "")))
         return sorted(out, key=lambda f: f.ts)
 
     def contract_details_many(self, symbols: Sequence[str], timeout: float = 20.0) -> Dict[str, Optional[dict]]:

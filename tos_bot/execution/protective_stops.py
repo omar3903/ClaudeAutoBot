@@ -96,6 +96,9 @@ class ProtectiveStops:
     STAND_DOWN_S, STAND_DOWN_POLL_S = 3.0, 0.25
     #: seconds before a stop that couldn't be placed, or was lost, is tried again
     STOP_RETRY_S = 30.0
+    #: a position with no stop at the broker for this long is reported, and again every UNPROTECTED_REPEAT_S
+    UNPROTECTED_WARN_S = 90.0
+    UNPROTECTED_REPEAT_S = 300.0
     #: ...and when the broker's share count is only catching up with a fill that arrived in pieces
     SHARES_RETRY_S = 5.0
     #: seconds before a target that couldn't be placed, or was lost, is tried again
@@ -109,6 +112,8 @@ class ProtectiveStops:
         self._stop_retry: Dict[str, float] = {}
         self._target_retry: Dict[str, float] = {}
         self._stop_notes: Dict[str, str] = {}
+        self._bare_since: Dict[str, float] = {}      # when each position was first seen with no stop at the broker
+        self._bare_warned: Dict[str, float] = {}
         self._plain: set = set()          # trades whose one-cancels-all pair the broker refused: a stop alone
         self._group_seq = getattr(self, "_group_seq", 0)
         self._swept_at = 0.0
@@ -197,10 +202,41 @@ class ProtectiveStops:
                 continue
             if abs(st.qty - qty) > 1e-9 or (abs(st.price - price) >= tick(price) and now - st.moved_at >= self.STOP_MOVE_S):
                 self._move_stop(st, qty, price)
+        self._watch_unprotected(trades, exiting, now)
         if now - self._swept_at >= self.SWEEP_S:
             self._swept_at = now
             # a list read before this pass placed or cancelled anything is stale: read the broker's orders again
             self._sweep_stops(open_ids, working if working is not None and not placed else self._working_at_broker())
+
+    def _watch_unprotected(self, trades: List[Dict[str, Any]], exiting: set, now: float) -> None:
+        """Say so - in the log and on the dashboard, and again every few minutes - when a position has
+        had no stop at the broker for a while. It places nothing: the reason is always one where an
+        order would be unsafe or impossible (the broker shows no shares, or fewer than the record; its
+        orders couldn't be read; it refused the stop), and while the app runs its exit manager still
+        watches the price and sends the exit itself. What it can't do is protect it while the app is off."""
+        bare = set()
+        for t in trades:
+            tid = t["id"]
+            if tid in exiting or tid in self._stops or not abs(float(t.get("quantity") or 0.0)) or not self._record_stop(t):
+                continue
+            bare.add(tid)
+            since = self._bare_since.setdefault(tid, now)
+            if (self._broker_resyncing() or now - since < self.UNPROTECTED_WARN_S
+                    or now - self._bare_warned.get(tid, float("-inf")) < self.UNPROTECTED_REPEAT_S):
+                continue
+            self._bare_warned[tid] = now
+            minutes = (now - since) / 60.0
+            reason = self._stop_notes.get(tid) or f"{t['symbol']}: the broker hasn't taken one yet"
+            log.warning("NO STOP AT THE BROKER  %s has had none for %.1f min - %s. The app still watches the price "
+                        "and exits it itself while it runs", t["symbol"], minutes, reason)
+            self.bus.publish("stop.missing", trade_id=tid, symbol=t["symbol"], minutes=round(minutes, 1), reason=reason)
+        for book in (self._bare_since, self._bare_warned):
+            for tid in [k for k in book if k not in bare]:
+                del book[tid]
+
+    def unprotected(self) -> List[str]:
+        """The open trades with no stop at the broker right now (after the first pass has looked)."""
+        return sorted(self._bare_since)
 
     def _pair_is_wrong(self, t: Dict[str, Any], now: float) -> bool:
         """Whether what rests for a trade has the wrong *shape* - something a price move can't fix:

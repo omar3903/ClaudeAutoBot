@@ -697,6 +697,24 @@ the target to the broker. A plain stop left by an earlier version is stood down 
 replaced by the pair. If IBKR refuses the pair, the trade gets a stop alone and the
 app works its target itself, as before.
 
+**A position without a stop at the broker is never silent.** A stop is only ever rested for shares
+the broker shows - triggered, one for shares it doesn't hold would open a position the other way - so
+during a fill landing in pieces it waits a few seconds, and if the broker's count and the record
+disagree (part sold by hand in TWS, say) it waits for them to agree. Meanwhile the app's exit
+manager still watches the price and sends the exit itself; what nothing covers is the app being off.
+So a position with no stop at the broker is marked **no stop at the broker yet** in amber on the
+Positions tab, and once that has lasted 90 seconds the log and the dashboard say so, with the reason,
+and again every five minutes until it's fixed.
+
+**An exit called off after filling in part is booked.** Quitting and then pressing *Stop quitting*, or
+cancelling an exit, can call off an exit order that has already sold part of the position. The app books
+that part when the broker reports the cancelled order - unless it stops first. So the position check also
+books it from the broker's executions: when a record holds more shares than the broker, the same way round,
+the fills tagged with that trade's own exit orders (`exit:<trade>`) are booked at their prices - never more
+than the record is over by, never while an exit for it is still working, only for a symbol with one record.
+The counts then agree, and the stop and target go back at the broker for what's left. A difference its own
+fills don't explain (shares sold by hand in TWS) is left alone and reported, as before.
+
 The Open orders panel lists them as **stop** and **target** with their trade. The
 simulator keeps its own bracket and gets no such orders.
 
@@ -710,6 +728,7 @@ held on the active platform — **entries need your click, exits never do**:
 | **take half off at the first target**, stop to break-even, the rest runs to the second target (Aziz) | 50 % | `scale_out_pct`, `scale_out_lock_r` (plays with one target exit whole) |
 | tighten the stop to **lock a small profit** once green | at +1.3 R, lock +0.3 R | `breakeven_at_r`, `breakeven_lock_r` |
 | **trail** the stop, keeping a fraction of the open R | from +2.0 R, lock 50% | `trail_start_r`, `trail_lock_ratio` |
+| **close a day trade that isn't working** once its setup's window has passed | on | `intraday_time_stop` |
 | **flatten day trades** before the (holiday-aware) close | 10 min before | `flatten_intraday_before_close_min` |
 | force-close **stale swings** | 10 days | `max_swing_hold_days` |
 
@@ -719,7 +738,15 @@ exit** toggle in the blotter if you want to hand-manage it.
 
 Every strategy also declares how long its trade *should* take. The blotter shows
 an **Age / Expected** bar per position (green → amber **aging** → red **⏰
-overdue**). This is **purely informational**: it never moves the stop.
+overdue**). For a swing trade this is informational. **A day trade that reaches
+overdue - its setup's longest expected hold, 35 minutes to six hours depending on
+the setup - and isn't working is closed then** (`intraday_time_stop`, exit reason
+`time-stop`): Aziz's point that a day trade which hasn't moved in its time is
+wrong, and a stalled one otherwise sits all afternoon holding a slot and capital a
+fresh setup could use. "Working" means its stop has reached break-even or better
+(after +1.3R, or once the first target has taken half off): it can no longer lose,
+and it keeps its trail until the flatten. The replay applies the same rule, so the
+records the proof rule reads are for the exits actually used.
 
 ---
 

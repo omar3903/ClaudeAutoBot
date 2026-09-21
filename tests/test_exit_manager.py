@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from tos_bot.core.models import Quote
-from tos_bot.execution.exit_manager import ExitManager
+from tos_bot.execution.exit_manager import ExitManager, stop_locked
 
 
 class FakeRepo:
@@ -175,3 +175,54 @@ def test_the_position_exits_whole_without_a_second_target_or_with_the_scale_out_
     em, ex = _mk(FakeRepo([_trade(target2_price=120.0, initial_quantity=1, quantity=1)]), price=110.5, cfg=cfg)
     em.run_once()                                                   # a single share can't be halved
     assert ex.closed == [("t1", "target")] and ex.reduced == []
+
+
+def _day_cfg(**over):
+    base = dict(enabled=True, breakeven_at_r=1.0, breakeven_buffer_bps=5, trail_start_r=1.5, trail_lock_ratio=0.5,
+                flatten_intraday_before_close_min=0, max_swing_hold_days=0, intraday_time_stop=True)
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_a_day_trade_past_its_window_that_isnt_working_is_closed():
+    events = []
+    repo = FakeRepo([_trade(timeframe="INTRADAY", time_status="overdue", overdue_notified=False, held_label="120m")])
+    ex = FakeExecutor(repo)
+    em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=100.3, ask=100.3, last=100.3),
+                     cfg=_day_cfg(), bus=SimpleNamespace(publish=lambda topic, **k: events.append((topic, k))))
+    em.run_once()
+    assert ex.closed == [("t1", "time-stop")]
+    [(_, overdue)] = [e for e in events if e[0] == "trade.overdue"]
+    assert "being closed" in overdue["msg"]
+
+
+def test_a_working_day_trade_a_swing_trade_or_the_rule_switched_off_are_left_to_run():
+    # working: its stop is at break-even or better, so it keeps its trail until the flatten
+    working = FakeRepo([_trade(timeframe="INTRADAY", time_status="overdue", stop_price=100.2)])
+    em, ex = _mk(working, price=100.8, cfg=_day_cfg())
+    em.run_once()
+    assert ex.closed == []
+    short_working = FakeRepo([_trade(side="SHORT", timeframe="INTRADAY", time_status="overdue", stop_price=99.9,
+                                     initial_stop_price=102.0, target_price=90.0, initial_target_price=90.0)])
+    em, ex = _mk(short_working, price=99.5, cfg=_day_cfg())
+    em.run_once()
+    assert ex.closed == []
+    # a swing trade past its window is the swing time-stop's business, not this one
+    swing = FakeRepo([_trade(timeframe="SWING", time_status="overdue")])
+    em, ex = _mk(swing, price=100.3, cfg=_day_cfg())
+    em.run_once()
+    assert ex.closed == []
+    # switched off, or a trade exited by hand: overdue only notifies
+    for cfg, managed in ((_day_cfg(intraday_time_stop=False), True), (_day_cfg(), False)):
+        repo = FakeRepo([_trade(timeframe="INTRADAY", time_status="overdue", managed_exit=managed)])
+        em, ex = _mk(repo, price=100.3, cfg=cfg)
+        em.run_once()
+        assert ex.closed == []
+
+
+def test_a_stop_at_break_even_or_better_is_locked_either_way():
+    assert stop_locked("LONG", 100.0, 100.0) and stop_locked("LONG", 100.5, 100.0)
+    assert not stop_locked("LONG", 99.5, 100.0) and not stop_locked("LONG", None, 100.0)
+    assert stop_locked("SHORT", 100.0, 100.0) and stop_locked("SHORT", 99.5, 100.0)
+    assert not stop_locked("SHORT", 100.5, 100.0)
+

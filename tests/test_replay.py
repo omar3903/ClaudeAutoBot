@@ -108,8 +108,43 @@ def test_a_stop_hit_books_minus_one_r_and_a_bar_touching_both_counts_as_the_stop
 
 
 def test_an_open_day_trade_is_flattened_before_the_close():
-    [t] = _replay([(100.0, 100.1, 99.9, 100.0)] + [(100.5, 100.6, 100.4, 100.5)] * 3)
+    import dataclasses
+
+    no_time_stop = dataclasses.replace(EXACT, intraday_time_stop=False)      # the flatten alone
+    [t] = replay_intraday([_LongAtBar()], "RPL", _session(FLAT + [(100.0, 100.1, 99.9, 100.0)]
+                                                          + [(100.5, 100.6, 100.4, 100.5)] * 3),
+                          _daily(), no_time_stop, QUIET)
     assert t.exit_reason == "eod-flatten" and t.r == 0.5 and t.exited_at.startswith(f"{DAY}T15:50")
+
+
+class _LongHeld(_LongAtBar):
+    """The same play, stated to take up to half an hour: six 5-minute bars."""
+
+    key = "long_held"
+    expected_hold = (15.0, 30.0)
+
+
+def test_a_day_trade_that_isnt_working_is_closed_once_its_window_has_passed():
+    # the signal at 100 (bar 5), filled at bar 6's open; then it drifts sideways, never near its target
+    drift = [(100.0, 100.3, 99.6, 100.1)] * 12
+    [t] = replay_intraday([_LongHeld()], "RPL", _session(FLAT + drift), _daily(), EXACT, QUIET)
+    assert t.exit_reason == "time-stop"
+    held = (pd.Timestamp(t.exited_at) - pd.Timestamp(t.entered_at)).total_seconds() / 60.0
+    assert held == 30.0 and t.r == pytest.approx(0.1)                        # its half hour, at the bar's close
+
+
+def test_a_day_trade_that_is_working_keeps_its_trail_past_its_window():
+    import dataclasses
+
+    # +1.5R early moves its stop past the entry (break-even at 1R); then it idles well past its half hour
+    working = [(100.0, 101.5, 100.0, 101.2)] + [(101.2, 101.4, 101.1, 101.2)] * 20
+    settings = dataclasses.replace(EXACT, breakeven_at_r=1.0, breakeven_lock_r=0.2)
+    [t] = replay_intraday([_LongHeld()], "RPL", _session(FLAT + working), _daily(), settings, QUIET)
+    assert t.exit_reason == "eod-flatten"                                     # held on: it can't lose any more
+    off = dataclasses.replace(EXACT, intraday_time_stop=False)
+    [idle] = replay_intraday([_LongHeld()], "RPL", _session(FLAT + [(100.0, 100.3, 99.6, 100.1)] * 12), _daily(),
+                             off, QUIET)
+    assert idle.exit_reason == "eod-flatten"                                  # switched off: the flatten as before
 
 
 def _spy(day_prices):
@@ -400,3 +435,29 @@ def test_the_replay_prepares_its_long_history_first_and_runs_on_without_it_if_th
         runner.wait(60)
         assert runner.state([], 1)["ran_at"]
     assert calls == ["prepared"]
+
+
+def test_the_replay_times_out_on_the_hold_live_gives_the_play(monkeypatch):
+    """Live, a reversal setup's hold comes from its price's half-life (scanner/evaluator.py); the replay
+    applies the same helper, so its time stop runs on the same window."""
+    from tos_bot.research import replay as replay_module
+
+    def ten_minutes(play, ctx, style):
+        play.expected_hold_typical, play.expected_hold_max = 5.0, 10.0
+
+    monkeypatch.setattr(replay_module, "hold_from_half_life", ten_minutes)
+    [t] = replay_intraday([_LongHeld()], "RPL", _session(FLAT + [(100.0, 100.3, 99.6, 100.1)] * 12), _daily(), EXACT, QUIET)
+    held = (pd.Timestamp(t.exited_at) - pd.Timestamp(t.entered_at)).total_seconds() / 60.0
+    assert t.exit_reason == "time-stop" and held == 10.0                      # not the class's half hour
+
+
+def test_a_play_not_taken_is_followed_with_the_time_stop_too():
+    from tos_bot.core.models import Play
+    from tos_bot.research.replay import shadow_trade
+
+    play = Play(symbol="RPL", side=Side.LONG, strategy="s", kind=StrategyKind.TECHNICAL, timeframe=Timeframe.INTRADAY,
+                entry=100.0, stop=99.0, targets=[102.0], expected_hold_typical=15.0, expected_hold_max=30.0)
+    session = _session(FLAT + [(100.0, 100.3, 99.6, 100.1)] * 12)
+    t = shadow_trade(play, session, session.index[5], EXACT)
+    assert t is not None and t.exit_reason == "time-stop"
+

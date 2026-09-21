@@ -216,7 +216,17 @@ def _play(row: Mapping[str, Any]) -> Optional[Play]:
         return None
     play.noise = list(row.get("noise") or [])
     play.confirmations = int(row.get("confirmations") or 1)
+    play.expected_hold_typical, play.expected_hold_max = held_for(row)
     return play if play.targets else None
+
+
+def held_for(row: Mapping[str, Any]) -> tuple:
+    """A play-log row's (typical, longest) hold - (0, 0) for a row written before it was kept."""
+    hold = (row.get("evidence") or {}).get("expected_hold") or (0.0, 0.0)
+    try:
+        return float(hold[0] or 0.0), float(hold[1] or 0.0)
+    except (TypeError, ValueError, IndexError):
+        return 0.0, 0.0
 
 
 def _seen_at(row: Mapping[str, Any]) -> Optional[pd.Timestamp]:

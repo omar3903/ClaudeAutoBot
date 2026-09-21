@@ -332,7 +332,7 @@ def test_how_long_each_order_took_to_fill_is_kept(repo):
                 timeframe=Timeframe.INTRADAY, entry=100.0, stop=99.0, targets=[102.0])
     repo.record_play(play)
     sent = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=6)
-    tid = repo.open_trade(play, 100.0, 10, "paper", submitted_at=sent)
+    tid = repo.open_trade(play, 100.0, 10, "ibkr-paper", submitted_at=sent)
     opened = repo.trade_record(tid)["trade"]
     assert 5.5 <= opened["entry_latency_s"] <= 8.0 and opened["submitted_at"]
 
@@ -343,10 +343,18 @@ def test_how_long_each_order_took_to_fill_is_kept(repo):
     play2 = Play(symbol="RST", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
                  timeframe=Timeframe.SWING, entry=10.0, stop=9.0, targets=[12.0])
     repo.record_play(play2)
-    rid = repo.open_trade(play2, 10.0, 5, "paper")                      # no send time known
+    rid = repo.open_trade(play2, 10.0, 5, "ibkr-paper")                 # no send time known
     repo.close_trade(rid, 12.0, exit_reason="target")                   # a target that rested at the broker
     rested = repo.trade_record(rid)["trade"]
     assert rested["entry_latency_s"] is None and rested["exit_latency_s"] is None
+
+    play3 = Play(symbol="SIM", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                 timeframe=Timeframe.INTRADAY, entry=10.0, stop=9.0, targets=[12.0])
+    repo.record_play(play3)
+    sid = repo.open_trade(play3, 10.0, 5, "paper", submitted_at=sent)         # the in-app simulator
+    repo.close_trade(sid, 12.0, exit_reason="target", submitted_at=sent)
+    simulated = repo.trade_record(sid)["trade"]
+    assert simulated["entry_latency_s"] is None and simulated["exit_latency_s"] is None   # it fills at once
 
 
 def test_an_exit_the_app_sends_records_how_long_the_broker_took(repo):

@@ -122,6 +122,15 @@ def add_readings(p: Play, ctx: StrategyContext, style: str, noise: Optional[Nois
     upcoming = next_report(ctx.earnings, ctx.now)
     if upcoming is not None:
         p.evidence["next_earnings"] = {**upcoming, "sessions": sessions_until(upcoming, ctx.now)}
+    hold_from_half_life(p, ctx, style)
+
+
+def hold_from_half_life(p: Play, ctx: StrategyContext, style: str) -> None:
+    """A reversal setup is expected to take about as long as its price takes to halve a deviation
+    from the mean (Chan ch. 2): its hold is set from the half-life when the price reads mean
+    reverting. The replay calls it too, so the day-trade time stop there uses the window live uses."""
+    intraday = p.timeframe is Timeframe.INTRADAY
+    character = ctx.price_character(intraday)
     life = (character or {}).get("half_life_bars")
     if style != "reversal" or not life or character["character"] != "mean reverting":
         return                          # a random walk's half-life is only noise in the estimate

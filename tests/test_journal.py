@@ -168,3 +168,21 @@ def test_the_repository_keeps_what_the_review_needs(repo):
     assert repo.get_review(today)["lessons"] == ["y"]
     assert any(r["session"] == today.isoformat() and (r["trades"], r["opened"], r["open_r"]) == (1, 2, 0.7)
                for r in repo.list_reviews())
+
+
+def test_the_play_log_keeps_the_hold_so_a_play_rebuilt_from_it_has_its_window(repo):
+    from tos_bot.execution.executor import _play_from_row
+    from tos_bot.research.journal import _play, held_for
+
+    play = Play(symbol="HLD", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=100.0, stop=99.0, targets=[102.0],
+                expected_hold_typical=40.0, expected_hold_max=90.0)
+    repo.record_play(play)
+    row = repo.get_play(play.id)
+    assert held_for(row) == (40.0, 90.0)
+    rebuilt = _play(row)                                                       # a shadow, in the daily review
+    assert (rebuilt.expected_hold_typical, rebuilt.expected_hold_max) == (40.0, 90.0)
+    adopted = _play_from_row(row)                                              # an entry taken back after a restart
+    assert (adopted.expected_hold_typical, adopted.expected_hold_max) == (40.0, 90.0)
+    assert held_for({"evidence": {}}) == (0.0, 0.0) and held_for({"evidence": {"expected_hold": "x"}}) == (0.0, 0.0)
+
