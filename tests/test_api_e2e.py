@@ -66,6 +66,20 @@ def test_scan_watchlist_approve_close(client):
         chart = client.get(f"/api/plays/{plays[0]['id']}/chart").json()
         assert chart["ok"] and chart["candles"] and {r["key"] for r in chart["routes"]} >= {"stop"}
     assert client.get("/api/plays/missing/chart").json()["ok"] is False
+    # the listing, like the board's push, carries what the table shows; the hover loads a play whole
+    assert plays and all("explanation" not in p and "spark" not in p["evidence"] for p in plays)
+    whole = client.get(f"/api/plays/{plays[0]['id']}").json()
+    assert whole["id"] == plays[0]["id"] and whole["explanation"] and "autopilot" in whole and "record" in whole
+    gone = client.get("/api/plays/missing")
+    assert gone.status_code == 404 and "expired" in gone.json()["detail"]
+    assert "content-encoding" not in gone.headers                        # a small answer isn't worth compressing
+    listing = client.get("/api/plays", params={"full": 1}, headers={"Accept-Encoding": "gzip"})
+    assert listing.headers["content-encoding"] == "gzip" and listing.json()["plays"][0]["explanation"]
+    with client.websocket_connect("/ws") as ws:
+        assert ws.receive_json()["topic"] == "hello"
+        pushed = ws.receive_json()
+    assert pushed["topic"] == "plays.updated" and pushed["payload"]["plays"]
+    assert all("explanation" not in p for p in pushed["payload"]["plays"])
     for play in plays:
         assessed = client.post(f"/api/plays/{play['id']}/assess").json()
         if not assessed.get("can_execute"):

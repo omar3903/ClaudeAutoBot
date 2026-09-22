@@ -1137,6 +1137,53 @@ def test_each_play_carries_its_setups_replay_record_read_once_for_the_board(engi
     assert len(engine.current_plays()) == 4 and sorted(reads) == ["setup_a", "setup_b", "setup_c"]
 
 
+#: what the dashboard reads of a play from the board's push: the plays table (plays.js), the notes, the orders,
+#: the chart, the Autopilot strip and the event handlers
+DASHBOARD_READS = {"id", "symbol", "sector", "side", "strategy", "timeframe", "entry", "stop", "targets", "reward_risk",
+                   "suggested_qty", "dollar_risk", "score", "status", "trade_id", "noise", "extended_hours_ok",
+                   "confirmations", "rationale", "last_price", "last_at", "autopilot", "record", "evidence"}
+
+
+def _explained_play(symbol, strategy="setup_a"):
+    p = _play(symbol, strategy=strategy)
+    p.rationale, p.explanation, p.invalidation = "one line", "THE EDGE ... " * 200, "a close below 95.00"
+    p.evidence = {"spark": [100.0 + i / 10 for i in range(60)], "signal_nudge": 0.02, "signal_reasons": "a filing",
+                  "expected_r": 0.6, "bar_at": "2026-01-05T15:30:00+00:00", "vol_forecast": {"vol": 0.02}}
+    return p
+
+
+def test_the_board_push_sends_only_what_the_dashboard_reads_of_a_play(engine, monkeypatch):
+    sent = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **payload: sent.append(payload["plays"])
+                        if topic == "plays.updated" else None)
+    engine.board.replace([_explained_play("AAA"), _explained_play("BBB", strategy="setup_b")])
+    engine._publish_plays()
+    rows = sent[-1]
+    assert len(rows) == 2
+    for row in rows:
+        assert DASHBOARD_READS <= set(row)
+        assert not {"explanation", "invalidation", "tags", "probability", "notional"} & set(row)
+        assert row["evidence"] == {"signal_nudge": 0.02, "signal_reasons": "a filing", "expected_r": 0.6}
+        # Autopilot's verdict and the replay record go whole
+        assert set(row["autopilot"]) == {"eligible", "why_not", "waiting", "acted", "skipped", "reason"}
+        assert row["autopilot"]["why_not"] == "Autopilot is off" and row["record"]["why"]
+    assert engine.current_plays() == rows                            # /api/plays and the socket's hello: the same rows
+    whole = engine.current_plays(full=True)                          # ?full=1
+    assert whole[0]["explanation"].startswith("THE EDGE") and len(whole[0]["evidence"]["spark"]) == 60
+    assert len(str(rows)) * 4 < len(str(whole))
+
+
+def test_one_play_is_served_whole_for_its_hover_until_it_leaves_the_board(engine):
+    p = _explained_play("AAA")
+    engine.board.replace([p])
+    row = engine.play_row(p.id)                                      # GET /api/plays/{id}
+    assert row["explanation"].startswith("THE EDGE") and row["evidence"]["spark"] and row["invalidation"]
+    assert row["autopilot"]["why_not"] and row["record"]["trades"] == 0
+    assert engine.play_row("play_gone") is None
+    engine.board.clear()
+    assert engine.play_row(p.id) is None                             # the route answers 404
+
+
 def test_refresh_prices_the_plays_and_the_positions_and_sends_the_plays_out_again(engine, monkeypatch):
     p = _play("MSFT")
     engine.board.replace([p])

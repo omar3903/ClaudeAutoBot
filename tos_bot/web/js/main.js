@@ -2,8 +2,7 @@
    Whatever you change here (filters, strategies, scan settings, routing,
    Autopilot) is saved on the server, applied to the bot straight away and
    pushed to every open tab. */
-import { api } from "./util.js";
-import { S, emit, refreshState } from "./state.js";
+import { refreshState } from "./state.js";
 import { initUi } from "./ui.js";
 import { initTooltips } from "./tooltips.js";
 import { initTopbar } from "./topbar.js";
@@ -26,8 +25,7 @@ import { connect } from "./events.js";
 
 refreshState();
 loadStrategies().catch(() => { /* names fall back to their keys */ });
-api("/api/plays").then(d => { S.plays = d.plays || []; emit("plays"); }).catch(() => { });
 loadOpen();
 loadOrders();
-connect();
+connect();                       // the socket sends the plays as it opens
 setInterval(refreshState, 15000);

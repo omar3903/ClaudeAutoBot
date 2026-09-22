@@ -1,5 +1,5 @@
 /* The plays table, and the detail panel: why, the numbers, and the order. */
-import { $, $$, escapeHtml, num, pct, pretty, post, sectorTag, sideBadge, tfLabel, usd } from "./util.js";
+import { $, $$, api, escapeHtml, num, pct, pretty, post, sectorTag, sideBadge, tfLabel, usd } from "./util.js";
 import { S, on } from "./state.js";
 import { openModal, toast } from "./ui.js";
 import { hideTip, showTipAt } from "./tooltips.js";
@@ -34,6 +34,11 @@ function emptyText() {
     : "No plays yet — hit <b>Scan now</b>.";
 }
 
+/* The rows on screen, by play id, each with its signature: its class and cells as last drawn. A push redraws
+   only the rows whose signature changed and moves rows only when the order did, so a hover, the selected row
+   and a click in flight survive a push that didn't touch them. */
+const shown = new Map();
+
 export function renderPlays() {
   const rows = visiblePlays();
   $("#plays-count").textContent = rows.length ? `(${rows.length})` : "";
@@ -41,9 +46,22 @@ export function renderPlays() {
     ? `All ${S.plays.length} plays are hidden by the view options above — untick <b>Hide noise</b> or <b>Hide executed</b> to see them.`
     : emptyText();
   $("#plays-empty").classList.toggle("hidden", rows.length > 0);
-  const body = $("#plays-body");
-  body.innerHTML = "";
-  for (const p of rows) body.appendChild(playRow(p));
+  const body = $("#plays-body"), ids = new Set(rows.map(p => p.id));
+  for (const [id, r] of shown) if (!ids.has(id)) { r.tr.remove(); shown.delete(id); }
+  rows.forEach((p, i) => {
+    const { cls, html } = playRow(p), sig = `${cls}|${html}`;
+    let r = shown.get(p.id);
+    if (!r || r.sig !== sig) {
+      const tr = document.createElement("tr");
+      tr.dataset.id = p.id;
+      tr.className = cls;
+      tr.innerHTML = html;
+      if (r) r.tr.replaceWith(tr);
+      shown.set(p.id, r = { tr, sig });
+    }
+    r.tr.classList.toggle("selected", p.id === S.selected);
+    if (body.children[i] !== r.tr) body.insertBefore(r.tr, body.children[i] || null);
+  });
 }
 
 /** A play whose score the insider or news signals moved: click for its stock on the Signals page. */
@@ -128,16 +146,13 @@ function switchOff(p) {
   });
 }
 
+/** A play's row: its class (the selected row's is added by renderPlays) and its cells. */
 function playRow(p) {
-  const tr = document.createElement("tr");
   const done = isDone(p), ap = p.autopilot || {};
   // it tried the play and the engine's assessment or the order was refused: no bar, and a faded robot saying why
   const skipped = !!ap.skipped && !done;
-  tr.dataset.id = p.id;
-  tr.classList.toggle("selected", p.id === S.selected);
-  tr.classList.toggle("done", done);
-  tr.classList.toggle("ap-eligible", !!ap.eligible && !ap.waiting && !skipped && !done);
-  tr.classList.toggle("ap-waiting", !!ap.eligible && !!ap.waiting && !skipped && !done);
+  const cls = [done && "done", ap.eligible && !ap.waiting && !skipped && !done && "ap-eligible",
+    ap.eligible && ap.waiting && !skipped && !done && "ap-waiting"].filter(Boolean).join(" ");
   // a play it won't take gets a faded robot too, only while Autopilot is on - off, every row would have one
   const refused = (!ap.eligible && !!ap.why_not || skipped) && !!(S.state.autopilot || {}).effective;
   const apMark = ap.acted && !skipped
@@ -148,7 +163,7 @@ function playRow(p) {
   const last = done
     ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
     : `<span class="info-dot">i</span>`;
-  tr.innerHTML = `
+  const html = `
     <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${orderMark(p)}${signalMark(p)}${apMark}${p.extended_hours_ok ? '<span class="ext" data-term="ext">ext</span>' : ""}${isNoisy(p) && !done ? `<span class="badge warn" data-term="noise" title="${escapeHtml(p.noise.map(noiseLabel).join(", "))}">noisy</span>` : ""}</td>
     <td>${sideBadge(p.side)}</td>
     <td>${stratLabel(p.strategy)} ${recordChip(p.record)}</td>
@@ -162,19 +177,51 @@ function playRow(p) {
     <td class="num">${usd(p.dollar_risk)}</td>
     <td class="num"><span class="score-bar"><i style="width:${Math.min(100, (p.score || 0) * 100)}%"></i></span></td>
     <td class="row-tools"><button class="chart-btn" title="Chart, and the ways this trade can end" aria-label="Chart">📈</button>${last}</td>`;
-  tr.addEventListener("click", e => {
-    if (e.target.closest(".chart-btn")) openChart(p);
-    else if (e.target.closest(".order-mark")) showTab("orders");
-    else if (e.target.closest(".sig-mark")) openSignals(p.symbol);
-    else selectPlay(p.id);
-  });
-  tr.addEventListener("mousemove", e => {
-    if (e.target.closest("[data-term]")) return;      // the term's own explanation is showing
-    showTipAt(e.clientX, e.clientY, ((S.strategies[p.strategy] || {}).title || pretty(p.strategy)).toUpperCase(),
-      (p.explanation || p.rationale || "").trim());
-  });
-  tr.addEventListener("mouseleave", hideTip);
-  return tr;
+  return { cls, html };
+}
+
+/* A row's hover shows the play's full explanation. The board's push leaves that out - it's most of a play's
+   size - so it's fetched whole (GET /api/plays/{id}) once the pointer has rested on the row, and kept while
+   the play's entry, stop, targets and rationale stay the same. Until it comes, or once the play has left the
+   board, the one-line rationale shows. */
+const EXPLAIN_WAIT_MS = 250;
+const explained = new Map();          // play id -> {stamp, text}
+let hovered = null, hoverTimer = null, hoverAt = [0, 0];
+const stamp = p => [p.entry, p.stop, (p.targets || []).join(","), p.rationale].join("|");
+const rowTitle = p => ((S.strategies[p.strategy] || {}).title || pretty(p.strategy)).toUpperCase();
+
+function rowTip(p) {
+  const known = explained.get(p.id);
+  return (p.explanation || (known && known.stamp === stamp(p) ? known.text : "") || p.rationale || "").trim();
+}
+
+function hoverRow(p, x, y) {
+  hoverAt = [x, y];
+  showTipAt(x, y, rowTitle(p), rowTip(p));
+  if (hovered === p.id) return;                      // already fetched, or on its way, for this visit
+  hovered = p.id;
+  clearTimeout(hoverTimer);
+  const known = explained.get(p.id);
+  if (!p.explanation && !(known && known.stamp === stamp(p))) hoverTimer = setTimeout(() => explain(p.id), EXPLAIN_WAIT_MS);
+}
+
+async function explain(id) {
+  let row;
+  // the app isn't reachable: the rationale stands, and the next visit asks again
+  try { row = await api(`/api/plays/${encodeURIComponent(id)}`); } catch { return; }
+  const p = S.plays.find(x => x.id === id);
+  if (!p) return;
+  // a play that has left the board answers 404: the rationale stands, and isn't asked again while it reads the same
+  const whole = row && row.id === id ? row : null;
+  explained.set(id, { stamp: stamp(whole || p), text: whole ? whole.explanation || "" : "" });
+  if (explained.size > 200) explained.delete(explained.keys().next().value);      // the oldest first
+  if (hovered === id) showTipAt(hoverAt[0], hoverAt[1], rowTitle(p), rowTip(p));
+}
+
+/** The play of the row an event happened in. */
+function rowPlay(target) {
+  const tr = target.closest("tr[data-id]");
+  return tr ? S.plays.find(x => x.id === tr.dataset.id) : null;
 }
 
 /* ---------- detail / confirm ---------- */
@@ -351,6 +398,22 @@ async function reject(id) {
 }
 
 export function initPlays() {
+  // one set of listeners for every row, whichever rows a push redraws
+  const body = $("#plays-body");
+  body.addEventListener("click", e => {
+    const p = rowPlay(e.target);
+    if (!p) return;
+    if (e.target.closest(".chart-btn")) openChart(p);
+    else if (e.target.closest(".order-mark")) showTab("orders");
+    else if (e.target.closest(".sig-mark")) openSignals(p.symbol);
+    else selectPlay(p.id);
+  });
+  body.addEventListener("mousemove", e => {
+    const p = rowPlay(e.target);
+    if (!p || e.target.closest("[data-term]")) { hovered = null; return; }    // the term's own explanation is showing
+    hoverRow(p, e.clientX, e.clientY);
+  });
+  body.addEventListener("mouseleave", () => { hovered = null; clearTimeout(hoverTimer); hideTip(); });
   on("plays", renderPlays);
   on("filters", renderPlays);
   on("strategies", renderPlays);

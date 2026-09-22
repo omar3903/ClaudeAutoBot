@@ -1028,7 +1028,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def _publish_plays(self) -> None:
         records: Dict[str, Dict[str, Any]] = {}                # each setup's record read once for the board
         self._publish("plays.updated",
-                      plays=[self._decorate(p, records) for p in self.board.ranked()[:self.BOARD_ROWS]])
+                      plays=[self._slim(self._decorate(p, records)) for p in self.board.ranked()[:self.BOARD_ROWS]])
 
     #: stocks the quick re-check looks at, best plays first
     PLAYS_REFRESH_MAX = 25
@@ -1785,6 +1785,24 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         row["record"] = self._play_record(p.strategy, {} if records is None else records)
         return self.autopilot.decorate_play(row)
 
+    #: what the dashboard reads of a play on the board - the table, the notes, the orders, the chart and the
+    #: Autopilot strip - and all the board's push and /api/plays send. The explanation and the evidence
+    #: behind a play are most of its size and only its hover and the detail panel show them, so those load
+    #: the play whole (play_row, assess_play). Autopilot's verdict and the replay record go whole.
+    ROW_FIELDS = ("id", "symbol", "sector", "side", "strategy", "kind", "timeframe", "entry", "stop", "targets",
+                  "reward_risk", "confidence", "score", "rationale", "suggested_qty", "dollar_risk",
+                  "extended_hours_ok", "status", "trade_id", "noise", "confirmations", "created_at", "expires_at",
+                  "last_price", "last_at", "autopilot", "record")
+    #: the evidence the table reads: the signals' nudge to the score and why, and the expected R
+    ROW_EVIDENCE = ("signal_nudge", "signal_reasons", "expected_r")
+
+    @classmethod
+    def _slim(cls, row: Dict[str, Any]) -> Dict[str, Any]:
+        """A decorated play cut to what the board's push sends (ROW_FIELDS)."""
+        evidence = row.get("evidence") or {}
+        return {**{k: row.get(k) for k in cls.ROW_FIELDS},
+                "evidence": {k: evidence[k] for k in cls.ROW_EVIDENCE if k in evidence}}
+
     def _play_record(self, strategy: str, records: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         """The setup's replayed record over the trades Autopilot would take, for the play's chip: its
         average and trades, the held-out sessions', what its wins average - set beside the play's expected
@@ -1881,9 +1899,17 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             "scan": self.scan_status(),
         }
 
-    def current_plays(self) -> List[Dict[str, Any]]:
+    def current_plays(self, full: bool = False) -> List[Dict[str, Any]]:
+        """The board's plays as the push sends them (_slim), or whole with ``full``."""
         records: Dict[str, Dict[str, Any]] = {}
-        return [self._decorate(p, records) for p in self.board.ranked()]
+        rows = [self._decorate(p, records) for p in self.board.ranked()]
+        return rows if full else [self._slim(r) for r in rows]
+
+    def play_row(self, play_id: str) -> Optional[Dict[str, Any]]:
+        """One play whole - its explanation and all the evidence - for the row's hover. None once it has
+        left the board."""
+        p = self.board.get(play_id)
+        return None if p is None else self._decorate(p)
 
 
 def _utc(value: Any) -> Optional[dt.datetime]:

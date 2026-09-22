@@ -1292,7 +1292,9 @@ the *edge* (what tends to happen at this setup) → what's true *right now* →
 **the plan** (entry, stop with the $-per-share you risk "to find out", target,
 reward:risk, and an *estimated ~P%* — a probability over many trades, not a call
 on this one) → the **invalidation** price → a reminder that wins and losses land
-randomly around an edge.
+randomly around an edge. The plays pushed to the dashboard carry only what the table
+shows, so this text is fetched once the pointer rests on a play; the one-line
+rationale shows until it arrives.
 
 ### Technical (`tos_bot/strategies/technical.py`)
 
