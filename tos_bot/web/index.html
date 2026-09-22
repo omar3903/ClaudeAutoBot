@@ -19,8 +19,11 @@
 </head>
 <body>
   <div id="quit-banner" class="banner quit hidden" role="status"></div>
+  <div id="offline-banner" class="banner bad hidden" role="alert"></div>
   <div id="conn-banner" class="banner hidden"></div>
   <div id="records-banner" class="banner hidden" role="alert"></div>
+  <div id="armed-banner" class="banner bad hidden" role="alert"></div>
+  <div id="loss-banner" class="banner bad hidden" role="alert"></div>
 
   <header class="topbar">
     <div class="brand">AutoTradeBot</div>
@@ -33,6 +36,7 @@
       <button id="ap-cfg" class="ghost mini" title="Autopilot settings">&#9881;</button>
     </div>
     <div class="statuses">
+      <span class="pill warn" id="pill-live">connecting…</span>
       <span class="pill" id="pill-market">market</span>
       <span class="pill" id="pill-data">data</span>
       <span class="pill hidden" id="pill-regime">market</span>
@@ -61,6 +65,10 @@
       <button id="btn-scan" class="lockable" title="Rescan the hot list and the next buffer names now">Scan now</button>
     </div>
   </header>
+  <div id="ap-strip" class="ap-strip hidden">
+    <span><span id="ap-strip-text" aria-live="polite"></span> <span id="ap-strip-next" class="muted"></span></span>
+    <span id="ap-strip-today" class="ap-today"></span>
+  </div>
 
   <main>
     <section class="plays">

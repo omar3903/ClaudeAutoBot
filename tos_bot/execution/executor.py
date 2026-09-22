@@ -188,7 +188,30 @@ class Executor(ProtectiveStops):
                 "purpose": p.kind if followed else _purpose(o), "reason": p.reason if followed else "",
                 "trade_id": trade_id, "play_id": play_id,
                 "strategy": (p.play.strategy if followed else "") or trade.get("strategy") or "",
-                "message": o.message}
+                "message": o.message, **self._entry_clock(p)}
+
+    def _entry_clock(self, p: Optional[_Pending]) -> Dict[str, Any]:
+        """When a followed entry's time is up, for the dashboard's countdowns - by the rules expire_entries
+        acts on: ``expires_at`` a day-trade entry's time-out (entry_timeout_min after it went out, or after it
+        was taken over), ``cut_at`` the rest of a part-filled one cancelled (partial_entry_wait_s after its
+        first fill; never a pair leg's), ``calling_off`` why the app has asked the broker to cancel it and is
+        waiting to hear it has. Times are UTC. engine._order_signature counts only whether each one is there,
+        so one appearing is pushed and the browser counts down - nothing is pushed each second."""
+        out: Dict[str, Any] = {"submitted_at": None, "expires_at": None, "cut_at": None, "calling_off": None}
+        if p is None or p.kind != "entry":
+            return out
+        limit = float(getattr(self.cfg, "entry_timeout_min", 0) or 0)
+        wait = float(getattr(self.cfg, "partial_entry_wait_s", 0) or 0)
+        if p.submitted_at is not None and not p.adopted:
+            out["submitted_at"] = p.submitted_at.isoformat(timespec="milliseconds")   # an adopted one's isn't known
+        if limit > 0 and p.submitted_at is not None and p.play.timeframe is Timeframe.INTRADAY:
+            out["expires_at"] = (p.submitted_at + dt.timedelta(minutes=limit)).isoformat(timespec="milliseconds")
+        if wait > 0 and p.first_fill_at is not None and not _pair_leg(p.play):
+            # the first fill was noted on the monotonic clock: it came this long before now, and the wait runs from it
+            due = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=p.first_fill_at + wait - time.monotonic())
+            out["cut_at"] = due.isoformat(timespec="milliseconds")
+        out["calling_off"] = p.expired or None
+        return out
 
     # ------------------------------------------------------------------ #
     def adopt_working_orders(self) -> List[Dict[str, Any]]:

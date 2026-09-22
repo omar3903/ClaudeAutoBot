@@ -137,7 +137,7 @@ export async function openMoverChart(session, symbol) {
   $(".chart-body", box).innerHTML = `<p class="muted">Loading the charts…</p>`;
   box.classList.remove("hidden");
   let d;
-  try { d = await api(`/api/journal/${encodeURIComponent(session)}/movers/${encodeURIComponent(symbol)}/chart`); } catch { d = { ok: false, reason: "The app isn't reachable." }; }
+  try { d = await api(`/api/journal/${encodeURIComponent(session)}/movers/${encodeURIComponent(symbol)}/chart`); } catch (e) { d = { ok: false, reason: `No chart - ${e.message}.` }; }
   if (box.dataset.play !== key || box.classList.contains("hidden")) return;
   $(".chart-body", box).innerHTML = d.ok ? moverChartHTML(d) : `<p class="reasons">${escapeHtml(d.reason || "No chart for this stock.")}</p>`;
 }

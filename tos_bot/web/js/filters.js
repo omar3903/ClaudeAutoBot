@@ -10,9 +10,15 @@ const BOXES = {
   "f-intraday": ["timeframes", "INTRADAY"], "f-swing": ["timeframes", "SWING"],
 };
 
+// boxes whose change is on its way to the app: a snapshot arriving meanwhile still carries the old filters, and
+// mustn't flick the box back before the answer - which sets it, or puts it back on a refusal
+const sending = new Set();
+
 function syncControls() {
   const f = S.state.filters;
-  if (f) for (const [id, [group, value]] of Object.entries(BOXES)) $("#" + id).checked = (f[group] || []).includes(value);
+  if (f) for (const [id, [group, value]] of Object.entries(BOXES)) {
+    if (!sending.has(id)) $("#" + id).checked = (f[group] || []).includes(value);
+  }
   renderSectorsButton();
 }
 
@@ -25,7 +31,11 @@ async function changeFilter(box) {
     toast(group === "sides" ? "Keep Long or Short switched on" : "Keep Intraday or Swing switched on", "warn");
     return;
   }
+  sending.add(box.id);
+  box.disabled = true;                                 // one change at a time
   const r = await post("/api/filters", { [group]: picked });
+  sending.delete(box.id);
+  box.disabled = false;
   if (!r.ok) { syncControls(); toast("Filter not changed: " + (r.reason || ""), "bad"); return; }
   S.state.filters = r.filters;
   emit("filters");
@@ -93,7 +103,7 @@ function renderSectorsButton() {
 
 async function pickSectors() {
   let d;
-  try { d = await api("/api/filters"); } catch { toast("The app isn't reachable", "bad"); return; }
+  try { d = await api("/api/filters"); } catch (e) { toast(`Couldn't read the sectors - ${e.message}`, "bad"); return; }
   const all = d.all_sectors || [], selected = (d.filters || {}).sectors || [];
   const checked = new Set(selected.length ? selected : all);
   openModal({

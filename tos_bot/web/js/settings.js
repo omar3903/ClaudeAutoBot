@@ -8,8 +8,8 @@ import { currentRun, kindLabel, nextFullScanText, progressHTML, requestScan } fr
 async function openSettings() {
   openDrawer("settings", "Settings", `<p class="muted">Loading…</p>`);
   let scan;
-  try { scan = await api("/api/settings"); } catch {
-    $("#drawer-body").innerHTML = `<p class="reasons">Couldn't load the settings.</p>`;
+  try { scan = await api("/api/settings"); } catch (e) {
+    $("#drawer-body").innerHTML = `<p class="reasons">Couldn't load the settings - ${escapeHtml(e.message)}.</p>`;
     return;
   }
   if (drawerOpen("settings")) render(scan);

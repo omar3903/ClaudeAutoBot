@@ -27,6 +27,7 @@ function renderTop() {
   // "armed" only means something in LIVE mode (the equity floor)
   $("#pill-armed").classList.toggle("hidden", s.mode === "paper");
   if (s.mode !== "paper") setPill("#pill-armed", s.armed ? "armed" : "disarmed", s.armed ? "good" : "bad");
+  renderArmed(s);
   renderBalances(s);
   renderCapital(s.capital);
   const c = s.connection || {};
@@ -35,6 +36,30 @@ function renderTop() {
   if (s.strategies_on != null) $("#btn-strategies").textContent = `Strategies · ${s.strategies_on}`;
   renderBanner(c);
   renderMismatches(s.mismatches || []);
+}
+
+/* LIVE and disarmed: every new entry - yours, Autopilot's, a pair's - is refused until the account is back over
+   the equity floor. The engine checks it again only on a start, a switch of account or Refresh, so the banner
+   says so. The reason is the engine's own (engine.disarmed); after a page load it is read from the snapshot. */
+let disarmedWhy = "";
+
+export function noteDisarmed(reason) {
+  disarmedWhy = reason || "";
+  S.state.armed = false;                    // until the next snapshot, which says the same
+  renderArmed(S.state);
+}
+
+function renderArmed(s) {
+  const b = $("#armed-banner"), show = s.mode === "live" && s.armed === false;
+  if (s.armed) disarmedWhy = "";
+  b.classList.toggle("hidden", !show);
+  if (!show) return;
+  const a = s.account, base = (a || {}).base || {};
+  const why = disarmedWhy || (!a ? "the account hasn't been read yet"
+    : !base.usd_per_base ? `no ${base.currency || "account-currency"}->USD exchange rate yet`
+    : `equity was under the ${usd(a.min_start_equity)} live floor when it was last checked (${usd(a.equity)} now)`);
+  b.innerHTML = `<span>⚠ LIVE, disarmed: ${escapeHtml(why)}. No new entry is sent until it re-arms - exits still run.
+    ↻ Refresh checks it again.</span>`;
 }
 
 function renderMismatches(list) {
@@ -123,7 +148,7 @@ export function renderCapital(c) {
 
 async function openCapital() {
   let d;
-  try { d = await api("/api/capital"); } catch { toast("The app isn't reachable", "bad"); return; }
+  try { d = await api("/api/capital"); } catch (e) { toast(`Couldn't read the trading capital - ${e.message}`, "bad"); return; }
   const c = d.capital;
   if (!c) { toast("No account data yet — connect IB Gateway first", "warn"); return; }
   const ccy = c.currency;

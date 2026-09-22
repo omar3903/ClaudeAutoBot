@@ -1,5 +1,5 @@
 /* Autopilot: hands-off entry. Exits are automatic either way. */
-import { $, $$, escapeHtml, money, post } from "./util.js";
+import { $, $$, escapeHtml, money, num, plural, post, pretty, usd } from "./util.js";
 import { S, emit, on } from "./state.js";
 import { openModal, toast } from "./ui.js";
 
@@ -48,6 +48,73 @@ export function renderAutopilot() {
       : (ap.blocked_note || "Autopilot is on but not routing (paper-only gate). Click to turn off."))
     : "Hands-off entry is OFF — you click every entry. Exits are automatic regardless. Click to turn on.";
   $("#autopilot-ctl").classList.toggle("live-warn", enabled && !eff);
+  renderStrip();
+  renderLossBanner();
+}
+
+/* Stopped for the day by the daily loss limit or the give-back rule (autopilot.daily_loss): a red banner that
+   stays until it's dismissed or the stop is lifted - a toast is gone in seconds. The reason is the engine's
+   own, from the event; after a page load, from the strip's reading. */
+let lossWhy = "", lossDismissed = false;
+
+export function onDailyLoss(p) {
+  lossWhy = p.reason || "";
+  lossDismissed = false;
+  S.state.autopilot = { ...(S.state.autopilot || {}), daily_loss_stop: true };   // until the next snapshot says so
+  toast(`🤖 Autopilot stopped for the day: ${lossWhy || "the daily loss limit was reached"}`, "bad");
+  renderAutopilot();
+}
+
+function renderLossBanner() {
+  const ap = S.state.autopilot || {}, h = ap.headline || {}, b = $("#loss-banner");
+  if (!ap.daily_loss_stop) { lossWhy = ""; lossDismissed = false; }        // lifted, or a new day: a new stop shows again
+  const show = !!ap.enabled && !!ap.daily_loss_stop && !lossDismissed;
+  b.classList.toggle("hidden", !show);
+  if (!show) return;
+  const why = lossWhy || (h.state === "stopped" ? h.text.replace(/^Stopped for the day: /, "") : "")
+    || "the daily loss limit or the give-back rule was reached";
+  if (b.dataset.why === why) return;                                        // the Dismiss button stays under the mouse
+  b.dataset.why = why;
+  b.innerHTML = `<span>🤖 Autopilot stopped for the day: ${escapeHtml(why)}. Positions already open keep their stops and
+    automatic exits.</span> <button class="ghost mini" id="loss-dismiss" title="The strip under the header still says so">Dismiss</button>`;
+  $("#loss-dismiss").onclick = () => { lossDismissed = true; renderLossBanner(); };
+}
+
+/* The strip under the header: what Autopilot is doing now and why (status().headline, in the server's
+   words), how many plays on the board pass every check, a countdown while it paces its entries, and
+   today's closed trades by setup. The countdown runs from the reading that carried it - a redraw for
+   another reason doesn't restart it - and the ticker only runs while there is one. */
+let stripHeadline = null, stripDue = 0, stripTimer = null;
+
+function tickStrip() {
+  const left = Math.ceil((stripDue - Date.now()) / 1000);
+  $("#ap-strip-next").textContent = !stripDue ? "" : left > 0 ? `next entry in ${left}s` : "next entry on its next pass";
+  if (left <= 0 && stripTimer) { clearInterval(stripTimer); stripTimer = null; }
+}
+
+function renderStrip() {
+  const ap = S.state.autopilot || {}, h = ap.headline, strip = $("#ap-strip");
+  strip.classList.toggle("hidden", !h);
+  if (!h) return;
+  strip.dataset.state = h.state;
+  let text = h.text;
+  if (h.state === "taking" || h.state === "pacing") {
+    const tags = S.plays.map(p => p.autopilot || {}).filter(a => a.eligible && !a.acted);
+    const room = tags.filter(a => !a.waiting).length, held = tags.length - room;
+    text += room ? ` · ${plural(room, "play")} pass${room === 1 ? "es" : ""} every check` : " · no play passes every check right now";
+    if (held) text += `, ${held} more wait${held === 1 ? "s" : ""} for room`;
+  }
+  const el = $("#ap-strip-text");
+  if (el.textContent !== text) el.textContent = text;          // a live region: say it again only when it changes
+  el.title = (ap.replay_losers || []).map(l => `${l.strategy}: ${l.why}`).join("\n");
+  if (h !== stripHeadline) {                                  // a fresh reading from the server
+    stripHeadline = h;
+    stripDue = h.state === "pacing" && h.next_entry_in_s > 0 ? Date.now() + h.next_entry_in_s * 1000 : 0;
+  }
+  tickStrip();
+  if (stripDue > Date.now() && !stripTimer) stripTimer = setInterval(tickStrip, 1000);
+  $("#ap-strip-today").innerHTML = (ap.today || []).map(t =>
+    `<span class="chip ${t.r > 0 ? "good" : t.r < 0 ? "bad" : ""}" title="${escapeHtml(`${pretty(t.strategy)} today: ${plural(t.closed, "trade")} closed, ${t.wins} won, ${t.r >= 0 ? "+" : ""}${num(t.r)}R, ${usd(t.pl)}`)}">${escapeHtml(pretty(t.strategy))} ${t.wins}/${t.closed} · ${t.r >= 0 ? "+" : ""}${num(t.r, 1)}R</span>`).join("");
 }
 
 async function postAutopilot(body) {
@@ -183,6 +250,7 @@ export function initAutopilot() {
   on("scan", renderAutopilot);
   on("filters", renderAutopilot);                 // what it takes follows the filter boxes,
   on("capital", renderAutopilot);                 // and its slots the day / swing split
+  on("plays", renderStrip);                       // the strip counts the plays that pass every check
   $("#ap-toggle").onclick = toggle;
   $("#ap-cfg").onclick = configure;
 }

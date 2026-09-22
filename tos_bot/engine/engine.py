@@ -216,6 +216,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._account: Optional[Account] = None
         self._account_at = 0.0
         self._account_warned_at = float("-inf")     # the last time a failing account read was logged
+        # set to have the snapshot loop read the account now rather than at its next turn - after an order
+        # sent from the dashboard, whose reply doesn't wait for that read
+        self._snapshot_wake = threading.Event()
+        self._reconciled_at = float("-inf")         # the loop's last position check (see _reconcile_if_due)
         self._armed = False
 
         # hands-off entry (exits are always automatic)
@@ -282,6 +286,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def stop(self) -> None:
         self._stop.set()
         self._scan_wake.set()
+        self._snapshot_wake.set()
         self._day_changed(now=True)
         self.connections.close_all()
         log.info("engine stopped")
@@ -436,6 +441,23 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def _positions_here(self) -> List[Dict[str, Any]]:
         """OPEN trades held on the venue orders currently go to."""
         return [t for t in self._open_trades() if (t.get("broker") or "paper") == self._venue]
+
+    def open_positions(self) -> List[Dict[str, Any]]:
+        """The OPEN trade records for the Open positions tab, each with ``protection``: the stop and target
+        orders the executor keeps resting at the broker for it (Executor.protective_stops / resting_targets -
+        the ones it placed and follows, the same the exit manager leaves the target to), and whether this venue
+        rests them at all (``native``: IBKR does; on the simulator the app watches the price itself). None for
+        a trade held on another venue: nothing is placed for it while it's parked."""
+        ex = self.executor
+        native = bool(ex is not None and ex.native_stops_on())
+        stops = {s["trade_id"]: s for s in ex.protective_stops()} if ex is not None else {}
+        targets = {s["trade_id"]: s for s in ex.resting_targets()} if ex is not None else {}
+        trades = self.repo.open_trades()
+        for t in trades:
+            here = (t.get("broker") or "paper") == self._venue
+            t["protection"] = ({"native": native, "stop": stops.get(t["id"]), "target": targets.get(t["id"])}
+                               if here else None)
+        return trades
 
     def working_entries(self) -> List[Dict[str, Any]]:
         """Entry orders sent but not filled yet (see Executor.working_entries)."""
@@ -727,7 +749,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self._retry_connection()
                 self._watch_gateway()
                 if self._refresh_account():
-                    self._reconcile_open_trades()
+                    self._reconcile_if_due()
                 state = self.snapshot()
                 if self._account:
                     self.repo.snapshot_account(self._account, self._venue,
@@ -735,7 +757,22 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self._publish("account.snapshot", state=state)
             except Exception:  # noqa: BLE001
                 log.exception("snapshot failed")
-            self._stop.wait(10.0 if self._autopilot_day_active() else 30.0)
+            self._snapshot_wake.wait(10.0 if self._autopilot_day_active() else 30.0)
+            self._snapshot_wake.clear()
+
+    #: the least time between two of the loop's position checks
+    RECONCILE_MIN_GAP_S = 8.0
+
+    def _reconcile_if_due(self) -> None:
+        """The snapshot loop's position check, at most once per RECONCILE_MIN_GAP_S. A click that wakes the
+        loop early gets a fresh account read, but the check waits for its usual turn: a record only counts as
+        gone after two checks miss it, and two checks a second apart would let a stop filled at the broker be
+        booked as closed outside before the order sync books it as the stop it was."""
+        now = time.monotonic()
+        if now - self._reconciled_at < self.RECONCILE_MIN_GAP_S:
+            return
+        self._reconciled_at = now
+        self._reconcile_open_trades()
 
     def _orders_loop(self) -> None:
         """Keeps the dashboard's list of working orders current. It runs on its own, so a
@@ -1011,7 +1048,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         return {"watchlist": self.scanner.watchlist_state(), "scan": self.scan_status()}
 
     def _publish_plays(self) -> None:
-        self._publish("plays.updated", plays=[self._decorate(p) for p in self.board.ranked()[:self.BOARD_ROWS]])
+        records: Dict[str, Dict[str, Any]] = {}                # each setup's record read once for the board
+        self._publish("plays.updated",
+                      plays=[self._slim(self._decorate(p, records)) for p in self.board.ranked()[:self.BOARD_ROWS]])
 
     #: stocks the quick re-check looks at, best plays first
     PLAYS_REFRESH_MAX = 25
@@ -1428,7 +1467,14 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             # sent: the executor has saved it SUBMITTED (or the fill FILLED) - and the sync loop may already
             # have saved how it ended, which a write here would overwrite
             self._publish("play.decided", play_id=p.id, decision="approved", result=out, play=self._decorate(p))
-            self._refresh_account()
+            if operator == "autopilot":
+                # on the scan thread: its next play, and the next pass, read the account this order changed
+                self._refresh_account()
+            else:
+                # a click waits for its reply, and the order is out: the snapshot loop reads the account and
+                # sends it a moment later - the loop is woken rather than a thread started, so no second read
+                # runs alongside its own
+                self._snapshot_wake.set()
             self._day_changed(now=True)                   # a restart mustn't offer this setup again today
             return {"ok": out.get("ok", False), **out}
 
@@ -1758,12 +1804,50 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     # ------------------------------------------------------------------ #
     #  Views                                                             #
     # ------------------------------------------------------------------ #
-    def _decorate(self, p: Play) -> Dict[str, Any]:
+    def _decorate(self, p: Play, records: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """A play as the dashboard shows it. ``records``: the setups' records already read for this
+        board of plays (_play_record)."""
         row = p.to_row()
         row["executable_hint"] = p.suggested_qty > 0 and self._armed
         seen = self.md.last_seen(p.symbol)
         row["last_price"], row["last_at"] = (round(seen[0], 4), seen[1].isoformat()) if seen else (None, None)
+        row["record"] = self._play_record(p.strategy, {} if records is None else records)
         return self.autopilot.decorate_play(row, p)
+
+    #: what the dashboard reads of a play on the board - the table, the notes, the orders, the chart and the
+    #: Autopilot strip - and all the board's push and /api/plays send. The explanation and the evidence
+    #: behind a play are most of its size and only its hover and the detail panel show them, so those load
+    #: the play whole (play_row, assess_play). Autopilot's verdict and the replay record go whole.
+    ROW_FIELDS = ("id", "symbol", "sector", "side", "strategy", "kind", "timeframe", "entry", "stop", "targets",
+                  "reward_risk", "confidence", "score", "rationale", "suggested_qty", "dollar_risk",
+                  "extended_hours_ok", "status", "trade_id", "noise", "confirmations", "created_at", "expires_at",
+                  "last_price", "last_at", "autopilot", "record")
+    #: the evidence the table reads: the signals' nudge to the score and why, and the expected R
+    ROW_EVIDENCE = ("signal_nudge", "signal_reasons", "expected_r")
+
+    @classmethod
+    def _slim(cls, row: Dict[str, Any]) -> Dict[str, Any]:
+        """A decorated play cut to what the board's push sends (ROW_FIELDS)."""
+        evidence = row.get("evidence") or {}
+        return {**{k: row.get(k) for k in cls.ROW_FIELDS},
+                "evidence": {k: evidence[k] for k in cls.ROW_EVIDENCE if k in evidence}}
+
+    def _play_record(self, strategy: str, records: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """The setup's replayed record over the trades Autopilot would take, for the play's chip: its
+        average and trades, the held-out sessions', what its wins average - set beside the play's expected
+        R, which counts a win at the full target - and whether it is proven, in proof_missing's words.
+        Read once per setup into ``records``, which a whole board of plays shares."""
+        if strategy not in records:
+            rec = self.strategy_record(strategy) or {}
+            held = rec.get("out_of_sample") or {}
+            why = self.autopilot.proof_missing(strategy, rec)
+            records[strategy] = {
+                "trades": int(rec.get("trades", 0)), "expectancy_r": rec.get("expectancy_r"),
+                "win_rate": rec.get("win_rate"), "avg_win_r": rec.get("avg_win_r"),
+                "held_out_trades": int(held.get("trades", 0)), "held_out_r": held.get("expectancy_r"),
+                "proven": why is None, "why": why,
+            }
+        return records[strategy]
 
     #: a price the app fetched this recently is newer than the broker's portfolio mark, which IBKR updates
     #: every few minutes; the exit manager keeps every open position's this fresh
@@ -1844,8 +1928,17 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             "scan": self.scan_status(),
         }
 
-    def current_plays(self) -> List[Dict[str, Any]]:
-        return [self._decorate(p) for p in self.board.ranked()]
+    def current_plays(self, full: bool = False) -> List[Dict[str, Any]]:
+        """The board's plays as the push sends them (_slim), or whole with ``full``."""
+        records: Dict[str, Dict[str, Any]] = {}
+        rows = [self._decorate(p, records) for p in self.board.ranked()]
+        return rows if full else [self._slim(r) for r in rows]
+
+    def play_row(self, play_id: str) -> Optional[Dict[str, Any]]:
+        """One play whole - its explanation and all the evidence - for the row's hover. None once it has
+        left the board."""
+        p = self.board.get(play_id)
+        return None if p is None else self._decorate(p)
 
 
 def _utc(value: Any) -> Optional[dt.datetime]:
@@ -1863,6 +1956,13 @@ def _utc(value: Any) -> Optional[dt.datetime]:
 
 
 def _order_signature(orders: List[Dict[str, Any]]) -> tuple:
-    """What has to change for the dashboard to be told about the working orders."""
+    """What has to change for the dashboard to be told about the working orders. A countdown counts when it
+    starts or stops, not by its time: the part-fill cut is worked out again at each look, and the first fill
+    it runs from can be noted by the order sync after this loop has already sent the fill."""
     keys = ("order_id", "status", "filled", "remaining", "limit_price", "stop_price", "purpose", "trade_id")
-    return tuple(sorted((tuple(o.get(k) for k in keys) for o in orders), key=lambda row: str(row[0])))
+
+    def row(o: Dict[str, Any]) -> tuple:
+        clocks = (o.get("expires_at") is not None, o.get("cut_at") is not None, bool(o.get("calling_off")))
+        return tuple(o.get(k) for k in keys) + clocks
+
+    return tuple(sorted((row(o) for o in orders), key=lambda r: str(r[0])))

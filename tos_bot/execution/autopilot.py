@@ -24,6 +24,7 @@ It holds no broker or DB handles of its own; it drives the engine.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -82,7 +83,7 @@ class AutoPilot:
         self.max_auto_positions: int = int(cfg.max_auto_positions)
         self.max_auto_trades_per_day: int = int(cfg.max_auto_trades_per_day)
         self.max_per_strategy: int = int(getattr(cfg, "max_per_strategy", 2))
-        self.max_new_per_cycle: int = int(getattr(cfg, "max_new_per_cycle", 1))
+        self.max_new_per_cycle: int = max(1, int(getattr(cfg, "max_new_per_cycle", 1)))   # as configure() allows
         self.cooldown_after_loss: bool = bool(getattr(cfg, "cooldown_after_loss", True))
         self.max_daily_loss_pct: float = float(getattr(cfg, "max_daily_loss_pct", 2.0))
         self.max_giveback_pct: float = float(getattr(cfg, "max_giveback_pct", 30.0))
@@ -119,8 +120,11 @@ class AutoPilot:
         self._last_reason: Dict[str, str] = {}  # play_id -> why skipped (for the UI)
         self._blocked_note: str = ""
         self._loss_stop_day: str = ""           # the session the daily loss limit was reached on
+        self._loss_stop_reason: str = ""        # ...and why, in the words of daily_loss_reason, for the status strip
         self._peak_realized: float = 0.0        # the best the day's realized P/L has been
         self._realized: tuple = (float("-inf"), 0.0)   # (monotonic time read, realized P/L today)
+        #: today's closed trades by setup, read with the realized P/L above (_realized_today)
+        self._tally: List[Dict[str, Any]] = []
         self._entries_at: List[float] = []      # monotonic times of the latest entries, for the per-cycle cap
         #: (monotonic time read, {strategy: replayed record}) - the dashboard's rows share one read (_board_record)
         self._record_cache: Optional[tuple] = None
@@ -180,6 +184,7 @@ class AutoPilot:
                   "max_per_strategy", "max_new_per_cycle", "min_confirmations", "min_minutes_to_close"):
             if isinstance(d.get(k), int):
                 setattr(self, k, int(d[k]))
+        self.max_new_per_cycle = max(1, self.max_new_per_cycle)          # as configure() allows
         if isinstance(d.get("skip_noise"), list):
             self.skip_noise = [str(n) for n in d["skip_noise"] if str(n) in NOISE_LABELS]
         if "cooldown_after_loss" in d:
@@ -385,7 +390,8 @@ class AutoPilot:
     # ------------------------------------------------------------------ #
     def status(self) -> Dict[str, Any]:
         self._roll_day()
-        open_auto = len(self._open_auto_trades()) + len(self._working_auto_entries())
+        opens = self._open_auto_trades() + self._working_auto_entries()
+        losers = self.replay_losers()
         blocked = ""
         if self.enabled and not self._live_ok():
             blocked = ("Autopilot is paper-only until you set  autopilot.allow_live: true  "
@@ -424,11 +430,11 @@ class AutoPilot:
             "proof_p_value": self.proof_p_value,
             "skip_replay_losers": self.skip_replay_losers,
             "replay_loser_r": self.replay_loser_r,
-            "replay_losers": self.replay_losers(),
+            "replay_losers": losers,
             "model_mode": self.model_mode,
             "model_min_p": round(self.model_min_p, 2),
             "model": self._model_card(),
-            "open_auto_positions": open_auto,
+            "open_auto_positions": len(opens),
             "auto_trades_today": self._count_today,
             "sent_today": self._sent_today,
             "sent_ceiling": self.SENT_CEILING * self.max_auto_trades_per_day,
@@ -436,7 +442,89 @@ class AutoPilot:
             "mode": getattr(self.engine, "mode", "paper"),
             "allow_live": bool(getattr(self.cfg, "allow_live", False)),
             "blocked_note": blocked,
+            "headline": self._headline(opens, losers, blocked),
+            "today": self._today_by_setup(),
         }
+
+    # ---- the status strip under the dashboard's header ------------------- #
+    #: the states Autopilot comes out of by itself later in the session - the ones the strip's text also
+    #: says it trades at practice size, in a dry run, or skips the replay losers
+    RESUMING = ("full", "closed", "kind-full", "late", "pacing", "taking")
+
+    def _headline(self, opens: List[Dict[str, Any]], losers: List[Dict[str, str]], blocked: str) -> Dict[str, Any]:
+        """What Autopilot is doing right now and why, in one line. The first state that holds wins: off;
+        blocked (paper-only in Live); blind (no prices); stopped (the daily loss or give-back rule); done
+        (the day's entries used); ceiling (the orders sent); full (every position taken); then, for each
+        kind of trade it takes, closed (day trades wait for the open), kind-full (the kind's share of the
+        day / swing split) or late (the last minutes before the close) - and while a kind is free, pacing
+        (the per-cycle cap, with the seconds to the next entry) or taking. It only reads: status() runs on
+        the web threads as well as the scan thread, which writes the counts and the entry times."""
+        practice = not self.proof_required
+        skipping = [row["strategy"] for row in losers]
+
+        def line(state: str, text: str, wait: float = 0.0) -> Dict[str, Any]:
+            if state in self.RESUMING:
+                text += " · dry run: it places nothing" if self.dry_run else ""
+                text += " · unproven setups at practice size (a quarter of the risk)" if practice else ""
+                text += (" · skipping the replay losers: " + ", ".join(skipping)) if skipping else ""
+            return {"state": state, "text": text, "next_entry_in_s": math.ceil(wait), "practice": practice,
+                    "skipping": skipping}
+
+        if not self.enabled:
+            return line("off", "Off - you click every entry; exits stay automatic")
+        if blocked:
+            return line("blocked", blocked)
+        refused = getattr(self.engine, "prices_refused", None)
+        blind = refused() if callable(refused) else ""
+        if blind:
+            return line("blind", "No entries: prices can't be read - " + blind)
+        if self.stopped_for_the_day:
+            return line("stopped", "Stopped for the day: " + (self._loss_stop_reason or "the daily loss limit or "
+                                                               "the give-back rule was reached"))
+        cap = self.max_auto_trades_per_day
+        if self._count_today >= cap:
+            back = self._sent_today - self._count_today
+            return line("done", f"Done for today: {self._count_today} of the {cap} entries a day are used"
+                        + (f" ({back} more bought nothing and gave their slots back)" if back > 0 else ""))
+        if self._sent_today >= self.SENT_CEILING * cap:
+            return line("ceiling", f"No more today: {self._sent_today} entry orders sent - {self.SENT_CEILING} times "
+                        "the daily cap, counting the ones that bought nothing")
+        if len(opens) >= self.max_auto_positions:
+            return line("full", f"Full: {len(opens)} of {self.max_auto_positions} positions taken, open or being "
+                        "entered - no new entry until one closes")
+        waiting, free = [], []                  # (state, why) for each kind it can't take now; the kinds it can
+        for tf in self.play_types():
+            full = self._kind_full(tf, opens)
+            if tf == DAY and not clock.is_market_open():
+                waiting.append(("closed", "day trades wait for the open"))
+            elif full:
+                waiting.append(("kind-full", full))
+            elif tf == DAY and self.min_minutes_to_close > 0 and clock.minutes_to_close() < self.min_minutes_to_close:
+                waiting.append(("late", f"no new day trades in the last {self.min_minutes_to_close} minutes"))
+            else:
+                free.append(tf)
+        why = "; ".join(w for _, w in waiting)
+        if not free:
+            if not waiting:
+                return line("idle", ("Pairs only - the pair desk enters them; " if "PAIRS" in self.trade_types else "")
+                            + "day and swing trades are switched off, in the Intraday / Swing filters or its own boxes")
+            state = min((s for s, _ in waiting), key=("closed", "kind-full", "late").index)
+            return line(state, why[:1].upper() + why[1:])
+        rest = f" · {why}" if why else ""
+        wait = min(self._next_entry_in(tf) for tf in free)
+        if wait > 0:
+            n = self.max_new_per_cycle
+            return line("pacing", f"Pacing: {n} new entr{'y' if n == 1 else 'ies'} per scan cycle{rest}", wait)
+        kinds = " + ".join("day" if tf == DAY else "swing" for tf in free)
+        return line("taking", f"Taking {kinds} trades - {len(opens)} of {self.max_auto_positions} positions, "
+                    f"{self._count_today} of {cap} entries today{rest}")
+
+    def _today_by_setup(self) -> List[Dict[str, Any]]:
+        """Today's closed trades on the venue Autopilot trades on, by setup - taken by hand or by
+        Autopilot: how many closed, how many won, their R and their P/L. Read with the realized P/L of the
+        day, so once every REALIZED_CACHE_S."""
+        self._realized_today()
+        return list(self._tally)
 
     # ------------------------------------------------------------------ #
     def _open_auto_trades(self) -> List[Dict[str, Any]]:
@@ -562,6 +650,7 @@ class AutoPilot:
         if not stopped:
             self._loss_stop_day = ""               # the limit was raised or switched off: it isn't stopped any more
         if stopped:
+            self._loss_stop_reason = stopped
             if self._loss_stop_day != self._day:
                 self._loss_stop_day = self._day
                 log.warning("autopilot stopped for the day: %s", stopped)
@@ -719,16 +808,29 @@ class AutoPilot:
         not the 15-second re-check of the board, which would turn "one per cycle" into ten entries
         in three minutes, all the same bet on that moment. Without an engine that says, a cycle is
         one call."""
-        pace = getattr(self.engine, "entry_pace_seconds", None)
-        window = float(pace(timeframe)) if callable(pace) else 0.0
+        window = self._pace_window(timeframe)
         if window <= 0:
             return 0.0 if taken >= self.max_new_per_cycle else None
         now = time.monotonic()
         self._entries_at = [at for at in self._entries_at if now - at < 3600.0]
-        recent = sorted(at for at in self._entries_at if now - at < window)
-        if len(recent) < self.max_new_per_cycle:
-            return None
-        return max(0.0, window - (now - recent[-self.max_new_per_cycle]))
+        return self._next_entry_in(timeframe, window) or None
+
+    def _pace_window(self, timeframe: str) -> float:
+        pace = getattr(self.engine, "entry_pace_seconds", None)
+        return float(pace(timeframe)) if callable(pace) else 0.0
+
+    def _next_entry_in(self, timeframe: str, window: Optional[float] = None) -> float:
+        """Seconds until the per-cycle cap lets the next entry of this kind through - 0 when it would now.
+        It only reads the entry times: the status strip asks from the web threads while the scan thread
+        appends to them, so dropping the old ones is left to _pace_wait, on the scan thread."""
+        window = self._pace_window(timeframe) if window is None else window
+        if window <= 0:
+            return 0.0
+        now, n = time.monotonic(), max(1, self.max_new_per_cycle)
+        recent = sorted(at for at in list(self._entries_at) if now - at < window)
+        if len(recent) < n:
+            return 0.0
+        return max(0.0, window - (now - recent[-n]))
 
     # ------------------------------------------------------------------ #
     #: how long the realized P/L of the day is kept before it is read again
@@ -736,18 +838,32 @@ class AutoPilot:
 
     def _realized_today(self) -> float:
         """Realized P/L of the trades closed this session on the venue Autopilot trades on, by
-        hand or by Autopilot - they drain the same account."""
+        hand or by Autopilot - they drain the same account. The same read tallies them by setup for
+        the status strip (_today_by_setup); a pair's legs count in the P/L but not in the tally, where
+        two legs with no stop of their own would read as two trades without an R."""
         mono = time.monotonic()
         if mono - self._realized[0] < self.REALIZED_CACHE_S:
             return self._realized[1]
         venue = getattr(self.engine, "_venue", None)
-        total = 0.0
+        total, by_setup = 0.0, {}
         try:
             for t in self.engine.repo.trades_on(clock.session_date()):
                 if t.get("status") == "CLOSED" and (not venue or (t.get("broker") or "paper") == venue):
-                    total += float(t.get("realized_pl") or 0.0)
+                    pl = float(t.get("realized_pl") or 0.0)
+                    total += pl
+                    if t.get("pair_id"):
+                        continue
+                    row = by_setup.setdefault(t.get("strategy") or "?", {"closed": 0, "wins": 0, "r": 0.0, "pl": 0.0})
+                    row["closed"] += 1
+                    row["wins"] += int(pl > 0)
+                    row["r"] += float(t.get("r_multiple") or 0.0)
+                    row["pl"] += pl
         except Exception:  # noqa: BLE001
             log.debug("could not read today's closed trades", exc_info=True)
+        # the tally first: a reader on another thread that finds the fresh time finds the fresh tally too
+        self._tally = [{"strategy": key, "closed": row["closed"], "wins": row["wins"], "r": round(row["r"], 2),
+                        "pl": round(row["pl"], 2)}
+                       for key, row in sorted(by_setup.items(), key=lambda kv: (-kv[1]["closed"], kv[0]))]
         self._realized = (mono, total)
         return total
 
@@ -1056,6 +1172,9 @@ class AutoPilot:
             # it passes Autopilot's checks, but a cap has no room for it right now
             "waiting": waiting,
             "acted": pid in self._acted,
+            # it tried the play and the engine's assessment or the order was refused (autopilot.skipped) -
+            # not tried again today unless a setting changes; the reason below says why
+            "skipped": pid in self._refused,
             # what the last pass said - the checks that change from pass to pass reach the row here
             "reason": self._last_reason.get(pid, ""),
         }

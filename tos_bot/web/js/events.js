@@ -1,10 +1,10 @@
 /* The live feed: engine events over the WebSocket, applied to the dashboard. */
-import { $, num, pct, plural, pretty, usd } from "./util.js";
+import { $, count, fmtClock, num, pct, plural, pretty, usd } from "./util.js";
 import { S, emit, refreshState, setState } from "./state.js";
 import { closeModal, drawerOpen, toast } from "./ui.js";
-import { renderCapital } from "./topbar.js";
+import { noteDisarmed, renderCapital } from "./topbar.js";
 import { openQuitDialog, renderLock, showShutdown } from "./quit.js";
-import { renderAutopilot } from "./autopilot.js";
+import { onDailyLoss, renderAutopilot } from "./autopilot.js";
 import { onScanEvent } from "./scan.js";
 import { mergePlay, selectPlay } from "./plays.js";
 import { loadHistory, loadOpen, loadStats, openRecord, recordGone, tabVisible } from "./blotter.js";
@@ -18,15 +18,59 @@ import { loadPairs, showPairs } from "./pairs.js";
 
 export function connect() {
   if (S.stopped) return;
+  if (!linkTicker) linkTicker = setInterval(renderLink, 1000);
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => { S.live.open = true; S.live.downSince = null; renderLink(); };
   ws.onmessage = ev => {
+    S.live.lastAt = Date.now();
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
     handle(msg.topic, msg.payload || {});
   };
-  ws.onclose = () => { if (!S.stopped) setTimeout(connect, 2000); };
+  ws.onclose = () => {
+    // a retry that fails again doesn't restart the count - the link has been down since it first dropped
+    if (S.live.open) { S.live.open = false; S.live.downSince = Date.now(); renderLink(); }
+    if (!S.stopped) setTimeout(connect, 2000);
+  };
   ws.onerror = () => ws.close();
+}
+
+/* Whether this tab still hears the app. The socket closing is the only sign of an outage: a quiet spell (off
+   hours a snapshot comes about every 30 s) isn't one, so the last message's age is only the pill's text. The
+   banner and the disabled actions wait until it has been closed for 10 s - longer than a reconnect takes - and
+   the shut-down screen wins over both. The hello a reconnect brings re-syncs the tables. */
+const OFFLINE_AFTER_MS = 10000;
+let linkTicker = null;
+
+function ago(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 90 ? `${s} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${Math.round(s / 3600)} h`;
+}
+
+function renderLink() {
+  const L = S.live, pill = $("#pill-live"), banner = $("#offline-banner"), now = Date.now();
+  if (S.stopped) {
+    clearInterval(linkTicker); linkTicker = null;
+    document.body.classList.remove("offline");
+    banner.classList.add("hidden");
+    return;
+  }
+  const offline = !L.open && now - L.downSince >= OFFLINE_AFTER_MS;
+  const text = L.open ? (L.lastAt ? `live · ${ago(now - L.lastAt)}` : "live")
+    : L.lastAt ? `reconnecting · last update ${ago(now - L.lastAt)} ago` : "connecting…";
+  const cls = "pill " + (L.open ? "good" : offline ? "bad" : "warn"), title = L.open
+    ? "This tab hears the app's updates as they happen - the time is since the last one. Off hours one comes about every 30 s."
+    : "This tab has lost its link to the app and tries again every 2 s. What it shows isn't updating meanwhile.";
+  if (pill.textContent !== text) pill.textContent = text;
+  if (pill.className !== cls) pill.className = cls;
+  if (pill.title !== title) pill.title = title;
+  document.body.classList.toggle("offline", offline);
+  if (offline !== banner.classList.contains("hidden")) return;       // already showing, or already hidden
+  banner.classList.toggle("hidden", !offline);
+  if (offline) banner.innerHTML = `<span>⚠ No word from the app since ${fmtClock(new Date(L.lastAt || L.downSince).toISOString())}
+    - it may be restarting or stopped, and this tab reconnects by itself. What's shown is from then and isn't updating, and the
+    buttons that send orders or change settings are off until it's back.</span>`;
 }
 
 /* The dashboard's files as they were when this tab loaded them. After the app is updated and restarted the
@@ -52,7 +96,11 @@ function handle(topic, p) {
     case "engine.started":
       setState(p.state || p);
       if (tabVisible("open")) loadOpen();
-      if (topic === "hello") loadOrders();
+      if (topic === "hello") {                   // after a reconnect, the tab showing may be out of date
+        loadOrders();
+        if (tabVisible("history")) loadHistory();
+        if (tabVisible("stats")) loadStats();
+      }
       break;
     case "plays.updated":
       S.plays = p.plays || [];
@@ -146,6 +194,11 @@ function handle(topic, p) {
     case "stop.failed":
       toast("⚠ Protective stop: " + (p.reason || "could not be placed"), "warn");
       break;
+    case "stop.moved":
+      // the stop at the broker rests at its new price - exit.stop_moved has said what it locks, so no toast
+      loadOrders();
+      if (tabVisible("open")) loadOpen();
+      break;
     case "exit.stop_moved": {
       // what the stop keeps if it's hit, then where the trade stood when it moved
       const signedR = v => `${v >= 0 ? "+" : ""}${num(v, 1)}R`;
@@ -160,7 +213,9 @@ function handle(topic, p) {
       loadOpen();
       break;
     case "play.decided":
+      // the whole row, which says who sent it and when - an open detail panel follows it (plays.js followSelected)
       if (p.play) mergePlay(p.play);
+      else if (p.decision === "rejected") mergePlay({ id: p.play_id, status: "REJECTED" });     // dismissed in another tab
       if (p.decision === "approved" && p.result && !p.result.ok) toast("Order not sent: " + (p.result.reason || "rejected"), "bad");
       break;
 
@@ -185,6 +240,9 @@ function handle(topic, p) {
       toast(p.note || "Connected", "good");
       if (p.state) setState(p.state);
       loadOpen();
+      break;
+    case "engine.disarmed":
+      noteDisarmed(p.reason);
       break;
     case "broker.switched":
       if (p.state) setState(p.state);
@@ -232,10 +290,14 @@ function handle(topic, p) {
       indexStrategies(p.strategies);
       break;
 
+    case "replay.started":
     case "replay.progress":
     case "replay.completed":
     case "replay.failed":
       onReplayEvent(topic, p);
+      break;
+    case "model.trained":
+      toast(`The learned model was retrained on ${count(p.rows)} rows (${p.id}) - ${p.usable ? "usable" : "not usable yet, so it has no say"}.`);
       break;
 
     case "quit.requested":
@@ -272,5 +334,18 @@ function handle(topic, p) {
     case "autopilot.blocked":
       toast("🤖 " + (p.reason || "Autopilot is blocked"), "warn");
       break;
+    case "autopilot.daily_loss":
+      onDailyLoss(p);
+      refreshState();                             // the strip's reading says it too
+      break;
+    case "autopilot.skipped": {
+      // it tried a play and the engine's assessment or the order was refused: a note, and the play's robot
+      // keeps why (the next board push carries the same) - no toast
+      const row = S.plays.find(x => x.id === p.play_id);
+      if (row) mergePlay({ id: row.id, autopilot: { ...(row.autopilot || {}), acted: true, skipped: true, reason: p.reason } });
+      addNotes([{ id: `skip_${p.play_id}_${Date.now()}`, at: new Date().toISOString(), kind: "skipped", play_id: p.play_id,
+        symbol: p.symbol, side: row ? row.side : "", strategy: p.strategy, why: p.reason || "refused" }]);
+      break;
+    }
   }
 }

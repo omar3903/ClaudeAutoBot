@@ -444,6 +444,8 @@ The app is built to be left running:
 * **An open dashboard tab updates itself.** After the app is updated and restarted, a tab that was already
   open reconnects - and would go on running the scripts it loaded before. The server stamps the dashboard's
   files in its first message; a tab that started on another stamp reloads (or, with a dialog open, asks you to).
+  While the app is away the tab says so (the **live** pill, then a banner - see *Dashboard controls*) and picks
+  up again by itself.
 * **Days on end** - candles and quotes nothing has asked for in half an hour are let go, the log
   rotates at 5 MB, and the scans, the reports, Autopilot's daily counts and the pairs roll over by date.
 * **Sleep.** While the app runs it asks Windows not to go to sleep (the screen can still turn off);
@@ -566,7 +568,8 @@ are calibrated on the model's own out-of-fold predictions; the card keeps each f
 out-of-sample importance and information coefficient.
 
 * The engine **retrains after each day's review** and scores every fresh play; the odds are logged
-  in the play's evidence (`model: {p, id, usable}`).
+  in the play's evidence (`model: {p, id, usable}`). The dashboard says when a new model is in and
+  whether it is usable.
 * Autopilot's **learned model** setting (⚙): `shadow` (default) only logs; `gate` refuses plays under
   `model_min_p` (55%); `size` also scales the risk by the bet size of AFML ch. 10. Gate and size act
   **only while the model's own walk-forward verdict calls it usable** - today it does not.
@@ -622,7 +625,8 @@ use — click it to set an amount, or **Use the whole account** to clear it.
 shown so you can see where live would stop you.
 
 - **Equity floor** — if account equity `< min_start_equity` ($2,000), *no new
-  entries*.
+  entries*. The dashboard shows a red banner with the reason; the engine checks
+  again on a start, a switch of account or **↻ Refresh**.
 - **PDT** — FINRA flags a *pattern day trader* at **4 day trades in 5 business
   days** on a **margin** account; flagged accounts must hold **$25,000**. Below
   that line you get **3 day trades per rolling 5 sessions**. The guard counts
@@ -665,6 +669,11 @@ still working has the rest cancelled: the broker's answer books what was bought
 and the stop goes on in the same pass. Pair legs are left to the pairs desk. A
 cancel that doesn't take is sent again every 30 seconds, and if IBKR loses track
 of the order, the shares it was seen to buy are booked all the same.
+
+While an entry works, its play's ⏳ shows the shares filled of the order and the
+time left: to the time-out (amber in its last two minutes) or, after a part
+fill, to the cut (`cut in 18 s`), then `cancelling` until the broker confirms.
+The Active orders tab has the same countdown in its **Time left** column.
 
 **What became of each sent play** is saved to the play log with the reason -
 `CANCELED` (timed out, cancelled, or refused by IBKR, which reports refusals as
@@ -728,9 +737,9 @@ the broker shows - triggered, one for shares it doesn't hold would open a positi
 during a fill landing in pieces it waits a few seconds, and if the broker's count and the record
 disagree (part sold by hand in TWS, say) it waits for them to agree. Meanwhile the app's exit
 manager still watches the price and sends the exit itself; what nothing covers is the app being off.
-So a position with no stop at the broker is marked **no stop at the broker yet** in amber on the
-Positions tab, and once that has lasted 90 seconds the log and the dashboard say so, with the reason,
-and again every five minutes until it's fixed.
+So a position with no stop at the broker is marked **no stop at the broker yet** in red in the Open
+positions tab's **Protection** column, and once that has lasted 90 seconds the log and the dashboard say
+so, with the reason, and again every five minutes until it's fixed.
 
 **An exit called off after filling in part is booked.** Quitting and then pressing *Stop quitting*, or
 cancelling an exit, can call off an exit order that has already sold part of the position. The app books
@@ -813,12 +822,27 @@ the left of the row: **green** — Autopilot would take it on its next pass (it
 passes every check and a cap has room); **amber** — it passes the checks but a
 cap is full (the day's entries, the open positions, the day / swing slots, or
 the setup's own), and hovering the robot says which. A dim robot means it has
-already acted on the play; on one still on offer (the engine's own check
-refused it, say as too thin to trade) hovering it says why. While Autopilot is
-on, a play it won't take gets a faded grey robot: hovering it gives the first
-check the play fails, in the words the entry gate itself uses (the badge and
-the gate share one set of checks). The play's detail panel says the same in one
-line.
+already acted on the play; on one still on offer hovering it says why. While
+Autopilot is on, a play it won't take gets a faded grey robot: hovering it gives
+the first check the play fails, in the words the entry gate itself uses (the
+badge and the gate share one set of checks). The play's detail panel says the
+same in one line. A play Autopilot tried and was refused - by the engine's
+assessment (say as too thin to trade) or the broker - gets the faded robot with
+the refusal, and a note in **Autopilot notes**; it isn't tried again that day
+unless a setting changes.
+
+**The strip under the header** says what Autopilot is doing now and why, in one
+line: off, paper-only, no prices, stopped for the day, done (the day's entries
+used, and how many more bought nothing), the orders-sent ceiling, every position
+taken, then per kind - day trades waiting for the open or in the last minutes
+before the close, a kind holding its share of the day / swing split - and while
+a kind has room, pacing (with a countdown to the next entry) or taking, with how
+many plays pass every check. It adds when unproven setups trade at practice
+size and which replay losers are skipped, and ends with today's closed trades by
+setup - a chip per setup with won / closed and the R they made (pair legs aren't
+counted). Green is taking, amber waiting, red stopped or blind, grey off. When
+the daily loss limit or the give-back rule stops it, a red banner says so as
+well, with the reason, until it's dismissed or the stop is lifted.
 
 **Proof, noise and size.** A day-trade setup must show up `min_confirmations`
 (2) times in a row, and plays carrying a flag in `skip_noise` are skipped. With
@@ -949,6 +973,13 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 * **Connection pill** — what orders go to and whether it's healthy: `Simulator`,
   `IBKR paper ●`, `IBKR live ✕`. Click it to open **Connections**. A banner
   appears when the Gateway needs you.
+* **Live pill** — whether this tab still hears the app: `live · 3 s` (the time since its last update; off
+  hours one comes about every 30 s) or `reconnecting · last update 48 s ago`. Once the link has been down for
+  10 s a red banner says since when nothing has come in, the tables dim, and the buttons that send orders or
+  change settings are off until it's back - the tab reconnects by itself and the app's first message brings the
+  plays and the Open positions, Active orders, Trade history and P/L summary tabs up to date. Those four tabs,
+  when they can't be refreshed, keep what they showed, under *Couldn't refresh - showing data from 10:42* and
+  the reason, and a request the app refuses shows its own reason.
 * **Connections** — paper platform, IB Gateway settings, **Test paper / Test
   live**, **Reconnect**.
 * **Settings** — the scan schedule and list sizes, the scan status, **Run full
@@ -957,8 +988,8 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 * **Reports** — each session's report (see [Reports](#reports--every-session-the-market-and-the-bot));
   a dot marks one you haven't opened.
 * **Scan now** — rescan the hot list and the next buffer names. The plays header
-  shows the last scan, a progress bar while one runs, and when the next full
-  scan is due.
+  shows the last scan, a progress bar while one runs, when the next full
+  scan is due, and "replay running" while a replay runs in the background.
 * **Long / Short / Intraday / Swing** and **Sectors** — what the bot scans for
   and may trade.
 * **Strategies** — switch setups on or off and weight them.
@@ -971,10 +1002,25 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
   in R; amber beyond `execution.max_chase_r` (0.25R), where an entry is refused. The tooltip says when the
   price is from. The positions' **Mark** is the app's own price when it fetched one in the last two minutes
   (the one the exit manager acts on), otherwise the broker's mark, which IBKR updates only every few minutes.
+* **Replay record** (plays table, beside the setup) — the setup's replayed average R a trade and how many
+  trades, over the ones Autopilot would take: green proven, amber not proven yet, red losing, grey no replayed
+  trades. The tooltip adds the held-out sessions and why it isn't proven. The play's detail panel sets what the
+  replayed wins average beside the play's expected R (which counts a win at the full target), and **Switch
+  this setup off** is the Strategies switch: the setup stays off, through a restart, until it's switched back on.
+* **R now** and **Protection** (Open positions) — where each trade stands at its Mark in R, against the risk it
+  was opened with (entry to the original stop), as the exit manager measures it; and what stands ready to close
+  it: green when its stop (and target) rest at the broker - the orders the app placed and follows - amber when
+  the app watches the price itself (the simulator), red for **no stop at the broker yet**. Under it a day trade
+  counts down to its time stop, "out in 31 min unless working", amber in the last 5 minutes.
+* **Execute ✓ Yes** / **Dismiss** (a play's detail panel) — the click shows at once: the row says *sending…*,
+  or leaves the table, and a refusal puts it back as it was, with the app's reason. The answer comes as soon
+  as the order is out; the account is read and sent a moment later. The panel follows its play: once
+  Autopilot (or another tab) has sent it, Execute is gone and the panel says who sent it and when.
 * **Trading capital** — how much of the account the bot may use.
 * **Autopilot** + **⚙** — hands-off entry and its caps.
 * **Reset paper** (simulator only) — reset the balance.
-* **Exit** / **Exit all** — close one position, or all of them, at the market.
+* **Exit** / **Exit all** — close one position, or all of them, at the market. A position's Exit says
+  *Sending…* and stays off until the app answers.
 * **Quit** — close out, then shut down.
 * Bottom tabs: **Open positions**, **Active orders**, **Trade history**, **P/L summary**, **Watchlist**, **Pairs**.
 
@@ -1289,7 +1335,9 @@ the *edge* (what tends to happen at this setup) → what's true *right now* →
 **the plan** (entry, stop with the $-per-share you risk "to find out", target,
 reward:risk, and an *estimated ~P%* — a probability over many trades, not a call
 on this one) → the **invalidation** price → a reminder that wins and losses land
-randomly around an edge.
+randomly around an edge. The plays pushed to the dashboard carry only what the table
+shows, so this text is fetched once the pointer rests on a play; the one-line
+rationale shows until it arrives.
 
 ### Technical (`tos_bot/strategies/technical.py`)
 

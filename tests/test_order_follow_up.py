@@ -553,3 +553,71 @@ def test_a_part_filled_entry_the_broker_loses_track_of_books_what_it_was_seen_to
     for _ in range(ex.LOST_AFTER_POLLS):                                   # e.g. a Gateway restart mid-cancel
         ex.sync_open_orders()
     assert [(t["quantity"], t["entry_price"]) for t in repo.open_trades()] == [(4.0, 100.03)]   # so they get a stop
+
+
+# ---------------------------------------------------------------- the dashboard's countdowns on a working entry
+def _at_broker(order_id, play, filled=0.0):
+    """The entry the app sent, as the broker lists it while it works."""
+    return OrderResult(order_id=order_id, status="WORKING", symbol=play.symbol, submitted_qty=10,
+                       filled_qty=filled, side=play.side, tag=play.id)
+
+
+def test_a_working_day_trade_entry_says_when_its_time_out_comes():
+    import datetime as dt
+
+    broker, repo = _Broker(), _Repo([])
+    ex = _executor(broker, repo)
+    day, swing = _entry(ex), _entry(ex, "BBB", timeframe=Timeframe.SWING)
+    broker.working += [_at_broker("1", day), _at_broker("2", swing)]
+    orders = {o["order_id"]: o for o in ex.active_orders()}
+    sent, due = (dt.datetime.fromisoformat(orders["1"][k]) for k in ("submitted_at", "expires_at"))
+    assert due == sent + dt.timedelta(minutes=ex.cfg.entry_timeout_min)
+    assert (orders["1"]["cut_at"], orders["1"]["calling_off"]) == (None, None)
+    assert orders["2"]["submitted_at"] and orders["2"]["expires_at"] is None      # a swing entry keeps its DAY life
+
+    # the time counted down to is the one the order is called off at
+    assert ex.expire_entries(now=due - dt.timedelta(seconds=1)) == []
+    assert ex.expire_entries(now=due + dt.timedelta(milliseconds=1)) == ["1"]
+    listed = broker.working[0]                                              # still listed until the cancel takes
+    assert "not filled within" in ex._describe(listed, {})["calling_off"]
+    assert ex._describe(broker.working[1], {})["calling_off"] is None
+
+
+def test_a_part_filled_entry_says_when_the_rest_is_cut():
+    import datetime as dt
+    import time
+
+    broker, repo = _Broker(), _Repo([])
+    ex = _executor(broker, repo)
+    day, leg = _entry(ex), _entry(ex, "BBB", tags=["pair-leg"])
+    for oid, play in (("1", day), ("2", leg)):
+        broker.reports[oid] = OrderResult(order_id=oid, status="WORKING", symbol=play.symbol, submitted_qty=10,
+                                          filled_qty=4)
+        broker.working.append(_at_broker(oid, play, filled=4))
+    ex.sync_open_orders()
+    ex._pending["1"].first_fill_at = time.monotonic() - 10                 # its first shares were bought 10 s ago
+    wait = ex.cfg.partial_entry_wait_s
+    now = dt.datetime.now(dt.timezone.utc)
+    orders = {o["order_id"]: o for o in ex.active_orders()}
+    assert (orders["1"]["filled"], orders["1"]["qty"]) == (4.0, 10.0)
+    cut = dt.datetime.fromisoformat(orders["1"]["cut_at"])
+    assert abs((cut - now).total_seconds() - (wait - 10)) < 1               # from the first fill, not from now
+    assert orders["2"]["cut_at"] is None                                    # the pairs desk works its own legs
+
+    ex.expire_entries(mono=ex._pending["1"].first_fill_at + wait)
+    assert "filled in part" in ex._describe(broker.working[0], {})["calling_off"]   # listed until the cancel takes
+
+
+def test_an_entry_taken_over_after_a_restart_times_out_from_then():
+    import datetime as dt
+
+    broker = _Broker(working=[_working("21", side=Side.LONG, tag="play_left")])
+    ex = _executor(broker, _Repo([]))
+    before = dt.datetime.now(dt.timezone.utc)
+    ex.adopt_working_orders()
+    after = dt.datetime.now(dt.timezone.utc)
+    (order,) = ex.active_orders()
+    limit = dt.timedelta(minutes=ex.cfg.entry_timeout_min)
+    assert order["submitted_at"] is None                                    # when it really went out isn't known
+    due = dt.datetime.fromisoformat(order["expires_at"])
+    assert before + limit - dt.timedelta(milliseconds=1) <= due <= after + limit

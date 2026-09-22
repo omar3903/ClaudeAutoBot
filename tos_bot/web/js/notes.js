@@ -1,5 +1,6 @@
 /* Autopilot notes: while Autopilot is on, why each play joined or left the board, with
-   what Autopilot makes of a new one. Notes can be dismissed one by one or all at once. */
+   what Autopilot makes of a new one, and a play it tried and was refused (autopilot.skipped).
+   Notes can be dismissed one by one or all at once. */
 import { $, escapeHtml, fmtClock, pretty } from "./util.js";
 import { S } from "./state.js";
 import { selectPlay } from "./plays.js";
@@ -18,11 +19,11 @@ export function renderNotes() {
   $("#ap-notes-count").textContent = list.length ? `(${list.length})` : "";
   $("#ap-notes-list").innerHTML = list.map(n => {
     const title = (S.strategies[n.strategy] || {}).title || pretty(n.strategy);
-    const onBoard = n.kind === "added" && S.plays.some(p => p.id === n.play_id);
+    const onBoard = n.kind !== "removed" && S.plays.some(p => p.id === n.play_id);
     return `<div class="ap-note ${n.kind}${onBoard ? " clickable" : ""}" data-note="${escapeHtml(n.id)}">
       <button class="note-x" data-note-x="${escapeHtml(n.id)}" title="Dismiss this note">✕</button>
       <div class="note-head"><span class="badge ${n.kind === "added" ? "good" : "warn"}">${n.kind}</span>
-        <b>${escapeHtml(n.symbol)}</b> ${escapeHtml(n.side.toLowerCase())} · ${escapeHtml(title)}
+        <b>${escapeHtml(n.symbol)}</b> ${escapeHtml((n.side || "").toLowerCase())} · ${escapeHtml(title)}
         <span class="muted small">${fmtClock(n.at)}</span></div>
       <div class="note-why">${escapeHtml(n.why)}</div>
       ${n.autopilot ? `<div class="note-ap muted small">🤖 ${escapeHtml(n.autopilot)}</div>` : ""}
@@ -41,6 +42,6 @@ export function initNotes() {
     }
     const el = e.target.closest("[data-note]");
     const note = el && S.notes.find(n => n.id === el.dataset.note);
-    if (note && note.kind === "added" && S.plays.some(p => p.id === note.play_id)) selectPlay(note.play_id);
+    if (note && note.kind !== "removed" && S.plays.some(p => p.id === note.play_id)) selectPlay(note.play_id);
   });
 }

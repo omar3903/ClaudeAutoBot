@@ -4,13 +4,40 @@ export const $ = (sel, root = document) => root.querySelector(sel);
 export const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const LOCAL_HEADER = { "X-ATB-Request": "1" };      // the server's same-machine guard expects it
-export const api = (path, opt) => fetch(path, opt).then(r => r.json());
+
+/** The server's answer - or an Error saying why there isn't one: the server's own detail or reason when it
+    refused (e.status is the HTTP status, 404 for something gone, and e.body what it sent), or "the app isn't
+    reachable" when nothing answered (e.status 0). A refusal used to come back as if it were the answer. */
+export async function api(path, opt) {
+  let r, body;
+  try { r = await fetch(path, opt); } catch { throw Object.assign(new Error("the app isn't reachable"), { status: 0 }); }
+  try { body = await r.json(); } catch { body = undefined; }         // not JSON: a crash page
+  if (r.ok && body !== undefined) return body;
+  const why = body && (typeof body.detail === "string" ? body.detail : body.reason);
+  throw Object.assign(new Error(why || (r.ok ? "the app's answer couldn't be read" : `the app answered with an error (${r.status})`)),
+    { status: r.status, body });
+}
 export const getLocal = path => api(path, { headers: LOCAL_HEADER });
+/* A POST's refusal keeps the server's own answer ({ok: false, reason, ...}) - callers read its fields. */
 export const post = (path, body = {}) => api(path, {
   method: "POST",
   headers: { "Content-Type": "application/json", ...LOCAL_HEADER },
   body: JSON.stringify(body),
-}).catch(() => ({ ok: false, reason: "the app isn't reachable" }));
+}).catch(e => ({ ok: false, reason: e.message, ...(e.body && typeof e.body === "object" ? e.body : {}) }));
+
+/** A panel that couldn't be refreshed keeps what it showed, under a line saying so and when that came in -
+    so a table isn't taken for current while the app is away. `since` is when the panel last had a good
+    answer (null: never). Its next good render replaces the line along with the rest. */
+export function markStale(el, since, e) {
+  let line = el.querySelector(":scope > .stale-note");
+  if (!line) {
+    line = document.createElement("div");
+    line.className = "stale-note";
+    el.prepend(line);
+  }
+  line.textContent = (since ? `Couldn't refresh - showing data from ${fmtClock(since.toISOString())}` : "Couldn't load this")
+    + ` (${e.message})`;
+}
 
 /* ---------- formatting ---------- */
 const missing = v => v == null || isNaN(v);
@@ -37,7 +64,7 @@ export const shorten = (s, n) => s && s.length > n ? s.slice(0, n - 1) + "…" :
 export const pretty = key => (key || "").replace(/_/g, " ");
 export const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
-const parseDate = s => new Date(/[zZ]|[+-]\d\d:\d\d$/.test(s) ? s : s + "Z");     // the database stores UTC
+export const parseDate = s => new Date(/[zZ]|[+-]\d\d:\d\d$/.test(s) ? s : s + "Z");     // the database stores UTC
 export function fmtTime(s) {
   if (!s) return "–";
   const d = parseDate(s);

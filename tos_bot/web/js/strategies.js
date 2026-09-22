@@ -46,14 +46,22 @@ async function loadReplay() {
   try { S.replay = await api("/api/replay"); } catch { S.replay = null; }
 }
 
+/* The replay's events. "replay" is emitted when it starts or stops running, for the scan status beside the plays. */
 export async function onReplayEvent(topic, p) {
-  if (topic === "replay.progress") {
+  const was = !!(S.replay || {}).running;
+  if (topic === "replay.started") {
+    // the day's replay, started by itself after the morning's full scan
+    if (!p.ok) { toast("The day's replay didn't start: " + (p.reason || "unknown reason"), "warn"); return; }
+    S.replay = { ...(S.replay || {}), running: true, progress: { stage: "starting", done: 0, total: 1 } };
+  } else if (topic === "replay.progress") {
     S.replay = { ...(S.replay || {}), running: true, progress: p };
   } else {
     if (topic === "replay.failed") toast("Replay failed: " + (p.reason || "unknown error"), "bad");
     else toast(`Replay finished: ${p.trades} simulated trades. Strategy records are updated.`, "good");
     await loadReplay();
+    if (S.replay) S.replay.running = false;       // it has ended, whatever a read racing its last moment said
   }
+  if (!!(S.replay || {}).running !== was) emit("replay");
   if (drawerOpen("strategies")) renderStrategies();
 }
 
@@ -175,6 +183,7 @@ function renderStrategies() {
     toastResult(r);
     if (r.ok) {
       S.replay = { ...(S.replay || {}), running: true, progress: { stage: "starting", done: 0, total: 1 } };
+      emit("replay");
       renderStrategies();
     }
   };
@@ -185,11 +194,13 @@ function renderStrategies() {
   };
 }
 
-async function updateStrategy(key, body) {
+/* Also the play detail panel's "Switch this setup off" - one switch, wherever it's pressed. */
+export async function updateStrategy(key, body) {
   const r = await post(`/api/strategies/${encodeURIComponent(key)}`, body);
-  if (r.ok) { toast(r.note + (r.rescanning ? " Rescanning…" : ""), "good"); indexStrategies(r.strategies); return; }
+  if (r.ok) { toast(r.note + (r.rescanning ? " Rescanning…" : ""), "good"); indexStrategies(r.strategies); return r; }
   toast("Strategy not changed: " + (r.reason || ""), "bad");
   if (drawerOpen("strategies")) renderStrategies();
+  return r;
 }
 
 export function initStrategies() {

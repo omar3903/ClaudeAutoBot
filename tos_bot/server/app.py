@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -88,6 +89,9 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
 
     app = FastAPI(title="AutoTradeBot", version="0.4.0", lifespan=lifespan)
     app.state.shutdown = None           # run.py wires this to the uvicorn server
+    # the snapshot and the plays are tens of KB of JSON, fetched all session: gzipped they're a fraction of
+    # that. A small answer isn't worth compressing, and the WebSocket doesn't pass through here
+    app.add_middleware(GZipMiddleware, minimum_size=2048)
 
     def eng() -> TradingEngine:
         return app.state.engine
@@ -98,8 +102,16 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
         return eng().snapshot()
 
     @app.get("/api/plays")
-    def plays():
-        return {"plays": eng().current_plays()}
+    def plays(full: bool = False):
+        # what the table shows of each play, as the board's push sends it; ?full=1 for every play whole
+        return {"plays": eng().current_plays(full=full)}
+
+    @app.get("/api/plays/{play_id}")
+    def play(play_id: str):
+        row = eng().play_row(play_id)
+        if row is None:
+            raise HTTPException(404, "play not found (it may have expired)")
+        return row
 
     @app.post("/api/plays/{play_id}/assess")
     def assess(play_id: str):
@@ -120,8 +132,8 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     # ---- trades and P/L ------------------------------------------------- #
     @app.get("/api/trades")
     def trades(status: Optional[str] = None, limit: int = 100):
-        repo = eng().repo
-        return {"trades": repo.open_trades() if status == "OPEN" else repo.recent_trades(limit)}
+        e = eng()
+        return {"trades": e.open_positions() if status == "OPEN" else e.repo.recent_trades(limit)}
 
     @app.get("/api/orders")
     def orders(fresh: bool = False):
@@ -355,7 +367,7 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
         try:
             snap = await loop.run_in_executor(None, eng().snapshot)
             await sock.send_json({"topic": "hello", "payload": {**snap, "web_build": web_build()}})
-            rows = await loop.run_in_executor(None, eng().current_plays)
+            rows = await loop.run_in_executor(None, eng().current_plays)     # slim, like every later push
             await sock.send_json({"topic": "plays.updated", "payload": {"plays": rows}})
             while True:
                 evt = await q.get()

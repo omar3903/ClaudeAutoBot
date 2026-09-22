@@ -7,8 +7,10 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import os
+import re
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -205,9 +207,12 @@ def test_strategy_panel_switches_setups_live_and_remembers_only_changes(engine):
 def test_autopilot_is_part_of_the_snapshot_and_remembered(engine):
     snap = engine.snapshot()
     assert "trade_types" in snap["autopilot"] and snap["scan"]["fast"] is False
+    # the status strip: what it is doing now and why, and today's closed trades by setup
+    assert snap["autopilot"]["headline"]["state"] == "off" and snap["autopilot"]["today"] == []
     out = engine.set_autopilot(enabled=True, trade_types=["INTRADAY", "SWING"])
     assert out["ok"] and out["autopilot"]["enabled"] is True
     assert set(out["autopilot"]["trade_types"]) == {"INTRADAY", "SWING"}
+    assert out["autopilot"]["headline"]["state"] != "off" and out["autopilot"]["headline"]["text"]
     assert engine.runtime.read()["autopilot"]["enabled"] is True
 
 
@@ -981,6 +986,58 @@ def test_the_dashboard_lists_the_orders_working_at_the_broker(engine, monkeypatc
         ("AAPL", "entry", "play_waiting", 1.0)]
 
 
+def test_a_working_entrys_countdowns_are_sent_with_it_but_never_pushed_on_their_own(engine, monkeypatch):
+    """The browser counts down from the times sent with the order. The part-fill cut is worked out again at
+    each look; that alone isn't a change to push."""
+    from tos_bot.execution.executor import _Pending
+
+    play = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=100.0, stop=95.0, targets=[110.0])
+    engine.executor._pending["1"] = _Pending("1", play, "entry", qty=5, submitted_at=dt.datetime.now(dt.timezone.utc),
+                                             first_fill_at=time.monotonic())
+    working = [OrderResult(order_id="1", status="WORKING", symbol="AAA", submitted_qty=5, filled_qty=2,
+                           side=Side.LONG, tag=play.id, order_type="LIMIT", limit_price=100.0)]
+    monkeypatch.setattr(engine.executor.broker, "list_orders", lambda status=None: list(working))
+    heard = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **payload: heard.append(topic))
+    engine._refresh_orders()
+    engine._refresh_orders()                                                # nothing the broker says has changed
+    (order,) = engine.active_orders()["orders"]
+    assert order["expires_at"] and order["cut_at"] and order["filled"] == 2
+    assert heard.count("orders.updated") == 1
+
+
+def test_a_countdown_that_starts_after_its_order_was_sent_is_pushed(engine, monkeypatch):
+    """The orders loop can list a part-fill before the order sync notes its first fill, and an entry left
+    working by an earlier run is listed before it is taken over. The cut, or the time-out, that follows
+    changes nothing else about the order - it is still told to the browser, once."""
+    from tos_bot.execution.executor import _Pending
+
+    play = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=100.0, stop=95.0, targets=[110.0])
+    working = [OrderResult(order_id="1", status="WORKING", symbol="AAA", submitted_qty=5, filled_qty=0,
+                           side=Side.LONG, tag=play.id, order_type="LIMIT", limit_price=100.0)]
+    monkeypatch.setattr(engine.executor.broker, "list_orders", lambda status=None: list(working))
+    sent = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **payload: sent.append((topic, payload)))
+    pushed = lambda: [p["orders"][0] for t, p in sent if t == "orders.updated"]   # noqa: E731
+
+    engine._refresh_orders()                                                # not yet followed: no clock
+    assert [(o["purpose"], o["expires_at"]) for o in pushed()] == [("entry", None)]
+    engine.executor._pending["1"] = _Pending("1", play, "entry", qty=5, adopted=True,
+                                             submitted_at=dt.datetime.now(dt.timezone.utc))
+    engine._refresh_orders()                                                # taken over: its time-out starts
+    assert len(pushed()) == 2 and pushed()[-1]["expires_at"] and pushed()[-1]["cut_at"] is None
+
+    working[0] = dataclasses.replace(working[0], filled_qty=2)
+    engine._refresh_orders()                                                # the fill, before the sync has noted it
+    assert len(pushed()) == 3 and pushed()[-1]["filled"] == 2 and pushed()[-1]["cut_at"] is None
+    engine.executor._pending["1"].first_fill_at = time.monotonic()          # the order sync notes it
+    engine._refresh_orders()
+    engine._refresh_orders()
+    assert len(pushed()) == 4 and pushed()[-1]["cut_at"]
+
+
 def test_the_session_review_keeps_each_trade_with_what_it_was_taken_on(engine):
     from tos_bot.util import clock
 
@@ -1182,6 +1239,85 @@ def test_each_play_carries_the_latest_price_the_app_holds_and_when_its_from(engi
     assert row["last_price"] == engine.md.last_seen("AAPL")[0] and row["last_at"].startswith("20")
 
 
+def test_each_play_carries_its_setups_replay_record_read_once_for_the_board(engine, monkeypatch):
+    losing = {"trades": 40, "expectancy_r": -0.09, "win_rate": 0.4, "avg_win_r": 0.45,
+              "out_of_sample": {"trades": 12, "expectancy_r": -0.1}}
+    proven = {"trades": 36, "expectancy_r": 0.2, "win_rate": 0.5, "avg_win_r": 1.1,
+              "out_of_sample": {"trades": 12, "expectancy_r": 0.15}}
+    reads = []
+    monkeypatch.setattr(engine, "strategy_record",
+                        lambda key: reads.append(key) or {"setup_a": losing, "setup_b": proven}.get(key))
+    sent = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **payload: sent.append(payload["plays"])
+                        if topic == "plays.updated" else None)
+    engine.board.replace([_play("AAA", strategy="setup_a"), _play("BBB", strategy="setup_a"),
+                          _play("CCC", strategy="setup_b"), _play("DDD", strategy="setup_c")])
+    assert not engine.autopilot.enabled            # Autopilot reads no records itself: the reads are the rows'
+
+    engine._publish_plays()
+    rows = {r["symbol"]: r["record"] for r in sent[-1]}
+    assert rows["AAA"] == rows["BBB"] == {
+        "trades": 40, "expectancy_r": -0.09, "win_rate": 0.4, "avg_win_r": 0.45, "held_out_trades": 12,
+        "held_out_r": -0.1, "proven": False, "why": engine.autopilot.proof_missing("setup_a", losing)}
+    assert rows["CCC"]["proven"] is True and rows["CCC"]["why"] is None and rows["CCC"]["avg_win_r"] == 1.1
+    none = rows["DDD"]                             # a setup the replay has no trades from
+    assert (none["trades"], none["expectancy_r"], none["held_out_trades"], none["proven"]) == (0, None, 0, False)
+    assert "has 0 of the" in none["why"]
+    assert sorted(reads) == ["setup_a", "setup_b", "setup_c"]          # once a setup, not once a play
+    reads.clear()
+    engine._publish_plays()                        # read afresh each time: a new replay shows at once
+    assert sorted(reads) == ["setup_a", "setup_b", "setup_c"]
+    reads.clear()
+    assert len(engine.current_plays()) == 4 and sorted(reads) == ["setup_a", "setup_b", "setup_c"]
+
+
+#: what the dashboard reads of a play from the board's push: the plays table (plays.js), the notes, the orders,
+#: the chart, the Autopilot strip and the event handlers
+DASHBOARD_READS = {"id", "symbol", "sector", "side", "strategy", "timeframe", "entry", "stop", "targets", "reward_risk",
+                   "suggested_qty", "dollar_risk", "score", "status", "trade_id", "noise", "extended_hours_ok",
+                   "confirmations", "rationale", "last_price", "last_at", "autopilot", "record", "evidence"}
+
+
+def _explained_play(symbol, strategy="setup_a"):
+    p = _play(symbol, strategy=strategy)
+    p.rationale, p.explanation, p.invalidation = "one line", "THE EDGE ... " * 200, "a close below 95.00"
+    p.evidence = {"spark": [100.0 + i / 10 for i in range(60)], "signal_nudge": 0.02, "signal_reasons": "a filing",
+                  "expected_r": 0.6, "bar_at": "2026-01-05T15:30:00+00:00", "vol_forecast": {"vol": 0.02}}
+    return p
+
+
+def test_the_board_push_sends_only_what_the_dashboard_reads_of_a_play(engine, monkeypatch):
+    sent = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **payload: sent.append(payload["plays"])
+                        if topic == "plays.updated" else None)
+    engine.board.replace([_explained_play("AAA"), _explained_play("BBB", strategy="setup_b")])
+    engine._publish_plays()
+    rows = sent[-1]
+    assert len(rows) == 2
+    for row in rows:
+        assert DASHBOARD_READS <= set(row)
+        assert not {"explanation", "invalidation", "tags", "probability", "notional"} & set(row)
+        assert row["evidence"] == {"signal_nudge": 0.02, "signal_reasons": "a filing", "expected_r": 0.6}
+        # Autopilot's verdict and the replay record go whole
+        assert set(row["autopilot"]) == {"eligible", "why_not", "waiting", "acted", "skipped", "reason"}
+        assert row["autopilot"]["why_not"] == "Autopilot is off" and row["record"]["why"]
+    assert engine.current_plays() == rows                            # /api/plays and the socket's hello: the same rows
+    whole = engine.current_plays(full=True)                          # ?full=1
+    assert whole[0]["explanation"].startswith("THE EDGE") and len(whole[0]["evidence"]["spark"]) == 60
+    assert len(str(rows)) * 4 < len(str(whole))
+
+
+def test_one_play_is_served_whole_for_its_hover_until_it_leaves_the_board(engine):
+    p = _explained_play("AAA")
+    engine.board.replace([p])
+    row = engine.play_row(p.id)                                      # GET /api/plays/{id}
+    assert row["explanation"].startswith("THE EDGE") and row["evidence"]["spark"] and row["invalidation"]
+    assert row["autopilot"]["why_not"] and row["record"]["trades"] == 0
+    assert engine.play_row("play_gone") is None
+    engine.board.clear()
+    assert engine.play_row(p.id) is None                             # the route answers 404
+
+
 def test_autopilots_badge_is_handed_the_play_itself_not_only_its_rounded_row(engine, monkeypatch):
     p, handed = _play("AAA"), []
     monkeypatch.setattr(engine.autopilot, "decorate_play", lambda row, play=None: handed.append(play) or row)
@@ -1210,6 +1346,36 @@ def test_refresh_prices_the_plays_and_the_positions_and_sends_the_plays_out_agai
     engine.APP_MARK_S = -1.0                                                    # a price that has aged: the broker's mark
     [pos] = engine.snapshot()["positions"]
     assert (pos["market_price"], pos["price_at"], pos["unrealized_pl"]) == (100.0, None, 0.0)
+
+
+# ---------------------------------------------------------------- open positions on the dashboard
+def test_each_open_position_says_what_rests_at_the_broker_to_close_it(engine):
+    """The Open positions tab's protection chip reads the orders the executor placed and follows
+    (protective_stops / resting_targets), and its R now and time-stop cells read the record's own fields."""
+    engine._venue = "ibkr-paper"
+    both, stop_only = _open(engine, "AAA", venue="ibkr-paper"), _open(engine, "BBB", venue="ibkr-paper")
+    bare, parked = _open(engine, "CCC", venue="ibkr-paper"), _open(engine, "DDD", venue="paper")
+    stop = {"trade_id": both, "symbol": "AAA", "order_id": "11", "qty": 5.0, "stop_price": 95.0}
+    target = {"trade_id": both, "symbol": "AAA", "order_id": "12", "qty": 3.0, "limit_price": 110.0}
+    engine.executor.native_stops_on = lambda: True
+    engine.executor.protective_stops = lambda: [stop, {**stop, "trade_id": stop_only, "symbol": "BBB", "order_id": "21"}]
+    engine.executor.resting_targets = lambda: [target]
+
+    rows = {t["id"]: t for t in engine.open_positions()}
+    assert rows[both]["protection"] == {"native": True, "stop": stop, "target": target}           # green
+    assert rows[stop_only]["protection"]["stop"]["order_id"] == "21" and rows[stop_only]["protection"]["target"] is None
+    assert rows[bare]["protection"] == {"native": True, "stop": None, "target": None}              # red: none yet
+    assert rows[parked]["protection"] is None                  # another venue's: nothing is placed while it's parked
+    read = {"entry_price", "initial_stop_price", "stop_price", "side", "timeframe", "overwatch_at", "managed_exit",
+            "pair_id", "broker"}
+    assert all(read <= set(t) for t in rows.values())
+
+    engine.executor.native_stops_on = lambda: False            # a venue that rests none: the app watches the price
+    engine.executor.protective_stops = lambda: []
+    engine.executor.resting_targets = lambda: []
+    rows = {t["id"]: t for t in engine.open_positions()}
+    assert rows[both]["protection"] == {"native": False, "stop": None, "target": None}
+    assert engine.snapshot()["exit_manager"]["intraday_time_stop"] is True     # the countdown shows only while it's on
 
 
 # ---------------------------------------------------------------- what became of a play, in the play log
@@ -1295,6 +1461,49 @@ def test_a_play_already_sent_cant_be_dismissed_and_one_never_logged_is_logged_wh
                                                                                                     "autopilot")
 
 
+def test_a_click_is_answered_once_the_order_is_out_and_autopilot_still_reads_the_account_first(engine, monkeypatch):
+    """The dashboard's Yes doesn't wait for an account read: the snapshot loop is woken to read and send it.
+    Autopilot's approval, on the scan thread, still reads it before it goes on - its next play is sized on it."""
+    web, auto = _play("AAA"), _play("BBB")
+    engine.board.replace([web, auto])
+    monkeypatch.setattr(engine, "assess_play",
+                        lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
+    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen: None)
+    monkeypatch.setattr(engine.executor, "execute_play", lambda p, account, **kw: {"ok": True, "status": "SUBMITTED"})
+    reads, read_now = [], threading.Event()
+
+    def read():                                                             # a slow account read, as IBKR's can be
+        reads.append(threading.current_thread().name)
+        read_now.wait(10)
+        return False
+
+    monkeypatch.setattr(engine, "_refresh_account", read)
+    loop = threading.Thread(target=engine._snapshot_loop, name="snapshot-loop", daemon=True)
+    loop.start()
+    assert _until(lambda: reads == ["snapshot-loop"])                       # its own first pass, held up
+    started = time.monotonic()
+    assert engine.approve_play(web.id)["ok"]
+    assert time.monotonic() - started < 5 and reads == ["snapshot-loop"]    # answered without a read of its own
+    read_now.set()                                                          # the first pass finishes...
+    assert _until(lambda: reads == ["snapshot-loop"] * 2)                   # ...and the loop, woken, reads again at once
+
+    assert engine.approve_play(auto.id, operator="autopilot")["ok"]
+    assert reads[-1] == threading.current_thread().name != "snapshot-loop"   # read before it returned
+    engine._stop.set()
+    engine._snapshot_wake.set()
+    loop.join(5)
+    assert not loop.is_alive()
+
+
+def _until(check, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(0.02)
+    return False
+
+
 # ---------------------------------------------------------------- confirmations counted on candles
 def test_any_scan_on_a_newer_candle_confirms_a_day_play_and_the_setting_turns_it_off(engine, monkeypatch):
     import pandas as pd
@@ -1344,3 +1553,28 @@ def test_the_strategies_panel_says_when_a_day_setup_fires_on_one_candle(engine, 
     assert "fires on one candle" not in engine.replay_state()["proof"][key]
     engine.autopilot.confirm_on_new_candle, engine.autopilot.min_confirmations = True, 1
     assert "fires on one candle" not in engine.replay_state()["proof"][key]
+
+
+def test_every_topic_the_app_publishes_has_a_handler_in_the_dashboard():
+    """A topic the dashboard ignores is news nobody sees - a stop for the day, a disarmed engine, a skipped play."""
+    app = Path(__file__).resolve().parents[1] / "tos_bot"
+    published = {m.group(1) for f in app.rglob("*.py")
+                 for m in re.finditer(r'(?:_publish|\.publish)\(\s*"([\w.]+)"', f.read_text(encoding="utf-8"))}
+    handled = set(re.findall(r'case "([\w.]+)"', (app / "web" / "js" / "events.js").read_text(encoding="utf-8")))
+    assert len(published) > 50                                    # the search found the app's topics
+    assert sorted(published - handled) == []
+
+
+def test_a_click_that_wakes_the_snapshot_loop_leaves_the_position_check_to_its_usual_turn(engine, monkeypatch):
+    from tos_bot.engine import engine as module
+
+    checks, now = [], {"t": 1_000.0}
+    monkeypatch.setattr(engine, "_reconcile_open_trades", lambda force=False: checks.append(now["t"]) or [])
+    monkeypatch.setattr(module.time, "monotonic", lambda: now["t"])
+    engine._reconcile_if_due()                                     # a scheduled pass
+    now["t"] += 1.0
+    engine._reconcile_if_due()                                     # a pass a click woke a second later
+    assert checks == [1_000.0]
+    now["t"] += engine.RECONCILE_MIN_GAP_S
+    engine._reconcile_if_due()                                     # the next scheduled pass checks again
+    assert checks == [1_000.0, 1_000.0 + 1.0 + engine.RECONCILE_MIN_GAP_S]

@@ -62,6 +62,12 @@ th[data-term]{text-decoration:underline dotted var(--muted); text-underline-offs
 
 /* ---- lock while quitting: only exits stay usable ---- */
 body.locked .lockable{opacity:.4; pointer-events:none}
+/* ---- the app out of reach: the tables are the last it sent, and nothing can be sent to it ---- */
+body.offline :is(main, .blotter){opacity:.6}
+body.offline :is(.lockable, #btn-refresh, #btn-quit, #quit-cancel, #btn-exit-all, #modal-ok, #btn-reject, #rec-exit,
+  #orders-cancel-all, [data-exit], [data-untracked], [data-pair-close]){opacity:.4; pointer-events:none}
+.stale-note{background:var(--warn-bg); color:var(--warn); border:1px solid var(--warn-line); border-radius:6px;
+  padding:4px 10px; margin:6px 0; font-size:12px}
 
 /* ---- top bar ---- */
 .topbar{
@@ -83,6 +89,15 @@ body.locked .lockable{opacity:.4; pointer-events:none}
 .ap-btn.on{background:var(--long); color:var(--on-accent); border-color:transparent}
 .ap-btn.armed-paper{background:var(--warn-bg); color:var(--warn); border-color:var(--warn-line)}
 .autopilot-ctl.live-warn{outline:1px dashed var(--warn); outline-offset:2px; border-radius:8px}
+/* the strip under the header: green taking, amber waiting, red stopped or blind, grey off */
+.ap-strip{display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:5px 18px; font-size:12.5px;
+  background:var(--bg2); border-bottom:1px solid var(--line); border-left:4px solid var(--muted)}
+.ap-strip[data-state="taking"]{border-left-color:var(--long)}
+.ap-strip:is([data-state="pacing"],[data-state="closed"],[data-state="kind-full"],[data-state="late"],[data-state="full"],[data-state="done"]){border-left-color:var(--warn)}
+.ap-strip:is([data-state="blind"],[data-state="stopped"],[data-state="ceiling"],[data-state="blocked"]){border-left-color:var(--short)}
+.ap-today{display:inline-flex; gap:6px; flex-wrap:wrap; margin-left:auto}
+.ap-today .chip.good{color:var(--ok); border-color:var(--good-line)}
+.ap-today .chip.bad{color:var(--short); border-color:var(--bad-line)}
 .ap-badge{margin-left:5px; font-size:11px; vertical-align:middle; filter:grayscale(.3)}
 .ap-badge.acted{filter:none}
 tbody tr.ap-eligible{box-shadow:inset 3px 0 0 var(--long)}
@@ -181,6 +196,8 @@ tbody tr.done:hover{opacity:.9}
 .timebar{display:inline-block; width:52px; height:5px; background:var(--bg3); border-radius:3px; overflow:hidden}
 .timebar>i{display:block; height:100%}
 .timebar>i.ok{background:var(--ok)} .timebar>i.warn{background:var(--warn)} .timebar>i.bad{background:var(--short)}
+/* an open position's protection chip, with a day trade's time stop under it */
+td.protection{white-space:nowrap; line-height:1.7}
 tr.row-overdue{box-shadow:inset 3px 0 0 var(--short)}
 
 /* ---- detail panel ---- */
@@ -232,6 +249,8 @@ tr.row-overdue{box-shadow:inset 3px 0 0 var(--short)}
 .banner button{background:var(--warn); color:var(--bg2); padding:4px 10px}
 .banner button.ghost{background:transparent; color:var(--warn); border-color:var(--warn-line)}
 .banner.quit{background:var(--short-bg); color:var(--short); border-bottom-color:var(--bad-line); font-weight:600}
+.banner.bad{background:var(--short-bg); color:var(--short); border-bottom-color:var(--bad-line)}
+.banner.bad button.ghost{color:var(--short); border-color:var(--bad-line)}
 #toasts{position:fixed; right:16px; bottom:16px; display:flex; flex-direction:column; gap:8px; z-index:9998}
 .toast{background:var(--bg3); border:1px solid var(--line); border-left:3px solid var(--accent); border-radius:8px; padding:10px 14px; font-size:12.5px; max-width:340px; box-shadow:var(--shadow); animation:slide .2s ease}
 .toast.good{border-left-color:var(--ok)} .toast.bad{border-left-color:var(--short)} .toast.warn{border-left-color:var(--warn)}
@@ -329,7 +348,9 @@ tr.clickable-row{cursor:pointer}
 .ap-noise{display:grid; grid-template-columns:1fr 1fr; gap:2px 12px}
 
 /* ---- active orders ---- */
-.order-mark{margin-left:5px; font-size:11px; cursor:pointer; vertical-align:middle}
+.order-mark{margin-left:5px; font-size:11px; cursor:pointer; vertical-align:middle; white-space:nowrap}
+.countdown{font-variant-numeric:tabular-nums; white-space:nowrap}
+.countdown.warn{color:var(--warn)}
 .orders-table .purpose{white-space:nowrap}
 
 /* ---- play chart ---- */
@@ -441,6 +462,11 @@ button.link:hover{text-decoration:underline; filter:none}
 .signals-table tr.mover:hover, .signals-table tr.mover.open{background:var(--sel)}
 .sig-mark{font-size:10px; margin-left:4px; cursor:pointer}
 .badge.faint{color:var(--muted); font-weight:600}
+/* a play's replay record, beside its setup; in the detail panel with the setup's off switch */
+.rec-chip{margin-left:4px; white-space:nowrap; vertical-align:middle}
+.rec-box{font-size:12px; margin:6px 0 10px}
+.rec-box div{margin:3px 0}
+.rec-box button{margin-top:4px}
 .play-chart .band{fill:var(--sel)}
 .play-chart .vline{stroke-width:1.5; stroke-dasharray:3 3}
 .play-chart .vl-news, .chart-key .vl-news{stroke:var(--accent2); background:var(--accent2)}

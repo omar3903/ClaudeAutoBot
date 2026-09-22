@@ -1,9 +1,9 @@
 /* The plays table, and the detail panel: why, the numbers, and the order. */
-import { $, $$, escapeHtml, num, pct, pretty, post, sectorTag, sideBadge, tfLabel, usd } from "./util.js";
+import { $, $$, api, escapeHtml, fmtClock, num, pct, pretty, post, sectorTag, sideBadge, tfLabel, usd } from "./util.js";
 import { S, on } from "./state.js";
-import { toast } from "./ui.js";
+import { openModal, toast } from "./ui.js";
 import { hideTip, showTipAt } from "./tooltips.js";
-import { stratLabel } from "./strategies.js";
+import { stratLabel, updateStrategy } from "./strategies.js";
 import { hideExecuted, hideNoisy } from "./filters.js";
 import { loadOpen, openRecord, showTab } from "./blotter.js";
 import { orderMark } from "./orders.js";
@@ -15,16 +15,29 @@ const isDone = p => DONE.has(p.status);
 const isNoisy = p => (p.noise || []).length > 0;
 const noiseLabel = flag => ((S.state.autopilot || {}).noise_labels || {})[flag] || flag.replace(/_/g, " ");
 
+/* Clicks waiting on the app, by play id: "sending" (Execute) or "dismissing". The screen shows the click at
+   once - the row says it's sending, or is gone - and S.plays is never touched until the answer, so a refusal
+   puts the row back exactly as it was, and a push arriving meanwhile can't undo the click on screen. */
+const pending = new Map();
+
+function setPending(id, what) {
+  if (what) pending.set(id, what); else pending.delete(id);
+  renderPlays();
+}
+
 export function mergePlay(row) {
   const i = S.plays.findIndex(x => x.id === row.id);
   if (i >= 0) { S.plays[i] = { ...S.plays[i], ...row }; renderPlays(); }
 }
 
+// a dismissed play stays on the app's board (its setup isn't offered again today), so the push still carries it
+const dismissed = p => p.status === "REJECTED" || pending.get(p.id) === "dismissing";
+
 function visiblePlays() {
   const f = S.state.filters || {};
   const sides = f.sides || ["LONG", "SHORT"], tfs = f.timeframes || ["INTRADAY", "SWING"];
-  return S.plays.filter(p => sides.includes(p.side) && tfs.includes(p.timeframe) && (!hideExecuted() || !isDone(p))
-    && (!hideNoisy() || isDone(p) || !isNoisy(p)));
+  return S.plays.filter(p => !dismissed(p) && sides.includes(p.side) && tfs.includes(p.timeframe)
+    && (!hideExecuted() || !isDone(p)) && (!hideNoisy() || isDone(p) || !isNoisy(p)));
 }
 
 function emptyText() {
@@ -34,16 +47,35 @@ function emptyText() {
     : "No plays yet — hit <b>Scan now</b>.";
 }
 
+/* The rows on screen, by play id, each with its signature: its class and cells as last drawn. A push redraws
+   only the rows whose signature changed and moves rows only when the order did, so a hover, the selected row
+   and a click in flight survive a push that didn't touch them. */
+const shown = new Map();
+
 export function renderPlays() {
-  const rows = visiblePlays();
+  const rows = visiblePlays(), offered = S.plays.filter(p => !dismissed(p)).length;
   $("#plays-count").textContent = rows.length ? `(${rows.length})` : "";
-  $("#plays-empty").innerHTML = S.plays.length && !rows.length
-    ? `All ${S.plays.length} plays are hidden by the view options above — untick <b>Hide noise</b> or <b>Hide executed</b> to see them.`
+  $("#plays-empty").innerHTML = offered && !rows.length
+    ? `All ${offered} plays are hidden by the view options above — untick <b>Hide noise</b> or <b>Hide executed</b> to see them.`
     : emptyText();
   $("#plays-empty").classList.toggle("hidden", rows.length > 0);
-  const body = $("#plays-body");
-  body.innerHTML = "";
-  for (const p of rows) body.appendChild(playRow(p));
+  const body = $("#plays-body"), ids = new Set(rows.map(p => p.id));
+  for (const [id, r] of shown) if (!ids.has(id)) { r.tr.remove(); shown.delete(id); }
+  rows.forEach((p, i) => {
+    const { cls, html } = playRow(p), sig = `${cls}|${html}`;
+    let r = shown.get(p.id);
+    if (!r || r.sig !== sig) {
+      const tr = document.createElement("tr");
+      tr.dataset.id = p.id;
+      tr.className = cls;
+      tr.innerHTML = html;
+      if (r) r.tr.replaceWith(tr);
+      shown.set(p.id, r = { tr, sig });
+    }
+    r.tr.classList.toggle("selected", p.id === S.selected);
+    if (body.children[i] !== r.tr) body.insertBefore(r.tr, body.children[i] || null);
+  });
+  followSelected();
 }
 
 /** A play whose score the insider or news signals moved: click for its stock on the Signals page. */
@@ -66,39 +98,94 @@ function priceCell(p) {
 }
 
 /* What Autopilot makes of a play, in one line: the first of its checks the play fails (the gate's own
-   words), the cap it waits for, what its last pass said, or that it would take it. The robot's tooltip
-   and the detail panel both show it. */
+   words), that it tried the play and was refused, the cap it waits for, what its last pass said, or that
+   it would take it. The robot's tooltip and the detail panel both show it. */
 function apLine(ap) {
   if (ap.why_not) return `Won't take it: ${ap.why_not}`;
+  if (ap.skipped) return `Tried it and was refused: ${ap.reason || "no reason given"} - not tried again today unless a setting changes`;
   if (ap.waiting) return `Waiting: ${ap.waiting}`;
   if (ap.reason) return `Last pass: ${ap.reason}`;
   return ap.acted ? "Has acted on it" : "Would take it on its next pass";
 }
 
+/* The setup's replayed record over the trades Autopilot would take (row.record): its average R a trade over
+   how many trades. Green once proven, red while it loses, amber in between, grey with no replayed trades.
+   The tooltip adds the held-out sessions and, when it isn't proven, why not in the gate's own words. */
+const signedR = v => `${v >= 0 ? "+" : ""}${num(v, 2)}R`;
+const recordSentence = rec => "replayed the way Autopilot takes it, " + (rec.trades
+  ? `averaged ${signedR(rec.expectancy_r)} a trade over ${rec.trades} trades${rec.held_out_trades ? `, ${signedR(rec.held_out_r)} over the ${rec.held_out_trades} in the held-out sessions` : ""}`
+  : "has no trades yet");
+
+function recordChip(rec) {
+  if (!rec) return "";
+  const why = `This setup, ${recordSentence(rec)}. ${rec.proven ? "Proven" : `Not proven: ${rec.why || "no record"}`}`;
+  const cls = !rec.trades ? "faint" : rec.proven ? "good" : rec.expectancy_r < 0 ? "bad" : "warn";
+  return `<span class="badge ${cls} rec-chip" data-term="record" data-why="${escapeHtml(why)}">${rec.trades ? `${signedR(rec.expectancy_r)} ×${rec.trades}` : "no replay"}</span>`;
+}
+
+/* The record in the detail panel, with what the replayed wins average set beside the play's expected R -
+   which counts a win at the full target (up to 4R, as the ranking does) - and the setup's off switch. */
+function recordBlock(p) {
+  const rec = p.record;
+  if (!rec) return "";
+  const exp = (p.evidence || {}).expected_r;
+  const wins = !rec.trades || exp == null ? ""
+    : `<div class="muted small">This play expects ${signedR(exp)}, counting a win at the full target (${signedR(Math.min(p.reward_risk || 0, 4))}); ${rec.win_rate ? `the replayed wins average ${signedR(rec.avg_win_r)}` : "none of the replayed trades won"}.</div>`;
+  const enabled = (S.strategies[p.strategy] || {}).enabled !== false;
+  return `<div class="rec-box">
+      <div>The setup, ${escapeHtml(recordSentence(rec))}. <span class="badge ${rec.proven ? "good" : "warn"}" data-term="record">${rec.proven ? "proven" : "not proven"}</span></div>
+      ${rec.proven ? "" : `<div class="muted small">${escapeHtml(rec.why || "")}</div>`}
+      ${wins}
+      ${enabled ? `<button class="ghost mini lockable" id="btn-strat-off" title="The Strategies panel's switch - it stays off until you switch it back on">Switch this setup off</button>` : ""}
+    </div>`;
+}
+
+/* The Strategies panel's own switch, from a play: the setup stays off, through a restart, until it's switched
+   back on there. Its plays leave the board, so the panel closes once it's off. */
+function switchOff(p) {
+  const name = (S.strategies[p.strategy] || {}).title || pretty(p.strategy);
+  openModal({
+    title: `Switch ${name} off?`,
+    bodyHTML: `<p>The scans stop looking for this setup and its plays leave the board, for you and for Autopilot.</p>
+      <p><b>It stays off until you switch it back on</b> under Strategies - the change is saved and kept through a restart.</p>
+      <p class="muted">Positions it has open are left as they are, and their exits stay managed.</p>`,
+    okText: "Switch off", okClass: "danger",
+    onOk: async () => {
+      const r = await updateStrategy(p.strategy, { enabled: false });
+      if (r.ok && S.selected === p.id) {
+        $("#detail-body").classList.add("hidden");
+        $("#detail-empty").classList.remove("hidden");
+      }
+    },
+  });
+}
+
+/** A play's row: its class (the selected row's is added by renderPlays) and its cells. */
 function playRow(p) {
-  const tr = document.createElement("tr");
-  const done = isDone(p), ap = p.autopilot || {};
-  tr.dataset.id = p.id;
-  tr.classList.toggle("selected", p.id === S.selected);
-  tr.classList.toggle("done", done);
-  // a play it has acted on gets no bar: it won't look at it again today, whatever the caps say
-  tr.classList.toggle("ap-eligible", !!ap.eligible && !ap.waiting && !done && !ap.acted);
-  tr.classList.toggle("ap-waiting", !!ap.eligible && !!ap.waiting && !done && !ap.acted);
+  // one this tab is sending shows as sent until the answer - a refusal puts it back
+  const sending = pending.get(p.id) === "sending", done = isDone(p) || sending, ap = p.autopilot || {};
+  // it tried the play and the engine's assessment or the order was refused: no bar, and a faded robot saying why
+  const skipped = !!ap.skipped && !done;
+  // a play it has acted on gets no bar either: it won't look at it again today, whatever the caps say
+  const bar = ap.eligible && !skipped && !done && !ap.acted;
+  const cls = [done && "done", bar && !ap.waiting && "ap-eligible", bar && ap.waiting && "ap-waiting"]
+    .filter(Boolean).join(" ");
   // a play it won't take gets a faded robot too, only while Autopilot is on - off, every row would have one
-  const refused = !ap.eligible && !!ap.why_not && !!(S.state.autopilot || {}).effective;
-  // acted on but not sent - the engine's assessment refused it - the robot says why, as apLine does
-  const apMark = ap.acted
+  const refused = (!ap.eligible && !!ap.why_not || skipped) && !!(S.state.autopilot || {}).effective;
+  // acted on and still on offer: the robot says why, as apLine does
+  const apMark = ap.acted && !skipped
     ? `<span class="ap-badge acted" data-term="autopilot"${done ? "" : ` data-why="${escapeHtml(apLine(ap))}"`}>🤖</span>`
     : ((ap.eligible || refused) && !done
-      ? `<span class="ap-badge${ap.waiting ? " waiting" : ""}${refused ? " refused" : ""}" data-term="autopilot" data-why="${escapeHtml(apLine(ap))}">🤖</span>`
+      ? `<span class="ap-badge${ap.waiting && !skipped ? " waiting" : ""}${refused ? " refused" : ""}" data-term="autopilot" data-why="${escapeHtml(apLine(ap))}">🤖</span>`
       : "");
-  const last = done
-    ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
-    : `<span class="info-dot">i</span>`;
-  tr.innerHTML = `
-    <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${orderMark(p.symbol)}${signalMark(p)}${apMark}${p.extended_hours_ok ? '<span class="ext" data-term="ext">ext</span>' : ""}${isNoisy(p) && !done ? `<span class="badge warn" data-term="noise" title="${escapeHtml(p.noise.map(noiseLabel).join(", "))}">noisy</span>` : ""}</td>
+  const last = sending ? `<span class="badge warn" title="Sent to the app - waiting for its answer">sending…</span>`
+    : done
+      ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
+      : `<span class="info-dot">i</span>`;
+  const html = `
+    <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${orderMark(p)}${signalMark(p)}${apMark}${p.extended_hours_ok ? '<span class="ext" data-term="ext">ext</span>' : ""}${isNoisy(p) && !done ? `<span class="badge warn" data-term="noise" title="${escapeHtml(p.noise.map(noiseLabel).join(", "))}">noisy</span>` : ""}</td>
     <td>${sideBadge(p.side)}</td>
-    <td>${stratLabel(p.strategy)}</td>
+    <td>${stratLabel(p.strategy)} ${recordChip(p.record)}</td>
     <td class="tf">${tfLabel(p.timeframe)}</td>
     <td class="num">${num(p.entry)}</td>
     ${priceCell(p)}
@@ -109,24 +196,57 @@ function playRow(p) {
     <td class="num">${usd(p.dollar_risk)}</td>
     <td class="num"><span class="score-bar"><i style="width:${Math.min(100, (p.score || 0) * 100)}%"></i></span></td>
     <td class="row-tools"><button class="chart-btn" title="Chart, and the ways this trade can end" aria-label="Chart">📈</button>${last}</td>`;
-  tr.addEventListener("click", e => {
-    if (e.target.closest(".chart-btn")) openChart(p);
-    else if (e.target.closest(".order-mark")) showTab("orders");
-    else if (e.target.closest(".sig-mark")) openSignals(p.symbol);
-    else selectPlay(p.id);
-  });
-  tr.addEventListener("mousemove", e => {
-    if (e.target.closest("[data-term]")) return;      // the term's own explanation is showing
-    showTipAt(e.clientX, e.clientY, ((S.strategies[p.strategy] || {}).title || pretty(p.strategy)).toUpperCase(),
-      (p.explanation || p.rationale || "").trim());
-  });
-  tr.addEventListener("mouseleave", hideTip);
-  return tr;
+  return { cls, html };
+}
+
+/* A row's hover shows the play's full explanation. The board's push leaves that out - it's most of a play's
+   size - so it's fetched whole (GET /api/plays/{id}) once the pointer has rested on the row, and kept while
+   the play's entry, stop, targets and rationale stay the same. Until it comes, or once the play has left the
+   board, the one-line rationale shows. */
+const EXPLAIN_WAIT_MS = 250;
+const explained = new Map();          // play id -> {stamp, text}
+let hovered = null, hoverTimer = null, hoverAt = [0, 0];
+const stamp = p => [p.entry, p.stop, (p.targets || []).join(","), p.rationale].join("|");
+const rowTitle = p => ((S.strategies[p.strategy] || {}).title || pretty(p.strategy)).toUpperCase();
+
+function rowTip(p) {
+  const known = explained.get(p.id);
+  return (p.explanation || (known && known.stamp === stamp(p) ? known.text : "") || p.rationale || "").trim();
+}
+
+function hoverRow(p, x, y) {
+  hoverAt = [x, y];
+  showTipAt(x, y, rowTitle(p), rowTip(p));
+  if (hovered === p.id) return;                      // already fetched, or on its way, for this visit
+  hovered = p.id;
+  clearTimeout(hoverTimer);
+  const known = explained.get(p.id);
+  if (!p.explanation && !(known && known.stamp === stamp(p))) hoverTimer = setTimeout(() => explain(p.id), EXPLAIN_WAIT_MS);
+}
+
+async function explain(id) {
+  let row;
+  // the app isn't reachable, or failed: the rationale stands, and the next visit asks again
+  try { row = await api(`/api/plays/${encodeURIComponent(id)}`); } catch (e) { if (e.status !== 404) return; row = null; }
+  const p = S.plays.find(x => x.id === id);
+  if (!p) return;
+  // a play that has left the board answers 404: the rationale stands, and isn't asked again while it reads the same
+  const whole = row && row.id === id ? row : null;
+  explained.set(id, { stamp: stamp(whole || p), text: whole ? whole.explanation || "" : "" });
+  if (explained.size > 200) explained.delete(explained.keys().next().value);      // the oldest first
+  if (hovered === id) showTipAt(hoverAt[0], hoverAt[1], rowTitle(p), rowTip(p));
+}
+
+/** The play of the row an event happened in. */
+function rowPlay(target) {
+  const tr = target.closest("tr[data-id]");
+  return tr ? S.plays.find(x => x.id === tr.dataset.id) : null;
 }
 
 /* ---------- detail / confirm ---------- */
 export async function selectPlay(id) {
   S.selected = id;
+  drawn = null;
   $$("#plays-body tr").forEach(tr => tr.classList.toggle("selected", tr.dataset.id === id));
   $("#detail-empty").classList.add("hidden");
   const body = $("#detail-body");
@@ -135,10 +255,48 @@ export async function selectPlay(id) {
   const a = await post(`/api/plays/${id}/assess`);
   if (S.selected !== id) return;
   if (!a.ok) { body.innerHTML = `<p class="reasons">${escapeHtml(a.reason || "unavailable")}</p>`; return; }
+  drawDetail(a);
+}
+
+/* The detail panel as last drawn: its play's assessment, and the status its row had then. A push or a decision
+   that moves the play on - Autopilot sent it, its order filled or was refused - draws the panel again, so it
+   never offers Execute for a play that has gone out (the app would refuse it as already sent). */
+let drawn = null;                    // {id, a, seen}
+
+function drawDetail(a) {
+  const id = a.play.id, body = $("#detail-body");
+  drawn = { id, a, seen: (S.plays.find(x => x.id === id) || a.play).status };
+  $("#detail-empty").classList.add("hidden");
+  body.classList.remove("hidden");
   body.innerHTML = detailHTML(a);
   const approveBtn = $("#btn-approve"); if (approveBtn) approveBtn.onclick = () => approve(id);
   const rejectBtn = $("#btn-reject"); if (rejectBtn) rejectBtn.onclick = () => reject(id);
   const recordBtn = $("#btn-goto-trade"); if (recordBtn) recordBtn.onclick = () => openRecord(a.play.trade_id);
+  const offBtn = $("#btn-strat-off"); if (offBtn) offBtn.onclick = () => switchOff(a.play);
+  followSelected();                  // a push that came while it was being assessed
+}
+
+function hideDetail() {
+  $("#detail-body").classList.add("hidden");
+  $("#detail-empty").classList.remove("hidden");
+}
+
+/* Sent: drawn at once from the row over the assessment - play.decided brings the whole row, with who sent it and
+   when - with no request. Back on offer after it had gone out (its order was refused): assessed afresh, as Execute
+   needs. Dismissed in another tab: closed. A panel already showing the play as sent follows only the row's own
+   moves, never a row that lags the assessment - that would step a filled play back, or assess it again and again
+   until the next push. */
+function followSelected() {
+  if (!drawn || drawn.id !== S.selected || $("#detail-body").classList.contains("hidden")) return;
+  const row = S.plays.find(x => x.id === drawn.id);
+  if (!row) return;
+  const was = drawn.a.play, moved = row.status !== drawn.seen;
+  drawn.seen = row.status;
+  if (row.status === "REJECTED") { if (moved) hideDetail(); }
+  else if (isDone(row)) {
+    if ((moved || !isDone(was)) && row.status !== was.status)
+      drawDetail({ ...drawn.a, play: { ...was, ...row, evidence: { ...(was.evidence || {}), ...(row.evidence || {}) } } });
+  } else if (moved && isDone(was)) selectPlay(row.id);
 }
 
 /* How many times in a row a day play has shown: on 5-minute candles when Autopilot counts those
@@ -149,6 +307,18 @@ function seenText(p) {
     ? `seen on ${n} candle${n === 1 ? "" : "s"} in a row` : `seen in ${n} scan${n === 1 ? "" : "s"} in a row`;
 }
 
+/* Who sent a play's order and when - from what it was taken on (evidence.at_entry, in the whole row: the
+   assessment's, or the one play.decided brings) - and where the order stands. */
+const STANDS = { ACCEPTED: "going out", SUBMITTED: "working", WORKING: "working", PARTIAL: "part filled", FILLED: "filled" };
+
+function sentLine(p) {
+  const at = (p.evidence || {}).at_entry || {};
+  const who = at.by === "autopilot" || (!at.by && (p.autopilot || {}).acted) ? "Autopilot sent it"
+    : at.by ? "Sent from the dashboard" : "Sent";
+  return `✓ ${who}${at.at ? ` at ${fmtClock(at.at)}` : ""} · ${STANDS[p.status] || p.status.toLowerCase()}`
+    + (p.trade_id ? ` — trade <code>${escapeHtml(p.trade_id)}</code>` : "");
+}
+
 function detailHTML(a) {
   const p = a.play, op = a.order_preview, pdt = a.pdt || {}, em = S.state.exit_manager || {};
   const protection = { native: "broker OCO (TP + SL)", managed: "auto exit manager", none: "none" }[op.bracket_mode] || op.bracket_mode;
@@ -157,21 +327,22 @@ function detailHTML(a) {
     + (em.trail_start_r > 0 ? `, trail from ${num(em.trail_start_r, 1)}R (lock ${Math.round(em.trail_lock_ratio * 100)}%)` : "")
     + (p.timeframe === "INTRADAY" && em.flatten_intraday_before_close_min ? `, flatten ${em.flatten_intraday_before_close_min} min before the close` : "")
     : "OFF — you must close this manually";
-  const executed = a.already_executed || isDone(p);
+  const executed = a.already_executed || isDone(p), sending = pending.get(p.id) === "sending";
   const confirmBlock = executed
-    ? `<div class="reasons">${p.status === "ERROR" ? "⚠ the order errored — the setup isn't offered again today" : "✓ Already executed" + (p.trade_id ? ` — trade <code>${escapeHtml(p.trade_id)}</code>` : "")}</div>
+    ? `<div class="reasons">${p.status === "ERROR" ? "⚠ the order errored — the setup isn't offered again today" : sentLine(p)}</div>
        <div class="confirm-row">
          ${p.trade_id ? `<button id="btn-goto-trade">Show trade record</button>` : ""}
        </div>`
     : `${a.reasons && a.reasons.length ? `<div class="reasons">⚠ ${a.reasons.map(escapeHtml).join("<br>")}</div>` : ""}
        <div class="confirm-row">
-         <button class="${p.side === "LONG" ? "long" : "danger"} lockable" id="btn-approve" ${a.can_execute ? "" : "disabled"}>Execute &#10003; Yes</button>
-         <button class="ghost" id="btn-reject">Dismiss</button>
+         <button class="${p.side === "LONG" ? "long" : "danger"} lockable" id="btn-approve" ${a.can_execute && !sending ? "" : "disabled"}>${sending ? "Sending…" : "Execute &#10003; Yes"}</button>
+         <button class="ghost" id="btn-reject" ${sending ? "disabled" : ""}>Dismiss</button>
        </div>`;
   return `
     <h3>${escapeHtml(p.symbol)} ${sectorTag(p.sector)} ${sideBadge(p.side)}${executed ? ' <span class="badge good" data-term="executed">executed</span>' : ""}</h3>
     <div class="sub">${stratLabel(p.strategy)} · ${tfLabel(p.timeframe)} · conf ${num(p.confidence, 2)} · expected ${num((p.evidence || {}).expected_r, 2)}R · score ${num(p.score, 2)}${p.timeframe === "INTRADAY" ? ` · ${seenText(p)}` : ""} · session ${a.session}</div>
     ${p.autopilot && !executed ? `<div class="muted" style="margin:6px 0" data-term="autopilot">🤖 ${escapeHtml(apLine(p.autopilot))}</div>` : ""}
+    ${recordBlock(p)}
     ${(a.noise || []).length && !executed ? `<div class="warn-box" data-term="noise">⚠ Probably noise right now: ${a.noise.map(escapeHtml).join(" · ")}. Autopilot won't take it; you still can.</div>` : ""}
     ${sparkSvg(p.evidence && p.evidence.spark, p)}
     <div class="explain">${escapeHtml(p.explanation || p.rationale)}</div>
@@ -268,34 +439,67 @@ function sparkSvg(values, p) {
     <polyline points="${points}"/></svg>`;
 }
 
+/* The panel drawn again from its last assessment, after a click the app refused - the button as it was. */
+function restoreDetail(id) {
+  if (S.selected === id && drawn && drawn.id === id) drawDetail(drawn.a);
+}
+
 async function approve(id) {
-  const btn = $("#btn-approve");
+  if (pending.has(id)) return;                        // one click at a time
+  const btn = $("#btn-approve"), dismiss = $("#btn-reject");
   if (btn) { btn.disabled = true; btn.textContent = "Sending…"; }
+  if (dismiss) dismiss.disabled = true;
+  setPending(id, "sending");                          // the row says so at once
   const symbol = (S.plays.find(x => x.id === id) || {}).symbol || "";
   const r = await post(`/api/plays/${id}/approve`);
+  pending.delete(id);
   if (r.ok) {
     const where = r.order_session === "EXTENDED" ? " (extended-hours limit)" : "";
     toast(`Order sent for ${symbol}: ${r.order_type || ""} ${r.status || "ok"}${where}`, "good");
     mergePlay({ id, status: r.status === "FILLED" ? "FILLED" : "SUBMITTED", trade_id: r.trade_id || null });
-    selectPlay(id);
+    if (S.selected === id) selectPlay(id);            // another play picked meanwhile stays shown
     loadOpen();
   } else {
     toast("Not sent: " + (r.reason || "rejected"), "bad");
-    if (r.already_executed) { mergePlay({ id, status: "FILLED", trade_id: r.trade_id || null }); selectPlay(id); }
-    else if (btn) { btn.disabled = false; btn.innerHTML = "Execute &#10003; Yes"; }
+    if (r.already_executed) {
+      mergePlay({ id, status: "FILLED", trade_id: r.trade_id || null });
+      if (S.selected === id) selectPlay(id);
+    } else { renderPlays(); restoreDetail(id); }      // the row and the panel back as they were
   }
 }
 
 async function reject(id) {
+  if (pending.has(id)) return;
+  setPending(id, "dismissing");                       // the row goes at once...
+  hideDetail();
   const r = await post(`/api/plays/${id}/reject`);
-  if (r && r.ok === false) { toast("Not dismissed: " + (r.reason || "refused"), "bad"); return; }
-  S.plays = S.plays.filter(p => p.id !== id);
-  renderPlays();
-  $("#detail-body").classList.add("hidden");
-  $("#detail-empty").classList.remove("hidden");
+  pending.delete(id);
+  if (r && r.ok === false) {
+    toast("Not dismissed: " + (r.reason || "refused"), "bad");
+    renderPlays();                                    // ...and comes back as it was, with its panel
+    restoreDetail(id);
+    return;
+  }
+  mergePlay({ id, status: "REJECTED" });              // as the app's board now has it
 }
 
 export function initPlays() {
+  // one set of listeners for every row, whichever rows a push redraws
+  const body = $("#plays-body");
+  body.addEventListener("click", e => {
+    const p = rowPlay(e.target);
+    if (!p) return;
+    if (e.target.closest(".chart-btn")) openChart(p);
+    else if (e.target.closest(".order-mark")) showTab("orders");
+    else if (e.target.closest(".sig-mark")) openSignals(p.symbol);
+    else selectPlay(p.id);
+  });
+  body.addEventListener("mousemove", e => {
+    const p = rowPlay(e.target);
+    if (!p || e.target.closest("[data-term]")) { hovered = null; return; }    // the term's own explanation is showing
+    hoverRow(p, e.clientX, e.clientY);
+  });
+  body.addEventListener("mouseleave", () => { hovered = null; clearTimeout(hoverTimer); hideTip(); });
   on("plays", renderPlays);
   on("filters", renderPlays);
   on("strategies", renderPlays);
