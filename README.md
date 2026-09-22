@@ -845,6 +845,16 @@ setup never replayed is no reason to risk the full amount. Every trade keeps the
 settings it was taken on (`proof_required`, the floors, the caps) and whether
 its strategy was unproven, so practice trades are never mistaken for proven ones.
 
+**Losers are skipped even in practice.** With proof not asked for, Autopilot still
+skips a setup with evidence that it loses (`skip_replay_losers`, day trades by
+default; `off` / `day` / `all`): its replay the way Autopilot takes it averages
+`replay_loser_r` (0.05R) a trade or worse over `min_replay_trades` (30) and over
+10 held-out trades, or its own closed trades - the in-app simulator's count too -
+average -0.30R or worse over 10. The records are read afresh on every pass, so a
+replay that recovers lifts it. The threshold is fragile - a little lower and a
+setup flips - so set `off` to practise every setup again. The Autopilot dialog
+lists what is skipped now, and each trade keeps that list.
+
 **Faster loop while day-trading.** When Autopilot is armed with the **Intraday** filter on and
 the regular session is open, the hot list is rescanned every
 `scanner.fast_cycle_seconds` (60) between the regular cycles. The header button

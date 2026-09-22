@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from ..core.eventbus import BUS
 from ..scanner.noise import LABELS as NOISE_LABELS
+from ..research.journal import DRIFT_R, MIN_LIVE
 from ..research.significance import SPEED_LIMIT
 from ..util import clock
 
@@ -44,6 +45,8 @@ KINDS = (DAY, SWING)
 
 
 MODEL_MODES = ("shadow", "gate", "size")
+#: which plays the replay-loser check covers (AutoPilot.replay_loser): none, day trades, or swing trades too
+LOSER_SCOPES = ("off", "day", "all")
 
 
 def kind_of(timeframe: Any) -> str:
@@ -53,6 +56,11 @@ def kind_of(timeframe: Any) -> str:
 def _mode(value: Any) -> str:
     value = str(value or "shadow").lower()
     return value if value in MODEL_MODES else "shadow"
+
+
+def _loser_scope(value: Any) -> str:
+    value = str(value or "day").lower()
+    return value if value in LOSER_SCOPES else "day"
 
 
 class AutoPilot:
@@ -86,6 +94,8 @@ class AutoPilot:
         self.min_replay_trades: int = int(getattr(cfg, "min_replay_trades", 30))
         self.min_replay_expectancy_r: float = float(getattr(cfg, "min_replay_expectancy_r", 0.05))
         self.proof_p_value: float = float(getattr(cfg, "proof_p_value", 0.10))
+        self.skip_replay_losers: str = _loser_scope(getattr(cfg, "skip_replay_losers", "day"))
+        self.replay_loser_r: float = float(getattr(cfg, "replay_loser_r", 0.05))
         self.model_mode: str = _mode(getattr(cfg, "model_mode", "shadow"))
         self.model_min_p: float = float(getattr(cfg, "model_min_p", 0.55))
         self.dry_run: bool = bool(cfg.dry_run)
@@ -112,6 +122,8 @@ class AutoPilot:
         self._entries_at: List[float] = []      # monotonic times of the latest entries, for the per-cycle cap
         #: (monotonic time read, {strategy: replayed record}) - the dashboard's rows share one read (_board_record)
         self._record_cache: Optional[tuple] = None
+        #: (monotonic time, {strategy: replayed record}, [real records]) - one read per pass of consider()
+        self._pass_cache: Optional[tuple] = None
 
     # ------------------------------------------------------------------ #
     #  Persistable slice (goes into data/runtime.json alongside `mode`)  #
@@ -137,6 +149,8 @@ class AutoPilot:
             "min_minutes_to_close": self.min_minutes_to_close,
             "skip_noise": list(self.skip_noise),
             "require_proven": self.require_proven,
+            "skip_replay_losers": self.skip_replay_losers,
+            "replay_loser_r": self.replay_loser_r,
             "model_mode": self.model_mode,
             "model_min_p": self.model_min_p,
             "dry_run": self.dry_run,
@@ -172,6 +186,10 @@ class AutoPilot:
             self.require_proven = bool(d["require_proven"])
         if "confirm_on_new_candle" in d:
             self.confirm_on_new_candle = bool(d["confirm_on_new_candle"])
+        if "skip_replay_losers" in d:
+            self.skip_replay_losers = _loser_scope(d["skip_replay_losers"])
+        if isinstance(d.get("replay_loser_r"), (int, float)):
+            self.replay_loser_r = max(0.0, min(1.0, float(d["replay_loser_r"])))
         if "model_mode" in d:
             self.model_mode = _mode(d["model_mode"])
         if isinstance(d.get("model_min_p"), (int, float)):
@@ -231,6 +249,10 @@ class AutoPilot:
             self.min_confirmations = max(1, min(10, int(kw["min_confirmations"])))
         if "confirm_on_new_candle" in kw:
             self.confirm_on_new_candle = bool(kw["confirm_on_new_candle"])
+        if "skip_replay_losers" in kw:
+            self.skip_replay_losers = _loser_scope(kw["skip_replay_losers"])
+        if isinstance(kw.get("replay_loser_r"), (int, float)):
+            self.replay_loser_r = max(0.0, min(1.0, float(kw["replay_loser_r"])))
         if isinstance(kw.get("min_minutes_to_close"), int):
             self.min_minutes_to_close = max(0, min(120, int(kw["min_minutes_to_close"])))
         if "model_mode" in kw:
@@ -239,7 +261,7 @@ class AutoPilot:
             self.model_min_p = min(0.9, max(0.5, float(kw["model_min_p"])))
         if isinstance(kw.get("skip_noise"), list):
             self.skip_noise = [str(n) for n in kw["skip_noise"] if str(n) in NOISE_LABELS]
-        self._record_cache = None               # the records are over the trades these settings would take
+        self._record_cache = self._pass_cache = None   # the records are over the trades these settings would take
         self._persist()
         self.bus.publish("autopilot.config", **self.status())
         log.info("autopilot reconfigured: %s", self.status())
@@ -271,7 +293,7 @@ class AutoPilot:
         self._acted -= self._refused
         self._refused.clear()
         self._last_reason.clear()
-        self._record_cache = None               # the rows read the records afresh too - a new replay lands here
+        self._record_cache = self._pass_cache = None   # the rows read the records afresh too - a new replay lands here
 
     def publish_status(self) -> None:
         """Tell the dashboard what Autopilot is set to and holds - without saving or logging anything."""
@@ -398,6 +420,9 @@ class AutoPilot:
             "min_replay_trades": self.min_replay_trades,
             "min_replay_expectancy_r": self.min_replay_expectancy_r,
             "proof_p_value": self.proof_p_value,
+            "skip_replay_losers": self.skip_replay_losers,
+            "replay_loser_r": self.replay_loser_r,
+            "replay_losers": self.replay_losers(),
             "model_mode": self.model_mode,
             "model_min_p": round(self.model_min_p, 2),
             "model": self._model_card(),
@@ -544,7 +569,8 @@ class AutoPilot:
                     self._last_reason[p.id] = stopped
             return []
 
-        # highest-conviction first
+        # highest-conviction first; the records the checks read are read once for the pass
+        self._pass_cache = (time.monotonic(), {}, [])
         ordered = sorted(plays.values(), key=lambda p: getattr(p, "score", 0.0), reverse=True)
         for p in ordered:
             if p.id in self._acted:
@@ -662,6 +688,7 @@ class AutoPilot:
                 self.bus.publish("autopilot.skipped", play_id=p.id, symbol=p.symbol,
                                  strategy=p.strategy, reason=self._last_reason[p.id])
 
+        self._pass_cache = None
         return actions
 
     def _kind_full(self, timeframe: str, opens: List[Dict[str, Any]]) -> Optional[str]:
@@ -781,6 +808,9 @@ class AutoPilot:
         unproven = self._unproven(strategy, board=board)
         if unproven:
             return unproven
+        loser = self._losing(strategy, tf, board)
+        if loser:
+            return loser
         return None
 
     def _pre_gate(self, p: Any, equity: float) -> Optional[str]:
@@ -919,6 +949,75 @@ class AutoPilot:
 
     #: replayed trades a strategy needs in the held-out sessions (Chan: test out of sample)
     MIN_HELD_OUT_TRADES = 10
+
+    def _losing(self, strategy: str, timeframe: str, board: bool) -> Optional[str]:
+        """replay_loser, on records read once: for a board of rows (_board_record), or for the pass of
+        consider() under way - otherwise read now."""
+        if self.skip_replay_losers == "off" or self.proof_required:
+            return None                         # asked before anything is read
+        if board:
+            return self.replay_loser(strategy, timeframe, self._board_record(strategy))
+        cached = self._pass_cache
+        if cached is None or time.monotonic() - cached[0] > self.ROOM_CACHE_S:
+            return self.replay_loser(strategy, timeframe)
+        if strategy not in cached[1]:
+            cached[1][strategy] = self.engine.strategy_record(strategy) or {}
+        if not cached[2]:
+            cached[2].append(self._live_stats())
+        return self.replay_loser(strategy, timeframe, cached[1][strategy], cached[2][0])
+
+    def replay_loser(self, strategy: str, timeframe: str, record: Optional[Dict[str, Any]] = None,
+                     live: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Why a setup is skipped as a loser, if it is. Only while proof isn't asked for - on paper with
+        require_proven off, where unproven setups are practised; proof_missing is stricter anyway. Not
+        proven is one thing, evidence that it loses another: its replayed record the way Autopilot takes
+        it averages replay_loser_r (0.05R) a trade or worse over min_replay_trades, and its held-out
+        sessions say the same over MIN_HELD_OUT_TRADES - or its own closed trades (live_stats) average
+        DRIFT_R or worse over MIN_LIVE. The records are read afresh, so a replay that recovers lifts it by
+        itself. ``skip_replay_losers`` says which plays it covers: day trades by default - in the replay,
+        skipping the swing losers left the kept swing trades no better."""
+        scope = self.skip_replay_losers
+        if scope == "off" or self.proof_required or (scope == "day" and kind_of(timeframe) != DAY):
+            return None
+        record = (self.engine.strategy_record(strategy) if record is None else record) or {}
+        bar = -abs(self.replay_loser_r)
+        trades, held = int(record.get("trades", 0)), record.get("out_of_sample") or {}
+        n = int(held.get("trades", 0))
+        if (trades >= self.min_replay_trades and n >= self.MIN_HELD_OUT_TRADES
+                and float(record.get("expectancy_r", 0.0)) <= bar and float(held.get("expectancy_r", 0.0)) <= bar):
+            return (f"{strategy} loses in the replay the way Autopilot takes it: {float(record['expectancy_r']):+.2f}R "
+                    f"a trade over {trades} trades, {float(held['expectancy_r']):+.2f}R over the {n} in the held-out "
+                    "sessions - skipped while that holds (Autopilot settings: skip replay losers)")
+        real = ((self._live_stats() if live is None else live) or {}).get(strategy) or {}
+        m = int(real.get("trades", 0))
+        if m >= MIN_LIVE and float(real.get("expectancy_r", 0.0)) <= -DRIFT_R:
+            # live_stats counts the in-app simulator's trades as well as the broker's - said so
+            return (f"{strategy} is losing in the app's own trades (the simulator's and the broker's, over the recent "
+                    f"sessions): {float(real['expectancy_r']):+.2f}R a trade over its last {m} - skipped while that "
+                    "holds (Autopilot settings: skip replay losers)")
+        return None
+
+    def replay_losers(self) -> List[Dict[str, str]]:
+        """The setups replay_loser skips right now - for the settings, and kept with each trade taken."""
+        out: List[Dict[str, str]] = []
+        if self.skip_replay_losers == "off" or self.proof_required:
+            return out
+        live = self._live_stats()
+        for s in getattr(getattr(self.engine, "scanner", None), "strategies", None) or []:
+            try:
+                why = self.replay_loser(s.key, getattr(s.timeframe, "value", s.timeframe), live=live)
+            except Exception:  # noqa: BLE001
+                continue
+            if why:
+                out.append({"strategy": s.key, "why": why})
+        return out
+
+    def _live_stats(self) -> Dict[str, Any]:
+        stats = getattr(self.engine, "live_stats", None)
+        try:
+            return stats() if callable(stats) else {}
+        except Exception:  # noqa: BLE001
+            return {}
 
     def _learned_skips(self) -> List[str]:
         """The checks from the books' statistics that the replay shows are worth skipping."""

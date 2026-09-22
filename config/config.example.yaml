@@ -161,6 +161,10 @@ autopilot:
   require_proven: true               # only trade strategies the replay (Strategies panel) has proven...
   min_replay_trades: 30              # ...over at least this many replayed trades
   min_replay_expectancy_r: 0.05      # ...averaging at least this much per trade, in R
+  skip_replay_losers: day            # with require_proven off, still skip setups with evidence they lose: the replay
+                                     # averages -replay_loser_r or worse overall and held out, or their own trades
+                                     # -0.30R or worse over 10 (off / day / all)
+  replay_loser_r: 0.05               # ...the loss per trade that counts as losing
   cooldown_after_loss: true          # skip a ticker for the rest of the session after it stops out
   max_daily_loss_pct: 2.0            # Aziz's daily maximum loss: once today's closed trades have lost this
                                      # % of equity, no more entries until the next session (0 = off)

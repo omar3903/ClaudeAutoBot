@@ -456,6 +456,14 @@ def test_a_strategy_the_replay_hasnt_proven_trades_at_a_quarter_of_the_risk(engi
     assert engine.strategy_risk_pct("vwap_reclaim") == cap                      # ...its record sizes it
 
 
+def test_a_trade_keeps_the_setups_skipped_as_losers_when_it_was_taken(engine, monkeypatch):
+    engine.autopilot.configure(require_proven=False)
+    losing = {"trades": 40, "expectancy_r": -0.10, "out_of_sample": {"trades": 12, "expectancy_r": -0.08}}
+    monkeypatch.setattr(engine.replay, "records", lambda *terms: {"vwap_reclaim": losing})
+    settings = engine._entry_context(_play(), "autopilot")["settings"]
+    assert "vwap_reclaim" in settings["replay_losers"] and settings["skip_replay_losers"] == "day"
+
+
 # ---------------------------------------------------------------- a restart
 def _started_again(tmp_path, gateway, port, before=None):
     again = _new_engine(tmp_path, gateway, port)

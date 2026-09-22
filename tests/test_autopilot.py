@@ -53,6 +53,7 @@ class FakeEngine:
         self.est_risk = 200.0
         self.gross = 0.0                        # dollars already in positions
         self.records = {}                       # replayed strategy records
+        self.live = {}                          # closed real trades by strategy (live_stats)
         self._plays = {}                        # pid -> Play, populated by _run
 
     def assess_play(self, pid):
@@ -69,6 +70,9 @@ class FakeEngine:
 
     def strategy_record(self, key):
         return self.records.get(key)
+
+    def live_stats(self):
+        return self.live
 
     def approve_play(self, pid, operator="operator"):
         self.approved.append((pid, operator))
@@ -809,10 +813,15 @@ def _refused(status=None, noise=(), **over):
     ({"min_confirmations": 2}, _refused(), "seen on 1 of 2 five-minute candles in a row"),
     ({"min_confirmations": 2, "confirm_on_new_candle": False}, _refused(), "seen in 1 of 2 scans in a row"),
     ({"require_proven": True}, _refused(), "isn't proven yet"),
+    ({"records": {"opening_range_breakout": {"trades": 40, "expectancy_r": -0.10,
+                                             "out_of_sample": {"trades": 12, "expectancy_r": -0.08}}}},
+     _refused(), "loses in the replay"),
     ({}, _refused(), None),
 ])
 def test_the_bar_gives_the_gates_own_reason_for_every_check_on_the_play(cfg, play, words):
-    ap = AutoPilot(FakeEngine(), _cfg(**cfg), bus=SILENT)
+    eng = FakeEngine()
+    eng.records = dict(cfg.pop("records", {}))
+    ap = AutoPilot(eng, _cfg(**cfg), bus=SILENT)
     gate = ap._pre_gate(play, 100_000.0)
     bar = ap.decorate_play(play.to_row())["autopilot"]
     assert bar["why_not"] == gate                                                # one set of checks, one wording
@@ -966,3 +975,98 @@ def test_a_new_session_starts_the_slots_and_the_orders_sent_afresh():
     ap._day = "2000-01-03"                                                  # the session has turned over
     assert not ap.entry_unfilled(play.id)                                   # yesterday's entry hands back nothing today
     assert (ap._count_today, ap._sent_today, ap._counted) == (0, 0, {})
+
+
+# ---------------------------------------------------------------- setups that lose in the replay are skipped in practice too
+def _losing(trades=40, r=-0.10, held=12, held_r=-0.08):
+    return {"trades": trades, "expectancy_r": r, "out_of_sample": {"trades": held, "expectancy_r": held_r}}
+
+
+def _practice(record=None, **over):
+    eng = FakeEngine()
+    if record is not None:
+        eng.records["opening_range_breakout"] = record
+    return eng, AutoPilot(eng, _cfg(**{"require_proven": False, "trade_types": ["INTRADAY", "SWING"], **over}), bus=SILENT)
+
+
+def test_a_day_setup_that_loses_in_the_replay_is_skipped_with_proof_off():
+    eng, ap = _practice(_losing())
+    p = mkplay()
+    _run(ap, p)
+    assert eng.approved == [] and eng.assess_calls == []
+    assert "loses in the replay the way Autopilot takes it: -0.10R a trade over 40 trades, -0.08R over the 12"         in ap.verdict(p)
+    assert p.id not in ap._acted                                             # never cached: a new record lifts it
+    eng.records["opening_range_breakout"] = _losing(held_r=-0.01)
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]
+
+
+@pytest.mark.parametrize("record, over", [
+    (_losing(held_r=-0.01), {}),                                            # the held-out sessions don't lose
+    (_losing(trades=29), {}),                                               # not enough trades to say
+    (_losing(), {"skip_replay_losers": "off"}),
+])
+def test_a_setup_without_evidence_it_loses_is_still_practised(record, over):
+    eng, ap = _practice(record, **over)
+    p = mkplay()
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]
+
+
+def test_swing_losers_are_skipped_only_when_asked():
+    eng, ap = _practice(_losing())
+    swing = mkplay(tf=Timeframe.SWING)
+    assert ap._pre_gate(swing, 100_000.0) is None                           # 'day' by default
+    ap.configure(skip_replay_losers="all")
+    assert "loses in the replay" in ap._pre_gate(swing, 100_000.0)
+
+
+def test_a_setup_losing_in_its_own_trades_is_skipped():
+    eng, ap = _practice()
+    eng.live["opening_range_breakout"] = {"trades": 10, "expectancy_r": -0.40}
+    assert "is losing in the app's own trades" in ap._pre_gate(mkplay(), 100_000.0)
+    assert "simulator" in ap._pre_gate(mkplay(), 100_000.0)
+    eng.live["opening_range_breakout"] = {"trades": 9, "expectancy_r": -0.40}
+    assert ap._pre_gate(mkplay(), 100_000.0) is None
+
+
+def test_with_proof_asked_for_the_proof_message_wins():
+    eng, ap = _practice(_losing(), require_proven=True)
+    assert "averaged -0.10R" in ap._pre_gate(mkplay(), 100_000.0)
+    assert ap.status()["replay_losers"] == []
+    live = AutoPilot(FakeEngine(mode="live"), _cfg(allow_live=True, require_proven=False), bus=SILENT)
+    live.engine.records["opening_range_breakout"] = _losing()
+    assert "averaged -0.10R" in live._pre_gate(mkplay(), 100_000.0)
+
+
+def test_the_badge_and_the_settings_name_the_skipped_setup():
+    eng, ap = _practice(_losing())
+    eng.scanner = SimpleNamespace(strategies=[SimpleNamespace(key="opening_range_breakout", timeframe=Timeframe.INTRADAY),
+                                              SimpleNamespace(key="other_setup", timeframe=Timeframe.INTRADAY)])
+    bar = ap.decorate_play(mkplay().to_row())["autopilot"]
+    assert not bar["eligible"] and "loses in the replay" in bar["why_not"]
+    [row] = ap.status()["replay_losers"]
+    assert row["strategy"] == "opening_range_breakout" and "loses in the replay" in row["why"]
+
+
+def test_a_pass_reads_each_record_once():
+    eng, ap = _practice(_losing(held_r=-0.01), max_auto_positions=9, max_auto_trades_per_day=9)
+    reads = []
+    eng.strategy_record = lambda key: reads.append(key) or eng.records.get(key)
+    _run(ap, mkplay(sym="AAA"), mkplay(sym="BBB"), mkplay(sym="CCC"))
+    assert len(eng.approved) == 3 and reads == ["opening_range_breakout"]
+
+
+def test_the_loser_settings_are_saved_and_restored():
+    eng, ap = _practice()
+    assert ap.skip_replay_losers == "day" and ap.replay_loser_r == 0.05
+    ap.configure(skip_replay_losers="all", replay_loser_r=0.1)
+    ap.configure(skip_replay_losers="nonsense")                             # unknown -> the default scope
+    assert ap.skip_replay_losers == "day"
+    ap.configure(skip_replay_losers="all")
+    saved = ap.to_runtime()
+    assert saved["skip_replay_losers"] == "all" and saved["replay_loser_r"] == 0.1
+    again = AutoPilot(eng, _cfg(), bus=SILENT)
+    again.load_runtime(saved)
+    assert again.skip_replay_losers == "all" and again.replay_loser_r == 0.1
+    assert again.status()["skip_replay_losers"] == "all"

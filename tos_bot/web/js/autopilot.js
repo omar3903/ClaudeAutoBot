@@ -121,6 +121,14 @@ function configure() {
       <div class="ap-noise">${Object.entries(ap.noise_labels || {}).map(([flag, label]) =>
         `<label><input type="checkbox" class="ap-noise-check" value="${escapeHtml(flag)}" ${(ap.skip_noise || []).includes(flag) ? "checked" : ""}> ${escapeHtml(label)}</label>`).join("")}</div>
       <label title="With real money this is always on. On paper it is your choice: unticked, Autopilot practises the unproven setups too - at a quarter of the usual risk - and every trade is recorded with the settings it was taken on."><input type="checkbox" id="ap-proven" ${ap.require_proven !== false || live ? "checked" : ""} ${live ? "disabled" : ""}> Only trade strategies the replay has proven (Strategies panel)${live ? " - always on in Live" : (ap.require_proven === false ? " - off: unproven setups trade at practice size (a quarter of the risk)" : "")}</label>
+      <label title="With the box above unticked Autopilot practises unproven setups; this still skips a setup with evidence it loses: its replay, the way Autopilot takes it, averages -${ap.replay_loser_r ?? 0.05}R a trade or worse over ${ap.min_replay_trades ?? 30} trades and over 10 in the held-out sessions, or its own trades average -0.30R or worse over 10. A replay that recovers lifts it by itself. With proof required it has nothing to add.">Skip setups that lose in the replay
+        <select id="ap-losers">
+          <option value="off" ${ap.skip_replay_losers === "off" ? "selected" : ""}>off - practise them too</option>
+          <option value="day" ${(ap.skip_replay_losers || "day") === "day" ? "selected" : ""}>day trades</option>
+          <option value="all" ${ap.skip_replay_losers === "all" ? "selected" : ""}>day and swing trades</option>
+        </select></label>
+      ${(ap.replay_losers || []).length ? `<p class="muted small">Skipped now: ${ap.replay_losers.map(l =>
+        `<span title="${escapeHtml(l.why)}">${escapeHtml(l.strategy)}</span>`).join(", ")}</p>` : ""}
       <label title="The model learns, every night, the odds that a play pays from what happened to plays like it - live, not taken, and replayed. It only has a say while its own walk-forward test calls it usable.">The learned model
         <select id="ap-model">
           <option value="shadow" ${(ap.model_mode || "shadow") === "shadow" ? "selected" : ""}>shadow - log its odds, never act on them</option>
@@ -157,6 +165,7 @@ function configure() {
         max_giveback_pct: parseFloat($("#ap-giveback").value),
         skip_noise: $$(".ap-noise-check").filter(c => c.checked).map(c => c.value),
         ...(live ? {} : { require_proven: $("#ap-proven").checked }),      // in Live the box is locked on; the paper choice is kept
+        skip_replay_losers: $("#ap-losers").value,
         model_mode: $("#ap-model").value,
         cooldown_after_loss: $("#ap-cooldown").checked,
         dry_run: $("#ap-dry").checked,

@@ -255,8 +255,10 @@ class ResearchOps:
                              # the split and the filters in force: what each kind of trade was allowed to hold
                              "day_trade_pct": self.day_trade_pct, "split_on": self._both_kinds(),
                              "timeframes": list(self.filters.timeframes),
+                             # the setups skipped as losers then, so a later review judges by these, not later replays
+                             "replay_losers": [row["strategy"] for row in self.autopilot.replay_losers()],
                              **{k: getattr(self.autopilot, k) for k in (
                     "require_proven", "min_confidence", "min_swing_confidence", "min_reward_risk",
                     "min_confirmations", "confirm_on_new_candle", "model_mode", "max_auto_positions",
-                    "max_auto_trades_per_day")}},
+                    "max_auto_trades_per_day", "skip_replay_losers", "replay_loser_r")}},
                 "data_delayed": bool(self.md.delayed)}
