@@ -129,9 +129,10 @@ def test_a_play_not_taken_enters_on_the_bar_after_the_scan_that_wrote_its_row_fi
     [row] = _review(plays=[late])["shadows"]["plays"]
     assert (row["seen_at"], row["offered_at"]) == (f"{DAY}T09:57:00-04:00", f"{DAY}T10:00:30-04:00")
     assert (row["entered_at"], row["entry"]) == (f"{DAY}T10:05:00-04:00", 100.2)     # not the 10:00 bar's open
+    assert row["features"]["minutes_since_open"] == 30.5          # the model learns it as it was when on the board
     for finished in (f"{DAY}T13:50:00", None):          # a finish before the first sighting, or no scan on record
         [row] = _review(plays=[{**late, "scan_finished_at": finished}])["shadows"]["plays"]
-        assert row["offered_at"] == f"{DAY}T09:57:00-04:00"
+        assert row["offered_at"] == f"{DAY}T09:57:00-04:00" and row["features"]["minutes_since_open"] == 27.0
         assert (row["entered_at"], row["r"]) == (f"{DAY}T10:00:00-04:00", 2.0)
 
 
@@ -156,6 +157,7 @@ def test_an_entry_sent_and_never_filled_is_followed_as_sent_even_past_the_cap(mo
     assert set(rows) == {"p1", "q2"}
     assert (rows["q2"]["sent"], rows["q2"]["passed_checks"], rows["q2"]["confirmations"]) == (True, True, 2)
     assert (rows["q2"]["offered_at"], rows["q2"]["entered_at"]) == (f"{DAY}T10:01:10-04:00", f"{DAY}T10:05:00-04:00")
+    assert rows["q2"]["features"]["minutes_since_open"] == 31.2          # its features as it was sent, not first seen
     assert rows["p1"]["sent"] is False
     assert ("3 day setups weren't taken; the 1 highest-scoring and the 1 entry sent below them were followed on the "
             "session's candles") in " ".join(review["lessons"])
@@ -259,6 +261,25 @@ def test_a_check_is_called_helped_or_cost_only_on_a_real_difference():
     assert _compare(_plays_at(0.3, 10, spread=0.5), _plays_at(-0.3, 10, spread=0.5))["verdict"].startswith("cost")
     assert _compare(_plays_at(0.3, 4), _plays_at(-0.3, 10))["verdict"] == "too few plays to tell"
     assert _review()["shadows"]["checks"]["verdict"] == "too few plays to tell"      # one play followed
+
+
+def test_the_checks_helped_when_the_plays_they_turned_away_did_worse_and_cost_when_they_did_better():
+    """The checks are judged by the plays they turn away: worse than the ones they pass is the checks
+    doing their job; better is the checks turning away the better plays."""
+    lose = _session(FLAT + [(100.0, 100.1, 99.9, 100.0), (99.8, 99.9, 98.8, 98.9)])   # through the stop at 99: -1R
+    plays = [_row(f"w{i}", "13:57", symbol=f"W0{i}") for i in range(1, 6)] + \
+            [_row(f"l{i}", "13:57", symbol=f"L0{i}") for i in range(1, 6)]
+    bars = {**{f"W0{i}": BARS["RPL"] for i in range(1, 6)}, **{f"L0{i}": lose for i in range(1, 6)}}
+    helped = _review(plays=plays, bars=bars, passes=lambda row: row["symbol"].startswith("W"))
+    checks = helped["shadows"]["checks"]
+    assert (checks["passed"]["expectancy_r"], checks["turned_away"]["expectancy_r"]) == (2.0, -1.0)
+    assert checks["verdict"] == "helped"
+    assert ("passed Autopilot's checks would have averaged +2.00R over 5, the ones its checks turned away -1.00R "
+            "over 5 - the checks did their job.") in " ".join(helped["lessons"])
+    cost = _review(plays=plays, bars=bars, passes=lambda row: row["symbol"].startswith("L"))
+    assert cost["shadows"]["checks"]["verdict"] == "cost"
+    assert ("passed Autopilot's checks would have averaged -1.00R over 5, the ones its checks turned away +2.00R "
+            "over 5 - the checks turned away the better plays today.") in " ".join(cost["lessons"])
 
 
 def test_a_flag_that_made_no_clear_difference_gets_no_lesson():

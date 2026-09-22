@@ -1088,6 +1088,48 @@ def test_the_review_judges_the_checks_with_the_gates_in_force_that_session(engin
     assert now["source"] == "at the rebuild" and "late_flag" in now["skip_noise"] and now["min_confidence"] == 0.5
 
 
+def test_a_rebuilt_review_follows_the_plays_not_taken_on_the_gates_in_force_that_session(engine, monkeypatch):
+    import pandas as pd
+
+    today = clock.now_ny().date()
+    ap = engine.autopilot
+    ap.skip_noise, ap.min_confidence, ap.min_reward_risk, ap.min_confirmations = ["late_flag"], 0.5, 2.0, 1
+    missed = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                  timeframe=Timeframe.INTRADAY, entry=100.0, stop=99.0, targets=[102.0], confidence=0.6)
+    missed.noise = ["late_flag"]                      # flagged only with a flag learned after the session
+    engine.repo.record_play(missed)
+    session = pd.date_range(pd.Timestamp(f"{today} 09:30", tz="America/New_York"), periods=78, freq="5min")
+    candles = pd.DataFrame({"open": 100.0, "high": 100.05, "low": 99.95, "close": 100.0, "volume": 5e5}, index=session)
+    monkeypatch.setattr(engine, "_session_bars", lambda day, plays, booked=(): {"AAA": candles})
+
+    def review():
+        out = engine.review_session(today)
+        [row] = [r for r in out["review"]["shadows"]["plays"] if r["play_id"] == missed.id]
+        return out["review"], row
+
+    # no entry and no earlier build: today's settings, and the review says so
+    built, row = review()
+    assert built["settings"]["source"] == "at the rebuild" and not row["passed_checks"]
+    assert ("No Autopilot entry recorded the checks in force this session, so its plays were judged on the settings "
+            "at the rebuild.") in built["lessons"]
+
+    # an Autopilot entry recorded the session's checks: the play is judged on them, not on today's
+    taken = _play("BBB")
+    taken.evidence["at_entry"] = _entered(f"{today}T10:30:00-04:00", ["old_flag"])["play"]["evidence"]["at_entry"]
+    taken.suggested_qty = 5
+    engine.repo.record_play(taken)
+    engine.repo.open_trade(taken, 100.0, 5, "paper")
+    built, row = review()
+    assert built["settings"]["source"] == "at the last entry" and built["settings"]["skip_noise"] == ["old_flag"]
+    assert row["passed_checks"] and not any("judged on the settings at the rebuild" in s for s in built["lessons"])
+
+    # rebuilt with no entry on record: the gates the earlier build kept
+    monkeypatch.setattr(engine.repo, "trades_opened_between", lambda first, last: [])
+    built, row = review()
+    assert built["settings"]["source"] == "at the last entry" and built["settings"]["skip_noise"] == ["old_flag"]
+    assert row["passed_checks"]
+
+
 # ---------------------------------------------------------------- market prices on the dashboard
 def test_each_play_carries_the_latest_price_the_app_holds_and_when_its_from(engine):
     p = _play("AAPL")
