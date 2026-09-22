@@ -8,7 +8,7 @@ a strategy. After the close the review gathers, for one session:
 - **the trades** that closed, each with what it was taken on - its noise flags, the scans
   that confirmed it, the price's character, the volatility forecast, the market's regime -
   kept in the play's evidence when it was approved;
-- **the mistakes** - rule breaks and patterns that cost money: a loss beyond the planned
+- **the mistakes** - rule breaks and patterns that cost money: a loss well past the planned
   1R, a winner of 1R or more closed at a loss, a trade taken through a noise flag or before
   it was confirmed, going straight back into a stock that had just stopped out;
 - **the plays that weren't taken** and how each would have gone, followed on the session's
@@ -44,7 +44,7 @@ log = logging.getLogger(__name__)
 NY = "America/New_York"
 ROLLING_SESSIONS = 20
 MAX_SHADOWS = 150
-BEYOND_STOP_R = -1.2              # a loss this deep went past the stop
+BEYOND_STOP_R = -1.2              # a loss this deep went past the stop by more than slippage and commission
 GAVE_BACK_R = 1.0                 # a trade up this much shouldn't end in a loss
 DRIFT_R = 0.3                     # real results this far under the replay's are drifting
 MIN_LIVE = 10
@@ -161,9 +161,10 @@ def find_mistakes(trades: Sequence[Mapping[str, Any]], *, skip_noise: Iterable[s
     for t in sorted(trades, key=lambda t: t.get("entry_time") or ""):
         r, entry, mfe_r = t.get("r_multiple"), _at_entry(t), _in_r(t, "mfe")
         if r is not None and r < BEYOND_STOP_R:
-            add("loss_beyond_stop", "high", t, f"lost {r:+.2f}R - more than the 1R planned: the stop was gapped "
-                                               "or the exit came late")
-        if r is not None and r <= 0 and mfe_r is not None and mfe_r >= GAVE_BACK_R:
+            add("loss_beyond_stop", "high", t, f"lost {r:+.2f}R - {-1.0 - r:.2f}R past the planned stop: the stop was "
+                                               "gapped or the exit came late")
+        # break-even isn't a loss: only a winner that closed below zero gave it back
+        if r is not None and r < 0 and mfe_r is not None and mfe_r >= GAVE_BACK_R:
             add("gave_back_winner", "medium", t, f"was up {mfe_r:+.2f}R and still closed at {r:+.2f}R")
         flags = [f for f in entry.get("noise", []) if f in skip]
         if flags:
@@ -323,10 +324,18 @@ def lessons(day: Mapping[str, Any], mistakes: Sequence[Mapping[str, Any]], shado
     kinds: Dict[str, List[Mapping[str, Any]]] = {}
     for m in mistakes:
         kinds.setdefault(m["kind"], []).append(m)
-    if "loss_beyond_stop" in kinds:
-        worst = min(m["r"] for m in kinds["loss_beyond_stop"])
-        out.append(f"{len(kinds['loss_beyond_stop'])} trade(s) lost more than the planned 1R (worst {worst:+.2f}R). A stop "
-                   "that gets jumped is a gap or liquidity risk - thinner stocks and news days need smaller size.")
+    over = day.get("lost_over_1r", 0)
+    if over:
+        # every loss past 1R is counted; only the ones past the slippage a stop is allowed were jumped
+        beyond, slack = len(kinds.get("loss_beyond_stop", [])), -1.0 - BEYOND_STOP_R
+        lost = (f"{over} trade{'s' if over != 1 else ''} lost more than the planned 1R "
+                f"({'worst ' if over != 1 else ''}{day['worst_r']:+.2f}R)")
+        if beyond:
+            out.append(f"{lost}; {beyond} went more than {slack:.1f}R past the stop. A stop that gets jumped is a gap or "
+                       "liquidity risk - thinner stocks and news days need smaller size.")
+        else:
+            out.append(f"{lost}, none more than {slack:.1f}R past the stop - within the slippage and commission a stop "
+                       "filled at market can cost.")
     if "gave_back_winner" in kinds:
         out.append(f"{len(kinds['gave_back_winner'])} trade(s) were up 1R or more and still closed at a loss. The stop moves "
                    f"to break-even at +{breakeven_at_r:g}R; if this keeps happening, replay an earlier break-even.")
@@ -485,6 +494,8 @@ def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Se
     entered = opened_rows(opened, marks or {})
     standing = [row["open_r"] for row in entered if row["still_open"] and row["open_r"] is not None]
     day_stats = {**_stats(rs), "realized_pl": round(sum(float(t.get("realized_pl") or 0.0) for t in trades), 2),
+                 # to the hundredth of an R, as the lessons show it: a loss that reads -1.00R didn't lose more than 1R
+                 "lost_over_1r": sum(1 for r in rs if r is not None and round(float(r), 2) < -1.0),
                  "by_strategy": {k: _stats(t.get("r_multiple") for t in trades if t["strategy"] == k)
                                  for k in sorted({t["strategy"] for t in trades})},
                  "opened": len(entered), "still_open": sum(1 for row in entered if row["still_open"]),

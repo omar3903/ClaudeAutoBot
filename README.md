@@ -1146,10 +1146,11 @@ can't see them, and the report says so.
   0 closed", and what an entry was taken on is judged the day it is taken;
 * **the trades** that closed, each with what it was taken on — noise flags, scans
   in a row, price character, the market's regime, who took it;
-* **mistakes** — a loss beyond the planned 1R, a winner of 1R or more closed at a
-  loss, a trade taken through a noise flag or before it was confirmed, going
-  straight back into a stock that had just lost, a strategy without a proven
-  record;
+* **mistakes** — a loss more than 0.2R past the planned 1R (the lessons count every
+  loss over 1R, and how many went that far past the stop), a winner of 1R or more
+  closed at a loss (break-even isn't one), a trade taken through a noise flag or
+  before it was confirmed, going straight back into a stock that had just lost, a
+  strategy without a proven record;
 * **the plays not taken**, each followed on the session's 5-minute candles as if
   it had been — grouped by noise flag and by whether Autopilot's checks passed
   it, so every check is tested on live plays every day;

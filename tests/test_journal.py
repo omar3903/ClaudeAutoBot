@@ -86,6 +86,29 @@ def test_the_lessons_and_the_strategies_real_record_against_the_replay():
     assert drifting["drifting"] and live_records(losing)["s"]["trades"] == 12
 
 
+def test_break_even_is_not_a_loss_and_the_1r_lesson_counts_every_loss_past_1r():
+    """A winner that came back to break-even didn't close at a loss. The lesson counts every loss past 1R, and
+    apart from it the ones more than 0.2R past the stop - a loss a little past 1R is a stop's slippage and commission."""
+    trades = [_trade("b1", 0.0, symbol="AAA", mfe=1.4),                          # up 1.4R, out at break-even
+              _trade("b2", -1.05, symbol="BBB"), _trade("b3", -1.19, symbol="CCC"),
+              _trade("b4", -1.23, symbol="DDD"),
+              _trade("b5", -1.001, symbol="EEE")]                                # -1.00R to the hundredth
+    review = _review(trades=trades, rolling=trades)
+    kinds = [(m["kind"], m["trade_id"]) for m in review["mistakes"]]
+    assert not [tid for kind, tid in kinds if kind == "gave_back_winner"]
+    [beyond] = [m for m in review["mistakes"] if m["kind"] == "loss_beyond_stop"]
+    assert beyond["trade_id"] == "b4" and beyond["detail"].startswith("lost -1.23R - 0.23R past the planned stop")
+    assert review["day"]["lost_over_1r"] == 3
+    assert ("3 trades lost more than the planned 1R (worst -1.23R); 1 went more than 0.2R past the stop."
+            in " ".join(review["lessons"]))
+
+    # a loss past 1R that stayed within the stop's slippage is still told - and not as a jumped stop
+    within = [_trade("w1", -1.05, symbol="FFF")]
+    review = _review(trades=within, rolling=within)
+    assert all(m["kind"] != "loss_beyond_stop" for m in review["mistakes"])
+    assert "1 trade lost more than the planned 1R (-1.05R), none more than 0.2R past the stop" in " ".join(review["lessons"])
+
+
 def test_fill_times_are_a_true_median_over_the_fills_they_say_and_a_slow_market_exit_is_counted():
     """An even count takes the mean of the two middle fills; the note says which fills the times cover; an
     exit goes out at market, so one that took minutes is counted and told, not set aside like a resting limit."""
