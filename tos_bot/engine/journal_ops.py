@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import datetime as dt
 import time
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from ..research.replay import ReplaySettings
 from ..research.journal import ROLLING_SESSIONS, build_review, first_sightings, review_day
@@ -68,12 +68,7 @@ class JournalOps:
             return
         if not self.md.attached and time.monotonic() - self._started_at < self.JOURNAL_GATEWAY_WAIT_S:
             return
-        if wants_movers and self.md.attached:
-            try:
-                self.scanner.update_market_daily(day)
-            except Exception:  # noqa: BLE001
-                log.warning("could not download the session's daily candles for the movers", exc_info=True)
-        out = self.review_session(day) if review is None else self.add_movers(day)
+        out = self.review_session(day) if review is None else self.add_movers(day)    # both read the candles first
         if wants_movers and not movers_built(out.get("review")):
             self._movers_retry_at = time.monotonic() + self.MOVERS_RETRY_S
         else:
@@ -98,26 +93,32 @@ class JournalOps:
             self._publish("position.earnings_ahead", symbol=t["symbol"], trade_id=t["id"], report=dict(upcoming), note=note)
 
     def review_session(self, day: Optional[dt.date] = None) -> Dict[str, Any]:
-        """Build one session's review (again, if it exists) and keep it. Its movers are rebuilt once every
-        stock's candles for the session are on disk; until then the ones built before are kept."""
+        """Build one session's review (again, if it exists) and keep it. Its movers are rebuilt from every
+        stock's candles for the session, downloaded first when they aren't on disk (after a restart) and
+        the market is closed; when they can't be read the ones built before are kept, marked stale."""
+        with self._review_lock:
+            return self._review_session(day)
+
+    def _review_session(self, day: Optional[dt.date]) -> Dict[str, Any]:
         cfg = self.settings.config
         day = day or review_day(clock.now_ny(), cfg.journal.review_at)
         trades = [t for t in self.repo.closed_trades_between(day, day) if not t.get("pair_id")]
         opened = [t for t in self.repo.trades_opened_between(day, day) if not t.get("pair_id")]
         plays = self.repo.plays_on(day)
         pair_trades = self.repo.pair_trades_closed_between(day, day)
-        if not trades and not opened and not plays and not pair_trades and not self._movers_ready(day):
+        ready = self._load_market_daily(day)
+        if not trades and not opened and not plays and not pair_trades and not ready:
             return {"ok": False, "reason": f"Nothing was offered or traded on {day.isoformat()}."}
         first = min(clock.last_n_sessions(day, ROLLING_SESSIONS))
-        ap = self.autopilot
-        skipped = ap.skipped_noise()
+        earlier = self.journal.get(day) or {}
+        gates = self._session_gates(opened, earlier.get("settings"))
         review = build_review(
             day, trades=trades, plays=plays, rolling=self.repo.closed_trades_between(first, day),
             replay_records=self.replay.records(*self._record_terms()), evidence=self.evidence_state(),
-            regime=self.regime.reading(), bars=self._session_bars(day, plays),
+            regime=self.regime.reading(),
+            bars=self._session_bars(day, plays, booked=[t.get("play_id") for t in (*trades, *opened)]),
             settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay, cfg.risk.min_reward_risk),
-            skip_noise=skipped,
-            min_confirmations=ap.min_confirmations, passes=self._passes_checks,
+            gates=gates, passes=lambda row: self._passes_checks(row, gates),
             styles={k: c.style for k, c in REGISTRY.items()}, titles={k: c.title for k, c in REGISTRY.items()},
             breakeven_at_r=float(cfg.exit_manager.breakeven_at_r), opened=opened, marks=self._review_marks(day, opened))
         if pair_trades:
@@ -128,16 +129,20 @@ class JournalOps:
             review["lessons"].append(f"{len(pair_trades)} pair trade{'s' if len(pair_trades) != 1 else ''} "
                                      f"closed: {total:+.2f}R in all.")
         if cfg.journal.movers > 0:
-            earlier = (self.journal.get(day) or {}).get("movers")
-            review["movers"] = self._movers(day, review, plays) or (earlier if movers_built({"movers": earlier})
+            built = earlier.get("movers")
+            review["movers"] = self._movers(day, review, plays) or (self._stale_movers(day, built)
+                                                                    if movers_built({"movers": built})
                                                                     else self._movers_pending())
             if not trades and not opened and not plays and not pair_trades and not movers_built(review):
                 return {"ok": False, "reason": f"Nothing was offered or traded on {day.isoformat()}."}
             if not movers_built(review):
                 self._journal_checked, self._movers_retry_at = None, 0.0     # the journal loop adds them
         self.journal.save(review)
+        shadows = review["shadows"]
         try:
-            kept = self.repo.save_shadow_trades(day, review["shadows"].get("plays") or [])
+            # the day's rows are replaced by the ones this build followed - unless IB Gateway was away and it
+            # followed none (the note says so), when the rows an earlier build kept are the better record
+            kept = 0 if shadows.get("note") else self.repo.save_shadow_trades(day, shadows.get("plays") or [])
             if kept:
                 log.info("%d plays not taken on %s followed and kept for learning", kept, day.isoformat())
                 self.train_model_soon()                  # the day's rows are in: the model learns from them tonight
@@ -146,12 +151,12 @@ class JournalOps:
         self._live_stats_at = float("-inf")
         self._publish("journal.updated", session=review["session"], mistakes=len(review["mistakes"]),
                     lessons=len(review["lessons"]))
-        shadows = review["shadows"]
         return {"ok": True, "review": review,
                 "note": (f"Reviewed {review['session']}: {review['day'].get('opened', 0)} positions opened, "
                          f"{review['day'].get('trades', 0)} closed trades, "
-                         f"{len(review['mistakes'])} things to learn from, {shadows.get('filled', 0)} plays not taken "
-                         "followed to their outcome.")}
+                         f"{len(review['mistakes'])} things to learn from, {shadows.get('followed', 0)} of "
+                         f"{shadows.get('eligible', 0)} day setups not taken followed on the candles "
+                         f"({shadows.get('filled', 0)} would have filled).")}
 
     def _review_marks(self, day: dt.date, opened) -> Dict[str, float]:
         """Where each still-open position's stock stood at the review: the session's close once its
@@ -174,21 +179,54 @@ class JournalOps:
 
     def add_movers(self, day: dt.date) -> Dict[str, Any]:
         """Add the movers to a session's review written without them."""
-        review = self.journal.get(day)
-        if review is None:
-            return self.review_session(day)
-        movers = self._movers(day, review, self.repo.plays_on(day))
-        if movers is None:
-            return {"ok": False, "reason": "The session's movers can't be built yet."}
-        review["movers"] = movers
-        self.journal.save(review)
-        self._publish("journal.updated", session=review["session"], mistakes=len(review["mistakes"]),
-                    lessons=len(review["lessons"]))
-        return {"ok": True, "review": review}
+        with self._review_lock:
+            review = self.journal.get(day)
+            if review is None:
+                return self._review_session(day)
+            self._load_market_daily(day)
+            movers = self._movers(day, review, self.repo.plays_on(day))
+            if movers is None:
+                return {"ok": False, "reason": "The session's movers can't be built yet."}
+            review["movers"] = movers
+            self.journal.save(review)
+            self._publish("journal.updated", session=review["session"], mistakes=len(review["mistakes"]),
+                        lessons=len(review["lessons"]))
+            return {"ok": True, "review": review}
 
     def _movers_ready(self, day: dt.date) -> bool:
         have = self.scanner.market_daily
         return self.settings.config.journal.movers > 0 and have is not None and have[0] >= day
+
+    def _load_market_daily(self, day: dt.date) -> bool:
+        """Whether every tradable stock's daily candles reach ``day``, downloading them when they don't
+        (the app restarted since the evening's download, say). Only while the market is closed: the
+        listing and contract lookups for the whole market share IB Gateway with the orders."""
+        if self._movers_ready(day):
+            return True
+        if self.settings.config.journal.movers <= 0 or not self.md.attached or clock.is_market_open():
+            return False
+        try:
+            self.scanner.update_market_daily(day)
+        except Exception:  # noqa: BLE001
+            log.warning("could not download the session's daily candles for the movers", exc_info=True)
+        return self._movers_ready(day)
+
+    def _stale_movers(self, day: dt.date, built: Mapping[str, Any]) -> Dict[str, Any]:
+        """The movers an earlier build kept, saying when they were built and why this rebuild couldn't
+        refresh them - rather than passing them off as rebuilt. While the market is open the button
+        rebuilds the session before; from ``review_at`` it moves on to the new one, hence the window."""
+        try:
+            at = dt.datetime.fromisoformat(str(built["built_at"])).astimezone(clock.NY).strftime("Built %a %H:%M ET, ")
+        except (KeyError, ValueError):
+            at = "Built "
+        why = ("the movers couldn't be built (see the log). Rebuild to try again." if self._movers_ready(day) else
+               "the session's candles aren't downloaded while the market is open (the download shares IB Gateway "
+               f"with the orders). Rebuild between the close and {self.settings.config.journal.review_at} ET to "
+               "refresh." if clock.is_market_open() else
+               "IB Gateway wasn't connected, so the session's candles couldn't be read. Rebuild with it connected "
+               "to refresh." if not self.md.attached else
+               "the session's candles couldn't be read (see the log). Rebuild to try again.")
+        return {**built, "stale": True, "stale_note": f"{at}before this rebuild - {why}"}
 
     def _movers_pending(self) -> Dict[str, Any]:
         return {"ok": False, "note": "The market's biggest movers are added once every stock's candles for the session "
@@ -261,9 +299,12 @@ class JournalOps:
                 "daily": candles(daily, self.MOVER_CHART_BEFORE + self.MOVER_CHART_AFTER),
                 "intraday": candles(session, 200)}
 
-    def _session_bars(self, day: dt.date, plays: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """The session's 5-minute candles for the plays not taken (kept with the replay's candles)."""
-        symbols = list(dict.fromkeys(p["symbol"] for p in first_sightings(plays)))
+    def _session_bars(self, day: dt.date, plays: List[Dict[str, Any]],
+                      booked: Sequence[Any] = ()) -> Optional[Dict[str, Any]]:
+        """The session's 5-minute candles for the plays not taken that the review follows - the entries sent
+        and never filled among them, whatever their score (kept with the replay's candles). ``booked``: the
+        play ids the session's trades were opened from, so the setups taken are the review's own."""
+        symbols = list(dict.fromkeys(p["symbol"] for p in first_sightings(plays, booked=booked)))
         if not symbols:
             return {}
         if not self.md.attached:
@@ -275,18 +316,48 @@ class JournalOps:
             log.warning("could not download the session's candles for the review", exc_info=True)
             return None
 
-    def _passes_checks(self, row: Mapping[str, Any]) -> bool:
+    GATES = ("skip_noise", "min_confidence", "min_swing_confidence", "min_reward_risk", "min_confirmations")
+
+    def _session_gates(self, opened: Sequence[Mapping[str, Any]],
+                       earlier: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+        """The checks Autopilot applied that session, so a rebuild never judges it by flags or floors
+        learned afterwards (the evening replay adds skipped flags): the latest Autopilot entry's record
+        of them, else the ones an earlier build of the review kept, else today's settings, labelled."""
+        entries = [e for t in opened
+                   if (e := ((t.get("play") or {}).get("evidence") or {}).get("at_entry") or {}).get("by") == "autopilot"
+                   and isinstance(e.get("settings"), Mapping) and "skipped_noise" in e]
+        if entries:
+            e = max(entries, key=lambda x: str(x.get("at") or ""))
+            gates = {"skip_noise": list(e["skipped_noise"]),
+                     **{k: e["settings"][k] for k in self.GATES[1:] if k in e["settings"]},
+                     "source": "at the last entry"}
+            if e["settings"].get("replay_losers") is not None:   # recorded by the builds that turn replay losers away
+                gates["replay_losers"] = list(e["settings"]["replay_losers"])
+            if all(k in gates for k in self.GATES):
+                return gates
+        if earlier and all(k in earlier for k in self.GATES):
+            return {k: earlier[k] for k in (*self.GATES, "replay_losers", "source") if k in earlier}
+        ap = self.autopilot
+        return {"skip_noise": ap.skipped_noise(), **{k: getattr(ap, k) for k in self.GATES[1:]},
+                "source": "at the rebuild"}
+
+    def _passes_checks(self, row: Mapping[str, Any], gates: Optional[Mapping[str, Any]] = None) -> bool:
         """Whether a recorded play clears Autopilot's checks on the play itself: its confidence floor for
-        the timeframe, its reward:risk floor, the skipped flags and, for day trades, the confirmations.
+        the timeframe, its reward:risk floor, the skipped flags, the replay losers it turned away (when the
+        session recorded them) and, for day trades, the confirmations. ``gates``: the checks in force that
+        session (see _session_gates); today's settings without them.
         Not the day / swing boxes or the account's caps - those say what Autopilot may take, not what
         the play was worth, and the review compares the plays its checks would pass against the rest
         whether or not the box for their kind is ticked."""
         ap = self.autopilot
+        g = gates or {"skip_noise": ap.skipped_noise(), **{k: getattr(ap, k) for k in self.GATES[1:]}}
         timeframe = str(row.get("timeframe") or "")
-        return (float(row.get("confidence") or 0) >= ap.confidence_floor(timeframe)
-                and float(row.get("reward_risk") or 0) >= ap.min_reward_risk
-                and not set(ap.skipped_noise()).intersection(row.get("noise") or [])
-                and (timeframe != "INTRADAY" or int(row.get("confirmations") or 1) >= ap.min_confirmations))
+        floor = g["min_confidence"] if timeframe == "INTRADAY" else g["min_swing_confidence"]
+        return (float(row.get("confidence") or 0) >= float(floor)
+                and float(row.get("reward_risk") or 0) >= float(g["min_reward_risk"])
+                and not set(g["skip_noise"]).intersection(row.get("noise") or [])
+                and str(row.get("strategy") or "") not in (g.get("replay_losers") or ())
+                and (timeframe != "INTRADAY" or int(row.get("confirmations") or 1) >= int(g["min_confirmations"])))
 
     def journal_state(self, limit: int = 60) -> Dict[str, Any]:
         cfg = self.settings.config.journal

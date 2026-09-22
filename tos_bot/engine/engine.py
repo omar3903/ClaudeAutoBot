@@ -185,6 +185,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self.journal = Journal(data_dir / "journal", self.repo)
         self._journal_checked: Optional[dt.date] = None
         self._movers_retry_at = 0.0
+        self._review_lock = threading.Lock()       # the journal loop and the Rebuild button build one at a time
         self._earnings_warned: set = set()
         self._live_stats: Dict[str, Dict[str, Any]] = {}
         self._live_stats_at = float("-inf")

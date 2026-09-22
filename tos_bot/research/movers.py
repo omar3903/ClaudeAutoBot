@@ -8,10 +8,11 @@ each of the biggest movers it asks two things.
   action, a news story, or its whole sector moving with it. It also asks how it moved: a gap
   at the open or a climb during the session, how much more volume than usual, and whether it
   closed at a 20-day high or low.
-- **What the bot made of it.** Either the bot traded it (with the move or against it), offered
-  a setup that wasn't taken (and how that setup would have gone), watched it without finding
-  a setup, or never looked. When it never looked, the report says why: the morning's ranking
-  put it too far down, it was too thin for the scanner's filters, or its sector is switched off.
+- **What the bot made of it.** Either the bot traded it (with the move or against it), sent an
+  entry that never filled, offered a setup that wasn't taken (and how that setup would have
+  gone), watched it without finding a setup, or never looked. When it never looked, the report
+  says why: the morning's ranking put it too far down, it was too thin for the scanner's
+  filters, or its sector is switched off.
 
 Across many sessions, the share of movers the morning watchlist held shows how well the
 pre-market scan picks the day's stocks. The number of moves that began before the open shows
@@ -36,6 +37,7 @@ from ..scanner.heat import DailyMetrics, daily_metrics, liquid, rank_by_daily_he
 from ..scanner.watchlist import DayWatchlist
 from ..signals.news import is_material
 from ..util import clock
+from .journal import SENT_UNFILLED
 
 MIN_HISTORY = 30                  # daily candles before the session, as the scan's own ranking needs
 SECTOR_MIN_STOCKS = 5             # a sector's median move means little over fewer
@@ -232,6 +234,29 @@ def _utc_iso(stamp: Optional[str]) -> Optional[str]:
     return (t.replace(tzinfo=dt.timezone.utc) if t.tzinfo is None else t).isoformat()
 
 
+def _sent_at(play: Mapping[str, Any]) -> Optional[str]:
+    """When a play's entry went out, in UTC: the moment it was approved, kept in its evidence - the row
+    itself can have been written a scan or two before. The row's own time when that wasn't kept."""
+    try:
+        at = _utc_iso(((play.get("evidence") or {}).get("at_entry") or {}).get("at"))
+        return dt.datetime.fromisoformat(at).astimezone(dt.timezone.utc).isoformat() if at \
+            else _utc_iso(play.get("created_at"))
+    except (TypeError, ValueError):
+        return _utc_iso(play.get("created_at"))
+
+
+def _sent_label(p: Mapping[str, Any]) -> str:
+    """'gap and go long at 98.65, 10:10 ET'"""
+    at = dt.datetime.fromisoformat(p["sent_at"]).astimezone(clock.NY).strftime(", %H:%M ET") if p["sent_at"] else ""
+    price = f" at {p['entry']:.2f}" if p["entry"] is not None else ""
+    return f"{p['strategy'].replace('_', ' ')} {p['side'].lower()}{price}{at}"
+
+
+def _best(rows: Sequence[Mapping[str, Any]]) -> Optional[float]:
+    """The best of what the plays followed on the candles would have made, None when none would have filled."""
+    return max((p["shadow_r"] for p in rows if p["shadow_filled"]), default=None)
+
+
 def morning_watchlist(universe: Universe, sector_of: Callable[[str], str], hot_size: int,
                       queue_size: int) -> Dict[str, Tuple[str, str, int]]:
     """Where the morning's scan put each stock: symbol -> ("hot" | "buffer", sector, place)."""
@@ -272,24 +297,31 @@ def involvement(m: Move, *, trades: Sequence[Mapping[str, Any]], plays: Sequence
                 shadows: Sequence[Mapping[str, Any]], morning: Optional[Tuple[str, str, int]],
                 saved: Optional[Mapping[str, Any]], rank: Optional[int], ranked: int, thin: bool, filtered: bool,
                 active: bool, prefilter: Mapping[str, float]) -> Dict[str, Any]:
-    """Traded, offered, watched, or missed - and the details behind it."""
+    """Traded, sent, offered, watched, or missed - and the details behind it."""
     watched = _watched(m.symbol, morning, saved)
     direction = "LONG" if m.change_pct > 0 else "SHORT"
     trade_rows = [{"side": t["side"], "strategy": t["strategy"], "entry_time": _utc_iso(t.get("entry_time")),
                    "entry": t.get("entry_price"), "exit_time": _utc_iso(t.get("exit_time")), "exit": t.get("exit_price"),
                    "r": t.get("r_multiple"), "pl": t.get("realized_pl"), "status": t.get("status"),
                    "with_move": t["side"] == direction} for t in trades]
+    booked = {t.get("play_id") for t in trades}
     shadow_by_play = {s.get("play_id"): s for s in shadows}
     seen: Set[Tuple[str, str]] = set()
-    play_rows = []
+    play_rows, senders = [], set()
     for p in plays:
-        if (p["strategy"], p["side"]) in seen:
+        # each setup once, where it was first seen - and every entry of it that went out and never
+        # filled, which the setup's first sighting would otherwise hide
+        went_out = p.get("status") in SENT_UNFILLED and p.get("id") not in booked
+        if (p["strategy"], p["side"]) in seen and not went_out:
             continue
         seen.add((p["strategy"], p["side"]))
+        if went_out:
+            senders.add(p.get("decided_by") or "")
         shadow = shadow_by_play.get(p.get("id")) or {}
         play_rows.append({"side": p["side"], "strategy": p["strategy"], "seen_at": _utc_iso(p.get("created_at")),
                           "entry": p.get("entry"), "stop": p.get("stop"), "timeframe": p.get("timeframe"),
                           "status": p.get("status"), "with_move": p["side"] == direction,
+                          "sent": went_out, "sent_at": _sent_at(p) if went_out else None,
                           "shadow_r": shadow.get("r"), "shadow_filled": shadow.get("filled")})
     out: Dict[str, Any] = {"watched": watched, "trades": trade_rows, "plays": play_rows,
                            "rank": rank, "ranked": ranked}
@@ -300,9 +332,25 @@ def involvement(m: Move, *, trades: Sequence[Mapping[str, Any]], plays: Sequence
                    detail="; ".join(f"{t['side'].lower()} ({'with' if t['with_move'] else 'against'} the move)"
                                     for t in trade_rows))
         return out
+    sent = [p for p in play_rows if p["sent"]]
+    if sent:
+        # an order went out and nothing came of it: not the same as a setup nobody acted on
+        setups = {(p["strategy"], p["side"]) for p in sent}
+        others = [p for p in play_rows if (p["strategy"], p["side"]) not in setups]
+        best, other_best = _best(sent), _best(others)
+        n = len(sent)
+        lead = f"Autopilot sent {n} entr{'y' if n == 1 else 'ies'} that never filled" if senders == {"autopilot"} \
+            else f"{n} entr{'y was' if n == 1 else 'ies were'} sent and never filled"
+        out.update(status="sent", r=best, detail=(
+            f"{lead} ({'; '.join(_sent_label(p) for p in sent)})"
+            + (f" - taken as planned {'it' if n == 1 else 'the best'} would have made {best:+.2f}R"
+               if best is not None else "")
+            + (f"; {len(others)} other setup{'s' if len(others) != 1 else ''} offered"
+               + (f" - the best would have made {other_best:+.2f}R" if other_best is not None else "")
+               if others else "")))
+        return out
     if play_rows:
-        followed = [p for p in play_rows if p["shadow_filled"]]
-        best = max((p["shadow_r"] for p in followed), default=None)
+        best = _best(play_rows)
         out.update(status="offered", r=best, detail=(
             f"{len(play_rows)} setup{'s' if len(play_rows) != 1 else ''} offered, none taken"
             + (f" - the best would have made {best:+.2f}R" if best is not None
@@ -370,8 +418,8 @@ def capture(rows: Sequence[Mapping[str, Any]], morning: Mapping[str, Tuple[str, 
     traded = [r["bot"] for r in rows if r["bot"]["status"] == "traded"]
     offered = [r["bot"]["r"] for r in rows if r["bot"]["status"] == "offered" and r["bot"]["r"] is not None]
     return {
-        "movers": len(rows), "traded": status["traded"], "offered": status["offered"], "watched": status["watched"],
-        "missed": status["missed"], "offline": status["offline"],
+        "movers": len(rows), "traded": status["traded"], "sent": status["sent"], "offered": status["offered"],
+        "watched": status["watched"], "missed": status["missed"], "offline": status["offline"],
         "traded_r": round(sum(b["r"] or 0.0 for b in traded), 2), "traded_pl": round(sum(b["pl"] or 0.0 for b in traded), 2),
         "offered_r": round(sum(offered), 2) if offered else None,
         "in_watchlist": sum(1 for r in rows if r["bot"]["watched"] or r["symbol"] in morning),
@@ -404,6 +452,8 @@ def mover_lessons(s: Mapping[str, Any], rows: Sequence[Mapping[str, Any]], activ
         out.append(f"{s['offered']} had setups offered that weren't taken"
                    + (f"; taken as planned the best of each would have made {s['offered_r']:+.2f}R in all." if s["offered_r"]
                       is not None else "."))
+    if s["sent"]:
+        out.append(f"{s['sent']} had an entry sent that never filled.")
     against = [r["symbol"] for r in rows for t in r["bot"]["trades"] if not t["with_move"]]
     if against:
         out.append(f"Traded against the day's move: {', '.join(dict.fromkeys(against))}. A stock moving this hard on "

@@ -1,14 +1,16 @@
 /* The Reports page, opened from the top bar: one report per session. It starts with the market's
    biggest movers and what the bot made of them (movers.js), then the journal's review of the bot's
    own trading (journal.js). The dot on the button marks a report you haven't opened yet. */
-import { $, $$, api, escapeHtml, post, store, usd } from "./util.js";
-import { toastResult } from "./ui.js";
+import { $, $$, api, count, escapeHtml, post, store, usd } from "./util.js";
+import { busy, toastResult } from "./ui.js";
 import { inR, journalHTML, pctOf, tone } from "./journal.js";
 import { bindMovers, moversHTML } from "./movers.js";
 import { sheet, sheetOpen } from "./sheet.js";
 
 const SEEN = "reports.seen";
+const BUILD = "Rebuild the last session", BUILDING = "Rebuilding - reading the session's candles…";
 let selected = null;
+let building = false;     // a rebuild is running: its button stays busy when the list is drawn again
 
 export function initReports() {
   $("#btn-reports").onclick = () => openReports();
@@ -48,7 +50,7 @@ async function loadDays() {
     ? `Written after every session at ${state.review_at} ET, with the market's movers once every stock's candles are in`
     : "The daily report is off (journal.enabled in config.yaml)";
   $("#reports-side").innerHTML = `
-    <button class="mini lockable" id="reports-build" title="Build the report on the last session now (it's rebuilt if it exists)">Rebuild the last session</button>
+    <button class="mini lockable" id="reports-build" title="Build the report on the last session now (it's rebuilt if it exists)" ${building ? "disabled" : ""}>${building ? BUILDING : BUILD}</button>
     ${days.length ? days.map(d => `<button class="journal-day ${d.session === selected ? "active" : ""}" data-day="${escapeHtml(d.session)}">
         <b>${escapeHtml(longDate(d.session, true))}</b>
         ${d.opened && !d.trades
@@ -57,10 +59,14 @@ async function loadDays() {
         ${d.mistakes ? `<span class="badge warn">${d.mistakes} to learn from</span>` : ""}
       </button>`).join("") : `<div class="empty">No reports yet. The first is written after the next close.</div>`}`;
   $$("#reports-side [data-day]").forEach(b => { b.onclick = () => { selected = b.dataset.day; loadDays(); }; });
-  $("#reports-build").onclick = async () => {
+  $("#reports-build").onclick = async e => {
+    building = true;
+    busy(e.currentTarget, BUILDING);          // after a restart it downloads the session's candles first
     const r = await post("/api/journal/review", {});
+    building = false;
     toastResult(r);
-    if (r.ok && r.review) { selected = r.review.session; loadDays(); }
+    if (r.ok && r.review) selected = r.review.session;
+    loadDays();                               // draws the button again, ready
   };
   if (!selected) { $("#reports-body").innerHTML = ""; return; }
   showReport(selected, days[0]);
@@ -94,7 +100,9 @@ function headerHTML(r) {
       <div><label>Winners</label><b>${pctOf(d.win_rate)}</b></div>
       <div><label>In all</label><b class="${tone(d.total_r)}">${inR(d.total_r)}</b></div>
       <div><label>Realized</label><b class="${tone(d.realized_pl)}">${usd(d.realized_pl)}</b></div>
-      <div><label>Plays offered</label><b>${r.plays_offered || 0}</b></div>
+      ${r.setups_offered == null
+        ? `<div><label>Plays offered</label><b>${r.plays_offered || 0}</b></div>`
+        : `<div title="${count(r.plays_offered)} play-log rows: a setup that leaves the board and comes back is logged again"><label>Setups offered</label><b>${count(r.setups_offered)}</b></div>`}
       ${s ? `<div><label>Top movers traded</label><b>${s.traded} of ${s.movers}</b></div>` : ""}
     </div>`;
 }
