@@ -28,6 +28,7 @@ export async function loadOpen() {
   let trades;
   try { ({ trades } = await api("/api/trades?status=OPEN")); } catch (e) { markStale($("#tab-open"), loadedAt.open, e); return; }
   loadedAt.open = new Date();
+  $("#tab-open-count").textContent = trades.length ? ` · ${trades.length}` : "";   // as Active orders counts its own
   const here = hereVenue(), el = $("#tab-open");
   $("#btn-exit-all").classList.toggle("hidden", !trades.some(t => (t.broker || "paper") === here));
   if (!trades.length) { el.innerHTML = `<p class="muted pad">No open positions.</p>` + untrackedHTML(); wireUntracked(el); return; }
