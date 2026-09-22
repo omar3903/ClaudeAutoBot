@@ -135,8 +135,11 @@ class JournalOps:
             if not movers_built(review):
                 self._journal_checked, self._movers_retry_at = None, 0.0     # the journal loop adds them
         self.journal.save(review)
+        shadows = review["shadows"]
         try:
-            kept = self.repo.save_shadow_trades(day, review["shadows"].get("plays") or [])
+            # the day's rows are replaced by the ones this build followed - unless IB Gateway was away and it
+            # followed none (the note says so), when the rows an earlier build kept are the better record
+            kept = 0 if shadows.get("note") else self.repo.save_shadow_trades(day, shadows.get("plays") or [])
             if kept:
                 log.info("%d plays not taken on %s followed and kept for learning", kept, day.isoformat())
                 self.train_model_soon()                  # the day's rows are in: the model learns from them tonight
@@ -145,7 +148,6 @@ class JournalOps:
         self._live_stats_at = float("-inf")
         self._publish("journal.updated", session=review["session"], mistakes=len(review["mistakes"]),
                     lessons=len(review["lessons"]))
-        shadows = review["shadows"]
         return {"ok": True, "review": review,
                 "note": (f"Reviewed {review['session']}: {review['day'].get('opened', 0)} positions opened, "
                          f"{review['day'].get('trades', 0)} closed trades, "

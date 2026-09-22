@@ -522,7 +522,7 @@ choices rather than the market:
 | rows | where | written when |
 |---|---|---|
 | **live** - the trades the app took | `trades.entry_context` (+ `submitted_at`, `mfe_at`) | at the fill, whether Autopilot or you approved the play |
-| **shadow** - the plays shown and not taken | `shadow_trades` | by the 16:15 review, which follows each day-trade play on the session's candles as if it had been taken |
+| **shadow** - the plays shown and not taken | `shadow_trades` | by the 16:15 review, which follows each day-trade play on the session's candles as if it had been taken; a rebuild replaces the day's rows with the ones it followed, and keeps them when it followed none (IB Gateway away) |
 | **replay** - the simulated trades | `sim_trades` (one set of rows per run) | when a replay finishes; `held_out` marks its out-of-sample sessions |
 
 Export them as one CSV, with a `source` column, while the app keeps running:

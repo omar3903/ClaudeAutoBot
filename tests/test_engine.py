@@ -956,6 +956,18 @@ def test_the_session_review_keeps_each_trade_with_what_it_was_taken_on(engine):
     assert engine.journal_state()["days"][0]["session"] == today.isoformat()
 
 
+def test_a_rebuild_without_ib_gateway_keeps_the_plays_not_taken_followed_before(engine):
+    today = clock.now_ny().date()
+    p = _play("AAA")
+    p.timeframe = Timeframe.INTRADAY
+    engine.repo.record_play(p)                                              # a day setup offered and not taken
+    engine.repo.save_shadow_trades(today, [{"play_id": p.id, "symbol": "AAA", "side": "LONG", "strategy": p.strategy,
+                                            "filled": True, "r": 1.5, "features": {}}])
+    out = engine.review_session(today)                                      # IB Gateway is away: nothing is followed
+    assert out["ok"] and out["review"]["shadows"]["note"]
+    assert [(r["play_id"], r["r"]) for r in engine.repo.shadow_trades(today)] == [(p.id, 1.5)]
+
+
 def test_the_session_review_covers_positions_opened_and_still_open(engine, monkeypatch):
     from tos_bot.core.models import Quote
 

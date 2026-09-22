@@ -612,12 +612,18 @@ class Repository:
             return [sim_to_dict(r) for r in rows]
 
     def save_shadow_trades(self, day: dt.date, shadows: List[Dict[str, Any]]) -> int:
-        """Keep the review's shadow trades (research/journal.py shadow_outcomes rows) for ``day``."""
-        n = 0
+        """Keep the review's shadow trades (research/journal.py shadow_outcomes rows) for ``day`` in place of
+        the ones an earlier build of that review kept, so the day's rows are the ones its latest review
+        followed. No rows replaces nothing: the rows kept before stay."""
+        rows = [row for row in shadows if row.get("play_id")]
+        if not rows:
+            return 0
         with session_scope() as s:
-            for row in shadows:
-                if not row.get("play_id"):
-                    continue
+            # a play the rebuild no longer follows would otherwise go on teaching the model an outcome
+            # the report has dropped
+            s.execute(delete(ShadowTradeLog).where(ShadowTradeLog.session_date == day,
+                                                   ShadowTradeLog.play_id.notin_([row["play_id"] for row in rows])))
+            for row in rows:
                 feats = dict(row.get("features") or {})
                 s.merge(ShadowTradeLog(
                     play_id=row["play_id"], session_date=day, symbol=row["symbol"], strategy=row["strategy"],
@@ -628,8 +634,7 @@ class Repository:
                     r=row.get("r"), mfe_r=row.get("mfe_r"), exit_reason=str(row.get("exit_reason") or "")[:64],
                     noise=list(row.get("noise") or []), confirmations=int(row.get("confirmations") or 1),
                     features=feats, feature_schema=int(feats.get("schema", 0) or 0)))
-                n += 1
-        return n
+        return len(rows)
 
     def shadow_trades(self, day: Optional[dt.date] = None, limit: int = 200000) -> List[Dict[str, Any]]:
         with session_scope() as s:
