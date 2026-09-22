@@ -192,6 +192,14 @@ function renderBalances(s) {
   pnl.textContent = foreign ? money(today, "USD") : usd(today);
   pnl.title = foreign ? "Trades are in US dollars" : "";
   pnl.style.color = today > 0 ? "var(--long)" : today < 0 ? "var(--short)" : "var(--fg)";
+  // the positions held now, each at its latest price against its average cost - in US dollars, like the trades
+  const held = s.positions || [], open = held.reduce((sum, p) => sum + (p.unrealized_pl || 0), 0);
+  const upl = $("#a-pnl-open");
+  upl.textContent = held.length ? (foreign ? money(open, "USD") : usd(open)) : "–";
+  upl.title = held.length
+    ? `The ${held.length} position${held.length === 1 ? "" : "s"} held now, at the latest price against the average cost - since each was bought, not since today's open`
+    : "No positions held";
+  upl.style.color = open > 0 ? "var(--long)" : open < 0 ? "var(--short)" : "var(--fg)";
 }
 
 function renderBanner(c) {
