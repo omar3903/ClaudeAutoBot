@@ -313,6 +313,11 @@ class ExitManager:
                 t["id"], stop_price=round(new_stop, 4),
                 note_append=f"stop->{new_stop:.2f} @ {r_now:.1f}R",
             )
+            # what the stop now keeps if it's hit is not where the trade stands: a +1.4R trade whose
+            # stop goes to break-even locks about +0.3R. Send both (r stays, the same as r_now, for
+            # older readers)
+            kept_r = (round(new_stop, 4) - entry) * sign / risk_ps
             self.bus.publish("exit.stop_moved", trade_id=t["id"], symbol=sym,
-                             new_stop=round(new_stop, 4), r=round(r_now, 2))
+                             new_stop=round(new_stop, 4), locked_r=round(kept_r, 2),
+                             r_now=round(r_now, 2), r=round(r_now, 2))
         return None

@@ -181,6 +181,39 @@ def test_a_stop_the_broker_filled_is_booked_on_the_next_pass_with_its_reason():
     assert "trade.closed" in [t for t, _ in heard] and len(broker.orders) == 1
 
 
+def test_a_stop_that_never_moved_is_booked_as_a_stop_though_it_rests_at_the_rounded_price():
+    broker, repo, ex, _ = _setup(_trade(stop_price=97.9968, initial_stop_price=97.9968))
+    ex.sync_open_orders()
+    assert broker.stops()[0].stop_price == 98.0                                # rounded to the cent to be placed
+    broker.live["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                   avg_fill_price=97.95)
+    ex.sync_open_orders()
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_reason"]) == ("CLOSED", "stop")    # the rounding is no move
+
+
+def test_a_stop_an_earlier_run_left_at_the_rounded_first_stop_is_booked_as_a_stop():
+    left = [OrderResult(order_id="77", status="SUBMITTED", symbol="AAA", submitted_qty=10, side=Side.SHORT,
+                        tag="stop:t1", order_type="STOP", stop_price=98.0)]
+    broker, repo, ex, _ = _setup(_trade(stop_price=97.9968, initial_stop_price=97.9968), working=left)
+    ex.sync_open_orders()
+    assert ex.protective_stops()[0]["order_id"] == "77" and broker.modified == []   # followed, not moved
+    broker.reports["77"] = OrderResult(order_id="77", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                       avg_fill_price=97.95)
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["exit_reason"] == "stop"
+
+
+def test_a_stop_counts_as_moved_only_by_half_a_tick_or_more():
+    from tos_bot.execution.protective_stops import stop_exit_reason
+
+    assert stop_exit_reason(97.9968, 98.0) == "stop"                           # cents from a dollar up
+    assert stop_exit_reason(97.9968, 98.01) == "trailing-stop"
+    assert stop_exit_reason(0.51234, 0.5123) == "stop"                         # hundredths of a cent below
+    assert stop_exit_reason(0.51234, 0.5124) == "trailing-stop"
+    assert stop_exit_reason(None, 98.0) == "stop"                              # no first stop on the record
+
+
 def test_the_part_coming_off_shrinks_the_stop_first():
     broker, repo, ex, _ = _setup()
     ex.sync_open_orders()

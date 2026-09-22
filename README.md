@@ -423,7 +423,11 @@ The app is built to be left running:
 * **A slow answer never reads as an empty account.** An account or positions read IBKR doesn't
   answer in time (the Gateway busy with a big download, say) keeps the last snapshot, which then
   counts as stale: no record is deleted or closed on its say-so, no exit is refused for a position
-  that "isn't there", and the shares-without-a-record list doesn't blink.
+  that "isn't there", and the shares-without-a-record list doesn't blink. The same goes for the working
+  orders: one request for them is out at a time (whoever asks meanwhile shares its answer), and one
+  IBKR hasn't answered within 10 s is called off and counts as *unknown* - no stop is placed beside
+  one that may be resting, an exit still goes out capped by the shares held, and the orders an earlier
+  run left working are taken over by the next order sync that can list them.
 * **A restart picks the day up where it left off.** The plays on the board, the setups already traded
   or dismissed this session, the pre-market levels the gap check read and the time of the last wide
   scan are saved as the day goes (`data/day_state.bin`: after a scan at most every two minutes, at once

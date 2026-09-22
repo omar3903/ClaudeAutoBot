@@ -146,10 +146,15 @@ function handle(topic, p) {
     case "stop.failed":
       toast("⚠ Protective stop: " + (p.reason || "could not be placed"), "warn");
       break;
-    case "exit.stop_moved":
-      toast(`${p.symbol}: stop → ${num(p.new_stop)} (${num(p.r, 1)}R locked)`, "good");
+    case "exit.stop_moved": {
+      // what the stop keeps if it's hit, then where the trade stood when it moved
+      const signedR = v => `${v >= 0 ? "+" : ""}${num(v, 1)}R`;
+      const now = p.r_now ?? p.r;
+      toast(`${p.symbol}: stop → ${num(p.new_stop)}` + (p.locked_r == null ? "" : `, locks ${signedR(p.locked_r)}`)
+        + (now == null ? "" : ` (the trade was at ${signedR(now)})`), "good");
       loadOpen();
       break;
+    }
     case "trade.overdue":
       toast("⏰ " + (p.msg || `${p.symbol} exit is overdue`), p.winning ? "good" : "bad");
       loadOpen();
