@@ -51,7 +51,7 @@ from ..execution.order_builder import plan_order
 from ..persistence.db import init_db
 from ..persistence.repository import Repository
 from ..risk.pdt_guard import PdtGuard
-from ..risk.position_sizing import size_play
+from ..risk.position_sizing import liquidity_cap, size_play
 from ..research.features import play_features
 from ..research.model import Scorer, risk_factor
 from ..research.history import IntradayHistory
@@ -870,10 +870,13 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._publish("watchlist.updated", **self.watchlist_state())
             return
         self._size_plays(result.plays)
-        # the cycles don't re-check valuation setups, so those stay; a quick re-check isn't a confirmation
+        # the cycles don't re-check valuation setups, so those stay. A quick re-check isn't a scan confirming
+        # a setup - but with confirm_on_new_candle a day play counts candles, not scans, and a newer candle
+        # counts whichever scan read it
         self._score_plays(result.plays)
         changes = self.board.replace(result.plays, None if kind == "full" else result.symbols,
-                                     keep=lambda p: p.kind.value == "FUNDAMENTAL", confirm=not quick)
+                                     keep=lambda p: p.kind.value == "FUNDAMENTAL", confirm=not quick,
+                                     new_candle=self.autopilot.confirm_on_new_candle)
         self._last_scans[kind] = result.summary()
         self._day_changed()
         if not quick:
@@ -1352,6 +1355,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         elif p.suggested_qty <= 0:
             reasons.append(f"{p.symbol} already takes up the {cfg.risk.max_symbol_pct_of_equity:.0f}% of equity "
                            "allowed in one stock" if "max exposure per stock" in sizing.caps_hit
+                           else self._too_thin_reason(p, cfg.risk) if liquidity_cap(p, cfg.risk) == 0
                            else self._no_room_reason(p) if "trading capital" in sizing.caps_hit
                            else "position size rounds to zero for this risk budget")
         if p.reward_risk < cfg.risk.min_reward_risk and p.kind.value != "FUNDAMENTAL":
@@ -1375,6 +1379,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 "expected_hold": (f"~{p.expected_hold_typical:.0f} {hold_unit} "
                                   f"(review after {p.expected_hold_max:.0f})"),
                 "est_cost": round(p.notional, 2), "est_risk": round(p.dollar_risk, 2),
+                "caps": list(sizing.caps_hit),
                 "note": plan.get("note", ""), "routes_to": ROUTE_LABELS.get(self._venue, self._venue.upper()),
             },
         }
@@ -1424,6 +1429,13 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._refresh_account()
             self._day_changed(now=True)                   # a restart mustn't offer this setup again today
             return {"ok": out.get("ok", False), **out}
+
+    @staticmethod
+    def _too_thin_reason(p: Play, risk) -> str:
+        """Why a play sized to nothing under the liquidity cap: the stock trades too few shares a day."""
+        return (f"{p.symbol} is too thin to trade: it usually trades {float(p.evidence['adv_shares']):,.0f} "
+                f"shares a day, and the liquidity cap of {float(risk.max_adv_pct):g}% of that "
+                "(risk.max_adv_pct) is less than one share")
 
     def _no_room_reason(self, p: Play) -> str:
         """Why a play sized to nothing under the trading capital: its kind's share is full, or all of it is."""

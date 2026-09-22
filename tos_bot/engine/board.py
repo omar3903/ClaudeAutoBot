@@ -10,6 +10,12 @@ confirmation; once it has been acted on or dismissed, the setup isn't offered
 again until the next session. Opposite setups on one stock and timeframe are
 both flagged as a conflict (see scanner/noise.py).
 
+A day setup triggers on the last closed 5-minute candle, and the scans read
+that candle several times over before the next one closes. With
+``new_candle`` on, a day play counts a confirmation only when it shows on a
+newer candle than the one it last counted - from any scan, the quick re-check
+too - so "seen twice" means two candles running, the entry the replay tests.
+
 Every change says why: a new setup was found, or a play left because its setup
 no longer shows on the latest candles, it expired, or a filter or strategy switch
 dropped it. The engine turns these into the dashboard's Autopilot notes.
@@ -27,11 +33,18 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, Collection, Dict, Iterable, List, Optional, Set, Tuple
 
+import pandas as pd
+
 from ..core.enums import PlayStatus
 from ..core.models import Play
 from ..util import clock
 
 SetupKey = Tuple[str, str, str, str, dt.date]
+
+#: the scans' candles (data/market_data.py INTRADAY_BAR), and the most of them a day setup may move on
+#: between two counted sightings and still be seen "in a row" - a scan can land a candle late
+CANDLE = dt.timedelta(minutes=5)
+MAX_CANDLE_GAP = 2
 
 
 def setup_key(p: Play) -> SetupKey:
@@ -71,11 +84,12 @@ class PlayBoard:
 
     def replace(self, plays: Iterable[Play], scanned: Optional[Collection[str]] = None,
                 now: Optional[dt.datetime] = None, keep: Optional[Callable[[Play], bool]] = None,
-                confirm: bool = True) -> List[BoardChange]:
+                confirm: bool = True, new_candle: bool = False) -> List[BoardChange]:
         """``scanned`` = the symbols the scan looked at; None = it looked at everything.
         ``keep`` spares the plays on those symbols that the scan doesn't re-evaluate
         (valuation setups, say). ``confirm`` = False when a quick re-check shouldn't count
-        as another scan confirming a setup. Returns what was added and removed, and why."""
+        as another scan confirming a setup. ``new_candle``: a day play that knows its candle
+        counts by candles instead (see _confirmations). Returns what was added and removed, and why."""
         now = now or dt.datetime.now(dt.timezone.utc)
         with self._lock:
             today = clock.session_date(now)
@@ -97,7 +111,7 @@ class PlayBoard:
                 if old is not None:
                     p.id, p.created_at = old.id, old.created_at
                     p.scan_run_id = p.scan_run_id or old.scan_run_id
-                    p.confirmations = old.confirmations + 1 if confirm else old.confirmations
+                    p.confirmations = _confirmations(old, p, confirm, new_candle)
                 else:
                     changes.append(BoardChange("added", p, p.rationale or "a new setup was found"))
                 kept[p.id] = p
@@ -137,6 +151,37 @@ class PlayBoard:
     def clear(self) -> None:
         with self._lock:
             self._plays = {}
+
+
+def _confirmations(old: Play, new: Play, confirm: bool, new_candle: bool) -> int:
+    """The confirmations of a setup found again. With ``new_candle``, a day play counts one only on a
+    newer candle than the one it last counted (``counted_bar`` in its evidence), whichever scan saw it:
+    a scan reading the same candle again is the same sighting, and a sighting more than MAX_CANDLE_GAP
+    candles on starts the count again, like a setup that went away and came back. A swing play, or a
+    play from before the candles were kept, counts each scan that may confirm, as before."""
+    bar = _candle(new.evidence.get("bar_at"))
+    if not (new_candle and new.is_day_trade and bar is not None):
+        return old.confirmations + 1 if confirm else old.confirmations
+    counted_at = old.evidence.get("counted_bar") or old.evidence.get("bar_at")
+    counted = _candle(counted_at)
+    if counted is not None and bar <= counted:
+        new.evidence["counted_bar"] = counted_at          # the same candle again: nothing new was seen
+        return old.confirmations
+    new.evidence["counted_bar"] = new.evidence["bar_at"]
+    if counted is None:                                    # saved before the candles were kept
+        return old.confirmations + 1 if confirm else old.confirmations
+    return old.confirmations + 1 if bar - counted <= MAX_CANDLE_GAP * CANDLE else 1
+
+
+def _candle(value: object) -> Optional[pd.Timestamp]:
+    """A candle's time kept in a play's evidence, timezone-aware; None when there is none to read."""
+    if not value:
+        return None
+    try:
+        at = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    return at.tz_localize("UTC") if at.tzinfo is None else at
 
 
 def _why_gone(p: Play, scanned: Optional[Collection[str]], now: dt.datetime) -> str:

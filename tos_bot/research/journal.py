@@ -51,7 +51,7 @@ MIN_LIVE = 10
 MIN_GROUP = 5                     # plays on each side before a comparison is told
 TURBULENT = 0.7
 TAKEN = frozenset({"ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED"})
-LABELS = {**NOISE_LABELS, "unconfirmed": "seen in only one scan"}
+LABELS = {**NOISE_LABELS, "unconfirmed": "seen on only one candle"}
 
 
 def review_day(now: Optional[dt.datetime] = None, review_at: str = "16:15") -> dt.date:
@@ -169,7 +169,9 @@ def find_mistakes(trades: Sequence[Mapping[str, Any]], *, skip_noise: Iterable[s
         if flags:
             add("took_noise", "medium", t, "taken while flagged: " + ", ".join(LABELS.get(f, f) for f in flags))
         if t.get("timeframe") == "INTRADAY" and entry and int(entry.get("confirmations") or 1) < min_confirmations:
-            add("unconfirmed", "medium", t, f"taken after {int(entry.get('confirmations') or 1)} scan(s), before the "
+            # counted on 5-minute candles once confirm_on_new_candle came in; on scans before
+            seen = "candle(s)" if (entry.get("settings") or {}).get("confirm_on_new_candle") else "scan(s)"
+            add("unconfirmed", "medium", t, f"taken after {int(entry.get('confirmations') or 1)} {seen}, before the "
                                             f"{min_confirmations} in a row a day trade needs")
         if t["symbol"] in stopped_out and (t.get("entry_time") or "") > stopped_out[t["symbol"]]:
             add("reentered_after_loss", "medium", t, "went back into a stock that had already lost that session")
@@ -334,7 +336,7 @@ def lessons(day: Mapping[str, Any], mistakes: Sequence[Mapping[str, Any]], shado
         out.append(f"{len(kinds['took_noise'])} trade(s) were taken through noise flags Autopilot skips. The replay's "
                    "noise report says whether those flags earn their place - trading through them is the exception.")
     if "unconfirmed" in kinds:
-        out.append(f"{len(kinds['unconfirmed'])} day trade(s) were taken before the setup showed up in enough scans in a row.")
+        out.append(f"{len(kinds['unconfirmed'])} day trade(s) were taken before the setup had shown up enough times in a row.")
     if "reentered_after_loss" in kinds:
         out.append("Going straight back into a stock that just lost turns one loss into chop - let it cool off for the day.")
     if "unproven_strategy" in kinds:

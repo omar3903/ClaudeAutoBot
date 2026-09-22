@@ -112,14 +112,23 @@ function configure() {
         <span><label title="Aziz's give-back rule: once the day's realized gain has fallen this far from its best, stop for the day and keep what's left. 0 = off">...or after giving back % of the day's gain</label><input type="number" id="ap-giveback" min="0" max="100" step="5" value="${ap.max_giveback_pct ?? 30}"></span>
       </div>
       <div class="ap-row">
-        <span><label>Day trades: seen in scans in a row</label><input type="number" id="ap-confirm" min="1" max="10" step="1" value="${ap.min_confirmations ?? 2}"></span>
+        <span><label title="How many times in a row a day setup must show before Autopilot takes it - on new 5-minute candles while the box below is ticked, otherwise in scans">Day trades: seen in a row</label><input type="number" id="ap-confirm" min="1" max="10" step="1" value="${ap.min_confirmations ?? 2}"></span>
         <span><label title="Aziz keeps the last half hour for closing, and the exit manager flattens day trades 10 minutes before the bell - a new one this late has no time to work. 0 = off">Day trades: none in the last N minutes</label><input type="number" id="ap-close" min="0" max="120" step="5" value="${ap.min_minutes_to_close ?? 30}"></span>
         <span><label>Max % of equity in positions</label><input type="number" id="ap-gross" min="10" max="400" step="5" value="${ap.max_gross_exposure_pct ?? 100}"></span>
       </div>
+      <label title="The scans read one 5-minute candle several times over; the replay enters a day setup once it has shown on two candles running. Ticked, live counts the same way. A setup that fires on one candle (a reclaim, a flag) then never reaches two - set 1 above, or untick this, to practise those again. The replay models two at most."><input type="checkbox" id="ap-candles" ${ap.confirm_on_new_candle !== false ? "checked" : ""}> Count a day setup as seen again only on a new 5-minute candle, as the replay does</label>
       <label data-term="noise">Skip plays flagged as noise</label>
       <div class="ap-noise">${Object.entries(ap.noise_labels || {}).map(([flag, label]) =>
         `<label><input type="checkbox" class="ap-noise-check" value="${escapeHtml(flag)}" ${(ap.skip_noise || []).includes(flag) ? "checked" : ""}> ${escapeHtml(label)}</label>`).join("")}</div>
       <label title="With real money this is always on. On paper it is your choice: unticked, Autopilot practises the unproven setups too - at a quarter of the usual risk - and every trade is recorded with the settings it was taken on."><input type="checkbox" id="ap-proven" ${ap.require_proven !== false || live ? "checked" : ""} ${live ? "disabled" : ""}> Only trade strategies the replay has proven (Strategies panel)${live ? " - always on in Live" : (ap.require_proven === false ? " - off: unproven setups trade at practice size (a quarter of the risk)" : "")}</label>
+      <label title="With the box above unticked Autopilot practises unproven setups; this still skips a setup with evidence it loses: its replay, the way Autopilot takes it, averages -${ap.replay_loser_r ?? 0.05}R a trade or worse over ${ap.min_replay_trades ?? 30} trades and over 10 in the held-out sessions, or its own trades average -0.30R or worse over 10. A replay that recovers lifts it by itself. With proof required it has nothing to add.">Skip setups that lose in the replay
+        <select id="ap-losers">
+          <option value="off" ${ap.skip_replay_losers === "off" ? "selected" : ""}>off - practise them too</option>
+          <option value="day" ${(ap.skip_replay_losers || "day") === "day" ? "selected" : ""}>day trades</option>
+          <option value="all" ${ap.skip_replay_losers === "all" ? "selected" : ""}>day and swing trades</option>
+        </select></label>
+      ${(ap.replay_losers || []).length ? `<p class="muted small">Skipped now: ${ap.replay_losers.map(l =>
+        `<span title="${escapeHtml(l.why)}">${escapeHtml(l.strategy)}</span>`).join(", ")}</p>` : ""}
       <label title="The model learns, every night, the odds that a play pays from what happened to plays like it - live, not taken, and replayed. It only has a say while its own walk-forward test calls it usable.">The learned model
         <select id="ap-model">
           <option value="shadow" ${(ap.model_mode || "shadow") === "shadow" ? "selected" : ""}>shadow - log its odds, never act on them</option>
@@ -149,12 +158,14 @@ function configure() {
         max_per_strategy: int("#ap-maxstrat"),
         max_new_per_cycle: int("#ap-maxcycle"),
         min_confirmations: int("#ap-confirm"),
+        confirm_on_new_candle: $("#ap-candles").checked,
         min_minutes_to_close: int("#ap-close"),
         max_gross_exposure_pct: parseFloat($("#ap-gross").value),
         max_daily_loss_pct: parseFloat($("#ap-dayloss").value),
         max_giveback_pct: parseFloat($("#ap-giveback").value),
         skip_noise: $$(".ap-noise-check").filter(c => c.checked).map(c => c.value),
         ...(live ? {} : { require_proven: $("#ap-proven").checked }),      // in Live the box is locked on; the paper choice is kept
+        skip_replay_losers: $("#ap-losers").value,
         model_mode: $("#ap-model").value,
         cooldown_after_loss: $("#ap-cooldown").checked,
         dry_run: $("#ap-dry").checked,

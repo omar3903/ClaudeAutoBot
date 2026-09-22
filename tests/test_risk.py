@@ -89,6 +89,37 @@ def test_one_stock_never_takes_more_than_its_share_of_equity():
 
 
 # --------------------------------------------------------------------------- #
+#  A slice of the stock's usual daily volume
+# --------------------------------------------------------------------------- #
+def _thin(adv, entry=100.0, stop=90.0):
+    p = _play(entry, stop)
+    p.evidence["adv_shares"] = adv
+    return p
+
+
+def test_a_position_never_exceeds_one_percent_of_the_stocks_usual_daily_volume():
+    cfg = SimpleNamespace(**vars(RISK_CFG), max_adv_pct=1.0)
+    r = size_play(_thin(500), _acct(10000), cfg)            # 10 shares by risk alone; 1% of 500 is 5
+    assert r.qty == 5 and "liquidity: 1% of its usual daily volume" in r.caps_hit
+    assert size_play(_thin(5_000), _acct(10000), cfg).qty == 10      # plenty of volume: risk decides, no cap named
+    assert "liquidity: 1% of its usual daily volume" not in size_play(_thin(5_000), _acct(10000), cfg).caps_hit
+    assert size_play(_thin(90), _acct(10000), cfg).qty == 0          # too thin for one share
+
+
+def test_no_known_volume_means_no_liquidity_cap():
+    cfg = SimpleNamespace(**vars(RISK_CFG), max_adv_pct=1.0)
+    assert size_play(_thin(500), _acct(10000), cfg).qty == 5
+    assert size_play(_play(100, 90), _acct(10000), cfg).qty == 10    # a play saved before the scan wrote it
+    assert size_play(_thin(0), _acct(10000), cfg).qty == 10
+
+
+def test_the_liquidity_cap_can_be_switched_off():
+    assert size_play(_thin(500), _acct(10000), SimpleNamespace(**vars(RISK_CFG), max_adv_pct=0.5)).qty == 2
+    assert size_play(_thin(500), _acct(10000), SimpleNamespace(**vars(RISK_CFG), max_adv_pct=0.0)).qty == 10
+    assert size_play(_thin(500), _acct(10000), RISK_CFG).qty == 10   # no setting = off
+
+
+# --------------------------------------------------------------------------- #
 #  Aziz: a smaller size at Mid-day
 # --------------------------------------------------------------------------- #
 def test_a_day_trade_sized_at_midday_risks_a_fraction_of_the_usual(monkeypatch):

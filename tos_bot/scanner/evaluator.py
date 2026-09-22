@@ -26,6 +26,8 @@ from ..research.features import activity_summary
 from .filters import expected_r, rank_score
 from ..signals.calendar import next_report, sessions_until
 from .noise import NoiseSettings, context_flags
+from .schedule import last_completed_session
+from ..util import clock
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +51,31 @@ def with_today(daily: pd.DataFrame, intraday: Optional[pd.DataFrame]) -> pd.Data
         index=pd.DatetimeIndex([pd.Timestamp(day).tz_localize(daily.index.tz or "America/New_York")]),
     )
     return pd.concat([daily, bar])
+
+
+def closed_bar_at(intraday: Optional[pd.DataFrame]) -> Optional[str]:
+    """When the last closed 5-minute candle started - the one the day setups trigger on, since the newest
+    is still printing (strategies/technical.py _last_closed) - as ISO text a play's evidence can keep.
+    The board counts a day play's confirmations by it (engine/board.py)."""
+    if intraday is None or not len(intraday):
+        return None
+    return pd.Timestamp(intraday.index[-2 if len(intraday) >= 2 else -1]).isoformat()
+
+
+ADV_SESSIONS = 20   # sessions behind a stock's usual daily volume
+
+
+def median_volume(daily: pd.DataFrame, sessions: int = ADV_SESSIONS, now=None) -> Optional[float]:
+    """A stock's usual daily volume in shares: the median of its last ``sessions`` completed sessions.
+    Today's candle counts only once the session has closed, and the median shrugs off a one-off spike
+    day. None when the stock has no daily history, or none with volume. The sizer caps an order at a
+    slice of it (risk/position_sizing.py)."""
+    if daily is None or not len(daily) or "volume" not in daily:
+        return None
+    final = last_completed_session(now or clock.now_ny())
+    done = daily[daily.index.date <= final]["volume"].dropna().tail(sessions)
+    median = float(done.median()) if len(done) else 0.0
+    return median if median > 0 else None      # no volume is missing data, not a stock nobody trades
 
 
 def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
@@ -78,10 +105,16 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
         records={k: dict(v) for k, v in (records or {}).items()}, premarket=dict(premarket or {}),
     )
     plays: List[Play] = []
+    bar_at = closed_bar_at(intraday)
+    adv = median_volume(daily)
     for strategy in strategies:
         try:
             for p in strategy.generate(ctx):
                 p.scan_run_id = run_id
+                if bar_at is not None and p.timeframe is Timeframe.INTRADAY:
+                    p.evidence["bar_at"] = bar_at          # the board counts a day play's confirmations by it
+                if adv is not None:
+                    p.evidence["adv_shares"] = round(adv)   # the sizer caps the order at a slice of it
                 p.evidence["expected_r"] = round(expected_r(p, ctx.daily_atr), 3)
                 p.noise = context_flags(p, ctx, strategy.style, noise)
                 if p.evidence["expected_r"] < noise.min_expected_r:
