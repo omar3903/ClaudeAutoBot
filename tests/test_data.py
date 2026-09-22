@@ -189,3 +189,58 @@ def test_refresh_fetches_every_price_in_one_batch_and_keeps_to_the_limit(tmp_pat
     assert md.last_seen("BBB") is not None and md.last_seen("NOPE") is None
     gateway.requests.clear()
     assert md.refresh_prices(["AAA", "BBB", "CCC"], limit=2) == 2 and len(gateway.requests) == 2
+
+
+def test_refresh_shows_extended_hours_prices_but_the_quote_the_exits_read_stays_regular_hours(tmp_path):
+    gateway, md = fakes.FakeGateway(["AAA"], delayed=True), MarketData(DailyBarStore(tmp_path))
+    md.attach(gateway)
+    assert md.refresh_prices(["AAA"]) == 1 and gateway.requests == [("AAA", "1 min", "3600 S")]
+    shown = float(fakes.premarket_bars("AAA")["close"].iloc[-1])              # the fake's extended-hours candles
+    assert md.last_seen("AAA")[0] == pytest.approx(shown, abs=1e-4)
+    regular = float(fakes.intraday_bars("AAA")["close"].iloc[-1])
+    assert md.quote("AAA").last == pytest.approx(regular, abs=1e-4)             # the exits and entry checks: regular hours
+    assert regular != pytest.approx(shown, abs=1e-4)
+
+
+def test_the_latest_price_is_the_newer_of_a_price_to_show_and_the_quote(tmp_path):
+    import datetime as dt
+    import time
+
+    from tos_bot.data.market_data import quote_from_price
+
+    gateway, md = fakes.FakeGateway(["AAA"], delayed=True), MarketData(DailyBarStore(tmp_path))
+    md.attach(gateway)
+    q = md.quote("AAA")                                                         # the fake's session ends at 15:55
+    md.refresh_prices(["AAA"])                                                  # ...its extended-hours candles at 09:25
+    assert md.last_seen("AAA")[:2] == (q.last, q.ts)                            # the quote's candle is the later one
+
+    md._quotes["AAA"] = (time.monotonic() - 600, q)                             # fetched ten minutes ago...
+    md._shown["AAA"] = (time.monotonic(), quote_from_price("AAA", q.last, ts=q.ts))   # ...and the same candle just now
+    assert md.last_seen("AAA")[2] < 5                                           # counted as fresh
+
+    late = q.ts + dt.timedelta(minutes=35)
+    md._shown["AAA"] = (time.monotonic(), quote_from_price("AAA", 1.5, ts=late))     # a trade after the close
+    assert md.last_seen("AAA")[:2] == (1.5, late)
+    assert md.quote("AAA").last == q.last                                       # the exits still read regular hours
+
+
+def test_a_price_to_show_is_asked_for_at_most_every_15_seconds_and_a_broker_error_isnt_raised(tmp_path, monkeypatch):
+    gateway, md = fakes.FakeGateway(["AAA"], delayed=True), MarketData(DailyBarStore(tmp_path))
+    md.attach(gateway)
+    price, at, age = md.price_now("AAA", con_id=7)
+    assert price == pytest.approx(float(fakes.premarket_bars("AAA")["close"].iloc[-1]), abs=1e-4)
+    assert at == fakes.premarket_bars("AAA").index[-1].to_pydatetime() and len(gateway.requests) == 1
+    assert md.price_now("AAA")[0] == price and len(gateway.requests) == 1      # asked within 15 s: not again
+    assert md.price_now("NOPE") is None and md.price_now("NOPE") is None
+    assert len(gateway.requests) == 2                                           # nothing came back: still asked once
+
+    md._shown_asked["AAA"] -= 16                                                # 16 s on
+    assert md.price_now("AAA")[0] == price and len(gateway.requests) == 3      # asked again
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("the Gateway went away")
+
+    monkeypatch.setattr(gateway, "history_many", broken)
+    md._shown_asked["AAA"] -= 16
+    assert md.price_now("AAA")[0] == price                                      # what the app holds, not an error
+    assert md.price_now("ZZZ") is None

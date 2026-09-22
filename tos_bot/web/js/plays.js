@@ -9,6 +9,7 @@ import { loadOpen, openRecord, showTab } from "./blotter.js";
 import { orderMark } from "./orders.js";
 import { openChart } from "./chart.js";
 import { openSignals } from "./signals.js";
+import { watchPrice } from "./price.js";
 
 const DONE = new Set(["ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED", "ERROR"]);
 const isDone = p => DONE.has(p.status);
@@ -85,14 +86,20 @@ function signalMark(p) {
   return `<span class="badge sig-mark ${delta > 0 ? "good" : delta < 0 ? "bad" : ""}" title="Signals ${delta > 0 ? "+" : ""}${delta.toFixed(3)}: ${escapeHtml(ev.signal_reasons)}">signal</span>`;
 }
 
+/* How far a price is past the play's entry in R (negative: short of it), or null when the play has no risk. */
+function pastEntry(p, price) {
+  const risk = Math.abs(p.entry - p.stop);
+  return risk ? (p.side === "SHORT" ? -1 : 1) * (price - p.entry) / risk : null;
+}
+const pastEntryWords = r => `${Math.abs(r).toFixed(2)}R ${r >= 0 ? "past" : "short of"} the entry`;
+
 /* The latest price the app holds for the stock, and how far it has run from the entry in R - an entry is
    refused a quarter of an R past it (execution.max_chase_r). The time it's from is in the tooltip. */
 function priceCell(p) {
   if (p.last_price == null) return `<td class="num muted" title="No price yet - Refresh fetches one">–</td>`;
-  const risk = Math.abs(p.entry - p.stop), sign = p.side === "SHORT" ? -1 : 1;
-  const r = risk ? sign * (p.last_price - p.entry) / risk : null;
+  const r = pastEntry(p, p.last_price);
   const at = p.last_at ? new Date(p.last_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
-  const tip = `${at ? `As of ${at}` : ""}${(S.state.data || {}).delayed ? " (delayed data)" : ""}${r == null ? "" : `. ${Math.abs(r).toFixed(2)}R ${r >= 0 ? "past" : "short of"} the entry`}`;
+  const tip = `${at ? `As of ${at}` : ""}${(S.state.data || {}).delayed ? " (delayed data)" : ""}${r == null ? "" : `. ${pastEntryWords(r)}`}`;
   const cls = r == null ? "" : r > 0.25 ? "warn-text" : "muted";
   return `<td class="num" title="${escapeHtml(tip)}">${num(p.last_price)}${r == null ? "" : ` <span class="small ${cls}">${r >= 0 ? "+" : ""}${r.toFixed(1)}R</span>`}</td>`;
 }
@@ -273,6 +280,12 @@ function drawDetail(a) {
   const rejectBtn = $("#btn-reject"); if (rejectBtn) rejectBtn.onclick = () => reject(id);
   const recordBtn = $("#btn-goto-trade"); if (recordBtn) recordBtn.onclick = () => openRecord(a.play.trade_id);
   const offBtn = $("#btn-strat-off"); if (offBtn) offBtn.onclick = () => switchOff(a.play);
+  // the market price, kept fresh while the panel shows this play - and against the plan until it's sent
+  const sent = a.already_executed || isDone(a.play);
+  watchPrice($("[data-price]", body), a.play.symbol, d => {
+    const r = sent ? null : pastEntry(a.play, d.price);
+    return r == null ? "" : ` · ${pastEntryWords(r)}`;
+  });
   followSelected();                  // a push that came while it was being assessed
 }
 
@@ -347,6 +360,7 @@ function detailHTML(a) {
     ${sparkSvg(p.evidence && p.evidence.spark, p)}
     <div class="explain">${escapeHtml(p.explanation || p.rationale)}</div>
     <div class="kv">
+      <span>Market price</span><span data-price></span>
       <span data-term="entry">Entry</span><span>${num(p.entry)}</span>
       <span data-term="stop">Stop</span><span>${num(p.stop)} (${usd(-(Math.abs(p.entry - p.stop)))}/sh)</span>
       <span data-term="target">Target(s)</span><span>${(p.targets || []).map(t => num(t)).join(" → ")}</span>

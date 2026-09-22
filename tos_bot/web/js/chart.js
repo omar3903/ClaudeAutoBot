@@ -3,6 +3,7 @@
    same window shows a report's movers (movers.js). */
 import { $, api, escapeHtml, num } from "./util.js";
 import { S } from "./state.js";
+import { watchPrice } from "./price.js";
 
 const ROUTE_CLASS = { target: "rt-target", stop: "rt-stop", breakeven: "rt-lock", trail: "rt-trail", time: "rt-time" };
 
@@ -13,6 +14,9 @@ export async function openChart(play) {
   $(".chart-title", box).textContent = `${play.symbol} · ${play.side.toLowerCase()} · ${title}`;
   $(".chart-body", box).innerHTML = `<p class="muted">Loading the chart…</p>`;
   box.classList.remove("hidden");
+  // the market price, kept fresh while this chart is open - a mover's chart puts its own line here
+  $(".chart-price", box).innerHTML = `Market price <span data-price></span>`;
+  watchPrice($(".chart-price [data-price]", box), play.symbol);
   let d;
   try { d = await api(`/api/plays/${encodeURIComponent(play.id)}/chart`); } catch (e) { d = { ok: false, reason: `No chart - ${e.message}.` }; }
   if (box.dataset.play !== play.id || box.classList.contains("hidden")) return;
@@ -27,6 +31,7 @@ export function chartModal() {
   box.className = "modal hidden";
   box.innerHTML = `<div class="modal-card chart-card" role="dialog" aria-modal="true">
     <div class="chart-head"><h3 class="chart-title"></h3><button class="ghost mini" data-close title="Close">✕</button></div>
+    <div class="chart-price muted small"></div>
     <div class="chart-body"></div></div>`;
   document.body.appendChild(box);
   box.addEventListener("click", e => { if (e.target === box || e.target.closest("[data-close]")) box.classList.add("hidden"); });

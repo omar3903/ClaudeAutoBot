@@ -92,6 +92,9 @@ log = logging.getLogger(__name__)
 ORDERS_POLL_S = 5.0
 #: how old that list may be before a dashboard request asks the broker again
 ORDERS_MAX_AGE_S = 8.0
+#: the session a price was traded in, as a stock's price line says it
+SESSION_WORDS = {clock.Session.PRE: "pre-market", clock.Session.REGULAR: "regular",
+                 clock.Session.POST: "after-hours", clock.Session.CLOSED: "closed"}
 
 
 
@@ -233,6 +236,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._last_scans: Dict[str, Dict[str, Any]] = {}
         self._gappers_session: Optional[dt.date] = None      # the session the gap check last ran for
         self._replay_session: Optional[dt.date] = None       # the session the daily replay was started for
+        self._replay_resumed = False                         # an interrupted replay was looked for (_resume_replay)
         self._last_cycle_at = float("-inf")
         self._last_fast_at = float("-inf")
         self._last_plays_at = float("-inf")
@@ -717,6 +721,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 if kind:
                     self._run_scan(kind)
                 self._save_day()
+                self._resume_replay()
             except Exception:  # noqa: BLE001
                 log.exception("scan loop pass failed")
             self._scan_wake.wait(5.0)
@@ -1855,7 +1860,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def refresh_prices(self) -> int:
         """A fresh price for every play on the board and every open position, in one batched request -
-        the dashboard's Refresh. The plays go out again with them. Returns how many came back."""
+        the dashboard's Refresh. Pre-market and after-hours trades count, so outside regular hours they
+        still move; they're only shown (MarketData.refresh_prices). The plays go out again with them.
+        Returns how many came back."""
         if not self.md.attached:
             return 0
         plays = [p.symbol for p in self.board.ranked()[:self.BOARD_ROWS] if p.status not in _ACTED_ON]
@@ -1869,6 +1876,19 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return 0
         self._publish_plays()
         return n
+
+    def price_of(self, symbol: str) -> Dict[str, Any]:
+        """One stock's latest price for a panel about it, pre-market and after-hours included, with when
+        it's from and the session it traded in - GET /api/price/{symbol}. Fetched when the broker wasn't
+        asked for it in the last 15 s (MarketData.price_now). Shown only: nothing the app acts on reads it."""
+        if not self.md.attached:
+            return {"ok": False, "symbol": symbol, "reason": "IB Gateway isn't connected, so there's no price."}
+        seen = self.md.price_now(symbol, self.scanner.con_ids([symbol]).get(symbol))
+        if seen is None:
+            return {"ok": False, "symbol": symbol, "reason": f"No recent price for {symbol}."}
+        price, at, age = seen
+        return {"ok": True, "symbol": symbol, "price": round(price, 4), "at": at.isoformat(), "age_s": round(age, 1),
+                "session": SESSION_WORDS[clock.current_session(at)]}
 
     def _marks(self) -> Dict[str, Tuple[float, str]]:
         """The app's own price for each stock held, where it's fresher than the broker's mark."""

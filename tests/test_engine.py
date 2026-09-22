@@ -364,6 +364,42 @@ def test_the_session_the_daily_replay_ran_for_survives_a_restart(engine, tmp_pat
         again.stop()
 
 
+def test_a_replay_a_restart_interrupted_is_resumed_once_and_an_older_one_is_dropped(engine, port, monkeypatch):
+    last = clock.prev_trading_day(clock.session_date())
+    checkpoint = engine.replay.checkpoint
+    checkpoint.begin({"fingerprint": "f", "last": last.isoformat(), "sessions": 7, "swing_sessions": 30, "jobs": 5},
+                     resume=False)
+    checkpoint.add(("swing", "T01"), [])
+    started, events = [], []
+    monkeypatch.setattr(engine.replay, "start", lambda **kw: started.append(kw) or {"ok": True, "note": "n"})
+    monkeypatch.setattr(engine, "_publish", lambda topic, **p: events.append((topic, p)))
+
+    engine._resume_replay()                                                  # no Gateway yet
+    _connect(engine, port)
+    engine._resume_replay()                                                  # no watchlist yet
+    engine.settings.config.replay.daily = False
+    engine._run_scan("full")
+    engine.quit_state = {"by": "operator"}
+    engine._resume_replay()                                                  # quitting
+    engine.quit_state = None
+    monkeypatch.setattr(type(engine.replay), "running", property(lambda self: True))
+    engine._resume_replay()                                                  # another replay running
+    monkeypatch.setattr(type(engine.replay), "running", property(lambda self: False))
+    assert started == [] and checkpoint.path.exists()
+
+    engine._resume_replay()
+    engine._resume_replay()
+    assert len(started) == 1 and started[0]["resume"]                        # once, as a resumed run...
+    assert (started[0]["sessions"], started[0]["swing_sessions"]) == (7, 30)  # ...of the interrupted run's sessions
+    assert [p for topic, p in events if topic == "replay.started"][-1]["resumed"]
+
+    engine._replay_resumed = False                                           # a later start, with an older run's file
+    checkpoint.begin({"fingerprint": "f", "last": clock.prev_trading_day(last).isoformat(), "sessions": 7,
+                      "swing_sessions": 30, "jobs": 5}, resume=False)
+    engine._resume_replay()
+    assert len(started) == 1 and not checkpoint.path.exists()                # deleted, nothing started
+
+
 # ---------------------------------------------------------------- the split, and changes made while it runs
 def test_entries_still_working_count_in_their_kinds_share_of_the_capital(engine, port):
     _connect(engine, port)
@@ -1348,6 +1384,62 @@ def test_refresh_prices_the_plays_and_the_positions_and_sends_the_plays_out_agai
     assert (pos["market_price"], pos["price_at"], pos["unrealized_pl"]) == (100.0, None, 0.0)
 
 
+class _AfterTheClose(fakes.FakeGateway):
+    """A Gateway after the close: its extended-hours candles are the session's, then a trade at 16:30
+    a dollar above the last regular-hours price."""
+
+    def history_many(self, requests, con_ids=None, end=None, rth=True):
+        import pandas as pd
+
+        out = super().history_many(requests, con_ids, end)
+        if not rth:
+            for symbol, frame in out.items():
+                late = frame.iloc[[-1]].copy()
+                late.index = late.index + dt.timedelta(minutes=35)
+                late["close"] += 1.0
+                out[symbol] = pd.concat([frame, late])
+        return out
+
+
+def test_a_refresh_after_the_close_moves_a_positions_price_but_not_the_price_the_exits_read(engine, monkeypatch):
+    engine.md.attach(_AfterTheClose(["AAA"], delayed=True))
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAA", quantity=10, avg_price=100.0, market_price=100.0)]
+    regular = engine.md.quote("AAA")                                            # what the exit manager acts on
+    [before] = engine.snapshot()["positions"]
+    assert before["market_price"] == pytest.approx(regular.last, abs=1e-4)
+    monkeypatch.setattr(engine, "_publish_plays", lambda: None)
+    assert engine.refresh_prices() == 1
+    [after] = engine.snapshot()["positions"]
+    assert after["market_price"] == pytest.approx(regular.last + 1.0, abs=1e-3)
+    assert dt.datetime.fromisoformat(after["price_at"]) - dt.datetime.fromisoformat(before["price_at"]) \
+        == dt.timedelta(minutes=35)
+    assert engine.md.quote("AAA").last == regular.last                          # the exits never see it
+    assert engine.price_of("AAA")["session"] == "after-hours"
+
+
+def test_a_stocks_price_says_when_its_from_and_the_session_it_traded_in(engine, monkeypatch):
+    assert engine.price_of("AAA") == {"ok": False, "symbol": "AAA",
+                                      "reason": "IB Gateway isn't connected, so there's no price."}
+    engine.md.attach(fakes.FakeGateway(["AAA"], delayed=True))
+    held, asked = {}, []
+    monkeypatch.setattr(engine.md, "price_now", lambda symbol, con_id=None: asked.append(con_id) or held.get(symbol))
+    day = dt.date(2026, 9, 16)
+    for hhmm, session in (("04:00", "pre-market"), ("09:29", "pre-market"), ("09:30", "regular"),
+                          ("15:59", "regular"), ("16:00", "after-hours"), ("19:59", "after-hours")):
+        at = dt.datetime.combine(day, dt.time.fromisoformat(hhmm), clock.NY)
+        held["AAA"] = (12.3456, at, 3.04)
+        assert engine.price_of("AAA") == {"ok": True, "symbol": "AAA", "price": 12.3456, "at": at.isoformat(),
+                                          "age_s": 3.0, "session": session}
+    held["AAA"] = (12.3456, dt.datetime(2026, 9, 19, 12, 0, tzinfo=clock.NY), 1.0)    # a Saturday
+    assert engine.price_of("AAA")["session"] == "closed"
+    held.clear()
+    assert engine.price_of("AAA") == {"ok": False, "symbol": "AAA", "reason": "No recent price for AAA."}
+    engine.scanner.con_ids = lambda symbols: {"AAA": 1234}
+    engine.price_of("AAA")
+    assert asked[-1] == 1234                                                    # the stock's contract when it's known
+
+
 # ---------------------------------------------------------------- open positions on the dashboard
 def test_each_open_position_says_what_rests_at_the_broker_to_close_it(engine):
     """The Open positions tab's protection chip reads the orders the executor placed and follows
@@ -1563,6 +1655,42 @@ def test_every_topic_the_app_publishes_has_a_handler_in_the_dashboard():
     handled = set(re.findall(r'case "([\w.]+)"', (app / "web" / "js" / "events.js").read_text(encoding="utf-8")))
     assert len(published) > 50                                    # the search found the app's topics
     assert sorted(published - handled) == []
+
+
+#: every panel, popup or drawer about a stock: the script that draws it and the functions that open it
+PRICE_PANELS = {"plays.js": ["drawDetail"], "chart.js": ["openChart"], "movers.js": ["openMoverChart"],
+                "signals.js": ["openStock"], "blotter.js": ["renderRecord", "confirmExit", "confirmUntrackedExit"],
+                "pairs.js": ["openChart"]}
+
+
+def test_every_panel_about_a_stock_keeps_its_market_price_fresh():
+    """A play's panel and chart, its stock on the Signals page, an open trade's record, an exit's confirmation,
+    a mover's chart and a pair's chart each show the stock's price through the one shared helper, which asks
+    the route the server has for it."""
+    web = Path(__file__).resolve().parents[1] / "tos_bot" / "web" / "js"
+    helper = (web / "price.js").read_text(encoding="utf-8")
+    assert "/api/price/${" in helper and "export function watchPrice" in helper
+    assert '@app.get("/api/price/{symbol}")' in (web.parents[1] / "server" / "app.py").read_text(encoding="utf-8")
+    for script, openers in PRICE_PANELS.items():
+        source = (web / script).read_text(encoding="utf-8")
+        assert 'import { watchPrice } from "./price.js";' in source, script
+        for name in openers:
+            # the function's body, up to its closing brace at the start of a line
+            body = re.search(rf"^(?:export )?(?:async )?function {name}\(.*?^\}}", source, re.S | re.M)
+            assert body and "watchPrice(" in body.group(0), f"{script} {name}"
+
+
+def test_every_name_a_dashboard_script_imports_is_one_the_script_it_names_exports():
+    """The scripts load as ES modules: one missing export and the whole dashboard fails to start."""
+    web = Path(__file__).resolve().parents[1] / "tos_bot" / "web" / "js"
+    scripts = {f.name: f.read_text(encoding="utf-8") for f in web.glob("*.js")}
+    exports = {name: set(re.findall(r"^export (?:async )?(?:function|const) ([\w$]+)", src, re.M))
+               for name, src in scripts.items()}
+    imports = [(name, target, {n.strip() for n in names.split(",") if n.strip()}) for name, src in scripts.items()
+               for names, target in re.findall(r'^import \{([^}]*)\} from "\./([\w.]+)";', src, re.M)]
+    assert len(imports) > 80                                           # the search found the scripts' imports
+    assert [(name, target, sorted(wanted - exports[target])) for name, target, wanted in imports
+            if wanted - exports[target]] == []
 
 
 def test_a_click_that_wakes_the_snapshot_loop_leaves_the_position_check_to_its_usual_turn(engine, monkeypatch):

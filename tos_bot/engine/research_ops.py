@@ -38,8 +38,10 @@ class ResearchOps:
     # ------------------------------------------------------------------ #
     #  Strategy replay                                                   #
     # ------------------------------------------------------------------ #
-    def start_replay(self, sessions: Optional[int] = None, swing_sessions: Optional[int] = None) -> Dict[str, Any]:
-        """Replay the strategies over recent candles in the background (see research/)."""
+    def start_replay(self, sessions: Optional[int] = None, swing_sessions: Optional[int] = None,
+                     resume: bool = False) -> Dict[str, Any]:
+        """Replay the strategies over recent candles in the background (see research/); ``resume``
+        picks up the run a restart interrupted (_resume_replay)."""
         if not self.md.attached:
             return {"ok": False, "reason": "IB Gateway isn't connected, so there are no candles to replay."}
         symbols = replay_symbols(self.scanner.watchlist, int(self.settings.config.replay.swing_stocks or 0))
@@ -76,7 +78,35 @@ class ResearchOps:
             pairs=self._pair_replay_inputs() if cfg.pairs.enabled else None,
             held_out_fraction=float(cfg.replay.held_out_fraction),
             news=self._news_history if cfg.signals.enabled else None, benchmark=BENCHMARK,
-            records=self.strategy_odds())
+            records=self.strategy_odds(), resume=resume)
+
+    def _resume_replay(self) -> None:
+        """Once after a start, from the scan loop: pick up the replay a restart interrupted. The runner
+        keeps each finished job (research/runner.py Checkpoint); resumed, it replays only the rest and
+        downloads nothing, so a restart costs the job in flight and the quick local steps before the
+        jobs. Only this session's run is picked up - one from an earlier session is deleted. It waits for
+        IB Gateway and the watchlist, and never starts while quitting or beside another replay."""
+        if self._replay_resumed or self.quit_state or self.replay.running:
+            return
+        header = self.replay.checkpoint.header()
+        if header is None:
+            self._replay_resumed = True
+            return
+        if header.get("last") != clock.prev_trading_day(clock.session_date()).isoformat():
+            self.replay.checkpoint.clear()             # another session's run: its sessions are no longer the last ones
+            self._replay_resumed = True
+            return
+        if not self.md.attached or self.scanner.watchlist is None:
+            return                                     # looked at again on the next pass
+        self._replay_resumed = True                    # once, whatever comes of it
+        done = len(self.replay.checkpoint.read()[1])
+        out = self.start_replay(header.get("sessions"), header.get("swing_sessions"), resume=True)
+        if out.get("ok"):
+            log.info("resuming the replay interrupted at %d of %s jobs", done, header.get("jobs"))
+        else:
+            log.warning("the interrupted replay couldn't be resumed: %s", out.get("reason", ""))
+        self._publish("replay.started", auto=True, resumed=True,
+                      **{k: out[k] for k in ("ok", "note", "reason") if k in out})
 
     def _keep_sim_trades(self, data: Dict[str, Any], trades: Sequence[Any]) -> None:
         """The replay's sink: its simulated trades go to the database, next to the real ones and

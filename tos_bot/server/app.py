@@ -101,6 +101,11 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     def state():
         return eng().snapshot()
 
+    @app.get("/api/price/{symbol}")
+    def price(symbol: str):
+        # one stock's latest price, pre-market and after-hours included, for a panel that shows it
+        return eng().price_of(symbol.upper())
+
     @app.get("/api/plays")
     def plays(full: bool = False):
         # what the table shows of each play, as the board's push sends it; ?full=1 for every play whole

@@ -2,7 +2,7 @@
    P/L summary, the watchlist, and the trade-record drawer. */
 import {
   $, $$, SECTOR_SHORT, VENUE_SHORT, api, escapeHtml, fmtTime, markStale, num, parseDate, pct, plural, positionList, post,
-  sectorTag, sideBadge, tfLabel, usd, fmtDay, fmtClock,
+  sectorTag, sideBadge, tfLabel, usd, fmtDay, fmtClock, fmtWhen,
 } from "./util.js";
 import { S, on, refreshState, serverNow } from "./state.js";
 import { closeDrawer, drawerOpen, openDrawer, openModal, toast, toastResult } from "./ui.js";
@@ -10,6 +10,7 @@ import { stratLabel } from "./strategies.js";
 import { loadWatchlist } from "./watchlist.js";
 import { loadOrders } from "./orders.js";
 import { loadPairs } from "./pairs.js";
+import { watchPrice } from "./price.js";
 
 const LOADERS = {
   open: loadOpen, orders: () => loadOrders(true), history: loadHistory, stats: loadStats, watchlist: loadWatchlist,
@@ -88,10 +89,12 @@ function confirmUntrackedExit(symbol) {
     title: `Exit ${symbol} (no record)?`,
     bodyHTML: `${isLive() ? `<div class="warn-box">This sends a <b>real market order</b> to ${escapeHtml(venue)}.</div>` : ""}
       <p>${r.side === "SHORT" ? "Buy back" : "Sell"} ${num(r.qty, 0)} ${escapeHtml(symbol)} at the market - the shares the app has no record for.</p>
-      <p class="muted">The open-trade records${r.recorded ? ` (${num(r.recorded, 0)} shares)` : ""} are left alone.</p>`,
+      <p class="muted">The open-trade records${r.recorded ? ` (${num(r.recorded, 0)} shares)` : ""} are left alone.</p>
+      <p class="muted">Last trade <span data-price></span></p>`,
     okText: "Exit shares", okClass: "danger",
     onOk: async () => { toastResult(await post(`/api/positions/untracked/${encodeURIComponent(symbol)}/close`)); loadOpen(); refreshState(); },
   });
+  watchPrice($("#modal-body [data-price]"), symbol);      // roughly what the market order will get
 }
 
 export function untrackedChanged() {
@@ -211,7 +214,7 @@ function openRow(t, here) {
     <td class="num">${num(t.quantity, 0)}${t.initial_quantity && Math.abs(t.initial_quantity - t.quantity) > 1e-9
       ? ` <span class="muted" title="part of the position was taken off at the first target">of ${num(t.initial_quantity, 0)}</span>` : ""}</td>
     <td class="num">${num(t.entry_price)}</td>
-    <td class="num"${pos.price_at ? ` title="As of ${escapeHtml(new Date(pos.price_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))} - the price the exit manager acts on"` : ""}>${parked ? "–" : num(pos.market_price)}</td>
+    <td class="num"${pos.price_at ? ` title="As of ${escapeHtml(fmtWhen(pos.price_at))} - the app's own latest price, pre-market and after-hours included (the exits act on regular-hours prices)"` : ""}>${parked ? "–" : num(pos.market_price)}</td>
     <td class="num ${upl >= 0 ? "pl-pos" : "pl-neg"}">${usd(upl)}${t.banked_pl
       ? ` <span class="muted" title="realized on the part already taken off">+${usd(t.banked_pl)} banked</span>` : ""}</td>
     ${rCell}
@@ -252,7 +255,8 @@ function confirmExit(t, fromRecord = false) {
     title: `Exit ${t.symbol}?`,
     bodyHTML: `${isLive() ? `<div class="warn-box">This sends a <b>real market order</b> to ${escapeHtml(venue)}.</div>` : ""}
       <p>${t.side === "SHORT" ? "Buy back" : "Sell"} ${num(Math.abs(t.quantity), 0)} ${escapeHtml(t.symbol)} at the market and close the position.</p>
-      <p class="muted">Entered at ${num(t.entry_price)} · stop ${num(t.stop_price)} · target ${num(t.target_price)}.</p>`,
+      <p class="muted">Entered at ${num(t.entry_price)} · stop ${num(t.stop_price)} · target ${num(t.target_price)}.</p>
+      <p class="muted">Last trade <span data-price></span></p>`,
     okText: "Exit position", okClass: "danger",
     onOk: async () => {
       markExit(t.id, true);
@@ -264,6 +268,7 @@ function confirmExit(t, fromRecord = false) {
       if (fromRecord && drawerOpen("record") && S.recordId === t.id) openRecord(t.id);
     },
   });
+  watchPrice($("#modal-body [data-price]"), t.symbol);    // roughly what the market order will get
 }
 
 async function exitAll() {
@@ -371,7 +376,7 @@ function renderRecord(rec) {
       ${open ? "" : `<span>Exit</span><span>${num(t.exit_price)}</span>`}
       <span>Stop</span><span>${num(t.stop_price)}${moved ? ` (moved from ${num(t.initial_stop_price)})` : ""}</span>
       <span>Target</span><span>${num(t.target_price)}</span>
-      ${open ? `<span>At the broker</span><span>${atBroker}</span>`
+      ${open ? `<span>At the broker</span><span>${atBroker}</span><span>Market price</span><span data-price></span>`
       : `<span>P/L</span><span class="${t.realized_pl >= 0 ? "pl-pos" : "pl-neg"}">${usd(t.realized_pl)} (${pct(t.realized_pl_pct)}) · ${num(t.r_multiple, 2)}R</span>`}
       <span>Auto exit</span><span>${t.managed_exit ? "on" : "off"}</span>
       <span>Trade id</span><span><code>${escapeHtml(t.id)}</code></span>
@@ -392,6 +397,7 @@ function renderRecord(rec) {
       deleted once the broker confirms the position is gone.</p>` : ""}`;
   const exitBtn = $("#rec-exit");
   if (exitBtn) exitBtn.onclick = () => confirmExit(t, true);
+  if (open) watchPrice($("#drawer-body [data-price]"), t.symbol);   // while this record stays open
 }
 
 export function recordGone(ids) {

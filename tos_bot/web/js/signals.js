@@ -7,6 +7,7 @@ import { toastResult } from "./ui.js";
 import { openConnections } from "./connections.js";
 import { openStrategies } from "./strategies.js";
 import { sheet, sheetOpen } from "./sheet.js";
+import { watchPrice } from "./price.js";
 
 let view = "stocks";
 let open = null;                 // the stock whose story is showing
@@ -142,9 +143,11 @@ async function openStock(symbol, keep = false) {
   const earnings = (d.earnings || []).length ? `<div class="wide"><h5>Earnings</h5>${d.next_earnings
     ? `<p>Next report: <b>${escapeHtml(d.next_earnings.date)}</b> ${hour(d.next_earnings)}${d.next_earnings.eps_estimate != null ? ` · EPS estimate ${num(d.next_earnings.eps_estimate)}` : ""}</p>` : ""}
     <p class="muted small">${d.earnings.filter(e => e.eps_actual != null).map(e => `${escapeHtml(e.date)}: EPS ${num(e.eps_actual)} vs ${num(e.eps_estimate)} estimated${e.surprise != null ? ` (${e.surprise >= 0 ? "+" : ""}${Math.round(e.surprise * 100)}%)` : ""}`).join(" · ")}</p></div>` : "";
-  cell.innerHTML = `<div class="mover-story">${reasons}${effect}${earnings}
+  cell.innerHTML = `<p class="muted small">Market price <span data-price></span></p>
+    <div class="mover-story">${reasons}${effect}${earnings}
     <div class="wide"><h5>Its insiders' filings over the past year</h5>${filingsHTML(d.filings, d.filing_delays, 365, false)}</div>
     <div class="wide"><h5>Its news, the last 30 days</h5>${headlinesHTML(d.headlines, false)}</div></div>`;
+  watchPrice($("[data-price]", cell), symbol);         // until the story closes or the page draws it again
 }
 
 function filingsHTML(rows, lag, days, withStock) {

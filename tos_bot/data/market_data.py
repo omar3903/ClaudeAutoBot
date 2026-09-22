@@ -27,6 +27,7 @@ INTRADAY_DURATION = "5 D"            # today plus four sessions, for relative vo
 _INTRADAY_TTL_S = 60.0
 REFRESH_DURATION = "1800 S"           # the quick re-check fetches the last half hour only
 PREMARKET_DURATION = "1 D"            # the pre-open gap check: today's extended-hours candles
+SHOWN_DURATION = "3600 S"             # a price to show looks back an hour: long enough for a thin stock's last trade
 _QUOTE_TTL_S = 20.0
 #: candles and quotes nothing has asked for in this long are let go - the app runs for days
 _CACHE_KEEP_S = 1800.0
@@ -79,6 +80,10 @@ class MarketData:
         self._lock = threading.Lock()
         self._intraday: Dict[str, Tuple[float, pd.DataFrame]] = {}
         self._quotes: Dict[str, Tuple[float, Quote]] = {}
+        #: prices fetched only to be shown, pre-market and after-hours included. Kept apart from _quotes, which
+        #: the exits and the entry checks trade on through quote(): an after-hours print must never move a stop
+        self._shown: Dict[str, Tuple[float, Quote]] = {}
+        self._shown_asked: Dict[str, float] = {}      # when the broker was last asked for each one
         self._pruned_at = 0.0
         #: the morning scan and the movers report can want the same download; the second then finds it done
         self._daily_lock = threading.Lock()
@@ -93,6 +98,8 @@ class MarketData:
             self._source = None
             self._intraday.clear()
             self._quotes.clear()
+            self._shown.clear()
+            self._shown_asked.clear()
 
     @property
     def source(self) -> PriceSource:
@@ -224,6 +231,8 @@ class MarketData:
             self._pruned_at = now
             self._intraday = {s: hit for s, hit in self._intraday.items() if now - hit[0] < _CACHE_KEEP_S}
             self._quotes = {s: hit for s, hit in self._quotes.items() if now - hit[0] < _CACHE_KEEP_S}
+            self._shown = {s: hit for s, hit in self._shown.items() if now - hit[0] < _CACHE_KEEP_S}
+            self._shown_asked = {s: at for s, at in self._shown_asked.items() if now - at < _CACHE_KEEP_S}
 
     def refresh_intraday(self, symbols: Sequence[str],
                          con_ids: Optional[Mapping[str, int]] = None) -> Dict[str, pd.DataFrame]:
@@ -296,16 +305,20 @@ class MarketData:
 
     # ---- the latest price, and when it's from ---------------------------- #
     def last_seen(self, symbol: str) -> Optional[Tuple[float, dt.datetime, float]]:
-        """The newest price the app holds for ``symbol`` - its latest quote or the close of its latest
-        5-minute candle, whichever is from later - as (price, when it's from, how many seconds ago it was
-        fetched). None when it holds neither. Asks nothing of the broker."""
+        """The newest price the app holds for ``symbol`` - its latest quote, its latest price fetched to be
+        shown or the close of its latest 5-minute candle, whichever is from later - as (price, when it's from,
+        how many seconds ago it was fetched). None when it holds none. Asks nothing of the broker. For the
+        dashboard only: it can be a pre-market or after-hours price, which nothing may act on."""
         now, best = time.monotonic(), None
-        hit = self._quotes.get(symbol)
-        if hit is not None:
+        for hit in (self._quotes.get(symbol), self._shown.get(symbol)):
+            if hit is None:
+                continue
             q = hit[1]
             price = float(q.last or q.mid or 0.0)
-            if price > 0:
-                best = (price, q.ts if q.ts.tzinfo else q.ts.replace(tzinfo=dt.timezone.utc), now - hit[0])
+            at = q.ts if q.ts.tzinfo else q.ts.replace(tzinfo=dt.timezone.utc)
+            # the same candle fetched twice: the later fetch, so the age says how fresh it really is
+            if price > 0 and (best is None or at > best[1] or (at == best[1] and now - hit[0] < best[2])):
+                best = (price, at, now - hit[0])
         bars = self._intraday.get(symbol)
         if bars is not None and bars[1] is not None and len(bars[1]):
             at = _candle_time(bars[1])
@@ -316,12 +329,40 @@ class MarketData:
     def refresh_prices(self, symbols: Sequence[str], con_ids: Optional[Mapping[str, int]] = None,
                        limit: int = 120) -> int:
         """Fetch a fresh price for each of ``symbols`` now - the close of its latest one-minute candle,
-        in one batch (a snapshot quote each would take a request apiece) - for the dashboard's Refresh.
-        The first ``limit`` only. Returns how many came back."""
+        pre-market and after-hours included, in one batch (a snapshot quote each would take a request
+        apiece) - for the dashboard's Refresh. Shown, never traded on (see _shown). The first ``limit``
+        only. Returns how many came back."""
         wanted = list(dict.fromkeys(symbols))[:limit]
         if not wanted:
             return 0
-        got = self.source.history_many({s: ("1 min", "1800 S") for s in wanted}, con_ids)
+        return self._fetch_shown(wanted, con_ids)
+
+    def price_now(self, symbol: str, con_id: Optional[int] = None,
+                  max_age_s: float = 15.0) -> Optional[Tuple[float, dt.datetime, float]]:
+        """``symbol``'s latest price for a panel that shows it, as last_seen gives it: the latest trade,
+        pre-market and after-hours included, fetched now unless the broker was asked in the last
+        ``max_age_s`` - so any number of open panels cost IBKR one request per stock that often at most.
+        A newer price the app already holds still wins. None when there is none. A broker that fails
+        isn't the caller's problem: what the app holds is returned."""
+        now = time.monotonic()
+        with self._lock:
+            ask = now - self._shown_asked.get(symbol, now - max_age_s) >= max_age_s
+            if ask:
+                self._shown_asked[symbol] = now          # claimed before asking, so a second panel doesn't ask too
+        if ask:
+            try:
+                self._fetch_shown([symbol], {symbol: con_id} if con_id else None)
+            except Exception as e:  # noqa: BLE001
+                log.debug("price for %s unavailable: %s", symbol, e)
+        return self.last_seen(symbol)
+
+    def _fetch_shown(self, symbols: Sequence[str], con_ids: Optional[Mapping[str, int]] = None) -> int:
+        """The close of each symbol's latest one-minute candle, pre-market and after-hours included, into
+        the store of prices to show. Returns how many came back."""
+        asked = time.monotonic()
+        with self._lock:
+            self._shown_asked.update(dict.fromkeys(symbols, asked))
+        got = self.source.history_many({s: ("1 min", SHOWN_DURATION) for s in symbols}, con_ids, rth=False)
         now = time.monotonic()
         fresh = {}
         for symbol, frame in got.items():
@@ -331,5 +372,5 @@ class MarketData:
             fresh[symbol] = (now, quote_from_price(symbol, float(last["close"]), float(last["volume"]),
                                                    ts=_candle_time(frame)))
         with self._lock:
-            self._quotes.update(fresh)
+            self._shown.update(fresh)
         return len(fresh)

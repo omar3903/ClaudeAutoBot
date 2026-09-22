@@ -3,6 +3,7 @@ import { $, $$, api, escapeHtml, num, post, usd } from "./util.js";
 import { S } from "./state.js";
 import { openModal, toastResult } from "./ui.js";
 import { loadOpen } from "./blotter.js";
+import { watchPrice } from "./price.js";
 
 const inR = v => v == null ? "–" : `${v >= 0 ? "+" : ""}${num(v, 2)}R`;
 const SIDE = { LONG_SPREAD: "long the spread", SHORT_SPREAD: "short the spread" };
@@ -126,7 +127,9 @@ async function openChart(pair) {
   let d;
   try { d = await api(`/api/pairs/chart?pair=${encodeURIComponent(pair)}`); } catch { d = null; }
   if (!d || !d.ok) { toastResult(d || { ok: false, reason: "Couldn't chart that pair." }); return; }
-  openModal({ title: `${d.pair.first} / ${d.pair.second} — the spread`, bodyHTML: chartSVG(d), okText: "Close", okClass: "ghost", onOk: () => { } });
+  openModal({ title: `${d.pair.first} / ${d.pair.second} — the spread`, okText: "Close", okClass: "ghost", onOk: () => { },
+    bodyHTML: `<p class="muted small">Prices now <span data-price></span></p>${chartSVG(d)}` });
+  watchPrice($("#modal-body [data-price]"), [d.pair.first, d.pair.second]);     // both legs, while the chart is open
 }
 
 function chartSVG(d) {

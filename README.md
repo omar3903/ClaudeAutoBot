@@ -440,7 +440,7 @@ The app is built to be left running:
   and no price is restored: the first cycle reads fresh candles within seconds, and an entry still
   needs a current quote. With today's watchlist on disk the full scan isn't repeated either; open
   positions and their resting stop and target orders are found again from the trade records and the
-  order tags.
+  order tags. A replay the restart cut short resumes from its last finished job (see *The replay*).
 * **An open dashboard tab updates itself.** After the app is updated and restarted, a tab that was already
   open reconnects - and would go on running the scripts it loaded before. The server stamps the dashboard's
   files in its first message; a tab that started on another stamp reloads (or, with a dialog open, asks you to).
@@ -995,13 +995,21 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 * **Strategies** — switch setups on or off and weight them.
 * **◐** — light / dark theme.  **↻ Refresh** — re-pull account, positions and fills, and fetch a fresh
   price for every play on the board and every position held (one batched request of one-minute candles,
-  the positions first). When IB Gateway came up after the app, it connects at once instead of waiting for
-  the background retry. The button spins until the answer is in and then says what happened, so there is
-  no need to press it again.
+  pre-market and after-hours included, the positions first). When IB Gateway came up after the app, it
+  connects at once instead of waiting for the background retry. The button spins until the answer is in
+  and then says what happened, so there is no need to press it again.
 * **Price** (plays table) — the latest price the app holds for the stock and how far it is past the entry
   in R; amber beyond `execution.max_chase_r` (0.25R), where an entry is refused. The tooltip says when the
   price is from. The positions' **Mark** is the app's own price when it fetched one in the last two minutes
-  (the one the exit manager acts on), otherwise the broker's mark, which IBKR updates only every few minutes.
+  (the exit manager's, Refresh's or an open panel's), otherwise the broker's mark, which IBKR updates only
+  every few minutes. Prices fetched to be shown include pre-market and after-hours trades and are kept apart:
+  the exits and the entry checks read regular-hours prices only. `GET /api/price/{symbol}` gives one stock's
+  latest price with its time and session, asking IBKR at most every 15 s per stock.
+* **Market price** (every panel about a stock) — a play's detail panel (with how far it is past the entry in
+  R until the play is sent) and its chart, the stock on the Signals page, an open trade's record, an exit's
+  confirmation ("Last trade"), a mover's chart (the price now) and a pair's chart (both legs) show the latest
+  price with its time, and the session outside regular hours. It is fetched as the panel opens and every 30 s
+  while it stays open and the tab is in view.
 * **Replay record** (plays table, beside the setup) — the setup's replayed average R a trade and how many
   trades, over the ones Autopilot would take: green proven, amber not proven yet, red losing, grey no replayed
   trades. The tooltip adds the held-out sessions and why it isn't proven. The play's detail panel sets what the
@@ -1110,7 +1118,12 @@ fresh and the Gateway is free for the candles it downloads. So the records, the 
 half-Kelly sizes and the learned model are current for the session without anyone being awake for
 it; each morning also fetches another 20 minutes of past candles until the sixty sessions are
 covered. Once a session, never while a replay is already running or the app is quitting, and the
-session it ran for is remembered so a restart doesn't start a second one. A full scan *during*
+session it ran for is remembered so a restart doesn't start a second one. **A restart part way
+through picks the run up where it stopped**: each finished job is kept in
+`data/research/replay_partial.jsonl`, and once the Gateway is back the app resumes the same
+session's run, skipping those jobs and downloading no candles (the rest see the ones the finished
+jobs saw). A file from an earlier session is deleted; one made with other settings or other replay
+code is replayed afresh. A full scan *during*
 the session — a cold start at lunchtime, a widened filter — doesn't trigger it: the replay's
 downloads would be taking the Gateway from the cycles that need it, so it waits for the morning. **Run replay** in the
 Strategies panel still works whenever you want it.
