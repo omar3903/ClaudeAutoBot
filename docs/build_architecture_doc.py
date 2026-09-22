@@ -1298,6 +1298,8 @@ def build() -> str:
     A('<h3>REST routes (server/app.py)</h3>')
     A(table(["Route", "Method", "Engine call"], [
         ("/api/state", "GET", "snapshot(): account, positions, autopilot, filters, market, scan, pnl, venue ..."),
+        ("/api/price/{symbol}", "GET", "price_of(): one stock's latest price, pre-market and after-hours included, "
+         "with its time and session (asks IBKR at most every 15 s per stock)"),
         ("/api/plays[?full=1], /api/plays/{id}, /api/plays/{id}/assess | approve | reject | chart", "GET/POST",
          "current_plays() (slim rows - what the table shows - unless full=1), play_row() (one play whole, for "
          "the row's hover; 404 once it has left the board), assess_play(), approve_play(), reject_play(), "
@@ -1400,8 +1402,9 @@ def build() -> str:
         ("risk/position_sizing.py", "liquidity_cap()", "one order's shares are at most risk.max_adv_pct (1%) of the "
          "stock's median daily volume over 20 completed sessions (evidence.adv_shares); under one share the engine "
          "refuses the play as too thin"),
-        ("data/market_data.py", "last_seen(), refresh_prices()", "the newest price the app holds and when it's from, "
-         "with no broker request; one batched fetch of one-minute candles for every play and position"),
+        ("data/market_data.py", "last_seen(), refresh_prices(), price_now()", "the newest price the app holds and "
+         "when it's from, with no broker request; one batched fetch of one-minute candles for every play and "
+         "position, pre-market and after-hours included, kept apart from the quotes the exits act on"),
         ("engine/engine.py", "refresh_prices(), _marks()", "Refresh prices the board and the positions; a position's "
          "mark is the app's own price when fetched in the last APP_MARK_S (120 s), else the broker's"),
         ("execution/executor.py", "expire_entries(), _on_unfilled(), on_entry_unfilled", "calls off a day entry "

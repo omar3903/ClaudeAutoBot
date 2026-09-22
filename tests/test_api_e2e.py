@@ -127,6 +127,8 @@ def test_settings_round_trip_and_the_dashboard_loads(client):
     assert pairs["enabled"] and isinstance(pairs["watch"], list) and isinstance(pairs["trades"], list)
     assert client.post("/api/pairs/enter", json={"pair": "NOPE/PAIR"}).status_code == 400
     assert client.get("/api/pairs/chart", params={"pair": "NOPE/PAIR"}).json()["ok"] is False
+    price = client.get("/api/price/t01").json()                        # a panel's price line
+    assert price["ok"] and price["symbol"] == "T01" and price["price"] > 0 and price["at"] and price["session"]
 
 
 def test_an_open_tab_is_told_when_the_dashboards_files_have_changed(client, monkeypatch, tmp_path):

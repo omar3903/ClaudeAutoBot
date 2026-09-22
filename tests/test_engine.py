@@ -1348,6 +1348,62 @@ def test_refresh_prices_the_plays_and_the_positions_and_sends_the_plays_out_agai
     assert (pos["market_price"], pos["price_at"], pos["unrealized_pl"]) == (100.0, None, 0.0)
 
 
+class _AfterTheClose(fakes.FakeGateway):
+    """A Gateway after the close: its extended-hours candles are the session's, then a trade at 16:30
+    a dollar above the last regular-hours price."""
+
+    def history_many(self, requests, con_ids=None, end=None, rth=True):
+        import pandas as pd
+
+        out = super().history_many(requests, con_ids, end)
+        if not rth:
+            for symbol, frame in out.items():
+                late = frame.iloc[[-1]].copy()
+                late.index = late.index + dt.timedelta(minutes=35)
+                late["close"] += 1.0
+                out[symbol] = pd.concat([frame, late])
+        return out
+
+
+def test_a_refresh_after_the_close_moves_a_positions_price_but_not_the_price_the_exits_read(engine, monkeypatch):
+    engine.md.attach(_AfterTheClose(["AAA"], delayed=True))
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAA", quantity=10, avg_price=100.0, market_price=100.0)]
+    regular = engine.md.quote("AAA")                                            # what the exit manager acts on
+    [before] = engine.snapshot()["positions"]
+    assert before["market_price"] == pytest.approx(regular.last, abs=1e-4)
+    monkeypatch.setattr(engine, "_publish_plays", lambda: None)
+    assert engine.refresh_prices() == 1
+    [after] = engine.snapshot()["positions"]
+    assert after["market_price"] == pytest.approx(regular.last + 1.0, abs=1e-3)
+    assert dt.datetime.fromisoformat(after["price_at"]) - dt.datetime.fromisoformat(before["price_at"]) \
+        == dt.timedelta(minutes=35)
+    assert engine.md.quote("AAA").last == regular.last                          # the exits never see it
+    assert engine.price_of("AAA")["session"] == "after-hours"
+
+
+def test_a_stocks_price_says_when_its_from_and_the_session_it_traded_in(engine, monkeypatch):
+    assert engine.price_of("AAA") == {"ok": False, "symbol": "AAA",
+                                      "reason": "IB Gateway isn't connected, so there's no price."}
+    engine.md.attach(fakes.FakeGateway(["AAA"], delayed=True))
+    held, asked = {}, []
+    monkeypatch.setattr(engine.md, "price_now", lambda symbol, con_id=None: asked.append(con_id) or held.get(symbol))
+    day = dt.date(2026, 9, 16)
+    for hhmm, session in (("04:00", "pre-market"), ("09:29", "pre-market"), ("09:30", "regular"),
+                          ("15:59", "regular"), ("16:00", "after-hours"), ("19:59", "after-hours")):
+        at = dt.datetime.combine(day, dt.time.fromisoformat(hhmm), clock.NY)
+        held["AAA"] = (12.3456, at, 3.04)
+        assert engine.price_of("AAA") == {"ok": True, "symbol": "AAA", "price": 12.3456, "at": at.isoformat(),
+                                          "age_s": 3.0, "session": session}
+    held["AAA"] = (12.3456, dt.datetime(2026, 9, 19, 12, 0, tzinfo=clock.NY), 1.0)    # a Saturday
+    assert engine.price_of("AAA")["session"] == "closed"
+    held.clear()
+    assert engine.price_of("AAA") == {"ok": False, "symbol": "AAA", "reason": "No recent price for AAA."}
+    engine.scanner.con_ids = lambda symbols: {"AAA": 1234}
+    engine.price_of("AAA")
+    assert asked[-1] == 1234                                                    # the stock's contract when it's known
+
+
 # ---------------------------------------------------------------- open positions on the dashboard
 def test_each_open_position_says_what_rests_at_the_broker_to_close_it(engine):
     """The Open positions tab's protection chip reads the orders the executor placed and follows
