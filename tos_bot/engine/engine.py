@@ -435,6 +435,23 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         """OPEN trades held on the venue orders currently go to."""
         return [t for t in self._open_trades() if (t.get("broker") or "paper") == self._venue]
 
+    def open_positions(self) -> List[Dict[str, Any]]:
+        """The OPEN trade records for the Open positions tab, each with ``protection``: the stop and target
+        orders the executor keeps resting at the broker for it (Executor.protective_stops / resting_targets -
+        the ones it placed and follows, the same the exit manager leaves the target to), and whether this venue
+        rests them at all (``native``: IBKR does; on the simulator the app watches the price itself). None for
+        a trade held on another venue: nothing is placed for it while it's parked."""
+        ex = self.executor
+        native = bool(ex is not None and ex.native_stops_on())
+        stops = {s["trade_id"]: s for s in ex.protective_stops()} if ex is not None else {}
+        targets = {s["trade_id"]: s for s in ex.resting_targets()} if ex is not None else {}
+        trades = self.repo.open_trades()
+        for t in trades:
+            here = (t.get("broker") or "paper") == self._venue
+            t["protection"] = ({"native": native, "stop": stops.get(t["id"]), "target": targets.get(t["id"])}
+                               if here else None)
+        return trades
+
     def working_entries(self) -> List[Dict[str, Any]]:
         """Entry orders sent but not filled yet (see Executor.working_entries)."""
         return self.executor.working_entries() if self.executor else []

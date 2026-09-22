@@ -15,6 +15,7 @@ def exit_rules(cfg: Any) -> Dict[str, Any]:
     return {"enabled": bool(cfg.enabled), "breakeven_at_r": cfg.breakeven_at_r,
             "trail_start_r": cfg.trail_start_r, "trail_lock_ratio": cfg.trail_lock_ratio,
             "flatten_intraday_before_close_min": cfg.flatten_intraday_before_close_min,
+            "intraday_time_stop": bool(getattr(cfg, "intraday_time_stop", False)),
             "max_swing_hold_days": cfg.max_swing_hold_days,
             "scale_out_pct": float(getattr(cfg, "scale_out_pct", 0.0) or 0.0),
             "scale_out_lock_r": float(getattr(cfg, "scale_out_lock_r", 0.0) or 0.0)}

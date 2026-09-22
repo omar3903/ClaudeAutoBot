@@ -138,13 +138,14 @@ class ProtectiveStops:
                 and getattr(self, "exit_cfg", None) is not None)
 
     def protective_stops(self) -> List[Dict[str, Any]]:
-        """The stops resting at the broker, for the dashboard and the tests."""
+        """The stops resting at the broker, for the dashboard and the tests. (Read from a copy: the dashboard
+        asks from its own thread while a sync pass may be placing or dropping one.)"""
         return [{"trade_id": s.trade_id, "symbol": s.symbol, "order_id": s.order_id, "qty": s.qty, "stop_price": s.price}
-                for s in self._stops.values()]
+                for s in list(self._stops.values())]
 
     def resting_targets(self) -> List[Dict[str, Any]]:
         return [{"trade_id": s.trade_id, "symbol": s.symbol, "order_id": s.order_id, "qty": s.qty, "limit_price": s.price}
-                for s in self._targets.values()]
+                for s in list(self._targets.values())]
 
     def target_resting(self, trade_id: str) -> bool:
         """Whether the broker is working this trade's target - the exit manager then leaves it to it."""

@@ -76,7 +76,9 @@ def test_scan_watchlist_approve_close(client):
             break
     assert trade_id, "no play could be executed"
 
-    assert trade_id in [t["id"] for t in client.get("/api/trades?status=OPEN").json()["trades"]]
+    open_rows = {t["id"]: t for t in client.get("/api/trades?status=OPEN").json()["trades"]}
+    # the simulator rests no orders at the broker: the Open positions tab says the app watches the price
+    assert open_rows[trade_id]["protection"] == {"native": False, "stop": None, "target": None}
     orders = client.get("/api/orders?fresh=true").json()
     assert orders["ok"] and isinstance(orders["orders"], list)
     assert client.post(f"/api/trades/{trade_id}/close").json()["ok"]

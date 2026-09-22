@@ -1,10 +1,10 @@
 /* The bottom panel: open positions, active orders (see orders.js), trade history,
    P/L summary, the watchlist, and the trade-record drawer. */
 import {
-  $, $$, SECTOR_SHORT, VENUE_SHORT, api, escapeHtml, fmtTime, num, pct, plural, positionList, post,
+  $, $$, SECTOR_SHORT, VENUE_SHORT, api, escapeHtml, fmtTime, num, parseDate, pct, plural, positionList, post,
   sectorTag, sideBadge, tfLabel, usd, fmtDay, fmtClock,
 } from "./util.js";
-import { S, on, refreshState } from "./state.js";
+import { S, on, refreshState, serverNow } from "./state.js";
 import { closeDrawer, drawerOpen, openDrawer, openModal, toast, toastResult } from "./ui.js";
 import { stratLabel } from "./strategies.js";
 import { loadWatchlist } from "./watchlist.js";
@@ -30,9 +30,10 @@ export async function loadOpen() {
   if (!trades.length) { el.innerHTML = `<p class="muted pad">No open positions.</p>` + untrackedHTML(); wireUntracked(el); return; }
   el.innerHTML = exposureHTML(trades) +
     `<table><thead><tr><th data-term="symbol">Symbol</th><th data-term="side">Side</th><th data-term="tf">Type</th><th data-term="strategy_col">Strategy</th>
-    <th title="The order that opened the position, and what stands ready to close it">Orders in / out</th>
+    <th title="The order that opened the position">Order in</th>
     <th class="num" data-term="qty">Qty</th><th class="num" data-term="entry">Entry</th><th class="num" data-term="mark">Mark</th>
-    <th class="num" data-term="unrealized">Unrealized</th><th class="num" data-term="stop">Stop</th><th class="num" data-term="target">Target</th>
+    <th class="num" data-term="unrealized">Unrealized</th><th class="num" data-term="r_now">R&nbsp;now</th>
+    <th class="num" data-term="stop">Stop</th><th class="num" data-term="target">Target</th><th data-term="protection">Protection</th>
     <th data-term="age">Age / Expected</th><th class="num" data-term="mfe">MFE / MAE</th>
     <th data-term="auto_exit">Auto&nbsp;exit</th><th></th></tr></thead><tbody>${trades.map(t => openRow(t, here)).join("")}</tbody></table>` +
     untrackedHTML();
@@ -113,24 +114,58 @@ function exposureHTML(trades) {
   return `<div class="exposure">Exposure: ${parts}</div>`;
 }
 
-/* what stands ready to close a position: the stop order resting at the broker, or the app's own watch */
-function exitCell(t, parked) {
-  if (t.pair_id) return "the pair desk";
-  if (parked) return "paused";
-  const stop = ((S.orders || {}).orders || []).find(o => o.purpose === "stop" && o.trade_id === t.id);
+/* What stands ready to close a position, as a chip. Each open trade comes with its `protection`
+   (Engine.open_positions): the stop and target orders the executor placed at the broker and follows - the
+   ones the exit manager counts on - and whether this venue rests them at all. Green: they rest at the
+   broker, working on its prices even while the app is closed. Amber: the app watches the price and sends
+   the exit itself, only while it runs (the simulator). Red: the venue rests stops but this position has
+   none yet. A day trade adds its time stop. */
+function protectionCell(t, parked) {
+  if (t.pair_id) return `<span class="muted small">the pair desk</span>`;
+  if (parked) return `<span class="muted small">paused</span>`;
   const exiting = ((S.orders || {}).orders || []).find(o => o.purpose === "exit" && o.trade_id === t.id);
   if (exiting) return `<span class="badge warn" title="An exit order is working at the broker">exit working · ${escapeHtml(exiting.reason || exiting.order_type || "")}</span>`;
-  const out = t.overwatch_at ? fmtClock(t.overwatch_at) : "";
-  const late = t.timeframe !== "INTRADAY" ? ""
-    : ` · <span title="A day trade is closed once its setup's window has passed unless it's working (its stop at break-even or better), and every day trade is flat before the close">out ${out ? `by ${escapeHtml(out)} unless working, ` : ""}flat before the close</span>`;
-  const atBroker = (t.broker || "").startsWith("ibkr");
-  const target = ((S.orders || {}).orders || []).find(o => o.purpose === "target" && o.trade_id === t.id);
-  const tgt = target ? ` · <span title="A limit order rests at the broker at the target, in one group with the stop: when one fills the broker shrinks the other, so they can never both fill for the whole position">target ${num(target.limit_price)} ×${num(target.qty, 0)}</span>` : "";
-  return stop
-    ? `<span title="A good-till-cancelled stop order rests at the broker for these shares - it protects the position even while the app is closed">stop ${num(stop.stop_price)}</span>${tgt} at the broker${late}`
-    : atBroker
-      ? `<span class="badge warn" title="No stop order rests at the broker for this position: the app watches the price and sends the exit itself, but only while it's running. It places one as soon as it safely can - an order is never rested for shares the broker doesn't show. The log says why it hasn't">no stop at the broker yet</span>${late}`
-      : `<span title="No stop order rests at the broker: the app watches the price and sends the exit itself">stop watched by the app</span>${late}`;
+  const { native, stop, target } = t.protection || {};
+  const chip = stop
+    ? `<span class="badge good" title="${escapeHtml(`A good-till-cancelled stop order rests at the broker at ${num(stop.stop_price)} for ${plural(stop.qty, "share")}`
+      + (target ? `, and a limit order at the target, ${num(target.limit_price)} for ${plural(target.qty, "share")}, in one group with it: when one fills the broker shrinks the other, so they can never both fill for the whole position. Both work even while the app is closed.`
+        : ` - it protects the position even while the app is closed. The app works the target itself.`))}">${target ? "stop + target" : "stop"} at the broker</span>`
+    : native
+      ? `<span class="badge bad" title="No stop order rests at the broker for this position: the app watches the price and sends the exit itself, but only while it's running. It places one as soon as it safely can - an order is never rested for shares the broker doesn't show. The log says why it hasn't">no stop at the broker yet</span>`
+      : `<span class="badge warn" title="No stop order rests at the broker: the app watches the price and sends the exit itself, while it's running">watched by the app</span>`;
+  const late = timeStop(t);
+  return chip + (late ? `<br>${late}` : "");
+}
+
+/* A day trade's time stop (exit_manager.intraday_time_stop): once its setup's window has passed - its
+   overwatch_at - the exit manager closes it unless it's working, its stop at break-even or better; and every
+   day trade is flat before the close. Neither applies with Auto exit off. The minutes are counted on the
+   server's clock each time the tab redraws (every snapshot), which is often enough for whole minutes. */
+const TIME_STOP_WARN_MIN = 5;                          // amber in its last 5 minutes
+
+function timeStop(t) {
+  if (t.timeframe !== "INTRADAY" || !t.managed_exit) return "";
+  const rules = S.state.exit_manager || {}, at = t.overwatch_at ? parseDate(t.overwatch_at).getTime() : NaN;
+  // the flatten comes first when the window runs to the close
+  const flatAt = Date.parse((S.state.market || {}).regular_close || "") - (rules.flatten_intraday_before_close_min || 0) * 6e4;
+  if (!rules.intraday_time_stop || isNaN(at) || at >= flatAt) return `<span class="muted small">flat before the close</span>`;
+  const stop = t.stop_price || t.initial_stop_price;
+  if (stop && (t.side === "SHORT" ? stop <= t.entry_price : stop >= t.entry_price))
+    return `<span class="muted small" title="Its stop is at break-even or better, so its setup's window passing doesn't close it: it keeps its trailing stop until the flatten">working · flat before the close</span>`;
+  const min = Math.ceil((at - serverNow()) / 6e4);
+  const why = escapeHtml(`Its setup's window ends at ${fmtClock(t.overwatch_at)}: the exit manager then closes it unless it's working - its stop at break-even or better (exit_manager.intraday_time_stop). Every day trade is flat before the close.`);
+  return min > 0
+    ? `<span class="countdown small ${min <= TIME_STOP_WARN_MIN ? "warn" : ""}" title="${why}">out in ${min} min unless working</span>`
+    : `<span class="countdown small warn" title="${why}">window passed · closing</span>`;
+}
+
+/* Where the trade stands at the mark in R, the risk it was opened with: (mark − entry) ÷ (entry − the original
+   stop), as the exit manager measures it for the break-even and the trail. None for a pair leg (its stop is
+   the pair's), a parked position or one with no mark. */
+function rNow(t, pos, parked) {
+  const first = t.initial_stop_price || t.stop_price, risk = first ? Math.abs(t.entry_price - first) : 0;
+  if (t.pair_id || parked || pos.market_price == null || !risk) return null;
+  return { r: (pos.market_price - t.entry_price) * (t.side === "SHORT" ? -1 : 1) / risk, first, risk };
 }
 
 function openRow(t, here) {
@@ -141,6 +176,11 @@ function openRow(t, here) {
     : (pos.market_price - t.entry_price) * Math.abs(t.quantity) * (t.side === "SHORT" ? -1 : 1);
   const moved = t.initial_stop_price != null && Math.abs((t.stop_price ?? 0) - t.initial_stop_price) > 0.01;
   const stopCell = moved ? `<span title="moved from ${num(t.initial_stop_price)}">${num(t.stop_price)} ▲</span>` : num(t.stop_price);
+  const rn = rNow(t, pos, parked), rules = S.state.exit_manager || {};
+  const rCell = !rn ? `<td class="num muted">–</td>`
+    : `<td class="num ${rn.r >= 0 ? "pl-pos" : "pl-neg"}" title="${escapeHtml(`(mark − entry) ÷ ${num(rn.risk)} a share, the risk it was opened with (entry to the original stop, ${num(rn.first)})`
+      + (rules.breakeven_at_r ? `. At +${rules.breakeven_at_r}R the stop moves to lock a small profit` : "")
+      + (rules.trail_start_r ? `; from +${rules.trail_start_r}R it trails` : ""))}">${rn.r >= 0 ? "+" : ""}${rn.r.toFixed(2)}R</td>`;
   const status = t.time_status || "on_track";
   const barCls = status === "overdue" ? "bad" : status === "aging" ? "warn" : "ok";
   // when the setup usually exits, when it is due a look, and - for a swing trade - the day the time stop closes it
@@ -165,16 +205,18 @@ function openRow(t, here) {
       ? ' <span class="badge" title="One leg of a pair trade - the pair desk closes both legs together (Pairs tab)">pair</span>' : ""}</td><td>${sideBadge(t.side)}</td>
     <td class="tf">${t.timeframe ? tfLabel(t.timeframe) : "–"}</td>
     <td>${stratLabel(t.strategy)}</td>
-    <td class="muted small">in: ${t.order_type || "—"}${t.order_session === "EXTENDED" ? " · ext" : ""}<br>out: ${exitCell(t, parked)}</td>
+    <td class="muted small">${t.order_type || "—"}${t.order_session === "EXTENDED" ? " · ext" : ""}</td>
     <td class="num">${num(t.quantity, 0)}${t.initial_quantity && Math.abs(t.initial_quantity - t.quantity) > 1e-9
       ? ` <span class="muted" title="part of the position was taken off at the first target">of ${num(t.initial_quantity, 0)}</span>` : ""}</td>
     <td class="num">${num(t.entry_price)}</td>
     <td class="num"${pos.price_at ? ` title="As of ${escapeHtml(new Date(pos.price_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))} - the price the exit manager acts on"` : ""}>${parked ? "–" : num(pos.market_price)}</td>
     <td class="num ${upl >= 0 ? "pl-pos" : "pl-neg"}">${usd(upl)}${t.banked_pl
       ? ` <span class="muted" title="realized on the part already taken off">+${usd(t.banked_pl)} banked</span>` : ""}</td>
+    ${rCell}
     <td class="num">${stopCell}</td>
     <td class="num">${num(t.target_price)}${t.target2_price
       ? ` <span class="muted" title="part comes off at the first target, the rest runs to the second">→ ${num(t.target2_price)}</span>` : ""}</td>
+    <td class="protection">${protectionCell(t, parked)}</td>
     <td>${timeCell}</td>
     <td class="num muted">${usd(t.mfe)} / ${usd(t.mae == null ? null : -t.mae)}</td>
     <td class="no-row-click"><label class="switch lockable"><input type="checkbox" data-managed="${escapeHtml(t.id)}" ${t.managed_exit ? "checked" : ""} ${t.pair_id ? "disabled" : ""}><span></span></label></td>

@@ -37,7 +37,7 @@ export const shorten = (s, n) => s && s.length > n ? s.slice(0, n - 1) + "…" :
 export const pretty = key => (key || "").replace(/_/g, " ");
 export const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
-const parseDate = s => new Date(/[zZ]|[+-]\d\d:\d\d$/.test(s) ? s : s + "Z");     // the database stores UTC
+export const parseDate = s => new Date(/[zZ]|[+-]\d\d:\d\d$/.test(s) ? s : s + "Z");     // the database stores UTC
 export function fmtTime(s) {
   if (!s) return "–";
   const d = parseDate(s);

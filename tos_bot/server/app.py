@@ -120,8 +120,8 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     # ---- trades and P/L ------------------------------------------------- #
     @app.get("/api/trades")
     def trades(status: Optional[str] = None, limit: int = 100):
-        repo = eng().repo
-        return {"trades": repo.open_trades() if status == "OPEN" else repo.recent_trades(limit)}
+        e = eng()
+        return {"trades": e.open_positions() if status == "OPEN" else e.repo.recent_trades(limit)}
 
     @app.get("/api/orders")
     def orders(fresh: bool = False):

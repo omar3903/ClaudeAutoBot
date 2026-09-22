@@ -732,9 +732,9 @@ the broker shows - triggered, one for shares it doesn't hold would open a positi
 during a fill landing in pieces it waits a few seconds, and if the broker's count and the record
 disagree (part sold by hand in TWS, say) it waits for them to agree. Meanwhile the app's exit
 manager still watches the price and sends the exit itself; what nothing covers is the app being off.
-So a position with no stop at the broker is marked **no stop at the broker yet** in amber on the
-Positions tab, and once that has lasted 90 seconds the log and the dashboard say so, with the reason,
-and again every five minutes until it's fixed.
+So a position with no stop at the broker is marked **no stop at the broker yet** in red in the Open
+positions tab's **Protection** column, and once that has lasted 90 seconds the log and the dashboard say
+so, with the reason, and again every five minutes until it's fixed.
 
 **An exit called off after filling in part is booked.** Quitting and then pressing *Stop quitting*, or
 cancelling an exit, can call off an exit order that has already sold part of the position. The app books
@@ -989,6 +989,11 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
   trades. The tooltip adds the held-out sessions and why it isn't proven. The play's detail panel sets what the
   replayed wins average beside the play's expected R (which counts a win at the full target), and **Switch
   this setup off** is the Strategies switch: the setup stays off, through a restart, until it's switched back on.
+* **R now** and **Protection** (Open positions) — where each trade stands at its Mark in R, against the risk it
+  was opened with (entry to the original stop), as the exit manager measures it; and what stands ready to close
+  it: green when its stop (and target) rest at the broker - the orders the app placed and follows - amber when
+  the app watches the price itself (the simulator), red for **no stop at the broker yet**. Under it a day trade
+  counts down to its time stop, "out in 31 min unless working", amber in the last 5 minutes.
 * **Trading capital** — how much of the account the bot may use.
 * **Autopilot** + **⚙** — hands-off entry and its caps.
 * **Reset paper** (simulator only) — reset the balance.

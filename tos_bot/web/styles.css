@@ -190,6 +190,8 @@ tbody tr.done:hover{opacity:.9}
 .timebar{display:inline-block; width:52px; height:5px; background:var(--bg3); border-radius:3px; overflow:hidden}
 .timebar>i{display:block; height:100%}
 .timebar>i.ok{background:var(--ok)} .timebar>i.warn{background:var(--warn)} .timebar>i.bad{background:var(--short)}
+/* an open position's protection chip, with a day trade's time stop under it */
+td.protection{white-space:nowrap; line-height:1.7}
 tr.row-overdue{box-shadow:inset 3px 0 0 var(--short)}
 
 /* ---- detail panel ---- */

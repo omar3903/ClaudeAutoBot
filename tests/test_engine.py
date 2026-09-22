@@ -1158,6 +1158,36 @@ def test_refresh_prices_the_plays_and_the_positions_and_sends_the_plays_out_agai
     assert (pos["market_price"], pos["price_at"], pos["unrealized_pl"]) == (100.0, None, 0.0)
 
 
+# ---------------------------------------------------------------- open positions on the dashboard
+def test_each_open_position_says_what_rests_at_the_broker_to_close_it(engine):
+    """The Open positions tab's protection chip reads the orders the executor placed and follows
+    (protective_stops / resting_targets), and its R now and time-stop cells read the record's own fields."""
+    engine._venue = "ibkr-paper"
+    both, stop_only = _open(engine, "AAA", venue="ibkr-paper"), _open(engine, "BBB", venue="ibkr-paper")
+    bare, parked = _open(engine, "CCC", venue="ibkr-paper"), _open(engine, "DDD", venue="paper")
+    stop = {"trade_id": both, "symbol": "AAA", "order_id": "11", "qty": 5.0, "stop_price": 95.0}
+    target = {"trade_id": both, "symbol": "AAA", "order_id": "12", "qty": 3.0, "limit_price": 110.0}
+    engine.executor.native_stops_on = lambda: True
+    engine.executor.protective_stops = lambda: [stop, {**stop, "trade_id": stop_only, "symbol": "BBB", "order_id": "21"}]
+    engine.executor.resting_targets = lambda: [target]
+
+    rows = {t["id"]: t for t in engine.open_positions()}
+    assert rows[both]["protection"] == {"native": True, "stop": stop, "target": target}           # green
+    assert rows[stop_only]["protection"]["stop"]["order_id"] == "21" and rows[stop_only]["protection"]["target"] is None
+    assert rows[bare]["protection"] == {"native": True, "stop": None, "target": None}              # red: none yet
+    assert rows[parked]["protection"] is None                  # another venue's: nothing is placed while it's parked
+    read = {"entry_price", "initial_stop_price", "stop_price", "side", "timeframe", "overwatch_at", "managed_exit",
+            "pair_id", "broker"}
+    assert all(read <= set(t) for t in rows.values())
+
+    engine.executor.native_stops_on = lambda: False            # a venue that rests none: the app watches the price
+    engine.executor.protective_stops = lambda: []
+    engine.executor.resting_targets = lambda: []
+    rows = {t["id"]: t for t in engine.open_positions()}
+    assert rows[both]["protection"] == {"native": False, "stop": None, "target": None}
+    assert engine.snapshot()["exit_manager"]["intraday_time_stop"] is True     # the countdown shows only while it's on
+
+
 # ---------------------------------------------------------------- what became of a play, in the play log
 def test_the_executor_tells_autopilot_about_an_entry_that_bought_nothing_even_after_a_switch(engine):
     assert engine.executor.on_entry_unfilled == engine.autopilot.entry_unfilled
