@@ -64,9 +64,10 @@ more books of setups, **Grimes, *The Art and Science of Technical Analysis*** an
 - **Trading capital** — tell the bot to use only part of the account.
 - **A report on every session** — after the close: the market's biggest movers,
   why each one moved (earnings, filings, analyst actions, news, its sector) and
-  whether the bot traded it, offered it, watched it or missed it, with charts; then
-  each of the bot's trades with what it was taken on, the mistakes, how the plays it
-  didn't take would have done, and each strategy's real record against its replay.
+  whether the bot traded it, sent an entry that never filled, offered it, watched it
+  or missed it, with charts; then each of the bot's trades with what it was taken on,
+  the mistakes, how the plays it didn't take would have done, and each strategy's real
+  record against its replay.
 - **Proof before Autopilot trades** — every strategy is replayed on past candles
   with costs, and has to make money on the held-out latest third of them too.
 - **Pairs trading** — cointegrated stocks from one industry, one long and one short,
@@ -1123,6 +1124,9 @@ and they're added once it is. For each mover:
 * **how it moved** — gapped at the open or built during the session, volume against its
   20-day average, the move in average daily ranges, a close at a 20-day high or low;
 * **what the bot made of it** — *traded* (with the move or against it, R and P/L),
+  *sent, not filled* (an entry went out — Autopilot's or yours — and no trade came of it;
+  the row it was sent from is listed beside the setup's first sighting, with what it would
+  have made followed on the candles),
   *offered, not taken* (and what the setup would have made, followed on the candles),
   *watched, no setup* (on the hot list, adopted into it, or scanned from a sector buffer),
   or *not watched* — and why: the morning's ranking put it #412 of 2,950, it was too thin
@@ -1130,11 +1134,11 @@ and they're added once it is. For each mover:
 * **charts** (📈) — the session's 5-minute candles with the bot's entries and exits, the
   setups it offered and the news as it came out, and the daily candles around the day.
 
-Above the table, the score: how many of the movers were traded, offered, on the morning
-watchlist and moved at the open — and over the last 20 sessions, the share of the market's
-biggest movers the watchlist held. That share is the scanner's report card: if most movers
-make their move at the open on overnight news, a ranking of the previous day's candles
-can't see them, and the report says so.
+Above the table, the score: how many of the movers were traded, sent and not filled (when
+any were), offered, on the morning watchlist and moved at the open — and over the last 20
+sessions, the share of the market's biggest movers the watchlist held. That share is the
+scanner's report card: if most movers make their move at the open on overnight news, a
+ranking of the previous day's candles can't see them, and the report says so.
 
 ### The bot's own trading
 

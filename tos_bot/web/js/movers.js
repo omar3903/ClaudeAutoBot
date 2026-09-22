@@ -11,8 +11,8 @@ const CATALYST = {
   sector: ["Sector move", ""], none: ["No news found", "faint"], unchecked: ["News not read", "faint"],
 };
 const STATUS = {
-  traded: ["Traded", "good"], offered: ["Offered, not taken", "warn"], watched: ["Watched, no setup", ""],
-  missed: ["Not watched", "bad"], offline: ["App wasn't scanning", "faint"],
+  traded: ["Traded", "good"], sent: ["Sent, not filled", "accent"], offered: ["Offered, not taken", "warn"],
+  watched: ["Watched, no setup", ""], missed: ["Not watched", "bad"], offline: ["App wasn't scanning", "faint"],
 };
 const NEWS = new Set(["earnings", "filing", "analyst", "news"]);
 
@@ -38,6 +38,7 @@ export function moversHTML(m, capture) {
     ${m.stale ? `<p class="small warn-text">${escapeHtml(m.stale_note || "Built before this rebuild, which couldn't refresh them.")}</p>` : ""}
     <div class="journal-cards movers-score">
       ${card("Traded", `${s.traded} of ${s.movers}`, s.traded ? inR(s.traded_r) : "")}
+      ${s.sent ? card("Sent, not filled", s.sent, "an entry went out, no trade came of it") : ""}
       ${card("Offered, not taken", s.offered, s.offered_r != null ? `would have made ${inR(s.offered_r)}` : "")}
       ${card("On the morning watchlist", `${s.in_watchlist} of ${s.movers}`, `${s.on_hot_list} on the hot list`)}
       ${card("Moved at the open", `${s.before_open} of ${s.movers}`, `${s.news_before_open} with news before the bell`)}
@@ -62,7 +63,7 @@ function rowsHTML(rows) {
     const how = [r.before_open ? `gapped ${signed(r.gap_pct)}` : `${signed(r.session_pct)} intraday`,
       `${num(r.rvol, 1)}× vol`, r.extreme ? `20d ${r.extreme}` : ""].filter(Boolean).join(" · ");
     const result = r.bot.status === "traded" ? `${inR(r.bot.r)} · ${usd(r.bot.pl)}`
-      : r.bot.status === "offered" && r.bot.r != null ? `would have made ${inR(r.bot.r)}` : "";
+      : (r.bot.status === "offered" || r.bot.status === "sent") && r.bot.r != null ? `would have made ${inR(r.bot.r)}` : "";
     return `<tr class="mover" data-i="${i}" tabindex="0">
       <td><b>${escapeHtml(r.symbol)}</b><div class="muted small">${escapeHtml(r.sector || "–")}</div></td>
       <td class="num"><b class="${tone(r.change_pct)}">${signed(r.change_pct)}</b> <span class="muted small">$${num(r.close)}</span>
@@ -90,7 +91,9 @@ function detailHTML(r) {
       <td class="num">${num(t.entry)} → ${t.exit != null ? num(t.exit) : "–"}</td><td class="num ${tone(t.r)}">${inR(t.r)}</td><td class="num ${tone(t.pl)}">${usd(t.pl)}</td></tr>`).join("")}</table>` : "";
   const plays = b.plays.length ? `<table class="ev-table"><tr><th>Setup offered</th><th>First seen (ET)</th><th class="num">Entry / stop</th><th>Status</th><th class="num">Taken as planned</th></tr>
     ${b.plays.map(p => `<tr><td>${stratLabel(p.strategy)} · ${escapeHtml(p.side.toLowerCase())} <span class="badge ${p.with_move ? "good" : "bad"}">${p.with_move ? "with the move" : "against it"}</span></td>
-      <td>${etTime(p.seen_at)}</td><td class="num">${num(p.entry)} / ${num(p.stop)}</td><td>${escapeHtml((p.status || "").toLowerCase())}</td>
+      <td>${etTime(p.seen_at)}</td><td class="num">${num(p.entry)} / ${num(p.stop)}</td>
+      <td>${p.sent ? `<span class="badge accent">sent ${etTime(p.sent_at)}, not filled</span> <span class="muted small">${escapeHtml((p.status || "").toLowerCase())}</span>`
+        : escapeHtml((p.status || "").toLowerCase())}</td>
       <td class="num ${tone(p.shadow_r)}">${p.shadow_r != null ? inR(p.shadow_r) : p.shadow_filled === false ? "wouldn't have filled" : "–"}</td></tr>`).join("")}</table>` : "";
   return `<div class="mover-story">
     <div><h5>How it moved</h5><ul>${r.reasons.map(x => `<li>${escapeHtml(x)}</li>`).join("")}</ul></div>
