@@ -974,11 +974,11 @@ def test_a_working_entrys_countdowns_are_sent_with_it_but_never_pushed_on_their_
     each look; that alone isn't a change to push."""
     from tos_bot.execution.executor import _Pending
 
-    play = Play(symbol="AAPL", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+    play = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
                 timeframe=Timeframe.INTRADAY, entry=100.0, stop=95.0, targets=[110.0])
     engine.executor._pending["1"] = _Pending("1", play, "entry", qty=5, submitted_at=dt.datetime.now(dt.timezone.utc),
                                              first_fill_at=time.monotonic())
-    working = [OrderResult(order_id="1", status="WORKING", symbol="AAPL", submitted_qty=5, filled_qty=2,
+    working = [OrderResult(order_id="1", status="WORKING", symbol="AAA", submitted_qty=5, filled_qty=2,
                            side=Side.LONG, tag=play.id, order_type="LIMIT", limit_price=100.0)]
     monkeypatch.setattr(engine.executor.broker, "list_orders", lambda status=None: list(working))
     heard = []
