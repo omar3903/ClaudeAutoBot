@@ -249,13 +249,17 @@ def _plays_at(avg, n, spread=1.0):
 
 def test_a_check_is_called_helped_or_cost_only_on_a_real_difference():
     """A hundredth of an R between the two sides, or a gap well inside one standard error, is no clear
-    difference; a gap of tenths of an R with an ordinary spread is."""
+    difference; a gap of tenths of an R with an ordinary spread is. Only the first is told as the two sides
+    doing about as well - the table shows the verdict beside both averages."""
     from tos_bot.research.journal import _compare
 
     same = _compare(_plays_at(0.257, 12), _plays_at(0.258, 101))
-    assert same["verdict"].startswith("no clear difference") and abs(same["t"]) < 0.01
+    assert same["verdict"] == "no clear difference - the plays it flags did about as well as the rest"
+    assert abs(same["t"]) < 0.01
     wide = _compare(_plays_at(-0.1, 6, spread=2.0), _plays_at(0.1, 6, spread=2.0))       # 0.2R apart, t about -0.16
-    assert wide["verdict"].startswith("no clear difference")
+    assert wide["verdict"] == "no clear difference - the gap is within one session's noise"
+    noisy = _compare(_plays_at(-0.4, 6, spread=1.5), _plays_at(0.25, 100, spread=1.0))   # 0.65R apart, |t| below 1
+    assert abs(noisy["t"]) < 1 and "about as well" not in noisy["verdict"]
     helped = _compare(_plays_at(-0.3, 10, spread=0.5), _plays_at(0.3, 10, spread=0.5))
     assert helped["verdict"].startswith("helped") and helped["t"] < -1
     assert _compare(_plays_at(0.3, 10, spread=0.5), _plays_at(-0.3, 10, spread=0.5))["verdict"].startswith("cost")

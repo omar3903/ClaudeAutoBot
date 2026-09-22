@@ -318,9 +318,12 @@ def _compare(flagged: Sequence[Mapping[str, Any]], rest: Sequence[Mapping[str, A
     f_rs, r_rs = [r["r"] for r in flagged], [r["r"] for r in rest]
     diff, t = sum(f_rs) / len(f_rs) - sum(r_rs) / len(r_rs), _welch_t(f_rs, r_rs)
     out["t"] = round(t, 2) if t is not None else None
-    # a few hundredths of an R, or a gap one lucky play could make, is a session's noise, not the check's doing
-    if abs(diff) < NOISE_MARGIN_R or (t is not None and abs(t) < MIN_T):
+    # a few hundredths of an R, or a gap one lucky play could make, is a session's noise, not the check's doing -
+    # and only the first is told as the two sides doing about as well: a wide gap that noisy isn't a tie either
+    if abs(diff) < NOISE_MARGIN_R:
         out["verdict"] = "no clear difference - the plays it flags did about as well as the rest"
+    elif t is not None and abs(t) < MIN_T:
+        out["verdict"] = "no clear difference - the gap is within one session's noise"
     elif diff < 0:
         out["verdict"] = "helped - the plays it flags did worse"
     else:

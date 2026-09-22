@@ -95,11 +95,12 @@ function shadowsHTML(sh) {
   const noise = Object.entries(sh.by_noise || {});
   const list = (rows, title) => rows && rows.length ? `<div class="muted">${title}: ${rows.map(x =>
     `${escapeHtml(x.symbol)} ${escapeHtml(x.side.toLowerCase())} (${escapeHtml(x.strategy)}) ${inR(x.r)}`).join(" · ")}</div>` : "";
-  // the ones followed, told against every day setup not taken: past the cap, only the highest-scoring -
-  // and the entries sent that scored below them, said apart
-  const past = sh.sent_past_cap || 0;
+  // the ones followed, told against every day setup not taken: past the cap, only the highest-scoring (some
+  // of them when the candles for others couldn't be read) - and the entries sent that scored below them, said apart
+  const past = sh.sent_past_cap || 0, top = sh.followed - past;
   const followed = sh.eligible == null ? plural(sh.followed, "setup")          // saved before the setups not taken were counted
-    : sh.cap ? `${count(sh.eligible)} day setups not taken; the ${sh.followed - past} highest-scoring (the top ${Math.round(100 * sh.cap / sh.eligible)}% by score)${
+    : sh.cap ? `${count(sh.eligible)} day setups not taken; ${top < sh.cap ? `${count(top)} of the ${count(sh.cap)}` : `the ${count(sh.cap)}`
+      } highest-scoring (the top ${Math.round(100 * sh.cap / sh.eligible)}% by score)${
         past ? ` and ${past === 1 ? "the entry" : `the ${count(past)} entries`} sent below them` : ""}`
     : `${plural(sh.eligible, "day setup")} not taken; ${sh.followed === sh.eligible ? (sh.eligible === 1 ? "it was" : "all") : sh.followed}`;
   return `<h4>Plays not taken</h4>
