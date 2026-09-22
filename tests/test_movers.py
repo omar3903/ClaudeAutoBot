@@ -114,6 +114,54 @@ def test_what_the_bot_made_of_each_mover():
     assert next(r for r in rows if r["symbol"] == "GAPR")["bot"]["detail"].endswith("put it on the hot list)")
 
 
+def test_an_entry_sent_and_never_filled_is_its_own_status():
+    market = _market()
+    base = {"timeframe": "INTRADAY", "stop": 50.5, "decided_by": "", "evidence": {}}
+    reclaim = {**base, "symbol": "CLMB", "side": "LONG", "strategy": "vwap_reclaim", "entry": 51.0}
+    trades = [{"symbol": "GAPR", "side": "LONG", "strategy": "gap_and_go", "play_id": "g1",
+               "entry_time": "2026-09-15T14:00:00", "entry_price": 56.2, "exit_time": "2026-09-15T15:00:00",
+               "exit_price": 57.5, "r_multiple": 1.5, "realized_pl": 300.0, "status": "CLOSED"}]
+    plays = [
+        {**reclaim, "id": "c1", "created_at": "2026-09-15T15:10:00", "status": "PROPOSED"},
+        {**base, "symbol": "CLMB", "side": "LONG", "strategy": "orb", "entry": 52.0, "id": "c2",
+         "created_at": "2026-09-15T15:20:00", "status": "PROPOSED"},
+        {**reclaim, "id": "c3", "created_at": "2026-09-15T15:30:00", "status": "CANCELED", "decided_by": "autopilot",
+         "evidence": {"at_entry": {"at": "2026-09-15T11:40:00-04:00", "by": "autopilot"}}},   # sent, never filled
+        {**reclaim, "id": "c4", "created_at": "2026-09-15T15:50:00", "status": "PROPOSED"},   # the same setup again
+        {**base, "symbol": "GAPR", "side": "LONG", "strategy": "gap_and_go", "entry": 56.2, "id": "g1",
+         "created_at": "2026-09-15T13:55:00", "status": "ACCEPTED"},                        # its trade was booked
+        {**base, "symbol": "GAPR", "side": "LONG", "strategy": "orb", "entry": 57.0, "id": "g2",
+         "created_at": "2026-09-15T14:30:00", "status": "CANCELED", "decided_by": "autopilot"},
+        {**base, "symbol": "DROP", "side": "SHORT", "strategy": "orb", "entry": 48.0, "stop": 48.6, "id": "d1",
+         "created_at": "2026-09-15T14:05:00", "status": "SUBMITTED", "decided_by": "operator"},
+    ]
+    shadows = [{"play_id": "c3", "symbol": "CLMB", "r": 0.4, "filled": True},
+               {"play_id": "c2", "symbol": "CLMB", "r": 1.2, "filled": True}]
+    out = build_movers(market, per_side=3, sector_of=SECTORS.get, news={}, trades=trades, plays=plays, shadows=shadows,
+                       saved_watchlist={"hot": [], "queues": {}, "kept": {}, "decisions": []}, hot_size=2, queue_size=5,
+                       prefilter=PREFILTER)
+    bot = {r["symbol"]: r["bot"] for r in out["gainers"] + out["losers"]}
+
+    climb = bot["CLMB"]
+    assert climb["status"] == "sent" and climb["r"] == 0.4
+    assert [(p["strategy"], p["status"], p["sent"]) for p in climb["plays"]] == [
+        ("vwap_reclaim", "PROPOSED", False), ("orb", "PROPOSED", False), ("vwap_reclaim", "CANCELED", True)]
+    assert climb["plays"][2]["sent_at"] == "2026-09-15T15:40:00+00:00" and climb["plays"][2]["shadow_r"] == 0.4
+    assert climb["detail"] == ("Autopilot sent 1 entry that never filled (vwap reclaim long at 51.00, 11:40 ET) - taken "
+                               "as planned it would have made +0.40R; 1 other setup offered - the best would have "
+                               "made +1.20R")
+    gapper = bot["GAPR"]                              # a trade outranks an entry that didn't fill
+    assert gapper["status"] == "traded" and [p["sent"] for p in gapper["plays"]] == [False, True]
+    drop = bot["DROP"]                                # sent by hand; when it went out wasn't kept, so the row's time
+    assert drop["status"] == "sent" and drop["r"] is None
+    assert drop["detail"] == "1 entry was sent and never filled (orb short at 48.00, 10:05 ET)"
+
+    s = out["summary"]
+    assert (s["traded"], s["sent"], s["offered"], s["offered_r"]) == (1, 2, 0, None)
+    assert "2 had an entry sent that never filled." in out["lessons"]
+    assert not any("had setups offered" in line for line in out["lessons"])
+
+
 def test_the_watchlist_is_judged_only_on_sessions_the_app_was_scanning():
     def review(movers, in_watchlist, offline=0):
         return {"movers": {"ok": True, "summary": {"movers": movers, "in_watchlist": in_watchlist, "traded": 1,

@@ -1,6 +1,6 @@
 /* The journal half of a session's report (see reports.js): the trades and what they were taken on, the
    mistakes, the plays not taken and how they would have gone, the strategies' records, and the lessons. */
-import { escapeHtml, fmtClock, num, usd } from "./util.js";
+import { count, escapeHtml, fmtClock, num, plural, usd } from "./util.js";
 import { stratLabel } from "./strategies.js";
 
 export const inR = v => v == null ? "–" : `${v >= 0 ? "+" : ""}${num(v, 2)}R`;
@@ -9,10 +9,15 @@ export const pctOf = v => v == null ? "–" : `${Math.round(v * 100)}%`;
 const SEVERITY = { high: "bad", medium: "warn", info: "" };
 
 function executionHTML(x) {
-  if (!x || x.entry_latency_s == null) return "";
+  if (!x || (x.entry_latency_s == null && x.exit_latency_s == null)) return "";
   const s = v => v == null ? "–" : `${num(v, 1)}s`;
+  // the fills the times cover, and the market exits that were slow (reviews saved before these were kept don't say)
+  const span = x.since ? ` Over ${x.entry_fills} entr${x.entry_fills === 1 ? "y" : "ies"} and ${plural(x.exit_fills, "exit")}
+    timed since ${escapeHtml(x.since)}.` : "";
+  const slow = x.slow_exits ? ` ${plural(x.slow_exits, "market exit")} took longer than 60s, the slowest
+    ${count(Math.round(x.slowest_exit_s))}s.` : "";
   return `<h4>How the orders filled</h4><p class="muted">Typically ${s(x.entry_latency_s)} from the order going out to the fill coming back
-    on the way in${x.exit_latency_s == null ? "" : `, ${s(x.exit_latency_s)} on the way out`}${x.slowest_entry_s ? ` (slowest entry ${num(x.slowest_entry_s, 0)}s)` : ""}.
+    on the way in${x.exit_latency_s == null ? "" : `, ${s(x.exit_latency_s)} on the way out`}${x.slowest_entry_s ? ` (slowest entry ${num(x.slowest_entry_s, 0)}s)` : ""}.${span}${slow}
     A stop or target resting at the broker isn't counted - it waits for the price, not for the broker.</p>`;
 }
 
@@ -81,17 +86,30 @@ function tradesHTML(rows) {
 }
 
 function shadowsHTML(sh) {
-  if (sh.note) return `<h4>Plays not taken</h4><p class="muted">${escapeHtml(sh.note)}</p>`;
-  if (!sh.followed) return "";
+  // entries that went out and bought nothing (reviews saved before these were counted don't say)
+  const sent = sh.sent_unfilled ? `<p class="muted">${sh.sent_unfilled === 1 ? "1 entry was" : `${count(sh.sent_unfilled)} entries were`}
+    sent and never filled.</p>` : "";
+  if (sh.note) return `<h4>Plays not taken</h4><p class="muted">${escapeHtml(sh.note)}</p>${sent}`;
+  if (!sh.followed) return sent && `<h4>Plays not taken</h4>${sent}`;
   const s = sh.summary || {}, checks = sh.checks || {};
   const noise = Object.entries(sh.by_noise || {});
   const list = (rows, title) => rows && rows.length ? `<div class="muted">${title}: ${rows.map(x =>
     `${escapeHtml(x.symbol)} ${escapeHtml(x.side.toLowerCase())} (${escapeHtml(x.strategy)}) ${inR(x.r)}`).join(" · ")}</div>` : "";
+  // the ones followed, told against every day setup not taken: past the cap, only the highest-scoring (some
+  // of them when the candles for others couldn't be read) - and the entries sent that scored below them, said apart
+  const past = sh.sent_past_cap || 0, top = sh.followed - past;
+  const followed = sh.eligible == null ? plural(sh.followed, "setup")          // saved before the setups not taken were counted
+    : sh.cap ? `${count(sh.eligible)} day setups not taken; ${top < sh.cap ? `${count(top)} of the ${count(sh.cap)}` : `the ${count(sh.cap)}`
+      } highest-scoring (the top ${Math.round(100 * sh.cap / sh.eligible)}% by score)${
+        past ? ` and ${past === 1 ? "the entry" : `the ${count(past)} entries`} sent below them` : ""}`
+    : `${plural(sh.eligible, "day setup")} not taken; ${sh.followed === sh.eligible ? (sh.eligible === 1 ? "it was" : "all") : sh.followed}`;
   return `<h4>Plays not taken</h4>
-    <p class="muted">${sh.followed} setup${sh.followed === 1 ? "" : "s"} followed on the session's candles as if taken; ${sh.filled} would have filled.
+    <p class="muted">${followed} followed on the session's candles as if taken; ${sh.filled} would have filled.
       ${s.trades ? `They would have averaged ${inR(s.expectancy_r)} (${inR(s.total_r)} in all, ${pctOf(s.win_rate)} winners).` : ""}
       ${checks.passed && checks.passed.trades ? ` Passing Autopilot's checks: ${inR(checks.passed.expectancy_r)} over ${checks.passed.trades}.` : ""}
-      ${checks.turned_away && checks.turned_away.trades ? ` Turned away by them: ${inR(checks.turned_away.expectancy_r)} over ${checks.turned_away.trades}.` : ""}</p>
+      ${checks.turned_away && checks.turned_away.trades ? ` Turned away by them: ${inR(checks.turned_away.expectancy_r)} over ${checks.turned_away.trades}.` : ""}
+      ${checks.verdict === "no clear difference" ? " No clear difference between the two." : ""}</p>
+    ${sent}
     ${noise.length ? `<table class="ev-table"><tr><th>Noise flag</th><th class="num">Flagged</th><th class="num">Their average</th><th class="num">The rest</th><th>Today</th></tr>
       ${noise.map(([flag, n]) => `<tr><td>${escapeHtml(flag === "all_checks" ? "any flag" : flag)}</td><td class="num">${n.flagged}</td>
         <td class="num">${inR(n.flagged_avg_r)}</td><td class="num">${inR(n.rest_avg_r)}</td><td>${escapeHtml(n.verdict)}</td></tr>`).join("")}</table>` : ""}

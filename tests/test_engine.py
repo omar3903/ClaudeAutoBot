@@ -991,8 +991,22 @@ def test_the_session_review_keeps_each_trade_with_what_it_was_taken_on(engine):
     out = engine.review_session(today)
     review = out["review"]
     assert out["ok"] and review["day"]["trades"] == 1 and abs(review["trades"][0]["r"] - 0.6) < 1e-9
+    # the note says how many setups not taken were followed, and apart from them how many would have filled
+    assert "0 of 0 day setups not taken followed on the candles (0 would have filled)" in out["note"]
     assert engine.journal_review(today)["session"] == today.isoformat()
     assert engine.journal_state()["days"][0]["session"] == today.isoformat()
+
+
+def test_a_rebuild_without_ib_gateway_keeps_the_plays_not_taken_followed_before(engine):
+    today = clock.now_ny().date()
+    p = _play("AAA")
+    p.timeframe = Timeframe.INTRADAY
+    engine.repo.record_play(p)                                              # a day setup offered and not taken
+    engine.repo.save_shadow_trades(today, [{"play_id": p.id, "symbol": "AAA", "side": "LONG", "strategy": p.strategy,
+                                            "filled": True, "r": 1.5, "features": {}}])
+    out = engine.review_session(today)                                      # IB Gateway is away: nothing is followed
+    assert out["ok"] and out["review"]["shadows"]["note"]
+    assert [(r["play_id"], r["r"]) for r in engine.repo.shadow_trades(today)] == [(p.id, 1.5)]
 
 
 def test_the_session_review_covers_positions_opened_and_still_open(engine, monkeypatch):
@@ -1083,6 +1097,78 @@ def test_the_review_judges_a_play_on_autopilots_checks_not_on_its_type_boxes(eng
     assert not engine._passes_checks(row) and engine._passes_checks({**row, "confirmations": 2})
     swing = {**row, "timeframe": "SWING", "confidence": ap.min_swing_confidence}
     assert engine._passes_checks(swing) and not engine._passes_checks({**swing, "confidence": ap.min_swing_confidence - 0.01})
+
+
+def _entered(at, skipped, by="autopilot", **settings):
+    gates = {"min_confidence": 0.5, "min_swing_confidence": 0.5, "min_reward_risk": 2.0, "min_confirmations": 1,
+             **settings}
+    return {"play": {"evidence": {"at_entry": {"at": at, "by": by, "skipped_noise": skipped, "settings": gates}}}}
+
+
+def test_the_review_judges_the_checks_with_the_gates_in_force_that_session(engine):
+    ap = engine.autopilot
+    ap.skip_noise, ap.min_confidence, ap.min_reward_risk, ap.min_confirmations = ["late_flag"], 0.5, 2.0, 1
+    opened = [_entered("2026-01-05T10:00:00-05:00", ["old_flag"], min_reward_risk=3.0),
+              _entered("2026-01-05T11:00:00-05:00", ["against_gap"]),       # the latest entry's gates win
+              _entered("2026-01-05T12:00:00-05:00", ["other"], by="operator")]
+    gates = engine._session_gates(opened, None)
+    assert gates["skip_noise"] == ["against_gap"] and gates["min_reward_risk"] == 2.0
+    assert gates["source"] == "at the last entry" and "replay_losers" not in gates
+    row = {"timeframe": "INTRADAY", "confidence": 0.6, "reward_risk": 2.5, "noise": ["late_flag"],
+           "confirmations": 1, "strategy": "s1"}
+    assert engine._passes_checks(row, gates)                  # a flag learned after the session doesn't count
+    assert not engine._passes_checks(row)                     # ...as it would on today's settings
+    assert not engine._passes_checks({**row, "noise": ["against_gap"]}, gates)
+    # the replay losers the session turned away, only when recorded
+    losers = engine._session_gates([_entered("2026-01-05T10:00:00-05:00", [], replay_losers=["s1"])], None)
+    assert not engine._passes_checks(row, losers) and engine._passes_checks({**row, "strategy": "s2"}, losers)
+    # no entry: the earlier build's gates, else today's settings, labelled
+    earlier = {**gates, "source": "at the last entry", "rolling_sessions": 20}
+    assert engine._session_gates([], earlier) == {k: v for k, v in earlier.items() if k != "rolling_sessions"}
+    now = engine._session_gates([], {"skip_noise": ["x"], "min_confirmations": 2})   # an old review lacks the floors
+    assert now["source"] == "at the rebuild" and "late_flag" in now["skip_noise"] and now["min_confidence"] == 0.5
+
+
+def test_a_rebuilt_review_follows_the_plays_not_taken_on_the_gates_in_force_that_session(engine, monkeypatch):
+    import pandas as pd
+
+    today = clock.now_ny().date()
+    ap = engine.autopilot
+    ap.skip_noise, ap.min_confidence, ap.min_reward_risk, ap.min_confirmations = ["late_flag"], 0.5, 2.0, 1
+    missed = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                  timeframe=Timeframe.INTRADAY, entry=100.0, stop=99.0, targets=[102.0], confidence=0.6)
+    missed.noise = ["late_flag"]                      # flagged only with a flag learned after the session
+    engine.repo.record_play(missed)
+    session = pd.date_range(pd.Timestamp(f"{today} 09:30", tz="America/New_York"), periods=78, freq="5min")
+    candles = pd.DataFrame({"open": 100.0, "high": 100.05, "low": 99.95, "close": 100.0, "volume": 5e5}, index=session)
+    monkeypatch.setattr(engine, "_session_bars", lambda day, plays, booked=(): {"AAA": candles})
+
+    def review():
+        out = engine.review_session(today)
+        [row] = [r for r in out["review"]["shadows"]["plays"] if r["play_id"] == missed.id]
+        return out["review"], row
+
+    # no entry and no earlier build: today's settings, and the review says so
+    built, row = review()
+    assert built["settings"]["source"] == "at the rebuild" and not row["passed_checks"]
+    assert ("No Autopilot entry recorded the checks in force this session, so its plays were judged on the settings "
+            "at the rebuild.") in built["lessons"]
+
+    # an Autopilot entry recorded the session's checks: the play is judged on them, not on today's
+    taken = _play("BBB")
+    taken.evidence["at_entry"] = _entered(f"{today}T10:30:00-04:00", ["old_flag"])["play"]["evidence"]["at_entry"]
+    taken.suggested_qty = 5
+    engine.repo.record_play(taken)
+    engine.repo.open_trade(taken, 100.0, 5, "paper")
+    built, row = review()
+    assert built["settings"]["source"] == "at the last entry" and built["settings"]["skip_noise"] == ["old_flag"]
+    assert row["passed_checks"] and not any("judged on the settings at the rebuild" in s for s in built["lessons"])
+
+    # rebuilt with no entry on record: the gates the earlier build kept
+    monkeypatch.setattr(engine.repo, "trades_opened_between", lambda first, last: [])
+    built, row = review()
+    assert built["settings"]["source"] == "at the last entry" and built["settings"]["skip_noise"] == ["old_flag"]
+    assert row["passed_checks"]
 
 
 # ---------------------------------------------------------------- market prices on the dashboard

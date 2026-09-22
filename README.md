@@ -64,9 +64,10 @@ more books of setups, **Grimes, *The Art and Science of Technical Analysis*** an
 - **Trading capital** — tell the bot to use only part of the account.
 - **A report on every session** — after the close: the market's biggest movers,
   why each one moved (earnings, filings, analyst actions, news, its sector) and
-  whether the bot traded it, offered it, watched it or missed it, with charts; then
-  each of the bot's trades with what it was taken on, the mistakes, how the plays it
-  didn't take would have done, and each strategy's real record against its replay.
+  whether the bot traded it, sent an entry that never filled, offered it, watched it
+  or missed it, with charts; then each of the bot's trades with what it was taken on,
+  the mistakes, how the plays it didn't take would have done, and each strategy's real
+  record against its replay.
 - **Proof before Autopilot trades** — every strategy is replayed on past candles
   with costs, and has to make money on the held-out latest third of them too.
 - **Pairs trading** — cointegrated stocks from one industry, one long and one short,
@@ -526,7 +527,7 @@ choices rather than the market:
 | rows | where | written when |
 |---|---|---|
 | **live** - the trades the app took | `trades.entry_context` (+ `submitted_at`, `mfe_at`) | at the fill, whether Autopilot or you approved the play |
-| **shadow** - the plays shown and not taken | `shadow_trades` | by the 16:15 review, which follows each day-trade play on the session's candles as if it had been taken |
+| **shadow** - the plays shown and not taken | `shadow_trades` | by the 16:15 review, which follows each day-trade play on the session's candles as if it had been taken; a rebuild replaces the day's rows with the ones it followed, and keeps them when it followed none (IB Gateway away) |
 | **replay** - the simulated trades | `sim_trades` (one set of rows per run) | when a replay finishes; `held_out` marks its out-of-sample sessions |
 
 Export them as one CSV, with a `source` column, while the app keeps running:
@@ -1159,6 +1160,9 @@ and they're added once it is. For each mover:
 * **how it moved** — gapped at the open or built during the session, volume against its
   20-day average, the move in average daily ranges, a close at a 20-day high or low;
 * **what the bot made of it** — *traded* (with the move or against it, R and P/L),
+  *sent, not filled* (an entry went out — Autopilot's or yours — and no trade came of it;
+  the row it was sent from is listed beside the setup's first sighting, with what it would
+  have made followed on the candles),
   *offered, not taken* (and what the setup would have made, followed on the candles),
   *watched, no setup* (on the hot list, adopted into it, or scanned from a sector buffer),
   or *not watched* — and why: the morning's ranking put it #412 of 2,950, it was too thin
@@ -1166,11 +1170,11 @@ and they're added once it is. For each mover:
 * **charts** (📈) — the session's 5-minute candles with the bot's entries and exits, the
   setups it offered and the news as it came out, and the daily candles around the day.
 
-Above the table, the score: how many of the movers were traded, offered, on the morning
-watchlist and moved at the open — and over the last 20 sessions, the share of the market's
-biggest movers the watchlist held. That share is the scanner's report card: if most movers
-make their move at the open on overnight news, a ranking of the previous day's candles
-can't see them, and the report says so.
+Above the table, the score: how many of the movers were traded, sent and not filled (when
+any were), offered, on the morning watchlist and moved at the open — and over the last 20
+sessions, the share of the market's biggest movers the watchlist held. That share is the
+scanner's report card: if most movers make their move at the open on overnight news, a
+ranking of the previous day's candles can't see them, and the report says so.
 
 ### The bot's own trading
 
@@ -1181,25 +1185,49 @@ can't see them, and the report says so.
   all still open is not a session without trades: the day list says "9 opened ·
   0 closed", and what an entry was taken on is judged the day it is taken;
 * **the trades** that closed, each with what it was taken on — noise flags, scans
-  in a row, price character, the market's regime, who took it;
-* **mistakes** — a loss beyond the planned 1R, a winner of 1R or more closed at a
-  loss, a trade taken through a noise flag or before it was confirmed, going
-  straight back into a stock that had just lost, a strategy without a proven
-  record;
+  in a row, price character, the market's regime, who took it. A position taken off
+  in parts is shown whole: the shares it was entered with, at the size-weighted
+  average of every exit, its exit marked "(last of 2 exits)";
+* **mistakes** — a loss more than 0.2R past the planned 1R (the lessons count every
+  loss over 1R, and how many went that far past the stop), a winner of 1R or more
+  closed at a loss (break-even isn't one), a trade taken through a noise flag or
+  before it was confirmed, going straight back into a stock that had just lost, a
+  strategy without a proven record;
 * **the plays not taken**, each followed on the session's 5-minute candles as if
-  it had been — grouped by noise flag and by whether Autopilot's checks passed
-  it, so every check is tested on live plays every day;
+  it had been, from the next bar after it was on the board with the values it was
+  recorded with (a play's row holds the last scan that wrote it, and a scan's plays
+  reach the board when it finishes); an entry sent that never filled (a sent row
+  no trade was booked from, even one still marked submitted) is followed
+  from the row it was sent from, from the moment it went out, however it scored —
+  grouped by noise flag and by whether Autopilot's checks passed
+  it, so every check is tested on live plays every day. The checks are the ones in
+  force that session, as the last Autopilot entry recorded them (a rebuild keeps
+  them; with no entry, the settings at the rebuild, and the review says so), so a
+  flag the evening replay learns later never re-judges the day. A check is said to
+  have helped or cost only when the two sides are at least 0.10R a play apart and
+  at least one standard error apart (Welch's t); anything less reads "no clear
+  difference", and a flag with no clear difference gets no lesson. The counts are
+  told in order: every day setup not taken, the ones followed (past 150, only the
+  highest-scoring and the entries sent, and the review says what share of them
+  that was), and the ones that would have filled at the next bar's open. Entries
+  sent that never filled are counted apart, and the **Setups offered** card
+  counts a setup once however often it came back to the board (the play-log rows
+  are in its tooltip);
 * **each strategy's real record** over the last 20 sessions against its replay,
   flagged when it falls more than 0.3R a trade short;
 * **how the orders filled** — the seconds from an order going out to the fill coming back, typically
-  and at worst, going in and coming out. Every trade keeps its own (`entry_latency_s`,
-  `exit_latency_s`), so the training set can learn from how long a fill took, and a broker or a
-  venue that gets slower shows up as a number rather than a feeling. The review measures the broker
-  on fills within 60 s; a limit entry that rested longer was waiting for its price, and is counted
-  apart. A stop or target resting at the broker has no such time, nor an entry taken back after a
-  restart (when it really went out isn't known);
-* **lessons**, in plain sentences. **Rebuild the last session** writes it again on demand
-  (the movers are kept, and rebuilt once the session's candles are in).
+  (the median) and at worst, going in and coming out, with how many fills and since which day. Every
+  trade keeps its own (`entry_latency_s`, `exit_latency_s`), so the training set can learn from how
+  long a fill took, and a broker or a venue that gets slower shows up as a number rather than a
+  feeling. The review measures entries on fills within 60 s; a limit entry that rested longer was
+  waiting for its price, and is counted apart. Every exit counts, however slow - the app sends
+  exits at market - and the ones over 60 s are counted. A stop or target resting at the broker has
+  no such time, nor an entry taken back after a restart (when it really went out isn't known);
+* **lessons**, in plain sentences. **Rebuild the last session** writes it again on demand,
+  the movers too: after a restart it first downloads the session's daily candles again - only
+  while the market is closed, since the download shares IB Gateway with the orders. When it
+  can't (the market open, IB Gateway away), it keeps the movers built before and says when
+  they were built and why they weren't refreshed.
 
 ---
 

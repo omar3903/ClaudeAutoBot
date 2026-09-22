@@ -150,6 +150,20 @@ def test_the_plays_not_taken_are_kept_once_each(repo):
     assert kept["play_shadow_b"]["filled"] is False and kept["play_shadow_b"]["r"] is None
 
 
+def test_a_rebuild_replaces_that_days_plays_not_taken_and_no_other_days(repo):
+    day, other = dt.date(2026, 9, 8), dt.date(2026, 9, 9)
+    repo.save_shadow_trades(other, [_shadow("play_shadow_other")])
+    assert repo.save_shadow_trades(day, [_shadow("play_shadow_old"), _shadow("play_shadow_kept")]) == 2
+    # built again: one play is no longer followed, one is followed to another outcome, one is new
+    assert repo.save_shadow_trades(day, [_shadow("play_shadow_kept", filled=False), _shadow("play_shadow_new")]) == 2
+    assert {r["play_id"]: r["filled"] for r in repo.shadow_trades(day)} == {"play_shadow_kept": False,
+                                                                             "play_shadow_new": True}
+    assert [r["play_id"] for r in repo.shadow_trades(other)] == ["play_shadow_other"]     # another day's rows stay
+    assert repo.save_shadow_trades(day, []) == 0                  # a build that followed nothing replaces nothing
+    assert repo.save_shadow_trades(day, [{"symbol": "SHD"}]) == 0  # nor one whose rows name no play
+    assert len(repo.shadow_trades(day)) == 2
+
+
 # ---------------------------------------------------------------- where the rows come from
 def test_replayed_trades_carry_the_features_the_play_had_at_the_signal():
     import dataclasses
