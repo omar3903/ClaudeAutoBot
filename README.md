@@ -1145,7 +1145,9 @@ can't see them, and the report says so.
   all still open is not a session without trades: the day list says "9 opened ·
   0 closed", and what an entry was taken on is judged the day it is taken;
 * **the trades** that closed, each with what it was taken on — noise flags, scans
-  in a row, price character, the market's regime, who took it;
+  in a row, price character, the market's regime, who took it. A position taken off
+  in parts is shown whole: the shares it was entered with, at the size-weighted
+  average of every exit, its exit marked "(last of 2 exits)";
 * **mistakes** — a loss more than 0.2R past the planned 1R (the lessons count every
   loss over 1R, and how many went that far past the stop), a winner of 1R or more
   closed at a loss (break-even isn't one), a trade taken through a noise flag or

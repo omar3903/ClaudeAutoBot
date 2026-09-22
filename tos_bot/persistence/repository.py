@@ -121,6 +121,9 @@ def trade_to_dict(t: Trade) -> Dict[str, Any]:
         "is_day_trade": bool(t.is_day_trade),
         "session_date": t.session_date.isoformat() if t.session_date else None,
         "notes": t.notes, "pair_id": getattr(t, "pair_id", None),
+        # the times the plan gave it stay on a closed trade too, so its review can hold it to them
+        "expected_exit_at": t.expected_exit_at.isoformat() if getattr(t, "expected_exit_at", None) else None,
+        "overwatch_at": t.overwatch_at.isoformat() if getattr(t, "overwatch_at", None) else None,
         **_time_status(t),
     }
 
@@ -520,23 +523,28 @@ class Repository:
     # -------------------------------------------------------------- #
     def closed_trades_between(self, first: dt.date, last: dt.date) -> List[Dict[str, Any]]:
         """Trades closed during the New York sessions ``first`` .. ``last``, oldest first, each
-        with the play it came from - its evidence holds what the trade was taken on."""
+        with the play it came from - its evidence holds what the trade was taken on - and its exit
+        fills averaged (exit_avg_price, exit_parts)."""
         start, end = _ny_bounds(first)[0], _ny_bounds(last)[1]
         with session_scope() as s:
             rows = s.execute(select(Trade, PlayLog).outerjoin(PlayLog, Trade.play_id == PlayLog.id)
                              .where(Trade.status == "CLOSED", Trade.exit_time >= start, Trade.exit_time < end)
                              .order_by(Trade.exit_time)).all()
-            return [{**trade_to_dict(t), "play": play_to_dict(p) if p is not None else None} for t, p in rows]
+            exits = _exit_fills(s, [t.id for t, _ in rows])
+            return [{**trade_to_dict(t), **exits.get(t.id, NO_EXITS), "play": play_to_dict(p) if p is not None else None}
+                    for t, p in rows]
 
     def trades_opened_between(self, first: dt.date, last: dt.date) -> List[Dict[str, Any]]:
         """Trades opened during the New York sessions ``first`` .. ``last`` - still open or closed
-        since - oldest first, each with the play it came from."""
+        since - oldest first, each with the play it came from and its exit fills so far averaged."""
         start, end = _ny_bounds(first)[0], _ny_bounds(last)[1]
         with session_scope() as s:
             rows = s.execute(select(Trade, PlayLog).outerjoin(PlayLog, Trade.play_id == PlayLog.id)
                              .where(Trade.entry_time >= start, Trade.entry_time < end)
                              .order_by(Trade.entry_time)).all()
-            return [{**trade_to_dict(t), "play": play_to_dict(p) if p is not None else None} for t, p in rows]
+            exits = _exit_fills(s, [t.id for t, _ in rows])
+            return [{**trade_to_dict(t), **exits.get(t.id, NO_EXITS), "play": play_to_dict(p) if p is not None else None}
+                    for t, p in rows]
 
     def trades_on(self, day: dt.date) -> List[Dict[str, Any]]:
         """Trades opened or closed during the New York session ``day``, oldest first."""
@@ -742,6 +750,23 @@ def _ny_bounds(day: dt.date):
     def utc(d: dt.date) -> dt.datetime:
         return dt.datetime.combine(d, dt.time(0), tzinfo=clock.NY).astimezone(dt.timezone.utc).replace(tzinfo=None)
     return utc(day), utc(day + dt.timedelta(days=1))
+
+
+#: a trade with no exit fills on record (a record older than the fills, or one still whole)
+NO_EXITS: Dict[str, Any] = {"exit_avg_price": None, "exit_parts": 0}
+
+
+def _exit_fills(s, trade_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Each trade's exit fills, in one grouped query: their size-weighted average price and how many
+    parts the position left in. A trade's exit_price is only its last part's, so a position taken off
+    in parts needs the average for (exit - entry) x shares to come to what it made."""
+    if not trade_ids:
+        return {}
+    rows = s.execute(select(Fill.trade_id, func.sum(Fill.quantity * Fill.price), func.sum(Fill.quantity), func.count())
+                     .where(Fill.leg == "EXIT", Fill.trade_id.in_(trade_ids))
+                     .group_by(Fill.trade_id)).all()
+    return {tid: {"exit_avg_price": round(float(value) / float(qty), 6), "exit_parts": int(parts)}
+            for tid, value, qty, parts in rows if qty}
 
 
 # --------------------------------------------------------------------------- #

@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
+
 from test_replay import EXACT, FLAT, _session
 from tos_bot.core.enums import Side, StrategyKind, Timeframe
 from tos_bot.core.models import Play
-from tos_bot.research.journal import Journal, build_review, first_sightings, live_records, review_day
+from tos_bot.research.journal import (Journal, build_review, first_sightings, live_records, opened_rows, review_day,
+                                      trade_rows)
 from tos_bot.util import clock
 
 DAY = dt.date(2026, 9, 10)                     # the day test_replay's candles are for
@@ -218,6 +221,37 @@ def test_the_repository_keeps_what_the_review_needs(repo):
     assert repo.get_review(today)["lessons"] == ["y"]
     assert any(r["session"] == today.isoformat() and (r["trades"], r["opened"], r["open_r"]) == (1, 2, 0.7)
                for r in repo.list_reviews())
+
+
+def test_a_position_taken_off_in_parts_is_reviewed_whole_and_keeps_its_planned_exit_times(repo):
+    play = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=100.0, stop=99.0, targets=[102.0, 104.0],
+                expected_hold_typical=40.0, expected_hold_max=90.0)
+    repo.record_play(play)
+    tid = repo.open_trade(play, 100.0, 10, "paper")
+    repo.reduce_trade(tid, 4, 102.0)                                       # the first target: 4 of the 10 off
+    repo.close_trade(tid, exit_price=101.0, exit_reason="eod-flatten")      # the other 6 at the close
+    today = clock.now_ny().date()
+    [trade] = [t for t in repo.closed_trades_between(today, today) if t["id"] == tid]
+    assert (trade["exit_avg_price"], trade["exit_parts"], trade["quantity"]) == (101.4, 2, 6)
+    assert trade["expected_exit_at"] and trade["overwatch_at"]                  # a closed trade keeps its plan's times
+    [row] = trade_rows([trade])
+    assert (row["quantity"], row["exit"], row["last_exit"], row["exit_parts"]) == (10, 101.4, 101.0, 2)
+    assert row["pl"] == pytest.approx(14.0) and (row["exit"] - row["entry"]) * row["quantity"] == pytest.approx(row["pl"])
+    assert row["exit_reason"] == "eod-flatten (last of 2 exits)"
+    [old] = trade_rows([{**trade, "exit_avg_price": None, "exit_parts": 0}])            # a record with no exit fills
+    assert (old["exit"], old["exit_reason"]) == (101.0, "eod-flatten")
+    [entered] = [t for t in repo.trades_opened_between(today, today) if t["id"] == tid]
+    assert entered["expected_exit_at"] == trade["expected_exit_at"]
+    assert opened_rows([entered], {})[0]["exit_reason"] == "eod-flatten (last of 2 exits)"
+    whole = Play(symbol="BBB", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                 timeframe=Timeframe.INTRADAY, entry=100.0, stop=99.0, targets=[102.0])
+    repo.record_play(whole)
+    one = repo.open_trade(whole, 100.0, 10, "paper")
+    repo.close_trade(one, exit_price=102.0, exit_reason="target")
+    [trade] = [t for t in repo.closed_trades_between(today, today) if t["id"] == one]
+    [row] = trade_rows([trade])
+    assert (trade["exit_parts"], row["exit"], row["quantity"], row["exit_reason"]) == (1, 102.0, 10, "target")
 
 
 def test_the_play_log_keeps_the_hold_so_a_play_rebuilt_from_it_has_its_window(repo):

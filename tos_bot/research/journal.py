@@ -102,16 +102,27 @@ def _in_r(t: Mapping[str, Any], key: str) -> Optional[float]:
     return round(float(t[key]) / risk, 2) if risk and t.get(key) is not None else None
 
 
+def _exit_reason(t: Mapping[str, Any]) -> Optional[str]:
+    """How a trade ended, saying so when that was only the last of the parts it left in."""
+    reason, parts = t.get("exit_reason"), int(t.get("exit_parts") or 0)
+    return f"{reason} (last of {parts} exits)" if reason and parts > 1 else reason
+
+
 def trade_rows(trades: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """The closed trades as the review shows them. A position taken off in parts is shown whole: the
+    shares it was entered with, at the size-weighted average of every exit - its exit_price is only the
+    last part's - so (exit - entry) x quantity comes to its P/L; a record with no exit fills keeps its own."""
     rows = []
     for t in trades:
-        play = t.get("play") or {}
+        play, average = t.get("play") or {}, t.get("exit_avg_price")
         rows.append({
             "id": t["id"], "symbol": t["symbol"], "side": t["side"], "strategy": t["strategy"],
             "timeframe": t["timeframe"], "venue": t.get("broker"), "entry_time": t.get("entry_time"),
-            "exit_time": t.get("exit_time"), "entry": t.get("entry_price"), "exit": t.get("exit_price"),
-            "quantity": t.get("quantity"), "r": t.get("r_multiple"), "pl": t.get("realized_pl"),
-            "exit_reason": t.get("exit_reason"), "mfe_r": _in_r(t, "mfe"), "mae_r": _in_r(t, "mae"),
+            "exit_time": t.get("exit_time"), "entry": t.get("entry_price"),
+            "exit": average if average is not None else t.get("exit_price"),
+            "last_exit": t.get("exit_price"), "exit_parts": int(t.get("exit_parts") or 0),
+            "quantity": t.get("initial_quantity") or t.get("quantity"), "r": t.get("r_multiple"), "pl": t.get("realized_pl"),
+            "exit_reason": _exit_reason(t), "mfe_r": _in_r(t, "mfe"), "mae_r": _in_r(t, "mae"),
             "rationale": play.get("rationale", ""),
             "evidence": {k: v for k, v in (play.get("evidence") or {}).items() if k != "spark"},
         })
@@ -140,7 +151,7 @@ def opened_rows(trades: Sequence[Mapping[str, Any]], marks: Mapping[str, float])
             "mark": mark, "open_r": round(sign * (mark - entry) / risk, 2) if mark and risk else None,
             "open_pl": round(sign * (mark - entry) * qty + float(t.get("banked_pl") or 0.0), 2) if mark else None,
             "r": None if still else t.get("r_multiple"), "pl": None if still else t.get("realized_pl"),
-            "exit_reason": None if still else t.get("exit_reason"),
+            "exit_reason": None if still else _exit_reason(t),
             "entry_slippage_bps": t.get("entry_slippage_bps"), "rationale": play.get("rationale", ""),
             "evidence": {k: v for k, v in (play.get("evidence") or {}).items() if k != "spark"},
         })
