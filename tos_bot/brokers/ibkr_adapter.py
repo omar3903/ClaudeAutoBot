@@ -24,7 +24,7 @@ import math
 import re
 import threading
 import time
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -101,10 +101,17 @@ class _IBSession:
         self._loop.run_forever()
 
     def run_coro(self, factory: Callable[[Any], Any], timeout: float = 30.0):
-        """``factory(ib)`` returns an awaitable; block for its result."""
+        """``factory(ib)`` returns an awaitable; block for its result. One that takes longer than
+        ``timeout`` is cancelled on the loop - left running, it would hold its request open with no
+        one waiting for the answer."""
         if self._loop is None:
             raise AuthError("IBKR loop not started")
-        return asyncio.run_coroutine_threadsafe(factory(self.ib), self._loop).result(timeout=timeout)
+        fut = asyncio.run_coroutine_threadsafe(factory(self.ib), self._loop)
+        try:
+            return fut.result(timeout=timeout)
+        except FutureTimeout:
+            fut.cancel()
+            raise
 
     def call(self, fn: Callable[[Any], Any], timeout: float = 15.0):
         """``fn(ib)`` is a plain call run on the loop thread."""
@@ -157,6 +164,9 @@ class IbkrBroker(BrokerAdapter):
     RECONNECT_DELAYS_S = (5, 10, 15, 30, 30, 60, 60, 120)
     #: how long IB Gateway may stay up without IBKR's servers before its socket is dropped and made again
     SERVER_OUTAGE_RECONNECT_S = 600.0
+    #: seconds the account's open orders may take to arrive before the request is called off - the list is
+    #: then unknown, never empty
+    OPEN_ORDERS_TIMEOUT_S = 10.0
 
     def __init__(
         self,
@@ -204,6 +214,9 @@ class IbkrBroker(BrokerAdapter):
         self._live_checked_at = 0.0
         self._competing_at: Optional[float] = None
         self._lock = threading.RLock()
+        #: the request for the open orders that is out now, which any other caller waits on (see _open_orders)
+        self._orders_lock = threading.Lock()
+        self._orders_asked: Optional[Future] = None
 
     # ---- connection --------------------------------------------------- #
     @property
@@ -792,15 +805,43 @@ class IbkrBroker(BrokerAdapter):
         if not self.is_connected:
             return []
         if status in (None, "OPEN", "WORKING"):
-            # every open order on the account, including ones an earlier run of the app left working.
-            # reqAllOpenOrdersAsync hands back a future, not a coroutine, so it is awaited in one.
-            async def open_orders(ib):
-                return await ib.reqAllOpenOrdersAsync()
-            trades = self._session.run_coro(open_orders, timeout=15) or []
+            trades = self._open_orders()
         else:
             trades = self._session.call(lambda ib: list(ib.trades()), timeout=8) or []
         results = [self._result(t) for t in trades]
         return [r for r in results if not status or status.upper() in (r.status, "OPEN", "WORKING")]
+
+    def _open_orders(self) -> list:
+        """Every open order on the account, including ones an earlier run of the app left working.
+
+        One request at a time: ib_async keeps a single slot for it, so a second request sent while the
+        first is still being answered leaves the first waiting for an answer that never comes, and can
+        cut the second one short. A caller arriving while a request is out waits for that same answer
+        instead. A request that takes too long is called off and raises - an unanswered request must
+        never read as "no orders"."""
+        with self._orders_lock:
+            asked, lead = self._orders_asked, self._orders_asked is None
+            if lead:
+                asked = self._orders_asked = Future()
+        if lead:
+            try:
+                # a few seconds past the request's own limit: time for a busy loop to get to it
+                answer = self._session.run_coro(self._ask_open_orders, timeout=self.OPEN_ORDERS_TIMEOUT_S + 5)
+                asked.set_result(answer)
+            except BaseException as e:  # noqa: BLE001 - whatever ended it, every caller waiting hears the same
+                asked.set_exception(e)
+            finally:
+                with self._orders_lock:
+                    self._orders_asked = None
+        try:
+            return asked.result(timeout=self.OPEN_ORDERS_TIMEOUT_S + 10) or []
+        except (FutureTimeout, asyncio.TimeoutError) as e:     # asyncio's timeout, or what it becomes crossing threads
+            raise BrokerError(f"IBKR's open orders didn't arrive within {self.OPEN_ORDERS_TIMEOUT_S:.0f} s") from e
+
+    async def _ask_open_orders(self, ib):
+        # reqAllOpenOrdersAsync hands back a future, not a coroutine, so it is awaited in one. Timing out
+        # cancels that future; an answer arriving after it finds no one waiting
+        return await asyncio.wait_for(ib.reqAllOpenOrdersAsync(), self.OPEN_ORDERS_TIMEOUT_S)
 
     def news_headlines(self, con_ids: Mapping[str, int], days: int = 3, per_symbol: int = 10,
                        since: Optional[dt.datetime] = None,

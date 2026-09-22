@@ -83,6 +83,11 @@ class Executor(ProtectiveStops):
         #: told the play id of an entry that ended with nothing bought - Autopilot hands back the day's slot
         #: it took. Set once by the engine; a rebind keeps it
         self.on_entry_unfilled: Optional[Callable[[str], Any]] = None
+        #: told the play ids of the entries an earlier run left working, once they are taken over - Autopilot
+        #: counts the ones it sent. Set once by the engine; a rebind keeps it
+        self.on_entries_adopted: Optional[Callable[[List[str]], Any]] = None
+        #: the broker's orders couldn't be listed when they were to be taken over: each order sync tries again
+        self._adopt_due = False
         self._init_stops()
 
     def rebind(self, broker: BrokerAdapter, venue: Optional[str] = None) -> None:
@@ -193,8 +198,18 @@ class Executor(ProtectiveStops):
         An exit is matched to its open trade by its tag, or else by symbol, direction
         and share count. Extra copies of an exit the app itself sent - more shares
         than the open trades hold - are cancelled. An entry is matched to its play by
-        its tag."""
-        working = self._working_at_broker()
+        its tag.
+
+        A broker whose orders can't be listed has told us nothing, not that none are
+        working: each order sync tries again until the list comes back."""
+        working = self._working_or_none()
+        if working is None:
+            if not self._adopt_due:
+                log.warning("the orders working at %s couldn't be listed - taking them over is tried again at "
+                            "each order sync", venue_label(self.venue))
+            self._adopt_due = True
+            return []
+        self._adopt_due = False
         if not working:
             return []
         trades = [t for t in self.repo.open_trades() if (t.get("broker") or "paper") == self.venue]
@@ -222,15 +237,28 @@ class Executor(ProtectiveStops):
             log.warning("%s %s", msg, adopted)
             self.bus.publish("orders.adopted", adopted=adopted,
                              cancelled=[o.order_id for o in cancelled], msg=msg)
+        entries = [a["play_id"] for a in adopted if a["kind"] == "entry"]
+        if entries and self.on_entries_adopted is not None:
+            try:
+                self.on_entries_adopted(entries)
+            except Exception:  # noqa: BLE001 - never let it stop the order sync
+                log.exception("telling Autopilot about the entries taken over failed")
         return adopted
 
     def _working_at_broker(self) -> List[OrderResult]:
+        """The orders working at the broker, or none when it can't be asked - for the sweeps, which
+        then cancel nothing this time."""
+        return self._working_or_none() or []
+
+    def _working_or_none(self) -> Optional[List[OrderResult]]:
+        """The orders working at the broker, or None when it couldn't be asked - for the callers that
+        must tell "nothing is working" from "not known"."""
         try:
             return [o for o in self.broker.list_orders("WORKING")
                     if o.status not in DONE_STATUSES and o.side is not None]
         except Exception:  # noqa: BLE001
             log.debug("could not list the orders working at the broker", exc_info=True)
-            return []
+            return None
 
     def _track_exit(self, t: Dict[str, Any], order: OrderResult, reason: str) -> None:
         left = _remaining(order)
@@ -344,7 +372,13 @@ class Executor(ProtectiveStops):
             # a market exit would be rejected, and standing the stop down for it would leave the position
             # with nothing at the broker - so nothing is touched until the session opens
             return {"ok": False, "market_closed": True, "reason": closed}
-        working = self._working_at_broker()
+        working = self._working_or_none()
+        if working is None:
+            # not known is not "none working": an exit an earlier run left, or one placed by hand, can't be
+            # seen - the exits this run is following and the shares the broker holds still cap this one
+            log.warning("order list unavailable - the exit for %s goes out without checking %s for one already "
+                        "working", trade_id, venue_label(held_on))
+            working = []
         order = _match_exit(t, working, set(self._pending))
         if order is not None:
             # an earlier run of the app already sent this exit - follow it rather than send another
@@ -488,6 +522,13 @@ class Executor(ProtectiveStops):
     def sync_open_orders(self) -> None:
         """Poll the broker for fills on anything we're tracking. Also drives
         the paper broker's internal clock and detects bracket stop/target hits."""
+        # 0) take over the orders an earlier run left working, if the broker couldn't list them before
+        if self._adopt_due:
+            try:
+                self.adopt_working_orders()
+            except Exception:  # noqa: BLE001
+                log.exception("taking over the orders already working failed")
+
         # 1) advance the simulator
         if hasattr(self.broker, "poll"):
             try:

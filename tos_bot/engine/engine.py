@@ -330,10 +330,12 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self.executor.scale_out = 0.0 < float(getattr(cfg.exit_manager, "scale_out_pct", 0.0) or 0.0) < 100.0
             self.executor.exit_cfg = cfg.exit_manager
             self.executor.on_entry_unfilled = self.autopilot.entry_unfilled
+            self.executor.on_entries_adopted = self.autopilot.recognise_entries
         else:
             self.executor.rebind(broker, venue=venue)
-        adopted = self.executor.adopt_working_orders()          # before any exit can be sent twice
-        self.autopilot.recognise_entries([a["play_id"] for a in adopted or () if a.get("kind") == "entry"])
+        # before any exit can be sent twice. A broker that can't list its orders now has them taken over by
+        # a later order sync; either way Autopilot hears of the entries it sent (on_entries_adopted)
+        self.executor.adopt_working_orders()
         self.exit_manager = ExitManager(self.repo, self.executor, quote_fn=self.md.quote,
                                         cfg=cfg.exit_manager, bus=BUS, venue=venue)
         self.position_check.reset()

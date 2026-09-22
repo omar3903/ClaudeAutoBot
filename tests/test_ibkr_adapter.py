@@ -4,20 +4,24 @@ Covers the translation layer: interval -> barSize, order action (an order's
 side is its direction, exits included), order states and IBKR's rejection
 reasons, account parsing, quote NaN fallback, the delayed-data downgrade,
 bar-frame shaping, and connection state. The real Gateway path is not tested
-here (it needs a running IB Gateway).
+here (it needs a running IB Gateway). Where the app's threads overlap, the real
+session's loop runs around the fake (ThreadedSession).
 """
 
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import threading
+import time
+from concurrent.futures import TimeoutError as FutureTimeout
 from types import SimpleNamespace
 
 import pytest
 from ib_async.order import OrderStatus
 
 from tos_bot.brokers import ibkr_adapter as mod
-from tos_bot.brokers.base import DONE_STATUSES, AuthError, OrderRejected
+from tos_bot.brokers.base import DONE_STATUSES, AuthError, BrokerError, OrderRejected
 from tos_bot.brokers.paper_adapter import PaperBroker
 from tos_bot.core.enums import OrderType, Side, TimeInForce
 from tos_bot.core.models import OrderRequest, Quote
@@ -565,3 +569,119 @@ def test_each_fill_carries_the_tag_of_the_order_it_filled(broker):
     [fill] = broker.get_fills("AAPL")
     assert (fill.tag, fill.quantity, fill.price, fill.side) == ("exit:trd_1", 40.0, 12.5, Side.SHORT)
 
+
+
+# --------------------------------------------------------------------------- #
+#  the open orders, asked for by several threads at once
+# --------------------------------------------------------------------------- #
+class ThreadedSession(mod._IBSession):
+    """The real session - its asyncio loop on a thread of its own - around the fake IB, for what
+    happens when the app's threads ask at the same time."""
+
+    def _run(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self.ib = FakeIB()
+        self._ready.set()
+        self._loop.run_forever()
+
+
+class _CountingLock:
+    """A lock that counts the callers that have been through it."""
+
+    def __init__(self):
+        self._lock, self.entered = threading.Lock(), 0
+
+    def __enter__(self):
+        self._lock.acquire()
+        self.entered += 1
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+
+
+def _wait_for(condition, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out waiting"
+        time.sleep(0.01)
+
+
+@pytest.fixture
+def threaded(monkeypatch):
+    monkeypatch.setattr(mod, "port_is_open", lambda *a, **k: True)
+
+    async def _fast(*_a):
+        return None
+
+    monkeypatch.setattr(mod, "_sleep", _fast)
+    b = mod.IbkrBroker(port=4002, mode="paper", session_factory=ThreadedSession)
+    b.connect()
+    for symbol in ("AAA", "BBB"):
+        b.place_order(OrderRequest(symbol=symbol, side=Side.LONG, quantity=5, order_type=OrderType.LIMIT,
+                                   limit_price=10.0))
+    yield b
+    b.close()
+
+
+def test_threads_asking_for_the_open_orders_at_once_share_one_request(threaded):
+    # ib_async keeps one slot for this request: a second one sent while the first is out would leave
+    # the first waiting for an answer that never comes
+    ib, asked = threaded._session.ib, []
+
+    def answered_later():                       # like ib_async's: a future the loop resolves when the list ends
+        asked.append(asyncio.get_running_loop().create_future())
+        return asked[-1]
+
+    ib.reqAllOpenOrdersAsync = answered_later
+    threaded._orders_lock = counting = _CountingLock()
+    got = {}
+    callers = [threading.Thread(target=lambda n=n: got.__setitem__(n, threaded.list_orders("WORKING")))
+               for n in range(2)]
+    for c in callers:
+        c.start()
+    _wait_for(lambda: counting.entered >= 2 and asked)          # both callers are in and a request is out
+    threaded._session.call(lambda ib: asked[0].set_result(ib.trades()))
+    for c in callers:
+        c.join(timeout=5)
+    assert len(asked) == 1
+    assert [sorted(o.symbol for o in got[n]) for n in range(2)] == [["AAA", "BBB"]] * 2
+
+
+def test_open_orders_that_never_arrive_raise_and_leave_nothing_waiting_on_the_loop(threaded, monkeypatch):
+    monkeypatch.setattr(mod.IbkrBroker, "OPEN_ORDERS_TIMEOUT_S", 0.3)
+    ib, asked = threaded._session.ib, []
+    answer = ib.reqAllOpenOrdersAsync
+
+    def never_then_at_once():
+        asked.append(asyncio.get_running_loop().create_future() if not asked else None)
+        return asked[-1] if len(asked) == 1 else answer()
+
+    ib.reqAllOpenOrdersAsync = never_then_at_once
+    with pytest.raises(BrokerError, match="didn't arrive"):       # unknown - never an empty list
+        threaded.list_orders("WORKING")
+    assert asked[0].cancelled()                                   # the request was called off...
+    assert threaded._session.call(lambda ib: [t for t in asyncio.all_tasks() if not t.done()]) == []   # ...not left
+    assert sorted(o.symbol for o in threaded.list_orders("WORKING")) == ["AAA", "BBB"]
+    assert len(asked) == 2                                        # the next call asked afresh
+
+
+def test_a_request_that_outlasts_its_wait_is_cancelled_on_the_loop():
+    session = ThreadedSession()
+    session.start()
+    cancelled = threading.Event()
+
+    async def forever(ib):
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    try:
+        with pytest.raises(FutureTimeout):
+            session.run_coro(forever, timeout=0.2)
+        assert cancelled.wait(timeout=5)
+    finally:
+        session.stop()

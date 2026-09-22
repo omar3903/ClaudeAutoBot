@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
 
+from tos_bot.brokers.base import BrokerError
 from tos_bot.config import get_settings
 from tos_bot.core.enums import Side, StrategyKind, Timeframe
 from tos_bot.core.models import Account, OrderResult, Play, Position, Quote
@@ -155,6 +157,20 @@ def test_exits_never_add_up_to_more_shares_than_are_held():
     assert [o.quantity for o in broker.orders] == [10, 2]
 
 
+def _unanswered(status=None):
+    raise BrokerError("the open orders didn't arrive in time")
+
+
+def test_an_exit_still_goes_out_when_the_order_list_is_unknown_capped_by_the_shares_held(caplog):
+    broker = _Broker({"AAA": 6})                         # the record says 10
+    ex = _executor(broker, _Repo([_trade()]))
+    broker.list_orders = _unanswered
+    with caplog.at_level(logging.WARNING, logger="tos_bot.execution.executor"):
+        assert ex.close_trade("t1")["ok"]
+    assert [o.quantity for o in broker.orders] == [6]
+    assert "order list unavailable" in caplog.text        # said to be unknown, not taken for "none working"
+
+
 def test_an_order_the_broker_stops_knowing_is_given_up_after_a_few_polls():
     broker = _Broker({"AAA": 10})
     ex = _executor(broker, _Repo([_trade()]))
@@ -277,6 +293,25 @@ def test_an_entry_left_working_is_followed_and_booked_when_it_fills():
                                        filled_qty=10, avg_fill_price=100.05)
     ex.sync_open_orders()
     assert [(t["symbol"], t["quantity"]) for t in repo.open_trades()] == [("AAA", 10.0)]
+
+
+def test_orders_that_couldnt_be_listed_after_a_restart_are_taken_over_by_a_later_sync():
+    broker = _Broker({"AAA": 10}, working=[_working("7"), _working("21", side=Side.LONG, tag="play_left")])
+    ex = _executor(broker, _Repo([_trade()]))
+    told = []
+    ex.on_entries_adopted = told.append
+    listed, broker.list_orders = broker.list_orders, _unanswered
+
+    assert ex.adopt_working_orders() == []
+    ex.sync_open_orders()                               # still no answer
+    assert ex.pending_exit_trade_ids() == set() and ex.working_entries() == [] and told == []
+
+    broker.list_orders = listed
+    ex.sync_open_orders()
+    assert ex.pending_exit_trade_ids() == {"t1"} and [w["play_id"] for w in ex.working_entries()] == ["play_left"]
+    assert told == [["play_left"]]                      # Autopilot hears of the entry it sent
+    ex.sync_open_orders()
+    assert told == [["play_left"]] and broker.cancelled == []                   # taken over once
 
 
 # ---------------------------------------------------------------- the dashboard's list of working orders

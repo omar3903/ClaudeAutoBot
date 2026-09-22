@@ -1085,6 +1085,13 @@ def test_the_executor_tells_autopilot_about_an_entry_that_bought_nothing_even_af
     assert engine.executor.on_entry_unfilled == engine.autopilot.entry_unfilled
 
 
+def test_autopilot_hears_of_the_entries_taken_over_after_a_restart_even_after_a_switch(engine):
+    # they may be taken over by a later order sync, when the broker couldn't list them at the start
+    assert engine.executor.on_entries_adopted == engine.autopilot.recognise_entries
+    engine.executor.rebind(engine._broker, venue=engine._venue)
+    assert engine.executor.on_entries_adopted == engine.autopilot.recognise_entries
+
+
 def test_what_became_of_a_sent_play_is_saved_without_losing_who_sent_it(engine):
     from tos_bot.scanner.scanner import ScanResult
 
