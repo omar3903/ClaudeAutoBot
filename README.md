@@ -813,9 +813,17 @@ faded grey robot: hovering it gives the first check the play fails, in the
 words the entry gate itself uses (the badge and the gate share one set of
 checks). The play's detail panel says the same in one line.
 
-**Proof, noise and size.** A day-trade setup must show up in `min_confirmations`
-(2) scans in a row, and plays carrying a flag in `skip_noise` are skipped. With
-`require_proven` on, a strategy is auto-traded only once the replay (**Strategies
+**Proof, noise and size.** A day-trade setup must show up `min_confirmations`
+(2) times in a row, and plays carrying a flag in `skip_noise` are skipped. With
+`confirm_on_new_candle` (on) each of those is a newer 5-minute candle, whichever
+scan reads it - the scans read one candle several times over, and the replay
+enters once a setup has shown on two candles running; a sighting more than two
+candles after the last one counted starts the count again. A setup that fires on
+one candle by its nature (a reclaim, a flag) then never reaches two, and the
+Strategies panel says so: set 1 confirmation, or turn the setting off, to
+practise those again. The replay models two at most, so 3 or more asks live for
+more than it tested.
+With `require_proven` on, a strategy is auto-traded only once the replay (**Strategies
 → Run replay**) has at least `min_replay_trades` (30) trades Autopilot would have
 taken, averaging at least `min_replay_expectancy_r` (+0.05R) — **and** at least 10
 of them in the held-out latest third of the sessions, averaging more than 0R
@@ -1054,7 +1062,7 @@ asked again; a session IBKR really has nothing for is remembered and isn't.
 
 Every day setup is followed twice: **entered on sight** (the record of all trades) and **entered
 after it has shown two bars in a row**, one bar later and once a session per setup - which is how
-Autopilot enters when it asks a day trade to be seen in two scans running. Autopilot's record,
+Autopilot enters when it asks a day trade to be seen on two candles running. Autopilot's record,
 the one the proof rule reads, is built from the way in it really uses. Before, nearly every
 replayed day trade was entered on sight, so 27 of 1,466 counted and no day setup could ever
 reach the 30 trades proof asks for.

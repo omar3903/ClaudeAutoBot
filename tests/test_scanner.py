@@ -13,7 +13,8 @@ import pytest
 
 import fakes
 from tos_bot.config import get_settings
-from tos_bot.core.enums import Timeframe
+from tos_bot.core.enums import Side, StrategyKind, Timeframe
+from tos_bot.core.models import Play
 from tos_bot.data.bars import DailyBarStore
 from tos_bot.data.listings import UsListings, parse_directory
 from tos_bot.data.market_data import MarketData
@@ -21,7 +22,7 @@ from tos_bot.data.sec_edgar import SecEdgarFundamentals, annual_series, financia
 from tos_bot.data.sectors import SECTORS, sector_from_ibkr
 from tos_bot.data.symbols import SymbolMaster
 from tos_bot.scanner import schedule
-from tos_bot.scanner.evaluator import with_today
+from tos_bot.scanner.evaluator import evaluate, with_today
 from tos_bot.scanner.heat import daily_metrics, intraday_metrics, liquid, rank_by_daily_heat
 from tos_bot.scanner.scanner import BENCHMARK, Scanner
 from tos_bot.scanner.schedule import ScanSettings
@@ -165,6 +166,26 @@ def test_todays_candle_is_built_from_the_intraday_bars():
     assert len(full) == len(daily) + 1 and full.index[-1].date() == intraday.index[-1].date()
     assert full["high"].iloc[-1] == today["high"].max() and full["volume"].iloc[-1] == today["volume"].sum()
     assert with_today(full, intraday) is full and with_today(daily, None) is daily
+
+
+class _DayAndSwing:
+    """One day play and one swing play on every stock it is shown."""
+    key, style, weight = "both", "momentum", 1.0
+
+    def generate(self, ctx):
+        return [Play(symbol=ctx.symbol, side=Side.LONG, strategy=self.key, kind=StrategyKind.TECHNICAL, timeframe=tf,
+                     entry=ctx.price, stop=ctx.price * 0.99, targets=[ctx.price * 1.03])
+                for tf in (Timeframe.INTRADAY, Timeframe.SWING)]
+
+
+def test_a_day_play_carries_the_last_closed_candle_it_was_seen_on():
+    daily, intraday = fakes.daily_bars("AAA").iloc[:-1], fakes.intraday_bars("AAA")
+    day, swing = evaluate("AAA", [_DayAndSwing()], daily, intraday, run_id="r", equity=0.0, params={})
+    assert day.evidence["bar_at"] == intraday.index[-2].isoformat()       # the newest candle is still printing
+    assert pd.Timestamp(day.evidence["bar_at"]).tzinfo is not None
+    assert "bar_at" not in swing.evidence                                 # swing plays count scans, as before
+    no_candles, _ = evaluate("AAA", [_DayAndSwing()], daily, None, run_id="r", equity=0.0, params={})
+    assert no_candles.is_day_trade and "bar_at" not in no_candles.evidence   # no candles, nothing to count by
 
 
 # ---------------------------------------------------------------- heat

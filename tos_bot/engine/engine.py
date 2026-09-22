@@ -868,10 +868,13 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._publish("watchlist.updated", **self.watchlist_state())
             return
         self._size_plays(result.plays)
-        # the cycles don't re-check valuation setups, so those stay; a quick re-check isn't a confirmation
+        # the cycles don't re-check valuation setups, so those stay. A quick re-check isn't a scan confirming
+        # a setup - but with confirm_on_new_candle a day play counts candles, not scans, and a newer candle
+        # counts whichever scan read it
         self._score_plays(result.plays)
         changes = self.board.replace(result.plays, None if kind == "full" else result.symbols,
-                                     keep=lambda p: p.kind.value == "FUNDAMENTAL", confirm=not quick)
+                                     keep=lambda p: p.kind.value == "FUNDAMENTAL", confirm=not quick,
+                                     new_candle=self.autopilot.confirm_on_new_candle)
         self._last_scans[kind] = result.summary()
         self._day_changed()
         if not quick:

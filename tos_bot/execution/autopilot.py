@@ -79,6 +79,7 @@ class AutoPilot:
         self.giveback_floor_pct: float = float(getattr(cfg, "giveback_floor_pct", 0.25))
         self.max_gross_exposure_pct: float = float(getattr(cfg, "max_gross_exposure_pct", 100.0))
         self.min_confirmations: int = int(getattr(cfg, "min_confirmations", 2))
+        self.confirm_on_new_candle: bool = bool(getattr(cfg, "confirm_on_new_candle", True))
         self.min_minutes_to_close: int = int(getattr(cfg, "min_minutes_to_close", 30))
         self.skip_noise: List[str] = [str(n) for n in getattr(cfg, "skip_noise", list(NOISE_LABELS))]
         self.require_proven: bool = bool(getattr(cfg, "require_proven", True))
@@ -132,6 +133,7 @@ class AutoPilot:
             "peak_realized": self._peak_realized,
             "max_gross_exposure_pct": self.max_gross_exposure_pct,
             "min_confirmations": self.min_confirmations,
+            "confirm_on_new_candle": self.confirm_on_new_candle,
             "min_minutes_to_close": self.min_minutes_to_close,
             "skip_noise": list(self.skip_noise),
             "require_proven": self.require_proven,
@@ -168,6 +170,8 @@ class AutoPilot:
             self.cooldown_after_loss = bool(d["cooldown_after_loss"])
         if "require_proven" in d:
             self.require_proven = bool(d["require_proven"])
+        if "confirm_on_new_candle" in d:
+            self.confirm_on_new_candle = bool(d["confirm_on_new_candle"])
         if "model_mode" in d:
             self.model_mode = _mode(d["model_mode"])
         if isinstance(d.get("model_min_p"), (int, float)):
@@ -225,6 +229,8 @@ class AutoPilot:
             self.max_giveback_pct = max(0.0, min(100.0, float(kw["max_giveback_pct"])))
         if isinstance(kw.get("min_confirmations"), int):
             self.min_confirmations = max(1, min(10, int(kw["min_confirmations"])))
+        if "confirm_on_new_candle" in kw:
+            self.confirm_on_new_candle = bool(kw["confirm_on_new_candle"])
         if isinstance(kw.get("min_minutes_to_close"), int):
             self.min_minutes_to_close = max(0, min(120, int(kw["min_minutes_to_close"])))
         if "model_mode" in kw:
@@ -381,6 +387,7 @@ class AutoPilot:
             "daily_loss_stop": self.stopped_for_the_day,
             "max_gross_exposure_pct": round(self.max_gross_exposure_pct, 1),
             "min_confirmations": self.min_confirmations,
+            "confirm_on_new_candle": self.confirm_on_new_candle,
             "min_minutes_to_close": self.min_minutes_to_close,
             "skip_noise": list(self.skip_noise),
             "learned_skip_noise": self._learned_skips(),
@@ -764,7 +771,8 @@ class AutoPilot:
         if noisy:
             return "noise: " + ", ".join(NOISE_LABELS.get(n, n) for n in noisy)
         if tf == "INTRADAY" and confirmations < self.min_confirmations:
-            return f"not confirmed yet - seen in {confirmations} of {self.min_confirmations} scans in a row"
+            seen = "on {} of {} five-minute candles" if self.confirm_on_new_candle else "in {} of {} scans"
+            return f"not confirmed yet - seen {seen.format(confirmations, self.min_confirmations)} in a row"
         if not board and tf == "INTRADAY" and self.min_minutes_to_close > 0:
             left = clock.minutes_to_close()
             if left < self.min_minutes_to_close:

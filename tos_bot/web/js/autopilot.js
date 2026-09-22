@@ -112,10 +112,11 @@ function configure() {
         <span><label title="Aziz's give-back rule: once the day's realized gain has fallen this far from its best, stop for the day and keep what's left. 0 = off">...or after giving back % of the day's gain</label><input type="number" id="ap-giveback" min="0" max="100" step="5" value="${ap.max_giveback_pct ?? 30}"></span>
       </div>
       <div class="ap-row">
-        <span><label>Day trades: seen in scans in a row</label><input type="number" id="ap-confirm" min="1" max="10" step="1" value="${ap.min_confirmations ?? 2}"></span>
+        <span><label title="How many times in a row a day setup must show before Autopilot takes it - on new 5-minute candles while the box below is ticked, otherwise in scans">Day trades: seen in a row</label><input type="number" id="ap-confirm" min="1" max="10" step="1" value="${ap.min_confirmations ?? 2}"></span>
         <span><label title="Aziz keeps the last half hour for closing, and the exit manager flattens day trades 10 minutes before the bell - a new one this late has no time to work. 0 = off">Day trades: none in the last N minutes</label><input type="number" id="ap-close" min="0" max="120" step="5" value="${ap.min_minutes_to_close ?? 30}"></span>
         <span><label>Max % of equity in positions</label><input type="number" id="ap-gross" min="10" max="400" step="5" value="${ap.max_gross_exposure_pct ?? 100}"></span>
       </div>
+      <label title="The scans read one 5-minute candle several times over; the replay enters a day setup once it has shown on two candles running. Ticked, live counts the same way. A setup that fires on one candle (a reclaim, a flag) then never reaches two - set 1 above, or untick this, to practise those again. The replay models two at most."><input type="checkbox" id="ap-candles" ${ap.confirm_on_new_candle !== false ? "checked" : ""}> Count a day setup as seen again only on a new 5-minute candle, as the replay does</label>
       <label data-term="noise">Skip plays flagged as noise</label>
       <div class="ap-noise">${Object.entries(ap.noise_labels || {}).map(([flag, label]) =>
         `<label><input type="checkbox" class="ap-noise-check" value="${escapeHtml(flag)}" ${(ap.skip_noise || []).includes(flag) ? "checked" : ""}> ${escapeHtml(label)}</label>`).join("")}</div>
@@ -149,6 +150,7 @@ function configure() {
         max_per_strategy: int("#ap-maxstrat"),
         max_new_per_cycle: int("#ap-maxcycle"),
         min_confirmations: int("#ap-confirm"),
+        confirm_on_new_candle: $("#ap-candles").checked,
         min_minutes_to_close: int("#ap-close"),
         max_gross_exposure_pct: parseFloat($("#ap-gross").value),
         max_daily_loss_pct: parseFloat($("#ap-dayloss").value),

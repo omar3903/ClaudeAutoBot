@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import pickle
+
+import pandas as pd
 
 from tos_bot.core.enums import PlayStatus, Side, StrategyKind, Timeframe
 from tos_bot.core.models import Play
@@ -95,3 +98,92 @@ def test_the_board_says_which_of_a_scans_plays_it_took():
     late = _play()
     board.replace([late, other])
     assert not board.holds(late) and board.holds(other)                   # acted on: this session's sighting is left out
+
+
+# ---------------------------------------------------------------- confirmations counted on candles
+OPEN = pd.Timestamp("2026-03-02 09:30", tz="America/New_York")
+
+
+def _on_candle(minutes, symbol="AAA", timeframe=Timeframe.INTRADAY):
+    """A sighting of the setup whose last closed 5-minute candle started ``minutes`` after the open."""
+    p = _play(symbol)
+    p.timeframe = timeframe
+    p.evidence["bar_at"] = (OPEN + pd.Timedelta(minutes=minutes)).isoformat()
+    return p
+
+
+def _count(board):
+    [p] = board.plays.values()
+    return p.confirmations
+
+
+def test_a_second_scan_on_the_same_candle_is_not_a_confirmation():
+    board = PlayBoard()
+    board.replace([_on_candle(0)], scanned={"AAA"}, new_candle=True)
+    board.replace([_on_candle(0)], scanned={"AAA"}, new_candle=True)
+    board.replace([_on_candle(0)], scanned={"AAA"}, new_candle=True)
+    assert _count(board) == 1
+
+
+def test_a_newer_candle_counts_one_confirmation_even_from_the_quick_recheck():
+    board = PlayBoard()
+    board.replace([_on_candle(0)], scanned={"AAA"}, new_candle=True)
+    board.replace([_on_candle(5)], scanned={"AAA"}, confirm=False, new_candle=True)     # the 15-second re-check
+    assert _count(board) == 2
+    board.replace([_on_candle(5)], scanned={"AAA"}, new_candle=True)                    # a cycle, same candle
+    [p] = board.plays.values()
+    assert p.confirmations == 2 and p.evidence["counted_bar"] == (OPEN + pd.Timedelta(minutes=5)).isoformat()
+
+
+def test_a_sighting_more_than_two_candles_later_starts_counting_again():
+    board = PlayBoard()
+    board.replace([_on_candle(0)], scanned={"AAA"}, new_candle=True)
+    board.replace([_on_candle(10)], scanned={"AAA"}, new_candle=True)     # one candle skipped: a scan landing late
+    assert _count(board) == 2
+    board.replace([_on_candle(25)], scanned={"AAA"}, new_candle=True)     # three candles on: not "in a row"
+    assert _count(board) == 1
+    board.replace([_on_candle(30)], scanned={"AAA"}, new_candle=True)
+    assert _count(board) == 2
+
+
+def test_with_the_setting_off_every_scan_counts_as_before():
+    board = PlayBoard()
+    board.replace([_on_candle(0)], scanned={"AAA"}, new_candle=False)
+    board.replace([_on_candle(0)], scanned={"AAA"}, new_candle=False)
+    assert _count(board) == 2
+    board.replace([_on_candle(5)], scanned={"AAA"}, confirm=False, new_candle=False)   # a quick re-check never counts
+    assert _count(board) == 2
+
+
+def test_swing_plays_count_scans_as_before():
+    board = PlayBoard()
+    board.replace([_on_candle(0, timeframe=Timeframe.SWING)], scanned={"AAA"}, new_candle=True)
+    board.replace([_on_candle(0, timeframe=Timeframe.SWING)], scanned={"AAA"}, new_candle=True)
+    assert _count(board) == 2
+    board.replace([_on_candle(5, timeframe=Timeframe.SWING)], scanned={"AAA"}, confirm=False, new_candle=True)
+    assert _count(board) == 2
+
+
+def test_a_saved_board_keeps_the_candle_it_last_counted():
+    board = PlayBoard()
+    board.replace([_on_candle(0)], scanned={"AAA"}, new_candle=True)
+    board.replace([_on_candle(5)], scanned={"AAA"}, new_candle=True)
+    plays, settled = pickle.loads(pickle.dumps(board.saved()))            # the day's state file pickles them
+
+    again = PlayBoard()
+    assert again.restore(plays, settled) == 1
+    again.replace([_on_candle(5)], scanned={"AAA"}, new_candle=True)      # the candle it had counted: no more
+    assert _count(again) == 2
+    again.replace([_on_candle(10)], scanned={"AAA"}, new_candle=True)
+    assert _count(again) == 3
+
+
+def test_a_play_without_a_candle_time_counts_as_before():
+    board = PlayBoard()
+    board.restore([_play()])                                              # saved before plays knew their candle
+    board.replace([_on_candle(0)], scanned={"AAA"}, new_candle=True)
+    assert _count(board) == 2
+    board.replace([_on_candle(0)], scanned={"AAA"}, new_candle=True)      # from here it counts candles
+    assert _count(board) == 2
+    board.replace([_play()], scanned={"AAA"}, new_candle=True)            # a sighting that doesn't know its candle
+    assert _count(board) == 3

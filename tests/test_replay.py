@@ -461,3 +461,17 @@ def test_a_play_not_taken_is_followed_with_the_time_stop_too():
     t = shadow_trade(play, session, session.index[5], EXACT)
     assert t is not None and t.exit_reason == "time-stop"
 
+
+def test_the_replay_names_the_day_setups_it_only_ever_saw_on_one_candle(tmp_path):
+    from types import SimpleNamespace
+
+    from tos_bot.research.history import IntradayHistory
+    from tos_bot.research.runner import ReplayRunner
+
+    runner = ReplayRunner(tmp_path / "replay.json", IntradayHistory(tmp_path / "intraday"),
+                          bus=SimpleNamespace(publish=lambda *a, **k: None), workers=1)
+    swing = SimTrade(strategy="w", symbol="X", side="LONG", timeframe="SWING", entered_at="", exited_at="", entry=1.0,
+                     exit=1.0, r=1.0, exit_reason="x")
+    runner._trades = [_t(1.0, strategy="once"), _t(-1.0, strategy="once"),
+                      _t(1.0, strategy="twice"), _t(0.5, strategy="twice", entry_rule="second"), swing]
+    assert runner.one_candle_setups() == ["once"]           # a swing trade has one way in, and isn't a day setup

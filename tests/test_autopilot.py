@@ -450,6 +450,17 @@ def test_a_day_trade_setup_must_show_up_twice_before_autopilot_takes_it():
     assert eng.approved_ids() == [p.id]
 
 
+def test_counting_confirmations_on_candles_is_a_setting_that_is_remembered():
+    ap = AutoPilot(FakeEngine(), _cfg(), bus=SILENT)
+    assert ap.confirm_on_new_candle and ap.status()["confirm_on_new_candle"]     # on unless config says otherwise
+    ap.configure(confirm_on_new_candle=False)
+    assert ap.to_runtime()["confirm_on_new_candle"] is False and not ap.status()["confirm_on_new_candle"]
+    other = AutoPilot(FakeEngine(), _cfg(), bus=SILENT)
+    other.load_runtime(ap.to_runtime())
+    assert other.confirm_on_new_candle is False
+    assert AutoPilot(FakeEngine(), _cfg(confirm_on_new_candle=False), bus=SILENT).confirm_on_new_candle is False
+
+
 def test_autopilot_only_trades_strategies_the_replay_has_proven():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(require_proven=True, min_replay_trades=30, min_replay_expectancy_r=0.05), bus=SILENT)
@@ -795,7 +806,8 @@ def _refused(status=None, noise=(), **over):
     ({"min_reward_risk": 1.5}, _refused(target=102.4), "reward:risk 1.20 < 1.50"),
     ({}, _refused(kind=StrategyKind.FUNDAMENTAL), "valuation plays"),
     ({"skip_noise": ["against_trend"]}, _refused(noise=["against_trend"]), "noise: against the daily trend"),
-    ({"min_confirmations": 2}, _refused(), "seen in 1 of 2"),
+    ({"min_confirmations": 2}, _refused(), "seen on 1 of 2 five-minute candles in a row"),
+    ({"min_confirmations": 2, "confirm_on_new_candle": False}, _refused(), "seen in 1 of 2 scans in a row"),
     ({"require_proven": True}, _refused(), "isn't proven yet"),
     ({}, _refused(), None),
 ])

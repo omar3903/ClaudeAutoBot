@@ -1152,3 +1152,54 @@ def test_a_play_already_sent_cant_be_dismissed_and_one_never_logged_is_logged_wh
     assert not engine.reject_play(gone.id)["ok"]
     assert (engine.repo.get_play(gone.id)["status"], engine.repo.get_play(gone.id)["decided_by"]) == ("SUBMITTED",
                                                                                                     "autopilot")
+
+
+# ---------------------------------------------------------------- confirmations counted on candles
+def test_any_scan_on_a_newer_candle_confirms_a_day_play_and_the_setting_turns_it_off(engine, monkeypatch):
+    import pandas as pd
+    from tos_bot.scanner.scanner import ScanResult
+
+    engine.autopilot.enabled = False
+    opened = pd.Timestamp("2026-03-02 10:00", tz="America/New_York")
+
+    def seen(kind, minutes):
+        p = _play("AAA")
+        p.timeframe = Timeframe.INTRADAY
+        p.evidence["bar_at"] = (opened + pd.Timedelta(minutes=minutes)).isoformat()
+        return ScanResult(kind=kind, symbols=["AAA"], plays=[p])
+
+    candle = {"at": 0}
+    monkeypatch.setattr(engine.scanner, "run_cycle", lambda fast=False: seen("cycle", candle["at"]))
+    monkeypatch.setattr(engine.scanner, "run_plays", lambda symbols: seen("plays", candle["at"]))
+
+    def count():
+        [p] = engine.board.plays.values()
+        return p.confirmations
+
+    engine._run_scan("cycle")
+    engine._run_scan("cycle")                                  # the same candle read again
+    assert count() == 1
+    candle["at"] = 5
+    engine._run_scan("plays")                                  # a newer one, found by the quick re-check
+    assert count() == 2
+    engine._run_scan("cycle")
+    assert count() == 2
+
+    engine.set_autopilot(confirm_on_new_candle=False)          # counting scans, as before
+    candle["at"] = 10
+    engine._run_scan("plays")
+    assert count() == 2                                        # a quick re-check isn't a scan confirming it
+    engine._run_scan("cycle")
+    engine._run_scan("cycle")
+    assert count() == 4
+
+
+def test_the_strategies_panel_says_when_a_day_setup_fires_on_one_candle(engine, monkeypatch):
+    key = next(s.key for s in engine.scanner.strategies if s.timeframe is Timeframe.INTRADAY)
+    monkeypatch.setattr(engine.replay, "one_candle_setups", lambda: [key])
+    engine.autopilot.min_confirmations, engine.autopilot.confirm_on_new_candle = 2, True
+    assert "fires on one candle" in engine.replay_state()["proof"][key]
+    engine.autopilot.confirm_on_new_candle = False                        # counting scans: the usual proof text
+    assert "fires on one candle" not in engine.replay_state()["proof"][key]
+    engine.autopilot.confirm_on_new_candle, engine.autopilot.min_confirmations = True, 1
+    assert "fires on one candle" not in engine.replay_state()["proof"][key]

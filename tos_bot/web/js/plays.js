@@ -139,6 +139,14 @@ export async function selectPlay(id) {
   const recordBtn = $("#btn-goto-trade"); if (recordBtn) recordBtn.onclick = () => openRecord(a.play.trade_id);
 }
 
+/* How many times in a row a day play has shown: on 5-minute candles when Autopilot counts those
+   (a scan reading the same candle again isn't another sighting), otherwise in scans. */
+function seenText(p) {
+  const n = p.confirmations || 1;
+  return (S.state.autopilot || {}).confirm_on_new_candle && (p.evidence || {}).bar_at
+    ? `seen on ${n} candle${n === 1 ? "" : "s"} in a row` : `seen in ${n} scan${n === 1 ? "" : "s"} in a row`;
+}
+
 function detailHTML(a) {
   const p = a.play, op = a.order_preview, pdt = a.pdt || {}, em = S.state.exit_manager || {};
   const protection = { native: "broker OCO (TP + SL)", managed: "auto exit manager", none: "none" }[op.bracket_mode] || op.bracket_mode;
@@ -160,7 +168,7 @@ function detailHTML(a) {
        </div>`;
   return `
     <h3>${escapeHtml(p.symbol)} ${sectorTag(p.sector)} ${sideBadge(p.side)}${executed ? ' <span class="badge good" data-term="executed">executed</span>' : ""}</h3>
-    <div class="sub">${stratLabel(p.strategy)} · ${tfLabel(p.timeframe)} · conf ${num(p.confidence, 2)} · expected ${num((p.evidence || {}).expected_r, 2)}R · score ${num(p.score, 2)}${p.timeframe === "INTRADAY" ? ` · seen in ${p.confirmations || 1} scan${(p.confirmations || 1) === 1 ? "" : "s"} in a row` : ""} · session ${a.session}</div>
+    <div class="sub">${stratLabel(p.strategy)} · ${tfLabel(p.timeframe)} · conf ${num(p.confidence, 2)} · expected ${num((p.evidence || {}).expected_r, 2)}R · score ${num(p.score, 2)}${p.timeframe === "INTRADAY" ? ` · ${seenText(p)}` : ""} · session ${a.session}</div>
     ${p.autopilot && !executed ? `<div class="muted" style="margin:6px 0" data-term="autopilot">🤖 ${escapeHtml(apLine(p.autopilot))}</div>` : ""}
     ${(a.noise || []).length && !executed ? `<div class="warn-box" data-term="noise">⚠ Probably noise right now: ${a.noise.map(escapeHtml).join(" · ")}. Autopilot won't take it; you still can.</div>` : ""}
     ${sparkSvg(p.evidence && p.evidence.spark, p)}

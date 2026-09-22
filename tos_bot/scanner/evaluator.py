@@ -51,6 +51,15 @@ def with_today(daily: pd.DataFrame, intraday: Optional[pd.DataFrame]) -> pd.Data
     return pd.concat([daily, bar])
 
 
+def closed_bar_at(intraday: Optional[pd.DataFrame]) -> Optional[str]:
+    """When the last closed 5-minute candle started - the one the day setups trigger on, since the newest
+    is still printing (strategies/technical.py _last_closed) - as ISO text a play's evidence can keep.
+    The board counts a day play's confirmations by it (engine/board.py)."""
+    if intraday is None or not len(intraday):
+        return None
+    return pd.Timestamp(intraday.index[-2 if len(intraday) >= 2 else -1]).isoformat()
+
+
 def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
              intraday: Optional[pd.DataFrame], *, run_id: str, equity: float, params: Dict[str, Any],
              activity: Any = None, fundamentals: Optional[Financials] = None,
@@ -78,10 +87,13 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
         records={k: dict(v) for k, v in (records or {}).items()}, premarket=dict(premarket or {}),
     )
     plays: List[Play] = []
+    bar_at = closed_bar_at(intraday)
     for strategy in strategies:
         try:
             for p in strategy.generate(ctx):
                 p.scan_run_id = run_id
+                if bar_at is not None and p.timeframe is Timeframe.INTRADAY:
+                    p.evidence["bar_at"] = bar_at          # the board counts a day play's confirmations by it
                 p.evidence["expected_r"] = round(expected_r(p, ctx.daily_atr), 3)
                 p.noise = context_flags(p, ctx, strategy.style, noise)
                 if p.evidence["expected_r"] < noise.min_expected_r:

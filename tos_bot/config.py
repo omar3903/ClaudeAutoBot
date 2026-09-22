@@ -213,7 +213,12 @@ class AutopilotCfg(_Model):
     max_per_strategy: int = 2
     max_new_per_cycle: int = 1
     max_gross_exposure_pct: float = 100.0  # all positions together, as % of equity - 100 = never on margin
-    min_confirmations: int = 2            # a day-trade setup must show up in this many scans in a row
+    min_confirmations: int = 2            # a day-trade setup must show up this many times in a row
+    confirm_on_new_candle: bool = True    # ...each time on a newer 5-minute candle, not just another scan: the scans read
+                                          # one candle several times over, and the replay's proof enters a day setup once
+                                          # it has shown on two candles running. A setup that fires on one candle by its
+                                          # nature is then never taken - min_confirmations 1, or this off, brings those
+                                          # back. The replay models two at most, so 3 or more asks more than it tested
     min_minutes_to_close: int = 30        # no new day trades with fewer minutes than this to the close: Aziz keeps the
                                           # last half hour for closing, and the exit manager flattens day trades 10
                                           # minutes before the bell, so a late entry has no time to work (0 = off)

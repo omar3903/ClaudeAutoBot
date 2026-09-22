@@ -205,7 +205,8 @@ class Play:
     trade_id: Optional[str] = None          # set once this play becomes a trade
     #: why it's probably noise right now (see scanner/noise.py); empty = no flags
     noise: List[str] = field(default_factory=list)
-    #: scans in a row that found this setup (see PlayBoard.replace)
+    #: scans in a row that found this setup - for a day play, 5-minute candles when Autopilot counts those
+    #: (autopilot.confirm_on_new_candle; see PlayBoard.replace)
     confirmations: int = 1
     #: set on the two legs of a pair trade (see pairs/desk.py) - the pair desk handles their exits
     pair_id: Optional[str] = None

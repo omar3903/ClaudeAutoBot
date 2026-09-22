@@ -30,7 +30,7 @@ export async function openStrategies() {
 }
 
 /* ---------- the replay: each setup's record on past candles, and what each noise check removes ---------- */
-const EXTRA_CHECK_LABELS = { unconfirmed: "seen in only one scan", all_checks: "all of them together" };
+const EXTRA_CHECK_LABELS = { unconfirmed: "seen on only one candle", all_checks: "all of them together" };
 const inR = v => v == null ? "–" : `${v >= 0 ? "+" : ""}${num(v, 2)}R`;
 const recordText = r => `${r.trades} trades · ${Math.round((r.win_rate || 0) * 100)}% wins · ${inR(r.expectancy_r)} a trade`;
 /* what the books ask of a record: Tharp's quality number, Aronson's odds that it is luck, Carver's cost share */
