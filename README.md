@@ -1161,7 +1161,12 @@ can't see them, and the report says so.
   flag the evening replay learns later never re-judges the day. A check is said to
   have helped or cost only when the two sides are at least 0.10R a play apart and
   at least one standard error apart (Welch's t); anything less reads "no clear
-  difference", and a flag with no clear difference gets no lesson;
+  difference", and a flag with no clear difference gets no lesson. The counts are
+  told in order: every day setup not taken, the ones followed (past 150, only the
+  highest-scoring, and the review says what share of them that was), and the ones
+  that would have filled at the next bar's open. Entries sent that never filled
+  are counted apart, and the **Setups offered** card counts a setup once however
+  often it came back to the board (the play-log rows are in its tooltip);
 * **each strategy's real record** over the last 20 sessions against its replay,
   flagged when it falls more than 0.3R a trade short;
 * **how the orders filled** — the seconds from an order going out to the fill coming back, typically

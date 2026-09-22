@@ -950,6 +950,8 @@ def test_the_session_review_keeps_each_trade_with_what_it_was_taken_on(engine):
     out = engine.review_session(today)
     review = out["review"]
     assert out["ok"] and review["day"]["trades"] == 1 and abs(review["trades"][0]["r"] - 0.6) < 1e-9
+    # the note says how many setups not taken were followed, and apart from them how many would have filled
+    assert "0 of 0 day setups not taken followed on the candles (0 would have filled)" in out["note"]
     assert engine.journal_review(today)["session"] == today.isoformat()
     assert engine.journal_state()["days"][0]["session"] == today.isoformat()
 

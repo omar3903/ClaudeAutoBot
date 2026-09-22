@@ -79,6 +79,46 @@ def test_the_plays_not_taken_are_followed_to_their_outcome_once_each():
     assert _review(bars=None)["shadows"]["note"].startswith("IB Gateway wasn't connected")
 
 
+def test_the_plays_not_taken_are_told_as_not_taken_followed_filled_and_sent(monkeypatch):
+    """The lesson counts every day setup not taken, then the ones followed, then the ones that would have
+    filled - past the cap it says only the highest-scoring were followed. A setup seen twice is one setup
+    offered, and an entry that went out and never filled is told apart."""
+    import tos_bot.research.journal as journal
+
+    review = _review()
+    assert (review["plays_offered"], review["setups_offered"]) == (4, 2)      # RPL seen twice, DONE twice
+    assert (review["shadows"]["eligible"], review["shadows"]["cap"], review["shadows"]["sent_unfilled"]) == (1, None, 0)
+    text = " ".join(review["lessons"])
+    assert ("1 day setup wasn't taken; it was followed on the session's candles and 1 would have filled at the next "
+            "bar's open, making +2.00R.") in text
+    assert "offered and not taken" not in text and "sent and never filled" not in text
+
+    # a setup without candles isn't followed, and the lesson doesn't say it was
+    plays = PLAYS + [{**_row("q1", "13:57", symbol="AAA"), "score": 0.9}]
+    assert "2 day setups weren't taken; 1 could be followed on the session's" in " ".join(_review(plays=plays)["lessons"])
+
+    # past the cap, only the highest-scoring are followed - and the lesson says what share they were
+    monkeypatch.setattr(journal, "MAX_SHADOWS", 2)
+    plays = PLAYS + [{**_row(f"q{i}", "13:57", symbol=s), "score": score}
+                     for i, (s, score) in enumerate([("AAA", 0.9), ("BBB", 0.5), ("CCC", 0.4)])]
+    shadows = _review(plays=plays, bars={**BARS, "AAA": BARS["RPL"]})["shadows"]
+    assert (shadows["eligible"], shadows["cap"], shadows["followed"], shadows["filled"]) == (4, 2, 2, 2)
+    assert {p["symbol"] for p in shadows["plays"]} == {"RPL", "AAA"}
+    text = " ".join(_review(plays=plays, bars={**BARS, "AAA": BARS["RPL"]})["lessons"])
+    assert ("4 day setups weren't taken; the 2 highest-scoring were followed on the session's candles and 2 would have "
+            "filled at the next bar's open, averaging +2.00R (+4.00R in all) - the top 50% by score, not all of them.") in text
+
+    # sent and never filled: an entry whose order went out when no trade came of it, candles or not
+    sent = [_row("s1", "14:00", symbol="T01", status="CANCELED"), _row("s2", "14:05", symbol="T02", status="SUBMITTED"),
+            _row("s3", "14:10", symbol="T03", status="ERROR"), _row("s4", "14:15", symbol="T04", status="REJECTED"),
+            _row("s5", "14:20", symbol="T05", status="EXPIRED")]
+    booked = {**_opened("o1", "T03"), "play_id": "s3"}                       # its entry filled after all
+    for bars in (BARS, None):
+        review = _review(plays=PLAYS + sent, opened=[booked], bars=bars)
+        assert (review["shadows"]["sent_unfilled"], review["shadows"]["eligible"]) == (2, 5)   # RPL, and the four never taken
+        assert "2 entries were sent and never filled." in review["lessons"]
+
+
 def test_the_lessons_and_the_strategies_real_record_against_the_replay():
     review = _review()
     text = " ".join(review["lessons"])

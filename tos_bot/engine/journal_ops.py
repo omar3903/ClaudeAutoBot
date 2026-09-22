@@ -149,8 +149,9 @@ class JournalOps:
         return {"ok": True, "review": review,
                 "note": (f"Reviewed {review['session']}: {review['day'].get('opened', 0)} positions opened, "
                          f"{review['day'].get('trades', 0)} closed trades, "
-                         f"{len(review['mistakes'])} things to learn from, {shadows.get('filled', 0)} plays not taken "
-                         "followed to their outcome.")}
+                         f"{len(review['mistakes'])} things to learn from, {shadows.get('followed', 0)} of "
+                         f"{shadows.get('eligible', 0)} day setups not taken followed on the candles "
+                         f"({shadows.get('filled', 0)} would have filled).")}
 
     def _review_marks(self, day: dt.date, opened) -> Dict[str, float]:
         """Where each still-open position's stock stood at the review: the session's close once its

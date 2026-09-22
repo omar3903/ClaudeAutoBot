@@ -1,7 +1,7 @@
 /* The Reports page, opened from the top bar: one report per session. It starts with the market's
    biggest movers and what the bot made of them (movers.js), then the journal's review of the bot's
    own trading (journal.js). The dot on the button marks a report you haven't opened yet. */
-import { $, $$, api, escapeHtml, post, store, usd } from "./util.js";
+import { $, $$, api, count, escapeHtml, post, store, usd } from "./util.js";
 import { toastResult } from "./ui.js";
 import { inR, journalHTML, pctOf, tone } from "./journal.js";
 import { bindMovers, moversHTML } from "./movers.js";
@@ -94,7 +94,9 @@ function headerHTML(r) {
       <div><label>Winners</label><b>${pctOf(d.win_rate)}</b></div>
       <div><label>In all</label><b class="${tone(d.total_r)}">${inR(d.total_r)}</b></div>
       <div><label>Realized</label><b class="${tone(d.realized_pl)}">${usd(d.realized_pl)}</b></div>
-      <div><label>Plays offered</label><b>${r.plays_offered || 0}</b></div>
+      ${r.setups_offered == null
+        ? `<div><label>Plays offered</label><b>${r.plays_offered || 0}</b></div>`
+        : `<div title="${count(r.plays_offered)} play-log rows: a setup that leaves the board and comes back is logged again"><label>Setups offered</label><b>${count(r.setups_offered)}</b></div>`}
       ${s ? `<div><label>Top movers traded</label><b>${s.traded} of ${s.movers}</b></div>` : ""}
     </div>`;
 }

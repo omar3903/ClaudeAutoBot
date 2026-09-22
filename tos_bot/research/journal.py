@@ -54,6 +54,8 @@ NOISE_MARGIN_R = 0.10             # a check helped or cost only when the two sid
 MIN_T = 1.0                       # ... and by a standard error or more (Welch's t), not one lucky play's worth
 TURBULENT = 0.7
 TAKEN = frozenset({"ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED"})
+#: a play whose entry order went out - or was going out - when no trade came of it: it was sent and never filled
+SENT_UNFILLED = frozenset({"ACCEPTED", "SUBMITTED", "WORKING", "CANCELED", "ERROR"})
 LABELS = {**NOISE_LABELS, "unconfirmed": "seen in only one scan"}
 
 
@@ -208,9 +210,9 @@ def _key(row: Mapping[str, Any]) -> tuple:
     return row.get("symbol"), row.get("strategy"), row.get("side")
 
 
-def first_sightings(plays: Sequence[Mapping[str, Any]], limit: int = MAX_SHADOWS) -> List[Mapping[str, Any]]:
+def first_sightings(plays: Sequence[Mapping[str, Any]], limit: Optional[int] = MAX_SHADOWS) -> List[Mapping[str, Any]]:
     """Each day-trade setup the first time it was offered, when it was never taken - the
-    highest-scoring ones when there are too many to follow."""
+    highest-scoring ones when there are too many to follow (``limit=None``: every one)."""
     traded = {_key(p) for p in plays if p.get("status") in TAKEN}
     seen: set = set()
     out = []
@@ -220,6 +222,19 @@ def first_sightings(plays: Sequence[Mapping[str, Any]], limit: int = MAX_SHADOWS
         seen.add(_key(p))
         out.append(p)
     return sorted(out, key=lambda p: -float(p.get("score") or 0.0))[:limit]
+
+
+def sent_unfilled(plays: Sequence[Mapping[str, Any]], booked: Iterable[Any]) -> int:
+    """The entries sent that never filled: the play-log rows whose order went out when no trade came of
+    them (``booked``: the play ids the session's trades were opened from)."""
+    have = set(booked)
+    return sum(1 for p in plays if p.get("status") in SENT_UNFILLED and p.get("id") not in have)
+
+
+def setups_offered(plays: Sequence[Mapping[str, Any]]) -> int:
+    """How many setups the plays were: a setup that leaves the board and comes back is written again under
+    a new play, so the rows count comebacks as much as setups."""
+    return len({(p.get("symbol"), p.get("strategy"), p.get("side"), p.get("timeframe")) for p in plays})
 
 
 def _play(row: Mapping[str, Any]) -> Optional[Play]:
@@ -286,7 +301,9 @@ def _compare(flagged: Sequence[Mapping[str, Any]], rest: Sequence[Mapping[str, A
 def shadow_outcomes(plays: Sequence[Mapping[str, Any]], bars: Mapping[str, pd.DataFrame], day: dt.date,
                     settings: ReplaySettings, passes: Callable[[Mapping[str, Any]], bool]) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
-    for row in first_sightings(plays):
+    # every setup not taken is counted, so the ones followed are told as the share of them they are
+    eligible = first_sightings(plays, limit=None)
+    for row in eligible[:MAX_SHADOWS]:
         frame, play, seen_at = bars.get(row["symbol"]), _play(row), _seen_at(row)
         if frame is None or play is None or seen_at is None:
             continue
@@ -314,6 +331,7 @@ def shadow_outcomes(plays: Sequence[Mapping[str, Any]], bars: Mapping[str, pd.Da
     passed, away = [r for r in filled if r["passed_checks"]], [r for r in filled if not r["passed_checks"]]
     split = _compare(away, passed)                    # the checks "flag" the plays they turn away
     return {
+        "eligible": len(eligible), "cap": MAX_SHADOWS if len(eligible) > MAX_SHADOWS else None,
         "followed": len(rows), "filled": len(filled), "summary": _stats(r["r"] for r in filled),
         "checks": {"passed": _stats(r["r"] for r in passed), "turned_away": _stats(r["r"] for r in away),
                    "verdict": split["verdict"].split(" - ")[0], "t": split["t"]},
@@ -382,12 +400,29 @@ def lessons(day: Mapping[str, Any], mistakes: Sequence[Mapping[str, Any]], shado
         out.append("Going straight back into a stock that just lost turns one loss into chop - let it cool off for the day.")
     if "unproven_strategy" in kinds:
         out.append(f"{len(kinds['unproven_strategy'])} trade(s) came from a strategy the replay hasn't proven.")
-    summary = shadows.get("summary") or {}
-    if summary.get("trades"):
-        many = shadows["filled"] != 1
-        out.append(f"{shadows['filled']} play{'s were' if many else ' was'} offered and not taken; taken as planned "
-                   f"{'they' if many else 'it'} would have averaged {summary['expectancy_r']:+.2f}R "
-                   f"({summary['total_r']:+.2f}R in all).")
+    summary, filled = shadows.get("summary") or {}, shadows.get("filled", 0)
+    followed = shadows.get("followed", filled)
+    if followed:
+        # told against every day setup not taken: past the cap only the highest-scoring are followed, and
+        # the ones that would have filled are a part of those - never "the plays not taken" themselves
+        eligible, cap = shadows.get("eligible", followed), shadows.get("cap")
+        lead = f"{eligible} day setups weren't taken" if eligible != 1 else "1 day setup wasn't taken"
+        if cap:
+            which = (f"the {cap} highest-scoring were followed" if followed == cap
+                     else f"{followed} of the {cap} highest-scoring could be followed")
+        elif followed == eligible:
+            which = "all were followed" if eligible != 1 else "it was followed"
+        else:
+            which = f"{followed} could be followed"
+        fills = ("none would have filled" if not summary.get("trades") else
+                 f"1 would have filled at the next bar's open, making {summary['total_r']:+.2f}R" if filled == 1 else
+                 f"{filled} would have filled at the next bar's open, averaging {summary['expectancy_r']:+.2f}R "
+                 f"({summary['total_r']:+.2f}R in all)")
+        share = f" - the top {100 * cap / eligible:.0f}% by score, not all of them" if cap else ""
+        out.append(f"{lead}; {which} on the session's candles and {fills}{share}.")
+    sent = shadows.get("sent_unfilled") or 0
+    if sent:
+        out.append(f"{sent} entr{'ies were' if sent != 1 else 'y was'} sent and never filled.")
     checks = shadows.get("checks") or {}
     passed, away, verdict = checks.get("passed") or {}, checks.get("turned_away") or {}, checks.get("verdict")
     if verdict in ("helped", "cost", "no clear difference"):
@@ -544,10 +579,13 @@ def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Se
     mistakes = find_mistakes(list(trades) + still_open, skip_noise=skip_noise, min_confirmations=min_confirmations,
                              styles=styles)
     if bars is None:
-        shadows: Dict[str, Any] = {"followed": 0, "filled": 0, "summary": {"trades": 0},
+        shadows: Dict[str, Any] = {"eligible": len(first_sightings(plays, limit=None)), "followed": 0, "filled": 0,
+                                   "summary": {"trades": 0},
                                    "note": "IB Gateway wasn't connected, so the plays not taken couldn't be followed."}
     else:
         shadows = shadow_outcomes(plays, bars, day, settings, passes)
+    # an entry that went out and bought nothing is told apart, with candles or without
+    shadows["sent_unfilled"] = sent_unfilled(plays, (t.get("play_id") for t in (*trades, *opened)))
     strategies = strategy_table(live_records(rolling), replay_records, evidence, titles)
     fills = execution_quality(rolling, settings.slippage_bps + settings.commission_bps)
     notes = lessons(day_stats, mistakes, shadows, strategies, regime, titles, breakeven_at_r)
@@ -566,7 +604,8 @@ def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Se
     return {
         "session": day.isoformat(), "created_at": dt.datetime.now(dt.timezone.utc).isoformat(), "regime": regime,
         "day": day_stats, "trades": trade_rows(trades), "opened": entered, "mistakes": mistakes, "shadows": shadows,
-        "strategies": strategies, "plays_offered": len(plays), "execution": fills,
+        "strategies": strategies, "plays_offered": len(plays), "setups_offered": setups_offered(plays),
+        "execution": fills,
         "lessons": notes,
         "settings": {**gates, "skip_noise": skip_noise, "min_confirmations": min_confirmations,
                      "costs_bps": {"slippage": settings.slippage_bps, "commission": settings.commission_bps},

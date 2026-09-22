@@ -86,18 +86,26 @@ function tradesHTML(rows) {
 }
 
 function shadowsHTML(sh) {
-  if (sh.note) return `<h4>Plays not taken</h4><p class="muted">${escapeHtml(sh.note)}</p>`;
-  if (!sh.followed) return "";
+  // entries that went out and bought nothing (reviews saved before these were counted don't say)
+  const sent = sh.sent_unfilled ? `<p class="muted">${sh.sent_unfilled === 1 ? "1 entry was" : `${count(sh.sent_unfilled)} entries were`}
+    sent and never filled.</p>` : "";
+  if (sh.note) return `<h4>Plays not taken</h4><p class="muted">${escapeHtml(sh.note)}</p>${sent}`;
+  if (!sh.followed) return sent && `<h4>Plays not taken</h4>${sent}`;
   const s = sh.summary || {}, checks = sh.checks || {};
   const noise = Object.entries(sh.by_noise || {});
   const list = (rows, title) => rows && rows.length ? `<div class="muted">${title}: ${rows.map(x =>
     `${escapeHtml(x.symbol)} ${escapeHtml(x.side.toLowerCase())} (${escapeHtml(x.strategy)}) ${inR(x.r)}`).join(" · ")}</div>` : "";
+  // the ones followed, told against every day setup not taken: past the cap, only the highest-scoring
+  const followed = sh.eligible == null ? plural(sh.followed, "setup")          // saved before the setups not taken were counted
+    : sh.cap ? `${count(sh.eligible)} day setups not taken; the ${sh.followed} highest-scoring (the top ${Math.round(100 * sh.cap / sh.eligible)}% by score)`
+    : `${plural(sh.eligible, "day setup")} not taken; ${sh.followed === sh.eligible ? (sh.eligible === 1 ? "it was" : "all") : sh.followed}`;
   return `<h4>Plays not taken</h4>
-    <p class="muted">${sh.followed} setup${sh.followed === 1 ? "" : "s"} followed on the session's candles as if taken; ${sh.filled} would have filled.
+    <p class="muted">${followed} followed on the session's candles as if taken; ${sh.filled} would have filled.
       ${s.trades ? `They would have averaged ${inR(s.expectancy_r)} (${inR(s.total_r)} in all, ${pctOf(s.win_rate)} winners).` : ""}
       ${checks.passed && checks.passed.trades ? ` Passing Autopilot's checks: ${inR(checks.passed.expectancy_r)} over ${checks.passed.trades}.` : ""}
       ${checks.turned_away && checks.turned_away.trades ? ` Turned away by them: ${inR(checks.turned_away.expectancy_r)} over ${checks.turned_away.trades}.` : ""}
       ${checks.verdict === "no clear difference" ? " No clear difference between the two." : ""}</p>
+    ${sent}
     ${noise.length ? `<table class="ev-table"><tr><th>Noise flag</th><th class="num">Flagged</th><th class="num">Their average</th><th class="num">The rest</th><th>Today</th></tr>
       ${noise.map(([flag, n]) => `<tr><td>${escapeHtml(flag === "all_checks" ? "any flag" : flag)}</td><td class="num">${n.flagged}</td>
         <td class="num">${inR(n.flagged_avg_r)}</td><td class="num">${inR(n.rest_avg_r)}</td><td>${escapeHtml(n.verdict)}</td></tr>`).join("")}</table>` : ""}
