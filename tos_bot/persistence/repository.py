@@ -556,12 +556,16 @@ class Repository:
             return [trade_to_dict(t) for t in rows]
 
     def plays_on(self, day: dt.date, limit: int = 5000) -> List[Dict[str, Any]]:
-        """The plays recorded during the New York session ``day``, oldest first."""
+        """The plays recorded during the New York session ``day``, oldest first, each with when the scan that
+        last wrote it finished (``scan_finished_at``, None when that scan isn't on record): a row holds that
+        scan's values, and they reached the board only when it finished."""
         start, end = _ny_bounds(day)
         with session_scope() as s:
-            rows = s.execute(select(PlayLog).where(PlayLog.created_at >= start, PlayLog.created_at < end)
-                             .order_by(PlayLog.created_at).limit(limit)).scalars().all()
-            return [play_to_dict(r) for r in rows]
+            rows = s.execute(select(PlayLog, ScanRun.finished_at).outerjoin(ScanRun, PlayLog.scan_run_id == ScanRun.id)
+                             .where(PlayLog.created_at >= start, PlayLog.created_at < end)
+                             .order_by(PlayLog.created_at).limit(limit)).all()
+            return [{**play_to_dict(r), "scan_finished_at": finished.isoformat() if finished else None}
+                    for r, finished in rows]
 
     # -------------------------------------------------------------- #
     #  What a model learns from (research/dataset.py)               #

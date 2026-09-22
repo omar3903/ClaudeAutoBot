@@ -262,7 +262,8 @@ class JournalOps:
                 "intraday": candles(session, 200)}
 
     def _session_bars(self, day: dt.date, plays: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """The session's 5-minute candles for the plays not taken (kept with the replay's candles)."""
+        """The session's 5-minute candles for the plays not taken that the review follows - the entries sent
+        and never filled among them, whatever their score (kept with the replay's candles)."""
         symbols = list(dict.fromkeys(p["symbol"] for p in first_sightings(plays)))
         if not symbols:
             return {}

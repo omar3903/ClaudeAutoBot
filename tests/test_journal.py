@@ -119,6 +119,45 @@ def test_the_plays_not_taken_are_told_as_not_taken_followed_filled_and_sent(monk
         assert "2 entries were sent and never filled." in review["lessons"]
 
 
+def test_a_play_not_taken_enters_on_the_bar_after_the_scan_that_wrote_its_row_finished():
+    """A play-log row holds the values of the last scan that wrote it, and a scan's plays reach the board
+    only when it finishes: the shadow enters on the next bar after that, never before the setup was first seen."""
+    late = {**_row("p1", "13:57"), "scan_finished_at": f"{DAY}T14:00:30"}      # 10:00:30 in New York
+    [row] = _review(plays=[late])["shadows"]["plays"]
+    assert (row["seen_at"], row["offered_at"]) == (f"{DAY}T09:57:00-04:00", f"{DAY}T10:00:30-04:00")
+    assert (row["entered_at"], row["entry"]) == (f"{DAY}T10:05:00-04:00", 100.2)     # not the 10:00 bar's open
+    for finished in (f"{DAY}T13:50:00", None):          # a finish before the first sighting, or no scan on record
+        [row] = _review(plays=[{**late, "scan_finished_at": finished}])["shadows"]["plays"]
+        assert row["offered_at"] == f"{DAY}T09:57:00-04:00"
+        assert (row["entered_at"], row["r"]) == (f"{DAY}T10:00:00-04:00", 2.0)
+
+
+def test_an_entry_sent_and_never_filled_is_followed_as_sent_even_past_the_cap(monkeypatch):
+    """A setup whose entry went out and never filled is followed from the row it was sent from - what it
+    was sent on, from the moment it went out - in place of its first sighting, whatever its score."""
+    import tos_bot.research.journal as journal
+
+    monkeypatch.setattr(journal, "MAX_SHADOWS", 1)
+    early = {**_row("q1", "13:52", symbol="AAA"), "score": 0.4, "confirmations": 1}      # first seen unconfirmed
+    sent = {**_row("q2", "13:58", symbol="AAA", status="CANCELED"), "score": 0.5, "scan_finished_at": f"{DAY}T14:00:05",
+            "evidence": {"at_entry": {"at": f"{DAY}T10:01:10-04:00", "by": "autopilot"}}}
+    other = {**_row("q3", "13:52", symbol="BBB"), "score": 0.45}                         # below the cap, never sent
+    plays = PLAYS + [early, sent, other]
+    assert [p["id"] for p in first_sightings(plays, limit=1)] == ["p1", "q2"]
+    assert {p["id"] for p in first_sightings(plays, limit=None)} == {"p1", "q2", "q3"}
+    review = _review(plays=plays, bars={**BARS, "AAA": BARS["RPL"], "BBB": BARS["RPL"]},
+                     passes=lambda row: int(row.get("confirmations") or 1) >= 2)
+    shadows = review["shadows"]
+    assert (shadows["eligible"], shadows["cap"], shadows["followed"], shadows["sent_past_cap"]) == (3, 1, 2, 1)
+    rows = {r["play_id"]: r for r in shadows["plays"]}
+    assert set(rows) == {"p1", "q2"}
+    assert (rows["q2"]["sent"], rows["q2"]["passed_checks"], rows["q2"]["confirmations"]) == (True, True, 2)
+    assert (rows["q2"]["offered_at"], rows["q2"]["entered_at"]) == (f"{DAY}T10:01:10-04:00", f"{DAY}T10:05:00-04:00")
+    assert rows["p1"]["sent"] is False
+    assert ("3 day setups weren't taken; the 1 highest-scoring and the 1 entry sent below them were followed on the "
+            "session's candles") in " ".join(review["lessons"])
+
+
 def test_the_lessons_and_the_strategies_real_record_against_the_replay():
     review = _review()
     text = " ".join(review["lessons"])
@@ -301,6 +340,22 @@ def test_the_repository_keeps_what_the_review_needs(repo):
     assert repo.get_review(today)["lessons"] == ["y"]
     assert any(r["session"] == today.isoformat() and (r["trades"], r["opened"], r["open_r"]) == (1, 2, 0.7)
                for r in repo.list_reviews())
+
+
+def test_the_play_log_says_when_the_scan_that_last_wrote_a_play_finished(repo):
+    from tos_bot.scanner.scanner import ScanResult
+
+    result = ScanResult(kind="wide", finished_at=clock.now_ny())
+    scanned = Play(symbol="SCNF", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                   timeframe=Timeframe.INTRADAY, entry=100.0, stop=99.0, targets=[102.0], scan_run_id=result.run_id)
+    repo.record_scan(result, plays=[scanned])
+    loose = Play(symbol="SCNL", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                 timeframe=Timeframe.INTRADAY, entry=100.0, stop=99.0, targets=[102.0])     # a quick re-check's
+    repo.record_play(loose)
+    rows = {r["id"]: r for r in repo.plays_on(clock.now_ny().date())}
+    finished = result.finished_at.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    assert dt.datetime.fromisoformat(rows[scanned.id]["scan_finished_at"]) == finished
+    assert rows[loose.id]["scan_finished_at"] is None
 
 
 def test_a_position_taken_off_in_parts_is_reviewed_whole_and_keeps_its_planned_exit_times(repo):

@@ -12,9 +12,10 @@ a strategy. After the close the review gathers, for one session:
   1R, a winner of 1R or more closed at a loss, a trade taken through a noise flag or before
   it was confirmed, going straight back into a stock that had just stopped out;
 - **the plays that weren't taken** and how each would have gone, followed on the session's
-  5-minute candles exactly the way the replay follows a trade - grouped by noise flag, so
-  every check is tested on live plays every day, and by whether Autopilot's checks
-  passed them;
+  5-minute candles exactly the way the replay follows a trade, from the moment the play was
+  on the board with the values it was recorded with (an entry sent that never filled, from
+  the moment it was sent) - grouped by noise flag, so every check is tested on live plays
+  every day, and by whether Autopilot's checks passed them;
 - **each strategy's real record** over the last 20 sessions against its replay record,
   and the evidence weight that follows (research/weights.py);
 - **lessons** - plain sentences drawn from all of it.
@@ -210,18 +211,29 @@ def _key(row: Mapping[str, Any]) -> tuple:
     return row.get("symbol"), row.get("strategy"), row.get("side")
 
 
+def _sent(row: Mapping[str, Any]) -> bool:
+    return row.get("status") in SENT_UNFILLED
+
+
+def _capped(ranked: Sequence[Mapping[str, Any]], limit: Optional[int]) -> List[Mapping[str, Any]]:
+    """The ``limit`` highest-scoring of ``ranked``, and every entry sent among the rest: what became of an
+    order that went out is worth knowing whatever its score."""
+    return list(ranked) if limit is None else [*ranked[:limit], *(p for p in ranked[limit:] if _sent(p))]
+
+
 def first_sightings(plays: Sequence[Mapping[str, Any]], limit: Optional[int] = MAX_SHADOWS) -> List[Mapping[str, Any]]:
-    """Each day-trade setup the first time it was offered, when it was never taken - the
-    highest-scoring ones when there are too many to follow (``limit=None``: every one)."""
+    """Each day-trade setup the first time it was offered, when it was never taken - or, when its
+    entry was sent and never filled, the row it was sent from, which holds what it was sent on. The
+    highest-scoring ones when there are too many to follow, and the entries sent past them all the
+    same (``limit=None``: every one)."""
     traded = {_key(p) for p in plays if p.get("status") in TAKEN}
-    seen: set = set()
-    out = []
+    chosen: Dict[tuple, Mapping[str, Any]] = {}
     for p in sorted(plays, key=lambda p: p.get("created_at") or ""):
-        if p.get("timeframe") != "INTRADAY" or p.get("kind") != "TECHNICAL" or _key(p) in traded or _key(p) in seen:
+        if p.get("timeframe") != "INTRADAY" or p.get("kind") != "TECHNICAL" or _key(p) in traded:
             continue
-        seen.add(_key(p))
-        out.append(p)
-    return sorted(out, key=lambda p: -float(p.get("score") or 0.0))[:limit]
+        if _key(p) not in chosen or (_sent(p) and not _sent(chosen[_key(p)])):
+            chosen[_key(p)] = p
+    return _capped(sorted(chosen.values(), key=lambda p: -float(p.get("score") or 0.0)), limit)
 
 
 def sent_unfilled(plays: Sequence[Mapping[str, Any]], booked: Iterable[Any]) -> int:
@@ -259,12 +271,26 @@ def held_for(row: Mapping[str, Any]) -> tuple:
         return 0.0, 0.0
 
 
-def _seen_at(row: Mapping[str, Any]) -> Optional[pd.Timestamp]:
+def _ny(stamp: Any) -> Optional[pd.Timestamp]:
+    """A recorded time in New York - one without a zone is UTC, the way the database keeps it."""
     try:
-        stamp = pd.Timestamp(row["created_at"])
-    except (KeyError, TypeError, ValueError):
+        at = pd.Timestamp(stamp)
+    except (TypeError, ValueError):
         return None
-    return (stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp).tz_convert(NY)
+    if pd.isna(at):
+        return None
+    return (at.tz_localize("UTC") if at.tzinfo is None else at).tz_convert(NY)
+
+
+def _offered_at(row: Mapping[str, Any], seen_at: pd.Timestamp) -> pd.Timestamp:
+    """When a play row was on the board with the values it holds. A row keeps the values of the last scan
+    that wrote it, and a scan's plays reach the board only when it finishes - a wide scan takes minutes -
+    so the later of the setup's first sighting and that finish (the first sighting alone when the scan
+    wasn't recorded). A row that was sent holds what it was sent on, so it starts when it went out."""
+    later = [_ny(row.get("scan_finished_at"))]
+    if _sent(row):
+        later.append(_ny(((row.get("evidence") or {}).get("at_entry") or {}).get("at")))
+    return max([seen_at, *(t for t in later if t is not None)])
 
 
 def _welch_t(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
@@ -303,15 +329,21 @@ def shadow_outcomes(plays: Sequence[Mapping[str, Any]], bars: Mapping[str, pd.Da
     rows: List[Dict[str, Any]] = []
     # every setup not taken is counted, so the ones followed are told as the share of them they are
     eligible = first_sightings(plays, limit=None)
-    for row in eligible[:MAX_SHADOWS]:
-        frame, play, seen_at = bars.get(row["symbol"]), _play(row), _seen_at(row)
+    past_cap = 0
+    for i, row in enumerate(_capped(eligible, MAX_SHADOWS)):
+        frame, play, seen_at = bars.get(row["symbol"]), _play(row), _ny(row.get("created_at"))
         if frame is None or play is None or seen_at is None:
             continue
+        past_cap += i >= MAX_SHADOWS                   # an entry sent that scored below the ones followed
+        # entered on the next bar after it was on the board as recorded, so its values, confirmations,
+        # features and checks all describe the moment it enters
+        offered_at = _offered_at(row, seen_at)
         session = frame[frame.index.date == day]
-        features = play_features(row, now=seen_at)
-        trade = shadow_trade(play, session, seen_at, settings, features=features) if len(session) else None
+        features = play_features(row, now=offered_at)
+        trade = shadow_trade(play, session, offered_at, settings, features=features) if len(session) else None
         rows.append({"play_id": row.get("id"), "symbol": play.symbol, "side": play.side.value, "strategy": play.strategy,
-                     "timeframe": play.timeframe.value, "seen_at": seen_at.isoformat(), "noise": play.noise,
+                     "timeframe": play.timeframe.value, "seen_at": seen_at.isoformat(),
+                     "offered_at": offered_at.isoformat(), "sent": _sent(row), "noise": play.noise,
                      "confirmations": play.confirmations,
                      "score": row.get("score"), "confidence": row.get("confidence"),
                      "reward_risk": row.get("reward_risk"), "passed_checks": bool(passes(row)),
@@ -332,6 +364,7 @@ def shadow_outcomes(plays: Sequence[Mapping[str, Any]], bars: Mapping[str, pd.Da
     split = _compare(away, passed)                    # the checks "flag" the plays they turn away
     return {
         "eligible": len(eligible), "cap": MAX_SHADOWS if len(eligible) > MAX_SHADOWS else None,
+        "sent_past_cap": past_cap,
         "followed": len(rows), "filled": len(filled), "summary": _stats(r["r"] for r in filled),
         "checks": {"passed": _stats(r["r"] for r in passed), "turned_away": _stats(r["r"] for r in away),
                    "verdict": split["verdict"].split(" - ")[0], "t": split["t"]},
@@ -408,8 +441,12 @@ def lessons(day: Mapping[str, Any], mistakes: Sequence[Mapping[str, Any]], shado
         eligible, cap = shadows.get("eligible", followed), shadows.get("cap")
         lead = f"{eligible} day setups weren't taken" if eligible != 1 else "1 day setup wasn't taken"
         if cap:
-            which = (f"the {cap} highest-scoring were followed" if followed == cap
-                     else f"{followed} of the {cap} highest-scoring could be followed")
+            # the entries sent that scored below the cap are followed too, and said apart from the top
+            past = shadows.get("sent_past_cap") or 0
+            top = followed - past
+            also = f" and the {past} entr{'ies' if past != 1 else 'y'} sent below them" if past else ""
+            which = (f"the {cap} highest-scoring{also} were followed" if top == cap
+                     else f"{top} of the {cap} highest-scoring{also} could be followed")
         elif followed == eligible:
             which = "all were followed" if eligible != 1 else "it was followed"
         else:
