@@ -226,3 +226,24 @@ def test_a_stop_at_break_even_or_better_is_locked_either_way():
     assert stop_locked("SHORT", 100.0, 100.0) and stop_locked("SHORT", 99.5, 100.0)
     assert not stop_locked("SHORT", 100.5, 100.0)
 
+
+
+def test_the_stop_moved_message_says_what_the_stop_locks_not_where_the_trade_is():
+    cfg = SimpleNamespace(enabled=True, breakeven_at_r=1.0, breakeven_lock_r=0.3, breakeven_buffer_bps=5,
+                          trail_start_r=1.5, trail_lock_ratio=0.5,
+                          flatten_intraday_before_close_min=10, max_swing_hold_days=0)
+    cases = [  # (side, initial stop, price, R the new stop locks, R the trade is at) - risk 2.0/sh from 100
+        ("LONG", 98.0, 102.8, 0.325, 1.4),      # break-even plus 0.3R and a 5 bp buffer: 100.65
+        ("SHORT", 102.0, 97.2, 0.325, 1.4),     # the same, below the entry: 99.35
+        ("LONG", 98.0, 106.0, 1.5, 3.0),        # the trail keeps half of +3R: 103
+    ]
+    for side, stop, price, locked, now in cases:
+        events = []
+        repo = FakeRepo([_trade(side=side, stop_price=stop, initial_stop_price=stop, target_price=None)])
+        em = ExitManager(repo, FakeExecutor(repo), quote_fn=lambda s, p=price: Quote(symbol=s, bid=p, ask=p, last=p),
+                         cfg=cfg, bus=SimpleNamespace(publish=lambda topic, **k: events.append((topic, k))))
+        em.run_once()
+        moved = [k for topic, k in events if topic == "exit.stop_moved"]
+        assert len(moved) == 1, side
+        assert abs(moved[0]["locked_r"] - locked) <= 0.006, (side, moved[0])
+        assert moved[0]["r_now"] == now and moved[0]["r"] == now      # r kept for older readers
