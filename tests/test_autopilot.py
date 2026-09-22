@@ -831,6 +831,18 @@ def test_the_bar_gives_the_gates_own_reason_for_every_check_on_the_play(cfg, pla
         assert words in gate and not bar["eligible"] and bar["waiting"] is None
 
 
+@pytest.mark.parametrize("play", [
+    mkplay(target=103.996),                                                 # reward:risk 1.998 - a row shows 2.0
+    mkplay(conf=0.4996),                                                    # confidence a row shows as 0.5
+])
+def test_the_bar_judges_the_plays_own_numbers_not_the_rows_rounded_ones(play):
+    ap = AutoPilot(FakeEngine(), _cfg(min_confidence=0.5, min_reward_risk=2.0), bus=SILENT)
+    gate = ap._pre_gate(play, 100_000.0)
+    assert gate is not None
+    bar = ap.decorate_play(play.to_row(), play)["autopilot"]
+    assert bar["why_not"] == gate and not bar["eligible"]                    # not green while the gate says no
+
+
 def test_the_bar_says_when_autopilot_itself_is_why_not():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(), bus=SILENT)
@@ -1070,3 +1082,18 @@ def test_the_loser_settings_are_saved_and_restored():
     again.load_runtime(saved)
     assert again.skip_replay_losers == "all" and again.replay_loser_r == 0.1
     assert again.status()["skip_replay_losers"] == "all"
+
+
+def test_a_bare_off_in_config_yaml_means_off():
+    import yaml
+
+    from tos_bot.config import AutopilotCfg
+
+    cfg = AutopilotCfg(**yaml.safe_load("skip_replay_losers: off"))         # YAML reads a bare off as false
+    assert cfg.skip_replay_losers == "off"
+    assert AutopilotCfg(**yaml.safe_load("skip_replay_losers: on")).skip_replay_losers == "day"
+    eng, ap = _practice(skip_replay_losers=False)
+    assert ap.skip_replay_losers == "off"
+    ap.configure(skip_replay_losers="day")
+    ap.load_runtime({"skip_replay_losers": False})
+    assert ap.skip_replay_losers == "off"

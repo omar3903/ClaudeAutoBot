@@ -1079,6 +1079,13 @@ def test_each_play_carries_the_latest_price_the_app_holds_and_when_its_from(engi
     assert row["last_price"] == engine.md.last_seen("AAPL")[0] and row["last_at"].startswith("20")
 
 
+def test_autopilots_badge_is_handed_the_play_itself_not_only_its_rounded_row(engine, monkeypatch):
+    p, handed = _play("AAPL"), []
+    monkeypatch.setattr(engine.autopilot, "decorate_play", lambda row, play=None: handed.append(play) or row)
+    engine._decorate(p)
+    assert handed == [p]
+
+
 def test_refresh_prices_the_plays_and_the_positions_and_sends_the_plays_out_again(engine, monkeypatch):
     p = _play("MSFT")
     engine.board.replace([p])

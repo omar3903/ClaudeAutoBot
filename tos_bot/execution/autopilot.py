@@ -59,6 +59,8 @@ def _mode(value: Any) -> str:
 
 
 def _loser_scope(value: Any) -> str:
+    if isinstance(value, bool):                 # YAML reads a bare off / on as false / true
+        return "day" if value else "off"
     value = str(value or "day").lower()
     return value if value in LOSER_SCOPES else "day"
 
@@ -813,12 +815,18 @@ class AutoPilot:
             return loser
         return None
 
+    @staticmethod
+    def _facts(p: Any) -> tuple:
+        """What _play_check reads off a play, unrounded: a play row rounds reward:risk and confidence for
+        show, so a 1.996 reads 2.00 there and would pass a 2.0 floor that the gate holds it to."""
+        return (p.timeframe.value, p.confidence, p.reward_risk, p.kind.value,
+                getattr(p.status, "value", str(p.status)), p.noise, p.confirmations, p.strategy)
+
     def _pre_gate(self, p: Any, equity: float) -> Optional[str]:
         """Cheap filters before we spend an engine assessment. Returns a reason
         string to skip, or None to proceed. The play's own checks come first (_play_check, which
         the dashboard's badge shares); the ones that change from pass to pass follow."""
-        why = self._play_check(p.timeframe.value, p.confidence, p.reward_risk, p.kind.value,
-                               getattr(p.status, "value", str(p.status)), p.noise, p.confirmations, p.strategy)
+        why = self._play_check(*self._facts(p))
         if why:
             return why
         doubted = self.model_refusal(p)
@@ -1032,11 +1040,12 @@ class AutoPilot:
         return list(self.skip_noise) + self._learned_skips()
 
     # ------------------------------------------------------------------ #
-    def decorate_play(self, row: Dict[str, Any]) -> Dict[str, Any]:
+    def decorate_play(self, row: Dict[str, Any], play: Any = None) -> Dict[str, Any]:
         """Tag a play row so the dashboard can show a '🤖 auto' badge - and, on a play Autopilot won't
-        take, why not, in the gate's own words."""
+        take, why not, in the gate's own words. ``play``: the Play the row was made from, when the caller
+        has it - its numbers are the gate's, where the row's are rounded."""
         pid = row.get("id")
-        why_not = self._why_not(row)
+        why_not = self._why_not(row, play)
         waiting = (self._waiting_for(str(row.get("timeframe") or ""), str(row.get("strategy") or ""))
                    if why_not is None else None)
         row["autopilot"] = {
@@ -1051,7 +1060,7 @@ class AutoPilot:
         }
         return row
 
-    def _why_not(self, row: Dict[str, Any]) -> Optional[str]:
+    def _why_not(self, row: Dict[str, Any], play: Any = None) -> Optional[str]:
         """Why Autopilot won't take a play row, if it won't: switched off, stopped for the day - which
         consider() says before any play is looked at - or the play's own checks."""
         if not self.enabled:
@@ -1060,6 +1069,8 @@ class AutoPilot:
             return "Autopilot is paper-only until autopilot.allow_live is set in config/config.yaml"
         if self.stopped_for_the_day:
             return "stopped for the day - the daily loss limit or the give-back rule was reached"
+        if play is not None:
+            return self._play_check(*self._facts(play), board=True)
         return self._play_check(str(row.get("timeframe") or ""), float(row.get("confidence", 0)),
                                 float(row.get("reward_risk", 0)), str(row.get("kind") or ""),
                                 str(row.get("status") or ""), row.get("noise") or [],

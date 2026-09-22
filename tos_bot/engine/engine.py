@@ -1759,7 +1759,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         row["executable_hint"] = p.suggested_qty > 0 and self._armed
         seen = self.md.last_seen(p.symbol)
         row["last_price"], row["last_at"] = (round(seen[0], 4), seen[1].isoformat()) if seen else (None, None)
-        return self.autopilot.decorate_play(row)
+        return self.autopilot.decorate_play(row, p)
 
     #: a price the app fetched this recently is newer than the broker's portfolio mark, which IBKR updates
     #: every few minutes; the exit manager keeps every open position's this fresh

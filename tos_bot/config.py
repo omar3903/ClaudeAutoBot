@@ -20,7 +20,7 @@ from typing import Any, Dict
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -249,6 +249,14 @@ class AutopilotCfg(_Model):
     giveback_floor_pct: float = 0.25      # the give-back rule only counts a peak gain of at least this % of equity
     require_catalyst: bool = False
     dry_run: bool = False
+
+    @field_validator("skip_replay_losers", mode="before")
+    @classmethod
+    def _bare_off(cls, value: Any) -> Any:
+        """YAML reads a bare ``off`` (or ``on``) as a boolean, which would stop the app starting."""
+        if isinstance(value, bool):
+            return "day" if value else "off"
+        return value
 
 
 class NoiseCfg(_Model):
