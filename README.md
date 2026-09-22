@@ -1182,8 +1182,11 @@ can't see them, and the report says so.
   waiting for its price, and is counted apart. Every exit counts, however slow - the app sends
   exits at market - and the ones over 60 s are counted. A stop or target resting at the broker has
   no such time, nor an entry taken back after a restart (when it really went out isn't known);
-* **lessons**, in plain sentences. **Rebuild the last session** writes it again on demand
-  (the movers are kept, and rebuilt once the session's candles are in).
+* **lessons**, in plain sentences. **Rebuild the last session** writes it again on demand,
+  the movers too: after a restart it first downloads the session's daily candles again - only
+  while the market is closed, since the download shares IB Gateway with the orders. When it
+  can't (the market open, IB Gateway away), it keeps the movers built before and says when
+  they were built and why they weren't refreshed.
 
 ---
 

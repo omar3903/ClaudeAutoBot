@@ -35,6 +35,7 @@ export function moversHTML(m, capture) {
       <div class="seg-group">${["gainers", "losers"].map(k => `<button class="seg mini ${side === k ? "active" : ""}" data-side="${k}">
         ${k === "gainers" ? "Gainers" : "Losers"} · ${m[k].length}</button>`).join("")}</div>
     </div>
+    ${m.stale ? `<p class="small warn-text">${escapeHtml(m.stale_note || "Built before this rebuild, which couldn't refresh them.")}</p>` : ""}
     <div class="journal-cards movers-score">
       ${card("Traded", `${s.traded} of ${s.movers}`, s.traded ? inR(s.traded_r) : "")}
       ${card("Offered, not taken", s.offered, s.offered_r != null ? `would have made ${inR(s.offered_r)}` : "")}

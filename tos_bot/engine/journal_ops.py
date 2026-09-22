@@ -68,12 +68,7 @@ class JournalOps:
             return
         if not self.md.attached and time.monotonic() - self._started_at < self.JOURNAL_GATEWAY_WAIT_S:
             return
-        if wants_movers and self.md.attached:
-            try:
-                self.scanner.update_market_daily(day)
-            except Exception:  # noqa: BLE001
-                log.warning("could not download the session's daily candles for the movers", exc_info=True)
-        out = self.review_session(day) if review is None else self.add_movers(day)
+        out = self.review_session(day) if review is None else self.add_movers(day)    # both read the candles first
         if wants_movers and not movers_built(out.get("review")):
             self._movers_retry_at = time.monotonic() + self.MOVERS_RETRY_S
         else:
@@ -98,15 +93,21 @@ class JournalOps:
             self._publish("position.earnings_ahead", symbol=t["symbol"], trade_id=t["id"], report=dict(upcoming), note=note)
 
     def review_session(self, day: Optional[dt.date] = None) -> Dict[str, Any]:
-        """Build one session's review (again, if it exists) and keep it. Its movers are rebuilt once every
-        stock's candles for the session are on disk; until then the ones built before are kept."""
+        """Build one session's review (again, if it exists) and keep it. Its movers are rebuilt from every
+        stock's candles for the session, downloaded first when they aren't on disk (after a restart) and
+        the market is closed; when they can't be read the ones built before are kept, marked stale."""
+        with self._review_lock:
+            return self._review_session(day)
+
+    def _review_session(self, day: Optional[dt.date]) -> Dict[str, Any]:
         cfg = self.settings.config
         day = day or review_day(clock.now_ny(), cfg.journal.review_at)
         trades = [t for t in self.repo.closed_trades_between(day, day) if not t.get("pair_id")]
         opened = [t for t in self.repo.trades_opened_between(day, day) if not t.get("pair_id")]
         plays = self.repo.plays_on(day)
         pair_trades = self.repo.pair_trades_closed_between(day, day)
-        if not trades and not opened and not plays and not pair_trades and not self._movers_ready(day):
+        ready = self._load_market_daily(day)
+        if not trades and not opened and not plays and not pair_trades and not ready:
             return {"ok": False, "reason": f"Nothing was offered or traded on {day.isoformat()}."}
         first = min(clock.last_n_sessions(day, ROLLING_SESSIONS))
         earlier = self.journal.get(day) or {}
@@ -128,7 +129,8 @@ class JournalOps:
                                      f"closed: {total:+.2f}R in all.")
         if cfg.journal.movers > 0:
             built = earlier.get("movers")
-            review["movers"] = self._movers(day, review, plays) or (built if movers_built({"movers": built})
+            review["movers"] = self._movers(day, review, plays) or (self._stale_movers(day, built)
+                                                                    if movers_built({"movers": built})
                                                                     else self._movers_pending())
             if not trades and not opened and not plays and not pair_trades and not movers_built(review):
                 return {"ok": False, "reason": f"Nothing was offered or traded on {day.isoformat()}."}
@@ -176,21 +178,54 @@ class JournalOps:
 
     def add_movers(self, day: dt.date) -> Dict[str, Any]:
         """Add the movers to a session's review written without them."""
-        review = self.journal.get(day)
-        if review is None:
-            return self.review_session(day)
-        movers = self._movers(day, review, self.repo.plays_on(day))
-        if movers is None:
-            return {"ok": False, "reason": "The session's movers can't be built yet."}
-        review["movers"] = movers
-        self.journal.save(review)
-        self._publish("journal.updated", session=review["session"], mistakes=len(review["mistakes"]),
-                    lessons=len(review["lessons"]))
-        return {"ok": True, "review": review}
+        with self._review_lock:
+            review = self.journal.get(day)
+            if review is None:
+                return self._review_session(day)
+            self._load_market_daily(day)
+            movers = self._movers(day, review, self.repo.plays_on(day))
+            if movers is None:
+                return {"ok": False, "reason": "The session's movers can't be built yet."}
+            review["movers"] = movers
+            self.journal.save(review)
+            self._publish("journal.updated", session=review["session"], mistakes=len(review["mistakes"]),
+                        lessons=len(review["lessons"]))
+            return {"ok": True, "review": review}
 
     def _movers_ready(self, day: dt.date) -> bool:
         have = self.scanner.market_daily
         return self.settings.config.journal.movers > 0 and have is not None and have[0] >= day
+
+    def _load_market_daily(self, day: dt.date) -> bool:
+        """Whether every tradable stock's daily candles reach ``day``, downloading them when they don't
+        (the app restarted since the evening's download, say). Only while the market is closed: the
+        listing and contract lookups for the whole market share IB Gateway with the orders."""
+        if self._movers_ready(day):
+            return True
+        if self.settings.config.journal.movers <= 0 or not self.md.attached or clock.is_market_open():
+            return False
+        try:
+            self.scanner.update_market_daily(day)
+        except Exception:  # noqa: BLE001
+            log.warning("could not download the session's daily candles for the movers", exc_info=True)
+        return self._movers_ready(day)
+
+    def _stale_movers(self, day: dt.date, built: Mapping[str, Any]) -> Dict[str, Any]:
+        """The movers an earlier build kept, saying when they were built and why this rebuild couldn't
+        refresh them - rather than passing them off as rebuilt. While the market is open the button
+        rebuilds the session before; from ``review_at`` it moves on to the new one, hence the window."""
+        try:
+            at = dt.datetime.fromisoformat(str(built["built_at"])).astimezone(clock.NY).strftime("Built %a %H:%M ET, ")
+        except (KeyError, ValueError):
+            at = "Built "
+        why = ("the movers couldn't be built (see the log). Rebuild to try again." if self._movers_ready(day) else
+               "the session's candles aren't downloaded while the market is open (the download shares IB Gateway "
+               f"with the orders). Rebuild between the close and {self.settings.config.journal.review_at} ET to "
+               "refresh." if clock.is_market_open() else
+               "IB Gateway wasn't connected, so the session's candles couldn't be read. Rebuild with it connected "
+               "to refresh." if not self.md.attached else
+               "the session's candles couldn't be read (see the log). Rebuild to try again.")
+        return {**built, "stale": True, "stale_note": f"{at}before this rebuild - {why}"}
 
     def _movers_pending(self) -> Dict[str, Any]:
         return {"ok": False, "note": "The market's biggest movers are added once every stock's candles for the session "
