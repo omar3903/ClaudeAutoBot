@@ -1007,6 +1007,37 @@ def test_a_working_entrys_countdowns_are_sent_with_it_but_never_pushed_on_their_
     assert heard.count("orders.updated") == 1
 
 
+def test_a_countdown_that_starts_after_its_order_was_sent_is_pushed(engine, monkeypatch):
+    """The orders loop can list a part-fill before the order sync notes its first fill, and an entry left
+    working by an earlier run is listed before it is taken over. The cut, or the time-out, that follows
+    changes nothing else about the order - it is still told to the browser, once."""
+    from tos_bot.execution.executor import _Pending
+
+    play = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=100.0, stop=95.0, targets=[110.0])
+    working = [OrderResult(order_id="1", status="WORKING", symbol="AAA", submitted_qty=5, filled_qty=0,
+                           side=Side.LONG, tag=play.id, order_type="LIMIT", limit_price=100.0)]
+    monkeypatch.setattr(engine.executor.broker, "list_orders", lambda status=None: list(working))
+    sent = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **payload: sent.append((topic, payload)))
+    pushed = lambda: [p["orders"][0] for t, p in sent if t == "orders.updated"]   # noqa: E731
+
+    engine._refresh_orders()                                                # not yet followed: no clock
+    assert [(o["purpose"], o["expires_at"]) for o in pushed()] == [("entry", None)]
+    engine.executor._pending["1"] = _Pending("1", play, "entry", qty=5, adopted=True,
+                                             submitted_at=dt.datetime.now(dt.timezone.utc))
+    engine._refresh_orders()                                                # taken over: its time-out starts
+    assert len(pushed()) == 2 and pushed()[-1]["expires_at"] and pushed()[-1]["cut_at"] is None
+
+    working[0] = dataclasses.replace(working[0], filled_qty=2)
+    engine._refresh_orders()                                                # the fill, before the sync has noted it
+    assert len(pushed()) == 3 and pushed()[-1]["filled"] == 2 and pushed()[-1]["cut_at"] is None
+    engine.executor._pending["1"].first_fill_at = time.monotonic()          # the order sync notes it
+    engine._refresh_orders()
+    engine._refresh_orders()
+    assert len(pushed()) == 4 and pushed()[-1]["cut_at"]
+
+
 def test_the_session_review_keeps_each_trade_with_what_it_was_taken_on(engine):
     from tos_bot.util import clock
 

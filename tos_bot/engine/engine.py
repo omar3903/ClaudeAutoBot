@@ -1940,6 +1940,13 @@ def _utc(value: Any) -> Optional[dt.datetime]:
 
 
 def _order_signature(orders: List[Dict[str, Any]]) -> tuple:
-    """What has to change for the dashboard to be told about the working orders."""
+    """What has to change for the dashboard to be told about the working orders. A countdown counts when it
+    starts or stops, not by its time: the part-fill cut is worked out again at each look, and the first fill
+    it runs from can be noted by the order sync after this loop has already sent the fill."""
     keys = ("order_id", "status", "filled", "remaining", "limit_price", "stop_price", "purpose", "trade_id")
-    return tuple(sorted((tuple(o.get(k) for k in keys) for o in orders), key=lambda row: str(row[0])))
+
+    def row(o: Dict[str, Any]) -> tuple:
+        clocks = (o.get("expires_at") is not None, o.get("cut_at") is not None, bool(o.get("calling_off")))
+        return tuple(o.get(k) for k in keys) + clocks
+
+    return tuple(sorted((row(o) for o in orders), key=lambda r: str(r[0])))

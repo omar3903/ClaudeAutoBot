@@ -195,8 +195,8 @@ class Executor(ProtectiveStops):
         acts on: ``expires_at`` a day-trade entry's time-out (entry_timeout_min after it went out, or after it
         was taken over), ``cut_at`` the rest of a part-filled one cancelled (partial_entry_wait_s after its
         first fill; never a pair leg's), ``calling_off`` why the app has asked the broker to cancel it and is
-        waiting to hear it has. Times are UTC. engine._order_signature leaves them out, so they are sent with
-        the order and the browser counts down - nothing is pushed each second."""
+        waiting to hear it has. Times are UTC. engine._order_signature counts only whether each one is there,
+        so one appearing is pushed and the browser counts down - nothing is pushed each second."""
         out: Dict[str, Any] = {"submitted_at": None, "expires_at": None, "cut_at": None, "calling_off": None}
         if p is None or p.kind != "entry":
             return out
