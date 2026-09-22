@@ -676,7 +676,23 @@ class Repository:
         wk = clock.last_n_sessions(today, 5)[0]
         with session_scope() as s:
             closed = s.execute(select(Trade).where(Trade.status == "CLOSED")).scalars().all()
+            pairs_open = set(s.execute(select(Trade.pair_id).where(Trade.status != "CLOSED",
+                                                                   Trade.pair_id.is_not(None))).scalars().all())
         pls = [float(t.realized_pl) for t in closed if t.realized_pl is not None]
+        # closed trades that made or lost money, by type: a pair is one trade - its legs' P/L together, once both
+        # are closed
+        by_type = {k: {"closed": 0, "profit": 0, "loss": 0, "even": 0} for k in ("INTRADAY", "SWING", "PAIRS")}
+        pair_pl: Dict[str, float] = {}
+        for t in closed:
+            if t.realized_pl is None:
+                continue
+            if t.pair_id:
+                if t.pair_id not in pairs_open:
+                    pair_pl[t.pair_id] = pair_pl.get(t.pair_id, 0.0) + float(t.realized_pl)
+                continue
+            _count_outcome(by_type["INTRADAY" if t.timeframe == "INTRADAY" else "SWING"], float(t.realized_pl))
+        for pl in pair_pl.values():
+            _count_outcome(by_type["PAIRS"], pl)
         wins = [x for x in pls if x > 0]
         losses = [x for x in pls if x < 0]
         day = sum(float(t.realized_pl or 0) for t in closed
@@ -698,6 +714,7 @@ class Repository:
             "expectancy": round(sum(pls) / n, 2) if n else 0.0,
             "best": round(max(pls), 2) if pls else 0.0,
             "worst": round(min(pls), 2) if pls else 0.0,
+            "by_type": by_type,
         }
 
     # -------------------------------------------------------------- #
@@ -725,6 +742,12 @@ class Repository:
 
 _PAIR_COLUMNS = {"first": "first_symbol", "second": "second_symbol"}
 _PAIR_TIMES = ("opened_at", "closed_at", "created_at")
+
+
+def _count_outcome(tally: Dict[str, int], pl: float) -> None:
+    """One closed trade into its type's tally: a profit, a loss, or even."""
+    tally["closed"] += 1
+    tally["profit" if pl > 0 else "loss" if pl < 0 else "even"] += 1
 
 
 def _pair_columns(row: Dict[str, Any]) -> Dict[str, Any]:

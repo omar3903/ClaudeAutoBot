@@ -331,7 +331,20 @@ export async function loadStats() {
     ${stat("Expectancy / trade", usd(s.expectancy))}
     ${stat("Best", usd(s.best), "pl-pos")}
     ${stat("Worst", usd(s.worst), "pl-neg")}
-  </div>`;
+  </div>` + byTypeHTML(s.by_type);
+}
+
+/* Closed trades by type: how many exited with a profit and how many with a loss. A pair counts once, both legs
+   together. Open positions aren't counted. */
+function byTypeHTML(bt) {
+  if (!bt) return "";
+  const rows = [["INTRADAY", "Day trades"], ["SWING", "Swing trades"], ["PAIRS", "Pairs"]].map(([key, label]) => {
+    const r = bt[key] || {};
+    return `<tr><td>${label}</td><td class="num">${r.closed || 0}</td><td class="num pl-pos">${r.profit || 0}</td>
+      <td class="num pl-neg">${r.loss || 0}</td><td class="num">${r.even || 0}</td></tr>`;
+  }).join("");
+  return `<table><thead><tr><th>Closed trades by type</th><th class="num">Closed</th><th class="num">Profit</th>
+    <th class="num">Loss</th><th class="num">Break-even</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 /* ---------- trade record (open or closed) ---------- */
