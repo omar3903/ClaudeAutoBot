@@ -115,7 +115,8 @@ class JournalOps:
         review = build_review(
             day, trades=trades, plays=plays, rolling=self.repo.closed_trades_between(first, day),
             replay_records=self.replay.records(*self._record_terms()), evidence=self.evidence_state(),
-            regime=self.regime.reading(), bars=self._session_bars(day, plays),
+            regime=self.regime.reading(),
+            bars=self._session_bars(day, plays, booked=[t.get("play_id") for t in (*trades, *opened)]),
             settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay, cfg.risk.min_reward_risk),
             gates=gates, passes=lambda row: self._passes_checks(row, gates),
             styles={k: c.style for k, c in REGISTRY.items()}, titles={k: c.title for k, c in REGISTRY.items()},
@@ -298,10 +299,12 @@ class JournalOps:
                 "daily": candles(daily, self.MOVER_CHART_BEFORE + self.MOVER_CHART_AFTER),
                 "intraday": candles(session, 200)}
 
-    def _session_bars(self, day: dt.date, plays: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _session_bars(self, day: dt.date, plays: List[Dict[str, Any]],
+                      booked: Sequence[Any] = ()) -> Optional[Dict[str, Any]]:
         """The session's 5-minute candles for the plays not taken that the review follows - the entries sent
-        and never filled among them, whatever their score (kept with the replay's candles)."""
-        symbols = list(dict.fromkeys(p["symbol"] for p in first_sightings(plays)))
+        and never filled among them, whatever their score (kept with the replay's candles). ``booked``: the
+        play ids the session's trades were opened from, so the setups taken are the review's own."""
+        symbols = list(dict.fromkeys(p["symbol"] for p in first_sightings(plays, booked=booked)))
         if not symbols:
             return {}
         if not self.md.attached:

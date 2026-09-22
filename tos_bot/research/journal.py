@@ -221,12 +221,16 @@ def _capped(ranked: Sequence[Mapping[str, Any]], limit: Optional[int]) -> List[M
     return list(ranked) if limit is None else [*ranked[:limit], *(p for p in ranked[limit:] if _sent(p))]
 
 
-def first_sightings(plays: Sequence[Mapping[str, Any]], limit: Optional[int] = MAX_SHADOWS) -> List[Mapping[str, Any]]:
+def first_sightings(plays: Sequence[Mapping[str, Any]], limit: Optional[int] = MAX_SHADOWS,
+                    booked: Iterable[Any] = ()) -> List[Mapping[str, Any]]:
     """Each day-trade setup the first time it was offered, when it was never taken - or, when its
     entry was sent and never filled, the row it was sent from, which holds what it was sent on. The
     highest-scoring ones when there are too many to follow, and the entries sent past them all the
-    same (``limit=None``: every one)."""
-    traded = {_key(p) for p in plays if p.get("status") in TAKEN}
+    same (``limit=None``: every one). A setup was taken when an entry of it filled or a trade was
+    booked from one of its rows (``booked``: those play ids) - a row still marked sent with no trade
+    booked is an entry sent that never filled, as sent_unfilled counts it."""
+    have = set(booked) - {None}
+    traded = {_key(p) for p in plays if (p.get("status") in TAKEN and not _sent(p)) or p.get("id") in have}
     chosen: Dict[tuple, Mapping[str, Any]] = {}
     for p in sorted(plays, key=lambda p: p.get("created_at") or ""):
         if p.get("timeframe") != "INTRADAY" or p.get("kind") != "TECHNICAL" or _key(p) in traded:
@@ -325,10 +329,11 @@ def _compare(flagged: Sequence[Mapping[str, Any]], rest: Sequence[Mapping[str, A
 
 
 def shadow_outcomes(plays: Sequence[Mapping[str, Any]], bars: Mapping[str, pd.DataFrame], day: dt.date,
-                    settings: ReplaySettings, passes: Callable[[Mapping[str, Any]], bool]) -> Dict[str, Any]:
+                    settings: ReplaySettings, passes: Callable[[Mapping[str, Any]], bool],
+                    booked: Iterable[Any] = ()) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
     # every setup not taken is counted, so the ones followed are told as the share of them they are
-    eligible = first_sightings(plays, limit=None)
+    eligible = first_sightings(plays, limit=None, booked=booked)
     past_cap = 0
     for i, row in enumerate(_capped(eligible, MAX_SHADOWS)):
         frame, play, seen_at = bars.get(row["symbol"]), _play(row), _ny(row.get("created_at"))
@@ -615,14 +620,15 @@ def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Se
     still_open = [t for t in opened if t.get("status") == "OPEN"]
     mistakes = find_mistakes(list(trades) + still_open, skip_noise=skip_noise, min_confirmations=min_confirmations,
                              styles=styles)
+    booked = {t.get("play_id") for t in (*trades, *opened)}          # the plays the session's trades came from
     if bars is None:
-        shadows: Dict[str, Any] = {"eligible": len(first_sightings(plays, limit=None)), "followed": 0, "filled": 0,
-                                   "summary": {"trades": 0},
+        shadows: Dict[str, Any] = {"eligible": len(first_sightings(plays, limit=None, booked=booked)), "followed": 0,
+                                   "filled": 0, "summary": {"trades": 0},
                                    "note": "IB Gateway wasn't connected, so the plays not taken couldn't be followed."}
     else:
-        shadows = shadow_outcomes(plays, bars, day, settings, passes)
+        shadows = shadow_outcomes(plays, bars, day, settings, passes, booked=booked)
     # an entry that went out and bought nothing is told apart, with candles or without
-    shadows["sent_unfilled"] = sent_unfilled(plays, (t.get("play_id") for t in (*trades, *opened)))
+    shadows["sent_unfilled"] = sent_unfilled(plays, booked)
     strategies = strategy_table(live_records(rolling), replay_records, evidence, titles)
     fills = execution_quality(rolling, settings.slippage_bps + settings.commission_bps)
     notes = lessons(day_stats, mistakes, shadows, strategies, regime, titles, breakeven_at_r)

@@ -1160,7 +1160,8 @@ ranking of the previous day's candles can't see them, and the report says so.
 * **the plays not taken**, each followed on the session's 5-minute candles as if
   it had been, from the next bar after it was on the board with the values it was
   recorded with (a play's row holds the last scan that wrote it, and a scan's plays
-  reach the board when it finishes); an entry sent that never filled is followed
+  reach the board when it finishes); an entry sent that never filled (a sent row
+  no trade was booked from, even one still marked submitted) is followed
   from the row it was sent from, from the moment it went out, however it scored —
   grouped by noise flag and by whether Autopilot's checks passed
   it, so every check is tested on live plays every day. The checks are the ones in

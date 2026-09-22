@@ -115,8 +115,11 @@ def test_the_plays_not_taken_are_told_as_not_taken_followed_filled_and_sent(monk
     booked = {**_opened("o1", "T03"), "play_id": "s3"}                       # its entry filled after all
     for bars in (BARS, None):
         review = _review(plays=PLAYS + sent, opened=[booked], bars=bars)
-        assert (review["shadows"]["sent_unfilled"], review["shadows"]["eligible"]) == (2, 5)   # RPL, and the four never taken
+        assert (review["shadows"]["sent_unfilled"], review["shadows"]["eligible"]) == (2, 5)   # RPL, and the four not taken
         assert "2 entries were sent and never filled." in review["lessons"]
+    # the two sent that never filled are setups not taken; the one a trade was booked from was taken
+    assert ({p["symbol"] for p in first_sightings(PLAYS + sent, limit=None, booked=["s3"])}
+            == {"RPL", "T01", "T02", "T04", "T05"})
 
 
 def test_a_play_not_taken_enters_on_the_bar_after_the_scan_that_wrote_its_row_finished():
@@ -156,6 +159,23 @@ def test_an_entry_sent_and_never_filled_is_followed_as_sent_even_past_the_cap(mo
     assert rows["p1"]["sent"] is False
     assert ("3 day setups weren't taken; the 1 highest-scoring and the 1 entry sent below them were followed on the "
             "session's candles") in " ".join(review["lessons"])
+
+
+def test_an_entry_still_marked_sent_with_no_trade_booked_is_followed_not_counted_as_taken():
+    """A play row still ACCEPTED, SUBMITTED or WORKING when no trade came of it is an entry sent that never
+    filled, as the review counts it - so its setup is followed from that row, not dropped as taken. One a
+    trade was booked from was taken, whatever its row says."""
+    for status in ("ACCEPTED", "SUBMITTED", "WORKING"):
+        plays = [_row("p1", "13:52"), _row("p2", "13:57", status=status)]
+        assert [p["id"] for p in first_sightings(plays, limit=None)] == ["p2"]
+        shadows = _review(plays=plays)["shadows"]
+        assert [(r["play_id"], r["sent"]) for r in shadows["plays"]] == [("p2", True)]
+        assert (shadows["eligible"], shadows["sent_unfilled"]) == (1, 1)
+
+        booked = {**_opened("o1", "RPL"), "play_id": "p2"}
+        assert first_sightings(plays, limit=None, booked=["p2"]) == []
+        taken = _review(plays=plays, opened=[booked])["shadows"]
+        assert (taken["eligible"], taken["followed"], taken["sent_unfilled"]) == (0, 0, 0)
 
 
 def test_the_lessons_and_the_strategies_real_record_against_the_replay():
