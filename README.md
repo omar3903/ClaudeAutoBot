@@ -1156,12 +1156,13 @@ can't see them, and the report says so.
 * **each strategy's real record** over the last 20 sessions against its replay,
   flagged when it falls more than 0.3R a trade short;
 * **how the orders filled** — the seconds from an order going out to the fill coming back, typically
-  and at worst, going in and coming out. Every trade keeps its own (`entry_latency_s`,
-  `exit_latency_s`), so the training set can learn from how long a fill took, and a broker or a
-  venue that gets slower shows up as a number rather than a feeling. The review measures the broker
-  on fills within 60 s; a limit entry that rested longer was waiting for its price, and is counted
-  apart. A stop or target resting at the broker has no such time, nor an entry taken back after a
-  restart (when it really went out isn't known);
+  (the median) and at worst, going in and coming out, with how many fills and since which day. Every
+  trade keeps its own (`entry_latency_s`, `exit_latency_s`), so the training set can learn from how
+  long a fill took, and a broker or a venue that gets slower shows up as a number rather than a
+  feeling. The review measures entries on fills within 60 s; a limit entry that rested longer was
+  waiting for its price, and is counted apart. Every exit counts, however slow - the app sends
+  exits at market - and the ones over 60 s are counted. A stop or target resting at the broker has
+  no such time, nor an entry taken back after a restart (when it really went out isn't known);
 * **lessons**, in plain sentences. **Rebuild the last session** writes it again on demand
   (the movers are kept, and rebuilt once the session's candles are in).
 

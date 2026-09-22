@@ -1,6 +1,6 @@
 /* The journal half of a session's report (see reports.js): the trades and what they were taken on, the
    mistakes, the plays not taken and how they would have gone, the strategies' records, and the lessons. */
-import { escapeHtml, fmtClock, num, usd } from "./util.js";
+import { count, escapeHtml, fmtClock, num, plural, usd } from "./util.js";
 import { stratLabel } from "./strategies.js";
 
 export const inR = v => v == null ? "–" : `${v >= 0 ? "+" : ""}${num(v, 2)}R`;
@@ -9,10 +9,15 @@ export const pctOf = v => v == null ? "–" : `${Math.round(v * 100)}%`;
 const SEVERITY = { high: "bad", medium: "warn", info: "" };
 
 function executionHTML(x) {
-  if (!x || x.entry_latency_s == null) return "";
+  if (!x || (x.entry_latency_s == null && x.exit_latency_s == null)) return "";
   const s = v => v == null ? "–" : `${num(v, 1)}s`;
+  // the fills the times cover, and the market exits that were slow (reviews saved before these were kept don't say)
+  const span = x.since ? ` Over ${x.entry_fills} entr${x.entry_fills === 1 ? "y" : "ies"} and ${plural(x.exit_fills, "exit")}
+    timed since ${escapeHtml(x.since)}.` : "";
+  const slow = x.slow_exits ? ` ${plural(x.slow_exits, "market exit")} took longer than 60s, the slowest
+    ${count(Math.round(x.slowest_exit_s))}s.` : "";
   return `<h4>How the orders filled</h4><p class="muted">Typically ${s(x.entry_latency_s)} from the order going out to the fill coming back
-    on the way in${x.exit_latency_s == null ? "" : `, ${s(x.exit_latency_s)} on the way out`}${x.slowest_entry_s ? ` (slowest entry ${num(x.slowest_entry_s, 0)}s)` : ""}.
+    on the way in${x.exit_latency_s == null ? "" : `, ${s(x.exit_latency_s)} on the way out`}${x.slowest_entry_s ? ` (slowest entry ${num(x.slowest_entry_s, 0)}s)` : ""}.${span}${slow}
     A stop or target resting at the broker isn't counted - it waits for the price, not for the broker.</p>`;
 }
 

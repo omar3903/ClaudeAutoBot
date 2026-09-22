@@ -378,9 +378,40 @@ def lessons(day: Mapping[str, Any], mistakes: Sequence[Mapping[str, Any]], shado
 MIN_FILLS = 5                     # measured fills before the replay's cost assumption is questioned
 
 
-#: a fill slower than this was a limit waiting for its price, not the broker taking its time - the
-#: review's "how the orders filled" measures the broker (the trade keeps its own seconds either way)
+#: an entry slower than this was a limit waiting for its price, not the broker taking its time - the
+#: review's "how the orders filled" measures the broker (the trade keeps its own seconds either way).
+#: Exits aren't cut: the app sends them at market, so a slow one was slow at the broker and is told
 BROKER_FILL_S = 60.0
+
+
+def _median(values: Sequence[float]) -> Optional[float]:
+    """The middle value - the mean of the two middle ones for an even count: a single slow fill can't skew it."""
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    half = len(ordered) // 2
+    return round(ordered[half] if len(ordered) % 2 else (ordered[half - 1] + ordered[half]) / 2, 2)
+
+
+def _wait(seconds: float) -> str:
+    """A fill time in words - "40s", "25 min (1,500s)" - so a slow one reads as slow."""
+    if seconds < 120:
+        return f"{seconds:.0f}s"
+    if seconds < 7200:
+        return f"{seconds / 60:.0f} min ({seconds:,.0f}s)"
+    return f"{seconds / 3600:.1f} h ({seconds:,.0f}s)"
+
+
+def _ny_day(stamp: Any) -> Optional[dt.date]:
+    """The New York day of a stored (UTC) time."""
+    if not stamp:
+        return None
+    try:
+        at = pd.Timestamp(stamp)
+    except (TypeError, ValueError):
+        return None
+    return (at.tz_localize("UTC") if at.tzinfo is None else at).tz_convert(NY).date()
+
 
 def execution_quality(trades: Sequence[Mapping[str, Any]], assumed_bps: float) -> Dict[str, Any]:
     """Harris's implementation shortfall over the rolling sessions: what the fills cost against the
@@ -390,28 +421,42 @@ def execution_quality(trades: Sequence[Mapping[str, Any]], assumed_bps: float) -
         values = [float(t[key]) for t in trades if t.get(key) is not None]
         return round(sum(values) / len(values), 2) if values else None
 
-    def fills(key: str) -> List[float]:
-        """The fills that measure the broker: a limit that rested longer was waiting for the price."""
-        return [float(t[key]) for t in trades if t.get(key) is not None and float(t[key]) <= BROKER_FILL_S]
+    def timed(key: str) -> List[float]:
+        return [float(t[key]) for t in trades if t.get(key) is not None]
 
-    def seconds(key: str) -> Optional[float]:
-        values = sorted(fills(key))
-        return round(values[len(values) // 2], 2) if values else None      # the middle one: a single slow fill can't skew it
-
+    # the fills that measure the broker: an entry that rested longer was a limit waiting for its price;
+    # an exit goes out at market, so every one counts, however slow
+    went_in = [s for s in timed("entry_latency_s") if s <= BROKER_FILL_S]
+    came_out = timed("exit_latency_s")
+    # the window the times cover: from the day of the first fill timed
+    days = ([_ny_day(t.get("entry_time")) for t in trades if t.get("entry_latency_s") is not None]
+            + [_ny_day(t.get("exit_time")) for t in trades if t.get("exit_latency_s") is not None])
+    since = min((d for d in days if d), default=None)
     entries = sum(1 for t in trades if t.get("entry_slippage_bps") is not None)
     exits = sum(1 for t in trades if t.get("exit_slippage_bps") is not None)
     out: Dict[str, Any] = {"entries": entries, "exits": exits, "entry_slippage_bps": mean("entry_slippage_bps"),
                            "exit_slippage_bps": mean("exit_slippage_bps"), "spread_bps": mean("spread_bps"),
                            "assumed_bps": round(float(assumed_bps), 2),
-                           # how long the broker took to fill, typically, in seconds
-                           "entry_latency_s": seconds("entry_latency_s"), "exit_latency_s": seconds("exit_latency_s"),
-                           "slowest_entry_s": max(fills("entry_latency_s"), default=None),
+                           # how long the broker took to fill, typically, in seconds - and over which fills
+                           "entry_latency_s": _median(went_in), "exit_latency_s": _median(came_out),
+                           "entry_fills": len(went_in), "exit_fills": len(came_out),
+                           "since": since.isoformat() if since else None,
+                           "slowest_entry_s": max(went_in, default=None), "slowest_exit_s": max(came_out, default=None),
+                           "slow_exits": sum(1 for s in came_out if s > BROKER_FILL_S),
                            "rested_entries": sum(1 for t in trades if t.get("entry_latency_s") is not None
                                                  and float(t["entry_latency_s"]) > BROKER_FILL_S)}
-    if out["entry_latency_s"] is not None:
-        out["latency_note"] = (f"Orders filled in {out['entry_latency_s']:.1f}s typically going in"
-                               + (f" and {out['exit_latency_s']:.1f}s coming out" if out["exit_latency_s"] is not None else "")
-                               + (f" (slowest entry {out['slowest_entry_s']:.0f}s)" if out["slowest_entry_s"] else "")
+    if went_in or came_out:
+        legs, n_in, n_out, slow = [], len(went_in), len(came_out), out["slow_exits"]
+        if went_in:
+            legs.append(f"{out['entry_latency_s']:,.1f}s going in ({n_in} entr{'y' if n_in == 1 else 'ies'}, "
+                        f"slowest {_wait(out['slowest_entry_s'])})")
+        if came_out:
+            legs.append(f"{out['exit_latency_s']:,.1f}s coming out ({n_out} exit{'' if n_out == 1 else 's'}, "
+                        f"slowest {_wait(out['slowest_exit_s'])})")
+        out["latency_note"] = ((f"Since {out['since']}, orders" if out["since"] else "Orders")
+                               + " typically filled in " + " and ".join(legs)
+                               + (f"; {slow} market exit{'' if slow == 1 else 's'} took longer than {BROKER_FILL_S:.0f}s"
+                                  if slow else "")
                                + (f"; {out['rested_entries']} limit entr{'y' if out['rested_entries'] == 1 else 'ies'} "
                                   f"rested longer than {BROKER_FILL_S:.0f}s, waiting for the price" if out["rested_entries"] else "")
                                + ". A stop or target resting at the broker isn't counted - it waits for the price.")

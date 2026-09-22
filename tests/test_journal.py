@@ -86,6 +86,33 @@ def test_the_lessons_and_the_strategies_real_record_against_the_replay():
     assert drifting["drifting"] and live_records(losing)["s"]["trades"] == 12
 
 
+def test_fill_times_are_a_true_median_over_the_fills_they_say_and_a_slow_market_exit_is_counted():
+    """An even count takes the mean of the two middle fills; the note says which fills the times cover; an
+    exit goes out at market, so one that took minutes is counted and told, not set aside like a resting limit."""
+    from tos_bot.research.journal import execution_quality
+
+    def timed(went_in, came_out, entered="2026-09-09T14:00:00"):      # stored in UTC
+        return {"entry_time": entered, "exit_time": f"{DAY}T15:00:00", "entry_latency_s": went_in,
+                "exit_latency_s": came_out}
+
+    trades = [timed(2.0, 1.0, entered="2026-09-09T02:00:00"),              # the evening before in New York
+              timed(4.0, 3.0), timed(10.0, 1_500.0), timed(6.0, 2.0),
+              timed(16_500.0, None)]                                     # a limit entry that rested for its price
+    out = execution_quality(trades, assumed_bps=6.0)
+    assert out["entry_latency_s"] == 5.0 and out["exit_latency_s"] == 2.5     # the two middle ones, averaged
+    assert (out["entry_fills"], out["exit_fills"], out["since"]) == (4, 4, "2026-09-08")
+    assert (out["slowest_exit_s"], out["slow_exits"], out["rested_entries"]) == (1_500.0, 1, 1)
+    note = out["latency_note"]
+    assert note.startswith("Since 2026-09-08, orders typically filled in 5.0s going in (4 entries, slowest 10s)")
+    assert "2.5s coming out (4 exits, slowest 25 min (1,500s)); 1 market exit took longer than 60s" in note
+    assert "1 limit entry rested longer than 60s" in note
+
+    # exits alone still say how they went
+    only = execution_quality([{"exit_time": f"{DAY}T15:00:00", "exit_latency_s": 9_000.0}], assumed_bps=6.0)
+    assert only["entry_latency_s"] is None and only["exit_latency_s"] == 9_000.0
+    assert "orders typically filled in 9,000.0s coming out (1 exit, slowest 2.5 h (9,000s))" in only["latency_note"]
+
+
 def _opened(tid, symbol, *, status="OPEN", noise=(), unproven=None, r=None):
     return {"id": tid, "symbol": symbol, "side": "LONG", "strategy": "s", "timeframe": "SWING", "broker": "paper",
             "status": status, "entry_time": f"{DAY}T18:00:00", "entry_price": 100.0, "initial_stop_price": 98.0,
