@@ -1009,7 +1009,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         return {"watchlist": self.scanner.watchlist_state(), "scan": self.scan_status()}
 
     def _publish_plays(self) -> None:
-        self._publish("plays.updated", plays=[self._decorate(p) for p in self.board.ranked()[:self.BOARD_ROWS]])
+        records: Dict[str, Dict[str, Any]] = {}                # each setup's record read once for the board
+        self._publish("plays.updated",
+                      plays=[self._decorate(p, records) for p in self.board.ranked()[:self.BOARD_ROWS]])
 
     #: stocks the quick re-check looks at, best plays first
     PLAYS_REFRESH_MAX = 25
@@ -1756,12 +1758,32 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     # ------------------------------------------------------------------ #
     #  Views                                                             #
     # ------------------------------------------------------------------ #
-    def _decorate(self, p: Play) -> Dict[str, Any]:
+    def _decorate(self, p: Play, records: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """A play as the dashboard shows it. ``records``: the setups' records already read for this
+        board of plays (_play_record)."""
         row = p.to_row()
         row["executable_hint"] = p.suggested_qty > 0 and self._armed
         seen = self.md.last_seen(p.symbol)
         row["last_price"], row["last_at"] = (round(seen[0], 4), seen[1].isoformat()) if seen else (None, None)
+        row["record"] = self._play_record(p.strategy, {} if records is None else records)
         return self.autopilot.decorate_play(row)
+
+    def _play_record(self, strategy: str, records: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """The setup's replayed record over the trades Autopilot would take, for the play's chip: its
+        average and trades, the held-out sessions', what its wins average - set beside the play's expected
+        R, which counts a win at the full target - and whether it is proven, in proof_missing's words.
+        Read once per setup into ``records``, which a whole board of plays shares."""
+        if strategy not in records:
+            rec = self.strategy_record(strategy) or {}
+            held = rec.get("out_of_sample") or {}
+            why = self.autopilot.proof_missing(strategy, rec)
+            records[strategy] = {
+                "trades": int(rec.get("trades", 0)), "expectancy_r": rec.get("expectancy_r"),
+                "win_rate": rec.get("win_rate"), "avg_win_r": rec.get("avg_win_r"),
+                "held_out_trades": int(held.get("trades", 0)), "held_out_r": held.get("expectancy_r"),
+                "proven": why is None, "why": why,
+            }
+        return records[strategy]
 
     #: a price the app fetched this recently is newer than the broker's portfolio mark, which IBKR updates
     #: every few minutes; the exit manager keeps every open position's this fresh
@@ -1843,7 +1865,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         }
 
     def current_plays(self) -> List[Dict[str, Any]]:
-        return [self._decorate(p) for p in self.board.ranked()]
+        records: Dict[str, Dict[str, Any]] = {}
+        return [self._decorate(p, records) for p in self.board.ranked()]
 
 
 def _utc(value: Any) -> Optional[dt.datetime]:

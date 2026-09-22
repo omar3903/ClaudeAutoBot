@@ -16,6 +16,7 @@ const GLOSSARY = {
   symbol: ["Symbol", "The ticker and its sector. Hover a row for the reasoning; click it for the numbers and the order."],
   side: ["Side", "LONG profits when the price rises, SHORT when it falls. Hover a badge for more."],
   strategy_col: ["Strategy", "The setup that found the play. Hover a name for how it works; switch setups on or off under Strategies."],
+  record: ["Replay record", "The setup's record in the strategy replay, over the trades Autopilot would have taken of it: its average R a trade × how many trades. Green: proven by Autopilot's own test, the one the Strategies panel shows (enough trades, and an edge that clears its bar and holds up in the held-out sessions). Amber: not proven yet. Red: it loses on average. Grey: the replay has no trades from it yet. Click the play for what its replayed wins average against the R the play expects, and to switch the setup off."],
   noise: ["Noise flags", "Signs this is a bad moment for the setup: against the daily trend, the wrong side of VWAP, against today's gap, heavier volume against it, another setup pointing the other way, or too little expected value. Autopilot skips flagged plays; you can still take one. The strategy replay shows whether each check removes worse trades than it keeps."],
   hide_noisy: ["Hide noise", "Hide plays with noise flags from the list. They are still scanned, recorded and measured."],
   tf: ["Timeframe", "day = intraday, closed the same session.\nswing = held for days to weeks."],
@@ -62,8 +63,8 @@ function termContent(el) {
     const how = `${s.timeframe === "INTRADAY" ? "Day trade" : "Swing"} · ${s.kind.toLowerCase()} · ${s.enabled ? `on, weight ${s.weight}` : "switched off"}`;
     return [s.title, `${s.thesis}\n\n${how}`];
   }
-  if (k === "autopilot" && el.dataset.why) {
-    const [title, text] = GLOSSARY.autopilot;
+  if ((k === "autopilot" || k === "record") && el.dataset.why) {
+    const [title, text] = GLOSSARY[k];
     return [title, `${el.dataset.why}.
 
 ${text}`];

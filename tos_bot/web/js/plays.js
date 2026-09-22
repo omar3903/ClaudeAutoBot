@@ -1,9 +1,9 @@
 /* The plays table, and the detail panel: why, the numbers, and the order. */
 import { $, $$, escapeHtml, num, pct, pretty, post, sectorTag, sideBadge, tfLabel, usd } from "./util.js";
 import { S, on } from "./state.js";
-import { toast } from "./ui.js";
+import { openModal, toast } from "./ui.js";
 import { hideTip, showTipAt } from "./tooltips.js";
-import { stratLabel } from "./strategies.js";
+import { stratLabel, updateStrategy } from "./strategies.js";
 import { hideExecuted, hideNoisy } from "./filters.js";
 import { loadOpen, openRecord, showTab } from "./blotter.js";
 import { orderMark } from "./orders.js";
@@ -75,6 +75,58 @@ function apLine(ap) {
   return ap.acted ? "Has acted on it" : "Would take it on its next pass";
 }
 
+/* The setup's replayed record over the trades Autopilot would take (row.record): its average R a trade over
+   how many trades. Green once proven, red while it loses, amber in between, grey with no replayed trades.
+   The tooltip adds the held-out sessions and, when it isn't proven, why not in the gate's own words. */
+const signedR = v => `${v >= 0 ? "+" : ""}${num(v, 2)}R`;
+const recordSentence = rec => "replayed the way Autopilot takes it, " + (rec.trades
+  ? `averaged ${signedR(rec.expectancy_r)} a trade over ${rec.trades} trades${rec.held_out_trades ? `, ${signedR(rec.held_out_r)} over the ${rec.held_out_trades} in the held-out sessions` : ""}`
+  : "has no trades yet");
+
+function recordChip(rec) {
+  if (!rec) return "";
+  const why = `This setup, ${recordSentence(rec)}. ${rec.proven ? "Proven" : `Not proven: ${rec.why || "no record"}`}`;
+  const cls = !rec.trades ? "faint" : rec.proven ? "good" : rec.expectancy_r < 0 ? "bad" : "warn";
+  return `<span class="badge ${cls} rec-chip" data-term="record" data-why="${escapeHtml(why)}">${rec.trades ? `${signedR(rec.expectancy_r)} ×${rec.trades}` : "no replay"}</span>`;
+}
+
+/* The record in the detail panel, with what the replayed wins average set beside the play's expected R -
+   which counts a win at the full target (up to 4R, as the ranking does) - and the setup's off switch. */
+function recordBlock(p) {
+  const rec = p.record;
+  if (!rec) return "";
+  const exp = (p.evidence || {}).expected_r;
+  const wins = !rec.trades || exp == null ? ""
+    : `<div class="muted small">This play expects ${signedR(exp)}, counting a win at the full target (${signedR(Math.min(p.reward_risk || 0, 4))}); ${rec.win_rate ? `the replayed wins average ${signedR(rec.avg_win_r)}` : "none of the replayed trades won"}.</div>`;
+  const enabled = (S.strategies[p.strategy] || {}).enabled !== false;
+  return `<div class="rec-box">
+      <div>The setup, ${escapeHtml(recordSentence(rec))}. <span class="badge ${rec.proven ? "good" : "warn"}" data-term="record">${rec.proven ? "proven" : "not proven"}</span></div>
+      ${rec.proven ? "" : `<div class="muted small">${escapeHtml(rec.why || "")}</div>`}
+      ${wins}
+      ${enabled ? `<button class="ghost mini lockable" id="btn-strat-off" title="The Strategies panel's switch - it stays off until you switch it back on">Switch this setup off</button>` : ""}
+    </div>`;
+}
+
+/* The Strategies panel's own switch, from a play: the setup stays off, through a restart, until it's switched
+   back on there. Its plays leave the board, so the panel closes once it's off. */
+function switchOff(p) {
+  const name = (S.strategies[p.strategy] || {}).title || pretty(p.strategy);
+  openModal({
+    title: `Switch ${name} off?`,
+    bodyHTML: `<p>The scans stop looking for this setup and its plays leave the board, for you and for Autopilot.</p>
+      <p><b>It stays off until you switch it back on</b> under Strategies - the change is saved and kept through a restart.</p>
+      <p class="muted">Positions it has open are left as they are, and their exits stay managed.</p>`,
+    okText: "Switch off", okClass: "danger",
+    onOk: async () => {
+      const r = await updateStrategy(p.strategy, { enabled: false });
+      if (r.ok && S.selected === p.id) {
+        $("#detail-body").classList.add("hidden");
+        $("#detail-empty").classList.remove("hidden");
+      }
+    },
+  });
+}
+
 function playRow(p) {
   const tr = document.createElement("tr");
   const done = isDone(p), ap = p.autopilot || {};
@@ -96,7 +148,7 @@ function playRow(p) {
   tr.innerHTML = `
     <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${orderMark(p.symbol)}${signalMark(p)}${apMark}${p.extended_hours_ok ? '<span class="ext" data-term="ext">ext</span>' : ""}${isNoisy(p) && !done ? `<span class="badge warn" data-term="noise" title="${escapeHtml(p.noise.map(noiseLabel).join(", "))}">noisy</span>` : ""}</td>
     <td>${sideBadge(p.side)}</td>
-    <td>${stratLabel(p.strategy)}</td>
+    <td>${stratLabel(p.strategy)} ${recordChip(p.record)}</td>
     <td class="tf">${tfLabel(p.timeframe)}</td>
     <td class="num">${num(p.entry)}</td>
     ${priceCell(p)}
@@ -137,6 +189,7 @@ export async function selectPlay(id) {
   const approveBtn = $("#btn-approve"); if (approveBtn) approveBtn.onclick = () => approve(id);
   const rejectBtn = $("#btn-reject"); if (rejectBtn) rejectBtn.onclick = () => reject(id);
   const recordBtn = $("#btn-goto-trade"); if (recordBtn) recordBtn.onclick = () => openRecord(a.play.trade_id);
+  const offBtn = $("#btn-strat-off"); if (offBtn) offBtn.onclick = () => switchOff(a.play);
 }
 
 /* How many times in a row a day play has shown: on 5-minute candles when Autopilot counts those
@@ -170,6 +223,7 @@ function detailHTML(a) {
     <h3>${escapeHtml(p.symbol)} ${sectorTag(p.sector)} ${sideBadge(p.side)}${executed ? ' <span class="badge good" data-term="executed">executed</span>' : ""}</h3>
     <div class="sub">${stratLabel(p.strategy)} · ${tfLabel(p.timeframe)} · conf ${num(p.confidence, 2)} · expected ${num((p.evidence || {}).expected_r, 2)}R · score ${num(p.score, 2)}${p.timeframe === "INTRADAY" ? ` · ${seenText(p)}` : ""} · session ${a.session}</div>
     ${p.autopilot && !executed ? `<div class="muted" style="margin:6px 0" data-term="autopilot">🤖 ${escapeHtml(apLine(p.autopilot))}</div>` : ""}
+    ${recordBlock(p)}
     ${(a.noise || []).length && !executed ? `<div class="warn-box" data-term="noise">⚠ Probably noise right now: ${a.noise.map(escapeHtml).join(" · ")}. Autopilot won't take it; you still can.</div>` : ""}
     ${sparkSvg(p.evidence && p.evidence.spark, p)}
     <div class="explain">${escapeHtml(p.explanation || p.rationale)}</div>

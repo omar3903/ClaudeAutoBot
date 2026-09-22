@@ -450,6 +450,11 @@ button.link:hover{text-decoration:underline; filter:none}
 .signals-table tr.mover:hover, .signals-table tr.mover.open{background:var(--sel)}
 .sig-mark{font-size:10px; margin-left:4px; cursor:pointer}
 .badge.faint{color:var(--muted); font-weight:600}
+/* a play's replay record, beside its setup; in the detail panel with the setup's off switch */
+.rec-chip{margin-left:4px; white-space:nowrap; vertical-align:middle}
+.rec-box{font-size:12px; margin:6px 0 10px}
+.rec-box div{margin:3px 0}
+.rec-box button{margin-top:4px}
 .play-chart .band{fill:var(--sel)}
 .play-chart .vline{stroke-width:1.5; stroke-dasharray:3 3}
 .play-chart .vl-news, .chart-key .vl-news{stroke:var(--accent2); background:var(--accent2)}

@@ -979,6 +979,11 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
   in R; amber beyond `execution.max_chase_r` (0.25R), where an entry is refused. The tooltip says when the
   price is from. The positions' **Mark** is the app's own price when it fetched one in the last two minutes
   (the one the exit manager acts on), otherwise the broker's mark, which IBKR updates only every few minutes.
+* **Replay record** (plays table, beside the setup) — the setup's replayed average R a trade and how many
+  trades, over the ones Autopilot would take: green proven, amber not proven yet, red losing, grey no replayed
+  trades. The tooltip adds the held-out sessions and why it isn't proven. The play's detail panel sets what the
+  replayed wins average beside the play's expected R (which counts a win at the full target), and **Switch
+  this setup off** is the Strategies switch: the setup stays off, through a restart, until it's switched back on.
 * **Trading capital** — how much of the account the bot may use.
 * **Autopilot** + **⚙** — hands-off entry and its caps.
 * **Reset paper** (simulator only) — reset the balance.

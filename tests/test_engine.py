@@ -1082,6 +1082,38 @@ def test_each_play_carries_the_latest_price_the_app_holds_and_when_its_from(engi
     assert row["last_price"] == engine.md.last_seen("AAPL")[0] and row["last_at"].startswith("20")
 
 
+def test_each_play_carries_its_setups_replay_record_read_once_for_the_board(engine, monkeypatch):
+    losing = {"trades": 40, "expectancy_r": -0.09, "win_rate": 0.4, "avg_win_r": 0.45,
+              "out_of_sample": {"trades": 12, "expectancy_r": -0.1}}
+    proven = {"trades": 36, "expectancy_r": 0.2, "win_rate": 0.5, "avg_win_r": 1.1,
+              "out_of_sample": {"trades": 12, "expectancy_r": 0.15}}
+    reads = []
+    monkeypatch.setattr(engine, "strategy_record",
+                        lambda key: reads.append(key) or {"setup_a": losing, "setup_b": proven}.get(key))
+    sent = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **payload: sent.append(payload["plays"])
+                        if topic == "plays.updated" else None)
+    engine.board.replace([_play("AAA", strategy="setup_a"), _play("BBB", strategy="setup_a"),
+                          _play("CCC", strategy="setup_b"), _play("DDD", strategy="setup_c")])
+    assert not engine.autopilot.enabled            # Autopilot reads no records itself: the reads are the rows'
+
+    engine._publish_plays()
+    rows = {r["symbol"]: r["record"] for r in sent[-1]}
+    assert rows["AAA"] == rows["BBB"] == {
+        "trades": 40, "expectancy_r": -0.09, "win_rate": 0.4, "avg_win_r": 0.45, "held_out_trades": 12,
+        "held_out_r": -0.1, "proven": False, "why": engine.autopilot.proof_missing("setup_a", losing)}
+    assert rows["CCC"]["proven"] is True and rows["CCC"]["why"] is None and rows["CCC"]["avg_win_r"] == 1.1
+    none = rows["DDD"]                             # a setup the replay has no trades from
+    assert (none["trades"], none["expectancy_r"], none["held_out_trades"], none["proven"]) == (0, None, 0, False)
+    assert "has 0 of the" in none["why"]
+    assert sorted(reads) == ["setup_a", "setup_b", "setup_c"]          # once a setup, not once a play
+    reads.clear()
+    engine._publish_plays()                        # read afresh each time: a new replay shows at once
+    assert sorted(reads) == ["setup_a", "setup_b", "setup_c"]
+    reads.clear()
+    assert len(engine.current_plays()) == 4 and sorted(reads) == ["setup_a", "setup_b", "setup_c"]
+
+
 def test_refresh_prices_the_plays_and_the_positions_and_sends_the_plays_out_again(engine, monkeypatch):
     p = _play("MSFT")
     engine.board.replace([p])

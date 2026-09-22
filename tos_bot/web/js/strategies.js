@@ -185,11 +185,13 @@ function renderStrategies() {
   };
 }
 
-async function updateStrategy(key, body) {
+/* Also the play detail panel's "Switch this setup off" - one switch, wherever it's pressed. */
+export async function updateStrategy(key, body) {
   const r = await post(`/api/strategies/${encodeURIComponent(key)}`, body);
-  if (r.ok) { toast(r.note + (r.rescanning ? " Rescanning…" : ""), "good"); indexStrategies(r.strategies); return; }
+  if (r.ok) { toast(r.note + (r.rescanning ? " Rescanning…" : ""), "good"); indexStrategies(r.strategies); return r; }
   toast("Strategy not changed: " + (r.reason || ""), "bad");
   if (drawerOpen("strategies")) renderStrategies();
+  return r;
 }
 
 export function initStrategies() {
