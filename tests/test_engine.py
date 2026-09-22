@@ -16,9 +16,11 @@ from types import SimpleNamespace
 import pytest
 
 import fakes
+from test_native_stop import _StopBroker
 from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Account, OrderResult, Play, Position
+from tos_bot.core.models import Account, Fill, OrderResult, Play, Position
 from tos_bot.engine import TradingEngine
+from tos_bot.execution.executor import Executor
 from tos_bot.engine.research_ops import PRACTICE_LABEL
 from tos_bot.engine.reconcile import PositionCheck
 from tos_bot.engine.runtime import load_filters
@@ -852,6 +854,153 @@ def test_shares_without_a_record_are_listed_and_can_be_exited(engine):
 
     engine._account.positions = [Position(symbol="MSFT", quantity=3, avg_price=100.0)]
     assert engine.untracked_positions() == []                               # fewer than recorded: a mismatch, not untracked
+
+
+# ---------------------------------------------------------------- fixing a share count from its warning
+class _FixAccount(_StopBroker):
+    """An IBKR account for the share-count fix: what it holds and marks, the executions it reports, and
+    stop orders that rest until a test fills them (test_native_stop)."""
+
+    is_connected = True
+
+    def __init__(self, held, mark=0.0):
+        super().__init__({"AAA": held})
+        self.fills, self.mark = [], mark
+
+    def get_account(self):
+        return Account(account_id="DU1", equity=50_000.0, cash=50_000.0, buying_power=100_000.0,
+                       positions=[Position(symbol=s, quantity=q, avg_price=100.0, market_price=self.mark)
+                                  for s, q in self.positions.items()])
+
+    def get_fills(self, symbol=None):
+        return [f for f in self.fills if not symbol or f.symbol == symbol]
+
+
+def _mismatched(engine, held=40, mark=0.0):
+    """A 100-share AAA record (entered at 100, stop 95, target 110) on an IBKR paper account holding ``held``."""
+    broker = _FixAccount(held, mark)
+    engine._broker, engine._venue = broker, "ibkr-paper"
+    engine.executor.rebind(broker, venue="ibkr-paper")
+    return broker, _open(engine, "AAA", venue="ibkr-paper", qty=100)
+
+
+def _sold(tid, *parts, tag="stop"):
+    """Executions of the record's own order (``tag``: stop / tgt / exit): (shares, price) each, a second apart."""
+    now = dt.datetime.now(dt.timezone.utc)
+    return [Fill(order_id="8", symbol="AAA", side=Side.SHORT, quantity=q, price=p, commission=0.5,
+                 ts=now + dt.timedelta(seconds=i), tag=f"{tag}:{tid}") for i, (q, p) in enumerate(parts)]
+
+
+def test_a_record_over_the_account_is_previewed_with_the_brokers_executions_of_the_missing_shares(engine):
+    broker, tid = _mismatched(engine, held=40)
+    now = dt.datetime.now(dt.timezone.utc)
+    broker.fills = _sold(tid, (30, 96.0), (30, 95.0)) + [
+        Fill(order_id="7", symbol="AAA", side=Side.LONG, quantity=100, price=100.0, ts=now, tag="play_x"),   # the entry
+        Fill(order_id="9", symbol="AAA", side=Side.SHORT, quantity=5, price=90.0, ts=now, tag="exit:trd_other")]
+    m = engine.mismatch_preview("AAA")
+    assert (m["kind"], m["side"], m["recorded"], m["held"], m["missing"]) == ("fewer", "LONG", 100, 40, 60)
+    assert [(r["qty"], r["price"], r["source"]) for r in m["executions"]] == [(30, 96.0, "stop"), (30, 95.0, "stop")]
+    b = m["booking"]
+    assert (b["qty"], b["price"], b["reason"], b["estimated"], b["commission"]) == (60, 95.5, "stop", False, 1.0)
+    assert "its stop order" in b["basis"]
+    assert m["actions"]["match"]["ok"] and m["actions"]["close"]["ok"]
+    assert engine.repo.get_trade(tid)["quantity"] == 100                    # a preview changes nothing
+
+
+def test_missing_shares_without_executions_are_estimated_at_the_last_price_and_it_says_so(engine):
+    broker, tid = _mismatched(engine, held=40, mark=97.0)
+    b = engine.mismatch_preview("AAA")["booking"]
+    assert (b["price"], b["reason"], b["estimated"]) == (97.0, "closed-outside", True)
+    assert "estimated at the last price" in b["basis"]
+    broker.fills = _sold(tid, (20, 95.0))                                   # some are reported: those at their price
+    b = engine.mismatch_preview("AAA")["booking"]
+    assert b["price"] == pytest.approx((20 * 95.0 + 40 * 97.0) / 60, abs=1e-4) and b["reason"] == "closed-outside"
+    broker.mark = 0.0                                                       # and nothing to estimate the rest at
+    m = engine.mismatch_preview("AAA")
+    assert m["booking"] is None and not m["actions"]["match"]["ok"] and "no price" in m["actions"]["match"]["reason"]
+
+
+def test_shares_the_record_already_booked_off_today_arent_counted_again(engine):
+    broker, tid = _mismatched(engine, held=50)
+    engine.repo.reduce_trade(tid, 20, 110.0, exit_reason="target-1")        # the scale-out, booked when it filled
+    broker.fills = _sold(tid, (20, 110.0), tag="tgt") + _sold(tid, (30, 94.0))
+    broker.fills[-1].ts += dt.timedelta(seconds=5)                          # the stop filled after the target
+    m = engine.mismatch_preview("AAA")
+    assert m["missing"] == 30 and [(r["qty"], r["source"]) for r in m["executions"]] == [(30, "stop")]
+    assert (m["booking"]["price"], m["booking"]["reason"]) == (94.0, "stop")
+
+
+def test_a_fix_is_refused_with_its_reason_when_it_isnt_safe_or_isnt_the_fix(engine, monkeypatch):
+    broker, tid = _mismatched(engine, held=40, mark=97.0)
+    assert engine.mismatch_preview("AAA")["actions"]["match"]["ok"]
+    engine.executor.pending_exit_trade_ids = lambda: {tid}                  # an exit for it is working
+    assert "still working" in engine.mismatch_preview("AAA")["actions"]["match"]["reason"]
+    del engine.executor.pending_exit_trade_ids
+    broker.is_connected = False
+    assert "isn't connected" in engine.mismatch_preview("AAA")["actions"]["close"]["reason"]
+    broker.is_connected = True
+    broker.positions["AAA"] = 100
+    assert engine.mismatch_preview("AAA")["kind"] == "agree"
+    broker.positions["AAA"] = 150                                           # more than the record: shares without one
+    m = engine.mismatch_preview("AAA")
+    assert m["kind"] == "more" and "Shares without a record" in m["actions"]["match"]["reason"]
+    assert not engine.fix_mismatch("AAA", "match")["ok"] and engine.repo.get_trade(tid)["quantity"] == 100
+    broker.positions["AAA"] = 40
+    monkeypatch.setattr(Executor, "_session_now", staticmethod(lambda: clock.Session.CLOSED))
+    actions = engine.mismatch_preview("AAA")["actions"]                     # after the close: the record can still match
+    assert actions["match"]["ok"] and not actions["close"]["ok"] and "market is closed" in actions["close"]["reason"]
+    assert broker.orders == []
+
+
+def test_no_fix_books_shares_a_resting_stop_has_filled_while_it_still_works(engine):
+    broker, tid = _mismatched(engine, held=100)
+    engine.executor.sync_open_orders()                                      # the stop goes on for the 100
+    oid = engine.executor.protective_stops()[0]["order_id"]
+    broker.live[oid].filled_qty = 60                                        # it has sold 60 and still works
+    broker.positions["AAA"] = 40
+    reason = engine.mismatch_preview("AAA")["actions"]["match"]["reason"]
+    assert "filled 60 shares" in reason and "still working" in reason       # it books them itself when it finishes
+
+
+def test_match_books_the_missing_shares_off_the_record_and_the_stop_follows_the_record(engine):
+    broker, tid = _mismatched(engine, held=40)
+    broker.fills = _sold(tid, (30, 96.0), (30, 95.0))
+    engine.position_check.mismatches = [{"symbol": "AAA", "recorded": 100.0, "held": 40.0, "records": 1, "note": "AAA"}]
+    m = engine.mismatch_preview("AAA")
+    r = engine.fix_mismatch("AAA", "match", expect={"recorded": m["recorded"], "held": m["held"]})
+    assert r["ok"] and "Booked 60 AAA shares" in r["note"] and r["booked"]["reason"] == "stop"
+    t = engine.repo.get_trade(tid)
+    assert (t["status"], t["quantity"], t["initial_quantity"]) == ("OPEN", 40, 100)
+    assert t["banked_pl"] == pytest.approx(60 * (95.5 - 100.0) - 1.0)
+    assert engine.snapshot()["mismatches"] == []                            # the warning goes with it
+    engine.executor.sync_open_orders()                                      # the next pass: a stop for what the record holds
+    assert [(s.quantity, s.stop_price) for s in broker.stops()] == [(40, 95.0)]
+    assert engine.mismatch_preview("AAA")["kind"] == "agree"                # booked once
+
+
+def test_close_matches_the_record_then_sells_the_rest_and_the_record_closes_when_it_fills(engine):
+    broker, tid = _mismatched(engine, held=40, mark=97.0)
+    r = engine.fix_mismatch("AAA", "close", expect={"recorded": 100, "held": 40})
+    assert r["ok"] and "Exit sent for the rest" in r["note"]
+    [out] = broker.exits()
+    assert (out.side, out.quantity, out.client_tag) == (Side.SHORT, 40, f"exit:{tid}")
+    assert engine.repo.get_trade(tid)["quantity"] == 40                     # the missing shares were booked first
+    oid = r["exit"]["order_id"]
+    broker.reports[oid] = OrderResult(order_id=oid, status="FILLED", symbol="AAA", submitted_qty=40, filled_qty=40,
+                                      avg_fill_price=96.0)
+    broker.positions.pop("AAA")
+    engine.executor.sync_open_orders()
+    t = engine.repo.get_trade(tid)
+    assert (t["status"], t["exit_price"], t["exit_reason"]) == ("CLOSED", 96.0, "manual")
+
+
+def test_a_fix_is_refused_when_the_counts_changed_since_the_preview(engine):
+    broker, tid = _mismatched(engine, held=40, mark=97.0)
+    m = engine.mismatch_preview("AAA")
+    broker.positions["AAA"] = 30                                            # more went while the preview was open
+    r = engine.fix_mismatch("AAA", "close", expect={"recorded": m["recorded"], "held": m["held"]})
+    assert not r["ok"] and r["changed"] and "30" in r["reason"]
+    assert engine.repo.get_trade(tid)["quantity"] == 100 and broker.orders == []
 
 
 def test_resetting_paper_deletes_the_simulators_open_records_only(engine):

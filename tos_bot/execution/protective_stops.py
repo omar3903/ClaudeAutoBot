@@ -152,6 +152,20 @@ class ProtectiveStops:
         """Whether the broker is working this trade's target - the exit manager then leaves it to it."""
         return trade_id in self._targets
 
+    def resting_filled(self, trade_id: str) -> Optional[float]:
+        """Shares the stop and target resting for a trade have filled while still working. They are booked when
+        the order finishes (_watch_stops), so nothing else may book them first. None when the broker can't say."""
+        filled = 0.0
+        for book in (self._stops, self._targets):
+            o = book.get(trade_id)
+            if o is None:
+                continue
+            try:
+                filled += float(self.broker.get_order(o.order_id).filled_qty or 0.0)
+            except Exception:  # noqa: BLE001
+                return None
+        return filled
+
     # ------------------------------------------------------------------ #
     #  Each sync pass                                                    #
     # ------------------------------------------------------------------ #

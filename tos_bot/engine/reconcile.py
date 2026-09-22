@@ -13,7 +13,8 @@ A forced check (right after a simulator reset) skips the last three.
 
 A position can also be a different size than its records add up to - an order
 that filled twice, or shares traded in the broker's own window. That is only
-reported, never traded or deleted on: which number is right is the operator's call.
+reported, never traded or deleted on by itself: which number is right is the
+operator's call, made with the warning's Fix button (engine.fix_mismatch).
 """
 
 from __future__ import annotations

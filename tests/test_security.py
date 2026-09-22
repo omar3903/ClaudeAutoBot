@@ -52,3 +52,12 @@ def test_rebound_host_is_refused(client):
 def test_remote_client_is_refused(monkeypatch):
     monkeypatch.setattr(security, "ALLOWED_HOSTS", security.ALLOWED_HOSTS | {"testserver"})
     assert TestClient(_app()).post("/secret", headers=OK).status_code == 403
+
+
+def test_the_share_count_fix_is_same_machine_only():
+    # it books P/L and can send a market exit; the guard answers before the handler needs an engine
+    from tos_bot.server.app import create_app
+
+    client = TestClient(create_app(lambda settings: None))
+    assert client.get("/api/positions/mismatch/AAA", headers=OK).status_code == 403
+    assert client.post("/api/positions/mismatch/AAA/fix", json={"action": "match"}, headers=OK).status_code == 403

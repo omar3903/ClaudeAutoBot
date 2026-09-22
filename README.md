@@ -753,6 +753,22 @@ than the record is over by, never while an exit for it is still working, only fo
 The counts then agree, and the stop and target go back at the broker for what's left. A difference its own
 fills don't explain (shares sold by hand in TWS) is left alone and reported, as before.
 
+**A share count that disagrees can be fixed from its warning.** Each yellow share-count warning has a
+**Fix…** button. It reads the account again and shows what the record and the account hold, the broker's
+executions of the stock since the entry that no record has booked (and which order sent each: the record's
+stop or target, an exit the app sent, or something outside the app), and the price and reason the missing
+shares would be booked at - from those executions, or estimated at the last price when the broker no longer
+reports them (IBKR keeps only today's), which it says. When the account holds fewer shares than the record,
+the same way round, there are two choices: **Match the record to the account** takes the missing shares off
+the record (`stop` / `trailing-stop` when its stop order sold them, `target-1` for its target,
+`closed-outside` otherwise), and the next pass sizes the stop at the broker from the corrected record; **Sell
+what's left and close the record** does the same, then sends a market exit for the rest. Nothing happens
+without the click, and the counts shown go with it: if they changed since, nothing is done. It is refused, with
+the reason, while not connected, while quitting, while an order for the stock is working or its resting stop
+or target has part filled (those shares are booked when it finishes), for a stock with more than one open
+record or a pair leg, and - the exit only - while the market is closed. More shares than the record are
+exited from **Shares without a record**, as before.
+
 The Open orders panel lists them as **stop** and **target** with their trade. The
 simulator keeps its own bracket and gets no such orders.
 
