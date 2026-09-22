@@ -1477,3 +1477,18 @@ def test_every_topic_the_app_publishes_has_a_handler_in_the_dashboard():
     handled = set(re.findall(r'case "([\w.]+)"', (app / "web" / "js" / "events.js").read_text(encoding="utf-8")))
     assert len(published) > 50                                    # the search found the app's topics
     assert sorted(published - handled) == []
+
+
+def test_a_click_that_wakes_the_snapshot_loop_leaves_the_position_check_to_its_usual_turn(engine, monkeypatch):
+    from tos_bot.engine import engine as module
+
+    checks, now = [], {"t": 1_000.0}
+    monkeypatch.setattr(engine, "_reconcile_open_trades", lambda force=False: checks.append(now["t"]) or [])
+    monkeypatch.setattr(module.time, "monotonic", lambda: now["t"])
+    engine._reconcile_if_due()                                     # a scheduled pass
+    now["t"] += 1.0
+    engine._reconcile_if_due()                                     # a pass a click woke a second later
+    assert checks == [1_000.0]
+    now["t"] += engine.RECONCILE_MIN_GAP_S
+    engine._reconcile_if_due()                                     # the next scheduled pass checks again
+    assert checks == [1_000.0, 1_000.0 + 1.0 + engine.RECONCILE_MIN_GAP_S]

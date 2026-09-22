@@ -218,6 +218,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         # set to have the snapshot loop read the account now rather than at its next turn - after an order
         # sent from the dashboard, whose reply doesn't wait for that read
         self._snapshot_wake = threading.Event()
+        self._reconciled_at = float("-inf")         # the loop's last position check (see _reconcile_if_due)
         self._armed = False
 
         # hands-off entry (exits are always automatic)
@@ -747,7 +748,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self._retry_connection()
                 self._watch_gateway()
                 if self._refresh_account():
-                    self._reconcile_open_trades()
+                    self._reconcile_if_due()
                 state = self.snapshot()
                 if self._account:
                     self.repo.snapshot_account(self._account, self._venue,
@@ -757,6 +758,20 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 log.exception("snapshot failed")
             self._snapshot_wake.wait(10.0 if self._autopilot_day_active() else 30.0)
             self._snapshot_wake.clear()
+
+    #: the least time between two of the loop's position checks
+    RECONCILE_MIN_GAP_S = 8.0
+
+    def _reconcile_if_due(self) -> None:
+        """The snapshot loop's position check, at most once per RECONCILE_MIN_GAP_S. A click that wakes the
+        loop early gets a fresh account read, but the check waits for its usual turn: a record only counts as
+        gone after two checks miss it, and two checks a second apart would let a stop filled at the broker be
+        booked as closed outside before the order sync books it as the stop it was."""
+        now = time.monotonic()
+        if now - self._reconciled_at < self.RECONCILE_MIN_GAP_S:
+            return
+        self._reconciled_at = now
+        self._reconcile_open_trades()
 
     def _orders_loop(self) -> None:
         """Keeps the dashboard's list of working orders current. It runs on its own, so a
