@@ -7,8 +7,10 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import os
+import re
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1320,3 +1322,13 @@ def test_the_strategies_panel_says_when_a_day_setup_fires_on_one_candle(engine, 
     assert "fires on one candle" not in engine.replay_state()["proof"][key]
     engine.autopilot.confirm_on_new_candle, engine.autopilot.min_confirmations = True, 1
     assert "fires on one candle" not in engine.replay_state()["proof"][key]
+
+
+def test_every_topic_the_app_publishes_has_a_handler_in_the_dashboard():
+    """A topic the dashboard ignores is news nobody sees - a stop for the day, a disarmed engine, a skipped play."""
+    app = Path(__file__).resolve().parents[1] / "tos_bot"
+    published = {m.group(1) for f in app.rglob("*.py")
+                 for m in re.finditer(r'(?:_publish|\.publish)\(\s*"([\w.]+)"', f.read_text(encoding="utf-8"))}
+    handled = set(re.findall(r'case "([\w.]+)"', (app / "web" / "js" / "events.js").read_text(encoding="utf-8")))
+    assert len(published) > 50                                    # the search found the app's topics
+    assert sorted(published - handled) == []

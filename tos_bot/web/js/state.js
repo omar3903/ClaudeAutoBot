@@ -17,7 +17,7 @@ export const S = {
 
 const listeners = new Map();
 
-/** Topics: state, plays, filters, strategies, scan, orders. */
+/** Topics: state, plays, filters, strategies, scan, orders, replay. */
 export function on(topic, fn) {
   if (!listeners.has(topic)) listeners.set(topic, []);
   listeners.get(topic).push(fn);

@@ -66,10 +66,11 @@ function priceCell(p) {
 }
 
 /* What Autopilot makes of a play, in one line: the first of its checks the play fails (the gate's own
-   words), the cap it waits for, what its last pass said, or that it would take it. The robot's tooltip
-   and the detail panel both show it. */
+   words), that it tried the play and was refused, the cap it waits for, what its last pass said, or that
+   it would take it. The robot's tooltip and the detail panel both show it. */
 function apLine(ap) {
   if (ap.why_not) return `Won't take it: ${ap.why_not}`;
+  if (ap.skipped) return `Tried it and was refused: ${ap.reason || "no reason given"} - not tried again today unless a setting changes`;
   if (ap.waiting) return `Waiting: ${ap.waiting}`;
   if (ap.reason) return `Last pass: ${ap.reason}`;
   return ap.acted ? "Has acted on it" : "Would take it on its next pass";
@@ -130,17 +131,19 @@ function switchOff(p) {
 function playRow(p) {
   const tr = document.createElement("tr");
   const done = isDone(p), ap = p.autopilot || {};
+  // it tried the play and the engine's assessment or the order was refused: no bar, and a faded robot saying why
+  const skipped = !!ap.skipped && !done;
   tr.dataset.id = p.id;
   tr.classList.toggle("selected", p.id === S.selected);
   tr.classList.toggle("done", done);
-  tr.classList.toggle("ap-eligible", !!ap.eligible && !ap.waiting && !done);
-  tr.classList.toggle("ap-waiting", !!ap.eligible && !!ap.waiting && !done);
+  tr.classList.toggle("ap-eligible", !!ap.eligible && !ap.waiting && !skipped && !done);
+  tr.classList.toggle("ap-waiting", !!ap.eligible && !!ap.waiting && !skipped && !done);
   // a play it won't take gets a faded robot too, only while Autopilot is on - off, every row would have one
-  const refused = !ap.eligible && !!ap.why_not && !!(S.state.autopilot || {}).effective;
-  const apMark = ap.acted
+  const refused = (!ap.eligible && !!ap.why_not || skipped) && !!(S.state.autopilot || {}).effective;
+  const apMark = ap.acted && !skipped
     ? '<span class="ap-badge acted" data-term="autopilot">🤖</span>'
     : ((ap.eligible || refused) && !done
-      ? `<span class="ap-badge${ap.waiting ? " waiting" : ""}${refused ? " refused" : ""}" data-term="autopilot" data-why="${escapeHtml(apLine(ap))}">🤖</span>`
+      ? `<span class="ap-badge${ap.waiting && !skipped ? " waiting" : ""}${refused ? " refused" : ""}" data-term="autopilot" data-why="${escapeHtml(apLine(ap))}">🤖</span>`
       : "");
   const last = done
     ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`

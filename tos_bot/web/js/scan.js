@@ -41,15 +41,21 @@ export function nextFullScanText(scan) {
 }
 
 function renderScanMeta() {
-  const scan = S.state.scan || {}, run = currentRun();
-  if (run) { $("#scan-meta").innerHTML = progressHTML(run); return; }
+  const scan = S.state.scan || {}, run = currentRun(), el = $("#scan-meta");
+  // a replay runs in the background, apart from the scans: said beside whatever they are doing
+  const replaying = !!(S.replay || {}).running;
+  if (replaying) el.title = "The strategies are being replayed on past candles in the background. Strategies shows how far "
+    + "it has got; the setups' records update when it finishes.";
+  else el.removeAttribute("title");
+  if (run) { el.innerHTML = progressHTML(run) + (replaying ? " · replay running" : ""); return; }
   const last = [scan.last_cycle, scan.last_full].filter(Boolean)
     .sort((a, b) => (a.started_at < b.started_at ? 1 : -1))[0];
   const parts = [];
   if (last) parts.push(`${kindLabel(last.kind)} ${fmtClock(last.finished_at)}: ${plural(last.n_plays, "play")}, ${last.elapsed_s}s`);
   if (last && last.hot && last.hot.length) parts.push(`hot list ${last.hot.length}`);
   parts.push(`next full scan ${nextFullScanText(scan)}`);
-  $("#scan-meta").textContent = parts.join(" · ");
+  if (replaying) parts.push("replay running");
+  el.textContent = parts.join(" · ");
 }
 
 export async function requestScan(kind, btn) {
@@ -62,5 +68,6 @@ export async function requestScan(kind, btn) {
 export function initScan() {
   on("state", renderScanMeta);
   on("scan", renderScanMeta);
+  on("replay", renderScanMeta);
   $("#btn-scan").onclick = e => requestScan("cycle", e.currentTarget);
 }

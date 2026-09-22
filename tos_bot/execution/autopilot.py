@@ -1161,6 +1161,9 @@ class AutoPilot:
             # it passes Autopilot's checks, but a cap has no room for it right now
             "waiting": waiting,
             "acted": pid in self._acted,
+            # it tried the play and the engine's assessment or the order was refused (autopilot.skipped) -
+            # not tried again today unless a setting changes; the reason below says why
+            "skipped": pid in self._refused,
             # what the last pass said - the checks that change from pass to pass reach the row here
             "reason": self._last_reason.get(pid, ""),
         }

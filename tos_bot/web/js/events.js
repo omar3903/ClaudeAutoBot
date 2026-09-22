@@ -1,10 +1,10 @@
 /* The live feed: engine events over the WebSocket, applied to the dashboard. */
-import { $, num, pct, plural, pretty, usd } from "./util.js";
+import { $, count, num, pct, plural, pretty, usd } from "./util.js";
 import { S, emit, refreshState, setState } from "./state.js";
 import { closeModal, drawerOpen, toast } from "./ui.js";
-import { renderCapital } from "./topbar.js";
+import { noteDisarmed, renderCapital } from "./topbar.js";
 import { openQuitDialog, renderLock, showShutdown } from "./quit.js";
-import { renderAutopilot } from "./autopilot.js";
+import { onDailyLoss, renderAutopilot } from "./autopilot.js";
 import { onScanEvent } from "./scan.js";
 import { mergePlay, selectPlay } from "./plays.js";
 import { loadHistory, loadOpen, loadStats, openRecord, recordGone, tabVisible } from "./blotter.js";
@@ -146,6 +146,11 @@ function handle(topic, p) {
     case "stop.failed":
       toast("⚠ Protective stop: " + (p.reason || "could not be placed"), "warn");
       break;
+    case "stop.moved":
+      // the stop at the broker rests at its new price - exit.stop_moved has said what it locks, so no toast
+      loadOrders();
+      if (tabVisible("open")) loadOpen();
+      break;
     case "exit.stop_moved": {
       // what the stop keeps if it's hit, then where the trade stood when it moved
       const signedR = v => `${v >= 0 ? "+" : ""}${num(v, 1)}R`;
@@ -185,6 +190,9 @@ function handle(topic, p) {
       toast(p.note || "Connected", "good");
       if (p.state) setState(p.state);
       loadOpen();
+      break;
+    case "engine.disarmed":
+      noteDisarmed(p.reason);
       break;
     case "broker.switched":
       if (p.state) setState(p.state);
@@ -232,10 +240,14 @@ function handle(topic, p) {
       indexStrategies(p.strategies);
       break;
 
+    case "replay.started":
     case "replay.progress":
     case "replay.completed":
     case "replay.failed":
       onReplayEvent(topic, p);
+      break;
+    case "model.trained":
+      toast(`The learned model was retrained on ${count(p.rows)} rows (${p.id}) - ${p.usable ? "usable" : "not usable yet, so it has no say"}.`);
       break;
 
     case "quit.requested":
@@ -272,5 +284,18 @@ function handle(topic, p) {
     case "autopilot.blocked":
       toast("🤖 " + (p.reason || "Autopilot is blocked"), "warn");
       break;
+    case "autopilot.daily_loss":
+      onDailyLoss(p);
+      refreshState();                             // the strip's reading says it too
+      break;
+    case "autopilot.skipped": {
+      // it tried a play and the engine's assessment or the order was refused: a note, and the play's robot
+      // keeps why (the next board push carries the same) - no toast
+      const row = S.plays.find(x => x.id === p.play_id);
+      if (row) mergePlay({ id: row.id, autopilot: { ...(row.autopilot || {}), acted: true, skipped: true, reason: p.reason } });
+      addNotes([{ id: `skip_${p.play_id}_${Date.now()}`, at: new Date().toISOString(), kind: "skipped", play_id: p.play_id,
+        symbol: p.symbol, side: row ? row.side : "", strategy: p.strategy, why: p.reason || "refused" }]);
+      break;
+    }
   }
 }

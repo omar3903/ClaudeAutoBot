@@ -49,6 +49,35 @@ export function renderAutopilot() {
     : "Hands-off entry is OFF — you click every entry. Exits are automatic regardless. Click to turn on.";
   $("#autopilot-ctl").classList.toggle("live-warn", enabled && !eff);
   renderStrip();
+  renderLossBanner();
+}
+
+/* Stopped for the day by the daily loss limit or the give-back rule (autopilot.daily_loss): a red banner that
+   stays until it's dismissed or the stop is lifted - a toast is gone in seconds. The reason is the engine's
+   own, from the event; after a page load, from the strip's reading. */
+let lossWhy = "", lossDismissed = false;
+
+export function onDailyLoss(p) {
+  lossWhy = p.reason || "";
+  lossDismissed = false;
+  S.state.autopilot = { ...(S.state.autopilot || {}), daily_loss_stop: true };   // until the next snapshot says so
+  toast(`🤖 Autopilot stopped for the day: ${lossWhy || "the daily loss limit was reached"}`, "bad");
+  renderAutopilot();
+}
+
+function renderLossBanner() {
+  const ap = S.state.autopilot || {}, h = ap.headline || {}, b = $("#loss-banner");
+  if (!ap.daily_loss_stop) { lossWhy = ""; lossDismissed = false; }        // lifted, or a new day: a new stop shows again
+  const show = !!ap.enabled && !!ap.daily_loss_stop && !lossDismissed;
+  b.classList.toggle("hidden", !show);
+  if (!show) return;
+  const why = lossWhy || (h.state === "stopped" ? h.text.replace(/^Stopped for the day: /, "") : "")
+    || "the daily loss limit or the give-back rule was reached";
+  if (b.dataset.why === why) return;                                        // the Dismiss button stays under the mouse
+  b.dataset.why = why;
+  b.innerHTML = `<span>🤖 Autopilot stopped for the day: ${escapeHtml(why)}. Positions already open keep their stops and
+    automatic exits.</span> <button class="ghost mini" id="loss-dismiss" title="The strip under the header still says so">Dismiss</button>`;
+  $("#loss-dismiss").onclick = () => { lossDismissed = true; renderLossBanner(); };
 }
 
 /* The strip under the header: what Autopilot is doing now and why (status().headline, in the server's

@@ -358,6 +358,29 @@ def test_not_executable_from_engine_is_skipped():
     assert eng.assess_calls, "it should have asked the engine"
 
 
+def test_a_play_it_tried_and_was_refused_says_so_on_its_row():
+    heard = []
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(), bus=SimpleNamespace(publish=lambda topic, **kw: heard.append((topic, kw))))
+    unassessed, unsent, entered, untried = mkplay(sym="AAA"), mkplay(sym="BBB"), mkplay(sym="CCC"), mkplay(sym="DDD")
+    eng.can_execute = False
+    _run(ap, unassessed)                                                        # the engine's assessment refuses it
+    eng.can_execute = True
+    eng.approve_play = lambda pid, operator="operator": {"ok": False, "reason": "the broker refused the order"}
+    _run(ap, unsent)                                                            # the order is refused
+    del eng.approve_play
+    _run(ap, entered)
+
+    bars = {p.symbol: ap.decorate_play(p.to_row())["autopilot"] for p in (unassessed, unsent, entered, untried)}
+    assert bars["AAA"]["skipped"] and bars["AAA"]["reason"] == "not executable in this session"
+    assert bars["BBB"]["skipped"] and bars["BBB"]["reason"] == "the broker refused the order"
+    assert [kw["play_id"] for topic, kw in heard if topic == "autopilot.skipped"] == [unassessed.id, unsent.id]
+    assert bars["CCC"]["acted"] and not bars["CCC"]["skipped"]                 # taken, not skipped
+    assert not bars["DDD"]["acted"] and not bars["DDD"]["skipped"]             # never looked at
+    ap.settings_changed()                                                       # judged again on the next pass
+    assert not ap.decorate_play(unassessed.to_row())["autopilot"]["skipped"]
+
+
 def test_configure_updates_and_persists():
     calls = []
     ap = AutoPilot(FakeEngine(), _cfg(), bus=SILENT, persist=lambda: calls.append(1))

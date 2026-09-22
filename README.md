@@ -565,7 +565,8 @@ are calibrated on the model's own out-of-fold predictions; the card keeps each f
 out-of-sample importance and information coefficient.
 
 * The engine **retrains after each day's review** and scores every fresh play; the odds are logged
-  in the play's evidence (`model: {p, id, usable}`).
+  in the play's evidence (`model: {p, id, usable}`). The dashboard says when a new model is in and
+  whether it is usable.
 * Autopilot's **learned model** setting (⚙): `shadow` (default) only logs; `gate` refuses plays under
   `model_min_p` (55%); `size` also scales the risk by the bet size of AFML ch. 10. Gate and size act
   **only while the model's own walk-forward verdict calls it usable** - today it does not.
@@ -621,7 +622,8 @@ use — click it to set an amount, or **Use the whole account** to clear it.
 shown so you can see where live would stop you.
 
 - **Equity floor** — if account equity `< min_start_equity` ($2,000), *no new
-  entries*.
+  entries*. The dashboard shows a red banner with the reason; the engine checks
+  again on a start, a switch of account or **↻ Refresh**.
 - **PDT** — FINRA flags a *pattern day trader* at **4 day trades in 5 business
   days** on a **margin** account; flagged accounts must hold **$25,000**. Below
   that line you get **3 day trades per rolling 5 sessions**. The guard counts
@@ -820,7 +822,10 @@ the setup's own), and hovering the robot says which. A dim robot means it has
 already acted on the play. While Autopilot is on, a play it won't take gets a
 faded grey robot: hovering it gives the first check the play fails, in the
 words the entry gate itself uses (the badge and the gate share one set of
-checks). The play's detail panel says the same in one line.
+checks). The play's detail panel says the same in one line. A play Autopilot
+tried and was refused - by the engine's assessment or the broker - gets the
+faded robot with the refusal, and a note in **Autopilot notes**; it isn't tried
+again that day unless a setting changes.
 
 **The strip under the header** says what Autopilot is doing now and why, in one
 line: off, paper-only, no prices, stopped for the day, done (the day's entries
@@ -831,7 +836,9 @@ a kind has room, pacing (with a countdown to the next entry) or taking, with how
 many plays pass every check. It adds when unproven setups trade at practice
 size and which replay losers are skipped, and ends with today's closed trades by
 setup - a chip per setup with won / closed and the R they made (pair legs aren't
-counted). Green is taking, amber waiting, red stopped or blind, grey off.
+counted). Green is taking, amber waiting, red stopped or blind, grey off. When
+the daily loss limit or the give-back rule stops it, a red banner says so as
+well, with the reason, until it's dismissed or the stop is lifted.
 
 **Proof, noise and size.** A day-trade setup must show up `min_confirmations`
 (2) times in a row, and plays carrying a flag in `skip_noise` are skipped. With
@@ -970,8 +977,8 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 * **Reports** — each session's report (see [Reports](#reports--every-session-the-market-and-the-bot));
   a dot marks one you haven't opened.
 * **Scan now** — rescan the hot list and the next buffer names. The plays header
-  shows the last scan, a progress bar while one runs, and when the next full
-  scan is due.
+  shows the last scan, a progress bar while one runs, when the next full
+  scan is due, and "replay running" while a replay runs in the background.
 * **Long / Short / Intraday / Swing** and **Sectors** — what the bot scans for
   and may trade.
 * **Strategies** — switch setups on or off and weight them.
