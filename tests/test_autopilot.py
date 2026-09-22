@@ -1288,3 +1288,13 @@ def test_a_bare_off_in_config_yaml_means_off():
     ap.configure(skip_replay_losers="day")
     ap.load_runtime({"skip_replay_losers": False})
     assert ap.skip_replay_losers == "off"
+
+
+
+def test_a_zero_per_cycle_cap_from_the_files_reads_as_one_and_the_strip_still_draws(session_open):
+    eng = FakeEngine()
+    eng.entry_pace_seconds = lambda timeframe: 60.0
+    ap = AutoPilot(eng, _cfg(max_new_per_cycle=0), bus=SILENT)             # as config.yaml might say
+    assert ap.max_new_per_cycle == 1 and ap.status()["headline"]["state"] == "taking"
+    ap.load_runtime({"max_new_per_cycle": 0})                                # as runtime.json might say
+    assert ap.max_new_per_cycle == 1 and ap.status()["headline"]["state"] == "taking"

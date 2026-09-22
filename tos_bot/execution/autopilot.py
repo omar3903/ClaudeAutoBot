@@ -83,7 +83,7 @@ class AutoPilot:
         self.max_auto_positions: int = int(cfg.max_auto_positions)
         self.max_auto_trades_per_day: int = int(cfg.max_auto_trades_per_day)
         self.max_per_strategy: int = int(getattr(cfg, "max_per_strategy", 2))
-        self.max_new_per_cycle: int = int(getattr(cfg, "max_new_per_cycle", 1))
+        self.max_new_per_cycle: int = max(1, int(getattr(cfg, "max_new_per_cycle", 1)))   # as configure() allows
         self.cooldown_after_loss: bool = bool(getattr(cfg, "cooldown_after_loss", True))
         self.max_daily_loss_pct: float = float(getattr(cfg, "max_daily_loss_pct", 2.0))
         self.max_giveback_pct: float = float(getattr(cfg, "max_giveback_pct", 30.0))
@@ -184,6 +184,7 @@ class AutoPilot:
                   "max_per_strategy", "max_new_per_cycle", "min_confirmations", "min_minutes_to_close"):
             if isinstance(d.get(k), int):
                 setattr(self, k, int(d[k]))
+        self.max_new_per_cycle = max(1, self.max_new_per_cycle)          # as configure() allows
         if isinstance(d.get("skip_noise"), list):
             self.skip_noise = [str(n) for n in d["skip_noise"] if str(n) in NOISE_LABELS]
         if "cooldown_after_loss" in d:
@@ -825,11 +826,11 @@ class AutoPilot:
         window = self._pace_window(timeframe) if window is None else window
         if window <= 0:
             return 0.0
-        now = time.monotonic()
+        now, n = time.monotonic(), max(1, self.max_new_per_cycle)
         recent = sorted(at for at in list(self._entries_at) if now - at < window)
-        if len(recent) < self.max_new_per_cycle:
+        if len(recent) < n:
             return 0.0
-        return max(0.0, window - (now - recent[-self.max_new_per_cycle]))
+        return max(0.0, window - (now - recent[-n]))
 
     # ------------------------------------------------------------------ #
     #: how long the realized P/L of the day is kept before it is read again
