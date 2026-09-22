@@ -53,10 +53,10 @@ MIN_LIVE = 10
 MIN_GROUP = 5                     # plays on each side before a comparison is told
 NOISE_MARGIN_R = 0.10             # a check helped or cost only when the two sides differ by this much a play
 MIN_T = 1.0                       # ... and by a standard error or more (Welch's t), not one lucky play's worth
-TURBULENT = 0.7
-TAKEN = frozenset({"ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED"})
 #: a play whose entry order went out - or was going out - when no trade came of it: it was sent and never filled
 SENT_UNFILLED = frozenset({"ACCEPTED", "SUBMITTED", "WORKING", "CANCELED", "ERROR"})
+TURBULENT = 0.7
+TAKEN = frozenset({"ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED"})
 LABELS = {**NOISE_LABELS, "unconfirmed": "seen in only one scan"}
 
 
