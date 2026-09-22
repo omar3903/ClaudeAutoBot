@@ -5,8 +5,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from test_order_follow_up import VENUE, _Broker, _executor, _Repo, _trade
+from tos_bot.brokers.base import BrokerError
 from tos_bot.core.enums import OrderType, Side, TimeInForce
-from tos_bot.core.models import OrderResult
+from tos_bot.core.models import Fill, OrderResult
 
 
 class _StopBroker(_Broker):
@@ -240,6 +241,57 @@ def test_a_stop_an_earlier_run_left_is_followed_and_strays_are_cancelled():
     assert sorted(broker.cancelled) == ["78", "90"]                            # the double, and the one without a trade
     described = {o["order_id"]: (o["purpose"], o["trade_id"]) for o in ex.active_orders()}
     assert described["77"] == ("stop", "t1")
+
+
+def _left_stop(qty=100, filled=0.0, avg=0.0):
+    """The stop an earlier run left working at the broker, for a 100-share record."""
+    return OrderResult(order_id="77", status="SUBMITTED", symbol="AAA", submitted_qty=qty, filled_qty=filled,
+                       avg_fill_price=avg, side=Side.SHORT, tag="stop:t1", order_type="STOP", stop_price=98.0)
+
+
+def test_a_stop_that_filled_in_part_while_the_app_was_off_is_booked_and_the_rest_gets_a_stop_from_the_record():
+    broker, repo, ex, heard = _setup(_trade(quantity=100), positions={"AAA": 40}, working=[_left_stop()])
+    # the order's own count says nothing filled; IBKR's executions of it say 60 shares did
+    broker.get_fills = lambda symbol=None: [
+        Fill(order_id="77", symbol="AAA", side=Side.SHORT, quantity=60, price=97.9, tag="stop:t1"),
+        Fill(order_id="12", symbol="AAA", side=Side.SHORT, quantity=5, price=99.0, tag="exit:t9")]   # another order's
+    ex.sync_open_orders()
+    t = repo.get_trade("t1")
+    assert (t["status"], t["quantity"]) == ("OPEN", 40)
+    [reduced] = [p for topic, p in heard if topic == "trade.reduced"]
+    assert (reduced["qty"], reduced["price"], reduced["reason"]) == (60, 97.9, "stop")
+    assert broker.cancelled == ["77"] and ex.protective_stops() == []          # not followed: it would count them again
+    ex._stop_retry.clear()
+    ex.sync_open_orders()
+    [stop] = broker.stops()
+    assert (stop.quantity, stop.stop_price, stop.client_tag) == (40, 98.0, "stop:t1")   # sized from the record
+    ex.sync_open_orders()
+    restarted = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    restarted.sync_open_orders()                                               # the same executions, another run
+    assert restarted.protective_stops()[0]["order_id"] == "1" and len(broker.stops()) == 1   # the fresh stop, followed
+    assert repo.get_trade("t1")["quantity"] == 40 and [t for t, _ in heard].count("trade.reduced") == 1
+
+
+def test_a_stop_found_filled_for_the_whole_record_closes_it_once():
+    broker, repo, ex, heard = _setup(_trade(quantity=100), positions={}, working=[_left_stop(filled=100, avg=97.8)])
+    ex.sync_open_orders()                                                      # no executions here: the order's own count
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_reason"], closed["exit_price"]) == ("CLOSED", "stop", 97.8)
+    ex._stop_retry.clear()
+    ex.sync_open_orders()
+    assert [t for t, _ in heard].count("trade.closed") == 1 and broker.stops() == [] and broker.cancelled == ["77"]
+
+
+def test_executions_that_cannot_be_read_change_nothing():
+    broker, repo, ex, heard = _setup(_trade(quantity=100), positions={"AAA": 40}, working=[_left_stop()])
+
+    def unreadable(symbol=None):
+        raise BrokerError("the executions didn't arrive")
+
+    broker.get_fills = unreadable
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["quantity"] == 100 and broker.cancelled == []  # left to the share-count warning
+    assert ex.protective_stops()[0]["order_id"] == "77" and "trade.reduced" not in [t for t, _ in heard]
 
 
 def test_a_record_closed_some_other_way_takes_its_stop_with_it():

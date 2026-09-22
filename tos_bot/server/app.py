@@ -1,9 +1,9 @@
 """FastAPI app: REST + a WebSocket that streams engine events to the dashboard.
 
-Endpoints that touch secrets, exit every position or quit the app are
-same-machine only (see :mod:`tos_bot.server.security`). Handlers that call into
-the engine are plain ``def``, so FastAPI runs them in its thread pool and a
-slow broker call never stalls the event loop that feeds the WebSocket.
+Endpoints that touch secrets, exit every position, fix a share count or quit
+the app are same-machine only (see :mod:`tos_bot.server.security`). Handlers
+that call into the engine are plain ``def``, so FastAPI runs them in its thread
+pool and a slow broker call never stalls the event loop that feeds the WebSocket.
 """
 
 from __future__ import annotations
@@ -162,6 +162,18 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     @app.post("/api/positions/untracked/{symbol}/close")
     def close_untracked(symbol: str):
         return _result(eng().close_untracked(symbol.upper()))
+
+    # a share-count warning's Fix: it books P/L and can send a market exit, so same machine only
+    @app.get("/api/positions/mismatch/{symbol}", dependencies=LOCAL_ONLY)
+    def mismatch_preview(symbol: str):
+        return eng().mismatch_preview(symbol.upper())
+
+    @app.post("/api/positions/mismatch/{symbol}/fix", dependencies=LOCAL_ONLY)
+    def fix_mismatch(symbol: str, body: dict):
+        b = body or {}
+        # the counts the preview showed: the engine refuses when they've changed since
+        expect = {k: b[k] for k in ("recorded", "held") if isinstance(b.get(k), (int, float))}
+        return _result(eng().fix_mismatch(symbol.upper(), str(b.get("action") or ""), expect=expect or None))
 
     @app.post("/api/trades/{trade_id}/managed")
     def set_managed(trade_id: str, body: dict):

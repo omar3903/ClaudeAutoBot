@@ -716,7 +716,10 @@ Two rules keep it safe:
   for the next pass. A partial exit first shrinks the stop to the shares that remain.
 * **Never a stop without a position.** A stop is placed only while the account shows
   the shares and the broker's orders could be read; a stop whose trade is no longer
-  open is cancelled; a stop an earlier run left is followed, never doubled.
+  open is cancelled; a stop an earlier run left is followed, never doubled. If it (or
+  its target) filled while the app was off, what it filled is booked first, from
+  IBKR's executions of that order and never more than the record holds beyond the
+  account, and the pair is placed afresh for the shares the record then holds.
 
 **And a target, in one group with it.** Beside the stop rests a good-till-cancelled
 **limit order at the target** (`execution.native_target`, on by default): for the part
@@ -749,6 +752,22 @@ the fills tagged with that trade's own exit orders (`exit:<trade>`) are booked a
 than the record is over by, never while an exit for it is still working, only for a symbol with one record.
 The counts then agree, and the stop and target go back at the broker for what's left. A difference its own
 fills don't explain (shares sold by hand in TWS) is left alone and reported, as before.
+
+**A share count that disagrees can be fixed from its warning.** Each yellow share-count warning has a
+**Fix…** button. It reads the account again and shows what the record and the account hold, the broker's
+executions of the stock since the entry that no record has booked (and which order sent each: the record's
+stop or target, an exit the app sent, or something outside the app), and the price and reason the missing
+shares would be booked at - from those executions, or estimated at the last price when the broker no longer
+reports them (IBKR keeps only today's), which it says. When the account holds fewer shares than the record,
+the same way round, there are two choices: **Match the record to the account** takes the missing shares off
+the record (`stop` / `trailing-stop` when its stop order sold them, `target-1` for its target,
+`closed-outside` otherwise), and the next pass sizes the stop at the broker from the corrected record; **Sell
+what's left and close the record** does the same, then sends a market exit for the rest. Nothing happens
+without the click, and the counts shown go with it: if they changed since, nothing is done. It is refused, with
+the reason, while not connected, while quitting, while an order for the stock is working or its resting stop
+or target has part filled (those shares are booked when it finishes), for a stock with more than one open
+record or a pair leg, and - the exit only - while the market is closed. More shares than the record are
+exited from **Shares without a record**, as before.
 
 The Open orders panel lists them as **stop** and **target** with their trade. The
 simulator keeps its own bracket and gets no such orders.

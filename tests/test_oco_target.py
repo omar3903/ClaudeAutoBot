@@ -8,7 +8,7 @@ from test_native_stop import _StopBroker
 from test_order_follow_up import CFG, _executor, _Repo, _trade
 from tos_bot.brokers.base import BrokerError
 from tos_bot.core.enums import OrderType, Side, TimeInForce
-from tos_bot.core.models import OrderResult
+from tos_bot.core.models import Fill, OrderResult
 from tos_bot.execution.exit_manager import ExitManager, scale_out_plan
 
 EXITS = SimpleNamespace(scale_out_pct=50.0, scale_out_lock_r=0.0, breakeven_buffer_bps=5.0)
@@ -192,6 +192,31 @@ def test_orders_an_earlier_run_left_are_followed_and_a_stray_target_is_cancelled
     described = {o["order_id"]: (o["purpose"], o["trade_id"]) for o in ex.active_orders()}
     assert described["71"] == ("target", "t1")
     assert ex.cancel_working_orders()["stops_kept"] == 2 and broker.cancelled == ["90"]   # neither is touched
+
+
+def test_a_target_that_filled_in_part_while_the_app_was_off_is_booked_as_the_first_target():
+    left = [OrderResult(order_id="70", status="SUBMITTED", symbol="AAA", submitted_qty=7, side=Side.SHORT,
+                        tag="stop:t1", order_type="STOP", stop_price=98.0),              # the group shrank it by 3
+            OrderResult(order_id="71", status="SUBMITTED", symbol="AAA", submitted_qty=5, side=Side.SHORT,
+                        tag="tgt:t1", order_type="LIMIT", limit_price=104.0)]
+    broker, repo, ex, _ = _setup(working=left)
+    broker.positions["AAA"] = 7
+    broker.get_fills = lambda symbol=None: [Fill(order_id="71", symbol="AAA", side=Side.SHORT, quantity=3,
+                                                 price=104.05, tag="tgt:t1")]
+    got = []
+    ex.bus = SimpleNamespace(publish=lambda topic, **p: got.append((topic, p)))
+    ex.sync_open_orders()
+    [reduced] = [p for topic, p in got if topic == "trade.reduced"]
+    assert (reduced["qty"], reduced["price"], reduced["reason"]) == (3, 104.05, "target-1")
+    t = repo.get_trade("t1")
+    assert (t["quantity"], t["stop_price"], t["target_price"]) == (7, 100.05, 110.0)   # what the rest now has to do
+    assert sorted(broker.cancelled) == ["70", "71"] and ex.protective_stops() == []
+    ex._stop_retry.clear()
+    ex.sync_open_orders()
+    (stop,), (target,) = broker.stops(), broker.targets()
+    assert (stop.quantity, stop.stop_price, target.quantity, target.limit_price) == (7, 100.05, 7, 110.0)
+    ex.sync_open_orders()
+    assert [topic for topic, _ in got].count("trade.reduced") == 1 and len(broker.orders) == 2
 
 
 def test_the_part_a_target_covers_is_the_part_the_exit_manager_would_take():

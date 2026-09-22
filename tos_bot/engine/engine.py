@@ -46,8 +46,9 @@ from ..data.sec_edgar import SecEdgarFundamentals
 from ..data.symbols import SymbolMaster
 from ..execution.autopilot import AutoPilot
 from ..execution.executor import Executor
-from ..execution.exit_manager import ExitManager
+from ..execution.exit_manager import ExitManager, scale_out_plan
 from ..execution.order_builder import plan_order
+from ..execution.protective_stops import TAG as STOP_TAG, TARGET_TAG, stop_exit_reason
 from ..persistence.db import init_db
 from ..persistence.repository import Repository
 from ..risk.pdt_guard import PdtGuard
@@ -254,6 +255,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._orders_lock = threading.Lock()
 
         self._quit_lock = threading.Lock()
+        self._fix_lock = threading.Lock()          # a share-count fix books at most once, however many tabs click
         self._quit_retry_at = 0.0
         self._quit_rounds = 0
         self._switch_lock = threading.RLock()
@@ -1325,6 +1327,232 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             tail = "" if status == "FILLED" else f" ({status.lower()})"
             out["note"] = f"Exit sent for {row['qty']:,.0f} {symbol} shares that had no record{tail}."
         return out
+
+    # ------------------------------------------------------------------ #
+    #  A share count that disagrees: the warning's Fix button            #
+    # ------------------------------------------------------------------ #
+    #: what sent an execution a fix can book, in the preview's words
+    EXEC_SOURCES = {"stop": "its stop order", "target": "its target order", "exit": "an exit the app sent",
+                    "other": "an order from outside the app"}
+
+    def mismatch_preview(self, symbol: str) -> Dict[str, Any]:
+        """What the Fix button on a share-count warning shows before anything changes: what the open record and
+        the account hold, the broker's executions of the stock no record has booked, the price and reason the
+        shares the account no longer holds would be booked at, and whether each fix is allowed now - with the
+        reason when it isn't. The account is read afresh: a warning can be minutes old."""
+        return self._mismatch(symbol, self._refresh_account())
+
+    def fix_mismatch(self, symbol: str, action: str, expect: Optional[Mapping[str, Any]] = None,
+                     operator: str = "operator") -> Dict[str, Any]:
+        """One of the Fix button's two choices, for a record holding more shares than the account, the same way
+        round. ``match`` books the shares the account no longer holds off the record - at the broker's executions
+        of them, or the estimate the preview stated - so the record matches the account, and the next protect
+        pass sizes the stop at the broker from it. ``close`` does that, then sends a market exit for what's left;
+        the record closes when it fills. The counts are read again first: ``expect`` is what the preview showed
+        ({recorded, held}), and when either has changed nothing is done. Only the record is changed."""
+        if action not in ("match", "close"):
+            return {"ok": False, "reason": "Choose 'match' or 'close'."}
+        with self._fix_lock:
+            m = self._mismatch(symbol, self._refresh_account())
+            if any(expect and expect.get(k) is not None and abs(float(expect[k]) - m[k]) > 1e-6
+                   for k in ("recorded", "held")):
+                return {"ok": False, "changed": True, "preview": m,
+                        "reason": (f"The counts changed since the preview: the record holds {m['recorded']:,.0f} and "
+                                   f"{m['venue_label']} {m['held']:,.0f} now. Open Fix again to see them.")}
+            allowed = m["actions"][action]
+            if not allowed["ok"]:
+                return {"ok": False, "reason": allowed["reason"], "preview": m}
+            tid, b = m["records"][0]["id"], m["booking"]
+            out = self.repo.reduce_trade(tid, b["qty"], b["price"], exit_reason=b["reason"],
+                                         commission=b["commission"], **b["after"])
+            if not out or out.get("status") != "OPEN":
+                return {"ok": False, "reason": "The record couldn't be changed - it may have closed just now."}
+            log.warning("share counts fixed by %s (%s): booked %s %s shares off %s at %.4f (%s; %s) - it now holds %s, "
+                        "as %s does", operator, action, f"{b['qty']:,.0f}", symbol, tid, b["price"], b["reason"],
+                        b["basis"], f"{m['held']:,.0f}", m["venue_label"])
+            self._publish("trade.reduced", trade=out, reason=b["reason"], qty=b["qty"], price=b["price"])
+            # the warning goes now rather than at the next position check: the counts agree, or an exit is working
+            self.position_check.mismatches = [x for x in self.position_check.mismatches if x.get("symbol") != symbol]
+            note = (f"Booked {b['qty']:,.0f} {symbol} shares off the record at {b['price']:.2f} ({b['reason']}); "
+                    f"it now holds {m['held']:,.0f}, as {m['venue_label']} does")
+            res: Dict[str, Any] = {"ok": True, "trade": out,
+                                   "booked": {k: b[k] for k in ("qty", "price", "reason", "estimated")}}
+            if action == "match":
+                res["note"] = note + (", and its stop at the broker follows the record."
+                                      if self.executor.native_stops_on() else ".")
+            else:
+                sent = self.executor.close_trade(tid, reason="manual")
+                res["exit"] = sent
+                if sent.get("ok"):
+                    status = str(sent.get("status") or "")
+                    tail = "" if status == "FILLED" else f" ({status.lower()})"
+                    res["note"] = note + f". Exit sent for the rest{tail}."
+                else:
+                    res.update(ok=False, reason=note + ", but the exit wasn't sent: "
+                               + (sent.get("reason") or "no reason given"))
+                    log.warning("the exit after a share-count fix of %s wasn't sent: %s", symbol, sent.get("reason"))
+        self._refresh_account()
+        self._publish("account.snapshot", state=self.snapshot())
+        return res
+
+    def _mismatch(self, symbol: str, read: bool) -> Dict[str, Any]:
+        """The Fix preview for ``symbol``, from the account as last read (``read``: whether that read just worked)."""
+        where, acc, ex = venue_label(self._venue), self._account, self.executor
+        mine = [t for t in self._positions_here() if t["symbol"] == symbol]
+        recorded = sum((1.0 if t["side"] == "LONG" else -1.0) * abs(float(t.get("quantity") or 0.0)) for t in mine)
+        pos = acc.position(symbol) if acc is not None else None
+        held = float(pos.quantity) if pos is not None else 0.0
+        if not mine:
+            kind = "no-record"
+        elif abs(held - recorded) < 1e-6:
+            kind = "agree"
+        elif abs(held) < 1e-9:
+            kind = "none"
+        elif (held > 0) != (recorded > 0):
+            kind = "other-side"
+        else:
+            kind = "more" if abs(held) > abs(recorded) else "fewer"
+        t = mine[0] if len(mine) == 1 and kind == "fewer" else None
+        missing = abs(recorded) - abs(held) if kind == "fewer" else 0.0
+        executions = self._unbooked_exits(t) if t is not None else []
+        mark = self._marks().get(symbol)
+        last = (mark[0] if mark else 0.0) or (float(pos.market_price or 0.0) if pos is not None else 0.0)
+        booking = (self._mismatch_booking(t, missing, executions, last)
+                   if t is not None and executions is not None else None)
+
+        # why neither fix may run now - the first reason that applies
+        why = ""
+        if ex is None or self._broker is None or not self._broker.is_connected:
+            why = f"{where} isn't connected, so its count can't be checked."
+        elif not read:
+            why = f"{where} didn't answer for the account just now - try again in a moment."
+        elif self.quit_state:
+            why = "The app is quitting - nothing but its exits can change until that's done."
+        elif kind == "no-record":
+            why = f"The app has no open record of {symbol} on {where}."
+        elif kind == "agree":
+            why = "The counts agree now - there's nothing to fix."
+        elif kind == "none":
+            why = (f"{where} shows no {symbol} shares. The position check books the record closed from the broker's "
+                   "fills, or removes it, by itself once it has seen that twice in a row.")
+        elif kind == "other-side":
+            why = f"{where} holds {symbol} the other way round - check the position there; the app won't guess."
+        elif kind == "more":
+            why = (f"{where} holds {abs(held) - abs(recorded):,.0f} shares more than the record. They're listed under "
+                   "Shares without a record in Open positions, with their own Exit.")
+        elif t is None:
+            why = (f"{symbol} has {len(mine)} open records ({', '.join(x['id'] for x in mine)}). The fix works on a "
+                   "stock with one - check them in Open positions.")
+        elif t.get("pair_id"):
+            why = "It's one leg of a pair trade - the pair desk closes both legs together (Pairs tab)."
+        elif symbol in ex.symbols_in_flight() or t["id"] in ex.pending_exit_trade_ids():
+            why = (f"An order for {symbol} is still working at {where} - its fills change the counts. Try again "
+                   "once it's done.")
+        elif executions is None:
+            why = f"{where} didn't say what it executed just now - try again in a moment."
+        else:
+            filled = ex.resting_filled(t["id"])
+            if filled is None:
+                why = f"The stop and target resting at {where} couldn't be checked just now - try again in a moment."
+            elif filled > 1e-9:
+                why = (f"The stop or target resting at {where} has filled {filled:,.0f} shares and is still working - "
+                       "the app books them itself when it finishes.")
+            elif booking is None:
+                why = (f"There's no price to book the {missing:,.0f} missing shares at: {where} reports no executions "
+                       "for them and the app has no last price.")
+        shut = "" if why else self._exits_cant_fill()
+        close_why = why or ("The market is closed, so an exit can't fill now. Match the record now, and exit what's left "
+                            "from Open positions once the regular session opens." if shut else "")
+        return {
+            "ok": True, "symbol": symbol, "kind": kind, "venue_label": where, "live": self.mode == "live",
+            "side": mine[0]["side"] if mine else "", "held_side": "LONG" if held > 0 else "SHORT" if held < 0 else "",
+            "recorded": abs(recorded), "held": abs(held), "missing": missing,
+            "records": [{k: x.get(k) for k in ("id", "quantity", "entry_price", "stop_price", "target_price")}
+                        for x in mine],
+            "executions": [{**{k: r[k] for k in ("qty", "price", "at", "source", "order_id")},
+                            "label": self.EXEC_SOURCES[r["source"]]} for r in executions or []],
+            "booking": booking, "last_price": last or None,
+            "actions": {"match": {"ok": not why, "reason": why}, "close": {"ok": not close_why, "reason": close_why}},
+        }
+
+    def _unbooked_exits(self, t: Mapping[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """The exit-side executions the broker reports for a record's stock since it was entered that no record
+        has booked, oldest first, each with what sent it (EXEC_SOURCES). Another trade's orders and the ones
+        closing shares without a record are left out, and the shares the record itself booked off today are
+        taken to be the first of its own orders' executions (IBKR reports only today's). None when the broker
+        couldn't say."""
+        get = getattr(self._broker, "get_fills", None)
+        if not callable(get):
+            return []
+        try:
+            fills = list(get(t["symbol"]) or [])
+        except Exception:  # noqa: BLE001
+            log.debug("fills for %s unavailable", t["symbol"], exc_info=True)
+            return None
+        tid, entered, today = t["id"], _utc(t.get("entry_time")), clock.session_date()
+        exit_side = Side.SHORT if t["side"] == "LONG" else Side.LONG
+        own = {f"{STOP_TAG}{tid}": "stop", f"{TARGET_TAG}{tid}": "target", f"exit:{tid}": "exit"}
+        booked = sum(float(f.get("quantity") or 0.0) for f in (self.repo.trade_record(tid) or {}).get("fills") or []
+                     if f.get("leg") == "EXIT" and _utc(f.get("ts")) and clock.session_date(_utc(f["ts"])) == today)
+        out: List[Dict[str, Any]] = []
+        for f in sorted(fills, key=lambda f: _utc(f.ts) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)):
+            tag, qty, at = getattr(f, "tag", "") or "", float(f.quantity), _utc(f.ts)
+            if f.side != exit_side or qty <= 0 or (entered and at and at < entered - dt.timedelta(minutes=1)):
+                continue
+            source = own.get(tag) or ("" if tag.startswith((STOP_TAG, TARGET_TAG, "exit:", "unwind:")) else "other")
+            if not source:
+                continue                             # another trade's order, or one closing shares without a record
+            fee = float(f.commission or 0.0)
+            if source != "other" and booked > 1e-9:
+                skip = min(booked, qty)
+                booked, fee, qty = booked - skip, fee * (qty - skip) / qty, qty - skip
+                if qty <= 1e-9:
+                    continue
+            out.append({"qty": qty, "price": float(f.price), "commission": fee, "source": source,
+                        "order_id": str(f.order_id), "at": at.isoformat() if at else None})
+        return out
+
+    def _mismatch_booking(self, t: Mapping[str, Any], missing: float, executions: List[Dict[str, Any]],
+                          last: float) -> Optional[Dict[str, Any]]:
+        """The price and reason the shares a record holds beyond the account are booked at: the broker's executions
+        of them, oldest first, and the last price for any it no longer reports (IBKR keeps only today's) - said
+        so. None when some are left with neither."""
+        qty = value = fees = 0.0
+        sources = set()
+        for r in executions:
+            take = min(r["qty"], missing - qty)
+            if take <= 1e-9:
+                break
+            qty, value, fees = qty + take, value + take * r["price"], fees + r["commission"] * take / r["qty"]
+            sources.add(r["source"])
+        rest = max(0.0, missing - qty)
+        if rest > 1e-9 and last <= 0:
+            return None
+        after: Dict[str, float] = {}
+        if rest > 1e-9 or len(sources) != 1:
+            reason = "closed-outside"
+        elif sources == {"stop"}:
+            # the stop order rests at the record's stop: moved from where it began, it was a trailing stop
+            reason = stop_exit_reason(t.get("initial_stop_price"),
+                                      float(t.get("stop_price") or t.get("initial_stop_price") or 0.0))
+        elif sources == {"target"}:
+            # the scale-out's part came off at the first target: the rest gets the stop and target it would have
+            reason = "target-1"
+            plan = scale_out_plan(t, self.settings.config.exit_manager)
+            after = dict(plan[1]) if plan else {}
+        else:
+            reason = "closed-outside"
+        whose = self.EXEC_SOURCES[next(iter(sources))] if len(sources) == 1 else "several orders"
+        if rest <= 1e-9:
+            basis = f"the broker's executions: {qty:,.0f} at {value / qty:.2f}, from {whose}"
+        elif qty > 0:
+            basis = (f"the broker's executions cover {qty:,.0f} at {value / qty:.2f} (from {whose}); the other "
+                     f"{rest:,.0f} are estimated at the last price, {last:.2f} - it reports only today's executions")
+        else:
+            basis = (f"estimated at the last price, {last:.2f} - the broker reports no executions for these shares "
+                     "(IBKR keeps only today's)")
+        return {"qty": missing, "price": round((value + rest * last) / missing, 4), "commission": round(fees, 2),
+                "reason": reason, "after": after, "estimated": rest > 1e-9, "basis": basis}
 
     def refresh_account_now(self) -> Dict[str, Any]:
         """The dashboard's Refresh. When IB Gateway came up after the app it connects right away

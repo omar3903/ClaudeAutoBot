@@ -1,10 +1,10 @@
 /* The top bar: paper / live, the market, data and connection pills, balances,
    trading capital, and the theme, refresh and paper-reset buttons. */
-import { $, $$, api, escapeHtml, money, num, post, shorten, store, usd } from "./util.js";
-import { S, emit, on, setState } from "./state.js";
+import { $, $$, api, escapeHtml, fmtTime, getLocal, money, num, post, shorten, store, usd } from "./util.js";
+import { S, emit, on, refreshState, setState } from "./state.js";
 import { busy, closeModal, openModal, toast, toastResult, unbusy } from "./ui.js";
 import { openConnections } from "./connections.js";
-import { loadOpen } from "./blotter.js";
+import { loadOpen, showTab } from "./blotter.js";
 
 function setPill(sel, text, cls) {
   const el = $(sel);
@@ -62,11 +62,85 @@ function renderArmed(s) {
     ↻ Refresh checks it again.</span>`;
 }
 
+let mismatchKey = "";
+
 function renderMismatches(list) {
-  // positions a different size than their records add up to - shown until they agree again
-  const b = $("#records-banner");
+  // positions a different size than their records add up to - shown until they agree again, each with its Fix. Drawn
+  // again only when the list changes, so a snapshot arriving mid-click doesn't swap the button out from under it
+  const b = $("#records-banner"), key = JSON.stringify(list.map(m => [m.symbol, m.note]));
   b.classList.toggle("hidden", !list.length);
-  b.innerHTML = list.map(m => `<span>⚠ ${escapeHtml(m.note)}</span>`).join("");
+  if (key === mismatchKey) return;
+  mismatchKey = key;
+  b.innerHTML = list.map(m => `<span>⚠ ${escapeHtml(m.note)}</span>
+    <button class="mini" data-fix="${escapeHtml(m.symbol)}" title="See what the record and the account hold, and fix the record">Fix…</button>`).join("");
+  $$("[data-fix]", b).forEach(btn => { btn.onclick = () => openFix(btn.dataset.fix); });
+}
+
+/* The Fix button on a share-count warning (engine.mismatch_preview / fix_mismatch): what the record and the account
+   hold, what the broker executed that no record has booked, and - when the account holds fewer shares than the
+   record, the same way round - the two ways to make them agree. Nothing changes without a click here; the counts
+   shown go with it, and the engine refuses if they've changed since. */
+let fixing = false;
+
+async function openFix(symbol) {
+  let m;
+  try { m = await getLocal(`/api/positions/mismatch/${encodeURIComponent(symbol)}`); }
+  catch (e) { toast(`Couldn't check ${symbol} - ${e.message}`, "bad"); return; }
+  const { match = {}, close = {} } = m.actions || {};
+  const title = `Fix ${m.symbol}: the record and the account disagree`;
+  if (m.kind === "more") {
+    openModal({ title, bodyHTML: fixPreviewHTML(m), okText: "Show the shares without a record", okClass: "long",
+      cancelText: "Close", onOk: () => showTab("open") });
+    return;
+  }
+  if (!match.ok) {
+    openModal({ title, bodyHTML: fixPreviewHTML(m), okText: "OK", okClass: "ghost", cancelText: "Close", onOk: () => {} });
+    return;
+  }
+  const verb = m.side === "SHORT" ? "Buy back" : "Sell";
+  openModal({
+    title, okText: "Match the record to the account", okClass: "long", onOk: () => sendFix(m, "match"),
+    bodyHTML: fixPreviewHTML(m) + `<div class="row-gap"><button class="danger" id="fix-close" ${close.ok ? "" : "disabled"}>
+        ${verb} what's left and close the record</button></div>
+      ${close.ok ? "" : `<p class="reasons">${escapeHtml(close.reason)}</p>`}`,
+  });
+  $("#fix-close").onclick = () => { closeModal(); sendFix(m, "close"); };
+}
+
+function fixPreviewHTML(m) {
+  const venue = escapeHtml(m.venue_label || "the broker"), b = m.booking, recs = m.records || [], ex = m.executions || [];
+  const way = s => s === "SHORT" ? " short" : s === "LONG" ? " long" : "";
+  const [verb, verbs] = m.side === "SHORT" ? ["Buy back", "buys back"] : ["Sell", "sells"];
+  return `${m.live ? `<div class="warn-box">This is your <b>live</b> account: closing sends a <b>real market order</b>.</div>` : ""}
+    <div class="kv">
+      <span>The app's record${recs.length === 1 ? "" : "s"}</span><span>${num(m.recorded, 0)} shares${way(m.side)}</span>
+      <span>Held in ${venue}</span><span>${num(m.held, 0)} shares${way(m.held_side)}</span>
+      ${m.missing ? `<span>Missing from the account</span><span>${num(m.missing, 0)}</span>` : ""}
+    </div>
+    ${recs.length ? `<table class="rec-table"><thead><tr><th>Record</th><th class="num">Qty</th><th class="num">Entry</th>
+      <th class="num">Stop</th></tr></thead><tbody>${recs.map(t => `<tr><td><code>${escapeHtml(t.id)}</code></td>
+      <td class="num">${num(t.quantity, 0)}</td><td class="num">${num(t.entry_price)}</td><td class="num">${num(t.stop_price)}</td></tr>`).join("")}
+      </tbody></table>` : ""}
+    ${m.kind === "fewer" ? `<h4>What ${venue} executed that no record has booked</h4>
+      ${ex.length ? `<table class="rec-table"><thead><tr><th>Time</th><th>Sent by</th><th class="num">Qty</th><th class="num">Price</th></tr></thead>
+        <tbody>${ex.map(f => `<tr><td>${fmtTime(f.at)}</td><td>${escapeHtml(f.label)}</td><td class="num">${num(f.qty, 0)}</td>
+        <td class="num">${num(f.price)}</td></tr>`).join("")}</tbody></table>`
+        : `<p class="muted small">Nothing since the entry - IBKR keeps only today's executions.</p>`}` : ""}
+    ${b ? `<p>The ${num(b.qty, 0)} missing shares are booked at <b>${num(b.price)}</b> (${escapeHtml(b.reason)}): ${escapeHtml(b.basis)}.</p>
+      <p class="muted small"><b>Match the record</b> takes them off it: it then holds ${num(m.held, 0)}, as ${venue} does, and the stop
+        at the broker is sized from it. <b>${verb} what's left</b> does the same, then ${verbs} the ${num(m.held, 0)} left at the
+        market and closes the record.</p>` : ""}
+    ${(m.actions || {}).match && !m.actions.match.ok ? `<p class="reasons">${escapeHtml(m.actions.match.reason)}</p>` : ""}`;
+}
+
+async function sendFix(m, action) {
+  if (fixing) return;                                 // the answer to the last click hasn't come back yet
+  fixing = true;
+  let r;
+  try { r = await post(`/api/positions/mismatch/${encodeURIComponent(m.symbol)}/fix`, { action, recorded: m.recorded, held: m.held }); }
+  finally { fixing = false; }
+  toastResult(r);
+  loadOpen(); refreshState();
 }
 
 function renderMarket(mk, open) {
