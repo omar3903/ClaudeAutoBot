@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tos_bot.core.enums import AssetClass, Side, StrategyKind, Timeframe
+from tos_bot.core.enums import AssetClass, PlayStatus, Side, StrategyKind, Timeframe
 from tos_bot.core.models import Account, Play, Position
 from tos_bot.execution.autopilot import AutoPilot
 
@@ -777,6 +777,81 @@ def test_a_play_that_passes_but_finds_its_cap_full_says_what_it_waits_for():
     ap.enabled = False                                                           # not taking it at all: no bar
     off = ap.decorate_play(_row("INTRADAY"))["autopilot"]
     assert not off["eligible"] and off["waiting"] is None
+
+
+# ---------------------------------------------------------------- the play's bar says why not, in the gate's words
+def _refused(status=None, noise=(), **over):
+    p = mkplay(**over)
+    p.noise = list(noise)
+    if status is not None:
+        p.status = status
+    return p
+
+
+@pytest.mark.parametrize("cfg, play, words", [
+    ({}, _refused(status=PlayStatus.REJECTED), "not a fresh proposed play"),
+    ({}, _refused(tf=Timeframe.SWING), "swing trades are switched off"),
+    ({"min_confidence": 0.8}, _refused(conf=0.7), "confidence 0.70 < 0.80"),
+    ({"min_reward_risk": 1.5}, _refused(target=102.4), "reward:risk 1.20 < 1.50"),
+    ({}, _refused(kind=StrategyKind.FUNDAMENTAL), "valuation plays"),
+    ({"skip_noise": ["against_trend"]}, _refused(noise=["against_trend"]), "noise: against the daily trend"),
+    ({"min_confirmations": 2}, _refused(), "seen in 1 of 2"),
+    ({"require_proven": True}, _refused(), "isn't proven yet"),
+    ({}, _refused(), None),
+])
+def test_the_bar_gives_the_gates_own_reason_for_every_check_on_the_play(cfg, play, words):
+    ap = AutoPilot(FakeEngine(), _cfg(**cfg), bus=SILENT)
+    gate = ap._pre_gate(play, 100_000.0)
+    bar = ap.decorate_play(play.to_row())["autopilot"]
+    assert bar["why_not"] == gate                                                # one set of checks, one wording
+    if words is None:
+        assert gate is None and bar["eligible"] and bar["waiting"] is None
+    else:
+        assert words in gate and not bar["eligible"] and bar["waiting"] is None
+
+
+def test_the_bar_says_when_autopilot_itself_is_why_not():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(), bus=SILENT)
+    ap.enabled = False
+    assert ap.decorate_play(_row("INTRADAY"))["autopilot"]["why_not"] == "Autopilot is off"
+    ap.enabled = True
+    ap._roll_day()
+    ap._loss_stop_day = ap._day                                                  # the daily loss limit was reached today
+    assert "stopped for the day" in ap.decorate_play(_row("INTRADAY"))["autopilot"]["why_not"]
+    live = AutoPilot(FakeEngine(mode="live"), _cfg(allow_live=False), bus=SILENT)
+    assert "paper-only" in live.decorate_play(_row("INTRADAY"))["autopilot"]["why_not"]
+
+
+def test_the_clock_and_what_is_held_reach_the_bar_as_the_last_passes_reason(monkeypatch):
+    from tos_bot.execution import autopilot as module
+
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(trade_types=["INTRADAY", "SWING"], min_minutes_to_close=30), bus=SILENT)
+    monkeypatch.setattr(module.clock, "minutes_to_close", lambda ts=None: 20.0)
+    late, held = mkplay(sym="AAA"), mkplay(sym="BBB", tf=Timeframe.SWING)
+    eng.repo.held.add("BBB")
+    _run(ap, late, held)
+    assert eng.approved == []
+    late_bar, held_bar = ap.decorate_play(late.to_row())["autopilot"], ap.decorate_play(held.to_row())["autopilot"]
+    assert late_bar["why_not"] is None and "minutes to the close" in late_bar["reason"]
+    assert held_bar["why_not"] is None and held_bar["reason"] == "already holding BBB"
+
+
+def test_a_board_of_plays_reads_each_strategys_record_once_and_the_gate_every_time():
+    eng = FakeEngine()
+    reads = []
+    eng.strategy_record = lambda key: reads.append(key) or eng.records.get(key)
+    ap = AutoPilot(eng, _cfg(require_proven=True), bus=SILENT)
+    for i in range(5):
+        assert "isn't proven yet" in ap.decorate_play({**_row("INTRADAY"), "id": f"row_{i}"})["autopilot"]["why_not"]
+    assert reads == ["opening_range_breakout"]                                   # one read for the whole board
+    eng.records["opening_range_breakout"] = {"trades": 40, "expectancy_r": 0.30}
+    ap.settings_changed()                                                        # a new replay lands here
+    assert ap.decorate_play(_row("INTRADAY"))["autopilot"]["eligible"] and len(reads) == 2
+    p = mkplay()
+    assert ap._pre_gate(p, 100_000.0) is None and ap._pre_gate(p, 100_000.0) is None
+    assert len(reads) == 4                                                       # the gate reads it afresh each pass
 
 
 # ---------------------------------------------------------------- an entry that bought nothing hands its slot back

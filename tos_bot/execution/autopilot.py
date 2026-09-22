@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from ..core.eventbus import BUS
 from ..scanner.noise import LABELS as NOISE_LABELS
@@ -109,6 +109,8 @@ class AutoPilot:
         self._peak_realized: float = 0.0        # the best the day's realized P/L has been
         self._realized: tuple = (float("-inf"), 0.0)   # (monotonic time read, realized P/L today)
         self._entries_at: List[float] = []      # monotonic times of the latest entries, for the per-cycle cap
+        #: (monotonic time read, {strategy: replayed record}) - the dashboard's rows share one read (_board_record)
+        self._record_cache: Optional[tuple] = None
 
     # ------------------------------------------------------------------ #
     #  Persistable slice (goes into data/runtime.json alongside `mode`)  #
@@ -231,6 +233,7 @@ class AutoPilot:
             self.model_min_p = min(0.9, max(0.5, float(kw["model_min_p"])))
         if isinstance(kw.get("skip_noise"), list):
             self.skip_noise = [str(n) for n in kw["skip_noise"] if str(n) in NOISE_LABELS]
+        self._record_cache = None               # the records are over the trades these settings would take
         self._persist()
         self.bus.publish("autopilot.config", **self.status())
         log.info("autopilot reconfigured: %s", self.status())
@@ -262,6 +265,7 @@ class AutoPilot:
         self._acted -= self._refused
         self._refused.clear()
         self._last_reason.clear()
+        self._record_cache = None               # the rows read the records afresh too - a new replay lands here
 
     def publish_status(self) -> None:
         """Tell the dashboard what Autopilot is set to and holds - without saving or logging anything."""
@@ -736,35 +740,49 @@ class AutoPilot:
                         f"than {self.max_giveback_pct:g}% of it - no more entries this session (Aziz's give-back rule)")
         return None
 
-    def _pre_gate(self, p: Any, equity: float) -> Optional[str]:
-        """Cheap filters before we spend an engine assessment. Returns a reason
-        string to skip, or None to proceed."""
-        if getattr(p.status, "value", str(p.status)) != "PROPOSED":
+    def _play_check(self, tf: str, confidence: float, reward_risk: float, kind: str, status: str,
+                    noise: Iterable[str], confirmations: int, strategy: str, *, board: bool = False) -> Optional[str]:
+        """Why Autopilot won't take a play, from the play itself and Autopilot's settings - None when it
+        passes. The gate (_pre_gate) and the dashboard's badge (decorate_play) both ask here, so the reason
+        a row shows is the gate's own words, not a second copy of the rules kept by hand. ``board``: for
+        the dashboard's rows - the clock is left to the gate, like the other checks that change from pass
+        to pass (the model, what is held, the cooling off), and reaches a row as the last pass's reason;
+        the replayed records are read once for the whole board."""
+        if status != "PROPOSED":
             return "not a fresh proposed play"
-        tf = p.timeframe.value
         if tf not in self.play_types():
             return f"{'day' if tf == 'INTRADAY' else tf.lower()} trades are switched off - in the Intraday / Swing filters or in Autopilot's own boxes"
         floor = self.confidence_floor(tf)
-        if p.confidence < floor:
-            return f"confidence {p.confidence:.2f} < {floor:.2f}{'' if tf == 'INTRADAY' else ' (the swing floor)'}"
-        if p.reward_risk < self.min_reward_risk:
-            return f"reward:risk {p.reward_risk:.2f} < {self.min_reward_risk:.2f}"
-        if p.kind.value == "FUNDAMENTAL":
+        if confidence < floor:
+            return f"confidence {confidence:.2f} < {floor:.2f}{'' if tf == 'INTRADAY' else ' (the swing floor)'}"
+        if reward_risk < self.min_reward_risk:
+            return f"reward:risk {reward_risk:.2f} < {self.min_reward_risk:.2f}"
+        if kind == "FUNDAMENTAL":
             return "valuation plays are not day/swing entries - not auto-traded"
         skipped = self.skipped_noise()
-        noisy = [n for n in p.noise if n in skipped]
+        noisy = [n for n in noise if n in skipped]
         if noisy:
             return "noise: " + ", ".join(NOISE_LABELS.get(n, n) for n in noisy)
-        if tf == "INTRADAY" and p.confirmations < self.min_confirmations:
-            return f"not confirmed yet - seen in {p.confirmations} of {self.min_confirmations} scans in a row"
-        if tf == "INTRADAY" and self.min_minutes_to_close > 0:
+        if tf == "INTRADAY" and confirmations < self.min_confirmations:
+            return f"not confirmed yet - seen in {confirmations} of {self.min_confirmations} scans in a row"
+        if not board and tf == "INTRADAY" and self.min_minutes_to_close > 0:
             left = clock.minutes_to_close()
             if left < self.min_minutes_to_close:
                 return (f"{left:.0f} minutes to the close - a day trade needs {self.min_minutes_to_close} "
                         "(Aziz keeps the last half hour for closing, and the exit manager flattens before the bell)")
-        unproven = self._unproven(p.strategy)
+        unproven = self._unproven(strategy, board=board)
         if unproven:
             return unproven
+        return None
+
+    def _pre_gate(self, p: Any, equity: float) -> Optional[str]:
+        """Cheap filters before we spend an engine assessment. Returns a reason
+        string to skip, or None to proceed. The play's own checks come first (_play_check, which
+        the dashboard's badge shares); the ones that change from pass to pass follow."""
+        why = self._play_check(p.timeframe.value, p.confidence, p.reward_risk, p.kind.value,
+                               getattr(p.status, "value", str(p.status)), p.noise, p.confirmations, p.strategy)
+        if why:
+            return why
         doubted = self.model_refusal(p)
         if doubted:
             return doubted
@@ -837,13 +855,30 @@ class AutoPilot:
         their trades are what the records and the learned model are built from."""
         return True if getattr(self.engine, "mode", "paper") == "live" else self.require_proven
 
-    def _unproven(self, strategy: str) -> Optional[str]:
-        """Why a strategy's replayed record isn't good enough to auto-trade, if it isn't."""
-        return self.proof_missing(strategy) if self.proof_required else None
+    def _unproven(self, strategy: str, board: bool = False) -> Optional[str]:
+        """Why a strategy's replayed record isn't good enough to auto-trade, if it isn't. ``board``: for the
+        dashboard's rows, which share one read of each record (_board_record)."""
+        if not self.proof_required:
+            return None
+        return self.proof_missing(strategy, self._board_record(strategy) if board else None)
 
-    def proof_missing(self, strategy: str) -> Optional[str]:
-        """Why a strategy's replayed record doesn't prove it, whether or not Autopilot asks for proof."""
-        record = self.engine.strategy_record(strategy) or {}
+    def _board_record(self, strategy: str) -> Dict[str, Any]:
+        """A strategy's replayed record for the dashboard's rows: read once for a whole board of plays
+        (ROOM_CACHE_S) and afresh after a change of settings or a new replay (settings_changed). The gate
+        reads it afresh on every pass."""
+        now = time.monotonic()
+        cached = self._record_cache
+        if cached is None or now - cached[0] > self.ROOM_CACHE_S:
+            cached = (now, {})
+            self._record_cache = cached
+        if strategy not in cached[1]:
+            cached[1][strategy] = self.engine.strategy_record(strategy) or {}
+        return cached[1][strategy]
+
+    def proof_missing(self, strategy: str, record: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Why a strategy's replayed record doesn't prove it, whether or not Autopilot asks for proof.
+        ``record``: one already read; otherwise it is read now."""
+        record = (self.engine.strategy_record(strategy) if record is None else record) or {}
         trades = int(record.get("trades", 0))
         if trades < self.min_replay_trades:
             return (f"{strategy} isn't proven yet: the replay has {trades} of the {self.min_replay_trades} "
@@ -891,30 +926,37 @@ class AutoPilot:
 
     # ------------------------------------------------------------------ #
     def decorate_play(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        """Tag a play row so the dashboard can show a '🤖 auto' badge."""
+        """Tag a play row so the dashboard can show a '🤖 auto' badge - and, on a play Autopilot won't
+        take, why not, in the gate's own words."""
         pid = row.get("id")
-        skipped = self.skipped_noise()
-        will = (
-            self.enabled and self._live_ok()
-            and row.get("timeframe") in self.play_types()
-            and float(row.get("confidence", 0)) >= self.confidence_floor(str(row.get("timeframe") or "INTRADAY"))
-            and float(row.get("reward_risk", 0)) >= self.min_reward_risk
-            and row.get("kind") != "FUNDAMENTAL"
-            and row.get("status") == "PROPOSED"
-            and not any(n in skipped for n in row.get("noise", []))
-            and (row.get("timeframe") != "INTRADAY" or int(row.get("confirmations", 1)) >= self.min_confirmations)
-            and not self._unproven(row.get("strategy", ""))
-            and not self.stopped_for_the_day
-        )
-        waiting = self._waiting_for(str(row.get("timeframe") or ""), str(row.get("strategy") or "")) if will else None
+        why_not = self._why_not(row)
+        waiting = (self._waiting_for(str(row.get("timeframe") or ""), str(row.get("strategy") or ""))
+                   if why_not is None else None)
         row["autopilot"] = {
-            "eligible": bool(will),
+            "eligible": why_not is None,
+            # the first of Autopilot's checks the play fails (_play_check) - None when it passes them all
+            "why_not": why_not,
             # it passes Autopilot's checks, but a cap has no room for it right now
             "waiting": waiting,
             "acted": pid in self._acted,
+            # what the last pass said - the checks that change from pass to pass reach the row here
             "reason": self._last_reason.get(pid, ""),
         }
         return row
+
+    def _why_not(self, row: Dict[str, Any]) -> Optional[str]:
+        """Why Autopilot won't take a play row, if it won't: switched off, stopped for the day - which
+        consider() says before any play is looked at - or the play's own checks."""
+        if not self.enabled:
+            return "Autopilot is off"
+        if not self._live_ok():
+            return "Autopilot is paper-only until autopilot.allow_live is set in config/config.yaml"
+        if self.stopped_for_the_day:
+            return "stopped for the day - the daily loss limit or the give-back rule was reached"
+        return self._play_check(str(row.get("timeframe") or ""), float(row.get("confidence", 0)),
+                                float(row.get("reward_risk", 0)), str(row.get("kind") or ""),
+                                str(row.get("status") or ""), row.get("noise") or [],
+                                int(row.get("confirmations", 1)), str(row.get("strategy") or ""), board=True)
 
     #: seconds the caps are read once for a whole board of plays
     ROOM_CACHE_S = 2.0

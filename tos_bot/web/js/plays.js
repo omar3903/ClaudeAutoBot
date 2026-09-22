@@ -65,6 +65,16 @@ function priceCell(p) {
   return `<td class="num" title="${escapeHtml(tip)}">${num(p.last_price)}${r == null ? "" : ` <span class="small ${cls}">${r >= 0 ? "+" : ""}${r.toFixed(1)}R</span>`}</td>`;
 }
 
+/* What Autopilot makes of a play, in one line: the first of its checks the play fails (the gate's own
+   words), the cap it waits for, what its last pass said, or that it would take it. The robot's tooltip
+   and the detail panel both show it. */
+function apLine(ap) {
+  if (ap.why_not) return `Won't take it: ${ap.why_not}`;
+  if (ap.waiting) return `Waiting: ${ap.waiting}`;
+  if (ap.reason) return `Last pass: ${ap.reason}`;
+  return ap.acted ? "Has acted on it" : "Would take it on its next pass";
+}
+
 function playRow(p) {
   const tr = document.createElement("tr");
   const done = isDone(p), ap = p.autopilot || {};
@@ -73,9 +83,13 @@ function playRow(p) {
   tr.classList.toggle("done", done);
   tr.classList.toggle("ap-eligible", !!ap.eligible && !ap.waiting && !done);
   tr.classList.toggle("ap-waiting", !!ap.eligible && !!ap.waiting && !done);
+  // a play it won't take gets a faded robot too, only while Autopilot is on - off, every row would have one
+  const refused = !ap.eligible && !!ap.why_not && !!(S.state.autopilot || {}).effective;
   const apMark = ap.acted
     ? '<span class="ap-badge acted" data-term="autopilot">🤖</span>'
-    : (ap.eligible && !done ? `<span class="ap-badge${ap.waiting ? " waiting" : ""}" data-term="autopilot"${ap.waiting ? ` data-waiting="${escapeHtml(ap.waiting)}"` : ""}>🤖</span>` : "");
+    : ((ap.eligible || refused) && !done
+      ? `<span class="ap-badge${ap.waiting ? " waiting" : ""}${refused ? " refused" : ""}" data-term="autopilot" data-why="${escapeHtml(apLine(ap))}">🤖</span>`
+      : "");
   const last = done
     ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
     : `<span class="info-dot">i</span>`;
@@ -147,6 +161,7 @@ function detailHTML(a) {
   return `
     <h3>${escapeHtml(p.symbol)} ${sectorTag(p.sector)} ${sideBadge(p.side)}${executed ? ' <span class="badge good" data-term="executed">executed</span>' : ""}</h3>
     <div class="sub">${stratLabel(p.strategy)} · ${tfLabel(p.timeframe)} · conf ${num(p.confidence, 2)} · expected ${num((p.evidence || {}).expected_r, 2)}R · score ${num(p.score, 2)}${p.timeframe === "INTRADAY" ? ` · seen in ${p.confirmations || 1} scan${(p.confirmations || 1) === 1 ? "" : "s"} in a row` : ""} · session ${a.session}</div>
+    ${p.autopilot && !executed ? `<div class="muted" style="margin:6px 0" data-term="autopilot">🤖 ${escapeHtml(apLine(p.autopilot))}</div>` : ""}
     ${(a.noise || []).length && !executed ? `<div class="warn-box" data-term="noise">⚠ Probably noise right now: ${a.noise.map(escapeHtml).join(" · ")}. Autopilot won't take it; you still can.</div>` : ""}
     ${sparkSvg(p.evidence && p.evidence.spark, p)}
     <div class="explain">${escapeHtml(p.explanation || p.rationale)}</div>

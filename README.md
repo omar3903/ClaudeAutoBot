@@ -808,7 +808,10 @@ the left of the row: **green** — Autopilot would take it on its next pass (it
 passes every check and a cap has room); **amber** — it passes the checks but a
 cap is full (the day's entries, the open positions, the day / swing slots, or
 the setup's own), and hovering the robot says which. A dim robot means it has
-already acted on the play.
+already acted on the play. While Autopilot is on, a play it won't take gets a
+faded grey robot: hovering it gives the first check the play fails, in the
+words the entry gate itself uses (the badge and the gate share one set of
+checks). The play's detail panel says the same in one line.
 
 **Proof, noise and size.** A day-trade setup must show up in `min_confirmations`
 (2) scans in a row, and plays carrying a flag in `skip_noise` are skipped. With
