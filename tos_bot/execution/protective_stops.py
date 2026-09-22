@@ -85,6 +85,16 @@ def on_tick(price: float) -> float:
     return round(float(price), 2 if price >= 1.0 else 4)
 
 
+def stop_exit_reason(initial_stop: Optional[float], trigger: float) -> str:
+    """A stop that filled is booked "stop" if it was still where the trade began, "trailing-stop" once
+    it had been moved. The order rests at the initial stop rounded to the tick, so the two are compared
+    on the tick: a difference of less than half a tick is the rounding, not a move."""
+    if not initial_stop:
+        return "stop"
+    moved = abs(on_tick(float(initial_stop)) - float(trigger)) >= tick(float(trigger)) / 2
+    return "trailing-stop" if moved else "stop"
+
+
 class ProtectiveStops:
     """Mixed into the Executor (it uses its broker, repo, bus, venue and booking)."""
 
@@ -496,8 +506,7 @@ class ProtectiveStops:
             return
         price = float(res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0) or st.price)
         filled = float(res.filled_qty or st.qty)
-        first = t.get("initial_stop_price")
-        reason = "trailing-stop" if first and abs(float(first) - st.price) > 1e-6 else "stop"
+        reason = stop_exit_reason(t.get("initial_stop_price"), st.price)
         partial = filled < abs(float(t["quantity"])) - 1e-9
         log.warning("STOP AT BROKER FILLED  %s x%s @ %.4f (%s)", st.symbol, filled, price, reason)
         self._book_exit(st.symbol, st.trade_id, price, filled, reason, partial, {} if partial else None, st.price)
