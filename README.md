@@ -975,9 +975,10 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 * **Live pill** — whether this tab still hears the app: `live · 3 s` (the time since its last update; off
   hours one comes about every 30 s) or `reconnecting · last update 48 s ago`. Once the link has been down for
   10 s a red banner says since when nothing has come in, the tables dim, and the buttons that send orders or
-  change settings are off until it's back - the tab reconnects by itself and the app's first message brings it
-  up to date. A tab of the bottom panel that can't be refreshed keeps what it showed, under *Couldn't refresh -
-  showing data from 10:42* and the reason, and a request the app refuses shows its own reason.
+  change settings are off until it's back - the tab reconnects by itself and the app's first message brings the
+  plays and the Open positions, Active orders, Trade history and P/L summary tabs up to date. Those four tabs,
+  when they can't be refreshed, keep what they showed, under *Couldn't refresh - showing data from 10:42* and
+  the reason, and a request the app refuses shows its own reason.
 * **Connections** — paper platform, IB Gateway settings, **Test paper / Test
   live**, **Reconnect**.
 * **Settings** — the scan schedule and list sizes, the scan status, **Run full

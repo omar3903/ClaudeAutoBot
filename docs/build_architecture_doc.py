@@ -1298,8 +1298,10 @@ def build() -> str:
     A('<h3>REST routes (server/app.py)</h3>')
     A(table(["Route", "Method", "Engine call"], [
         ("/api/state", "GET", "snapshot(): account, positions, autopilot, filters, market, scan, pnl, venue ..."),
-        ("/api/plays, /api/plays/{id}/assess | approve | reject | chart", "GET/POST",
-         "current_plays(), assess_play(), approve_play(), reject_play(), play_chart()"),
+        ("/api/plays[?full=1], /api/plays/{id}, /api/plays/{id}/assess | approve | reject | chart", "GET/POST",
+         "current_plays() (slim rows - what the table shows - unless full=1), play_row() (one play whole, for "
+         "the row's hover; 404 once it has left the board), assess_play(), approve_play(), reject_play(), "
+         "play_chart()"),
         ("/api/trades, /api/trades/{id}/close | managed | record, /api/trades/close-all", "GET/POST",
          "trade lists, close_position(), set_trade_managed(), trade_record(), close_all_positions()"),
         ("/api/positions/untracked/{symbol}/close", "POST", "close_untracked()"),
@@ -1317,8 +1319,11 @@ def build() -> str:
          "set_capital_split()"),
         ("/api/setup[/secrets|/reconnect|/ibkr/test|/paper-platform], /api/quit", "GET/POST",
          "same-machine only: setup_state(), save_secrets(), reconnect(), probe_ibkr(), begin_quit()"),
-        ("/ws", "WebSocket", "a queue on the EventBus; first message is a full snapshot"),
+        ("/ws", "WebSocket", "a queue on the EventBus; first message is a full snapshot, then the plays as slim "
+         "rows, like every later plays push"),
     ]))
+    A('<p>Answers over 2 KB go gzipped (FastAPI\'s <code>GZipMiddleware</code>); the WebSocket does not pass '
+      'through it.</p>')
     A('<h3>Events on the bus (core/eventbus.py)</h3>')
     A('<p><code>engine.started</code>, <code>account.snapshot</code>, <code>plays.updated</code>, '
       '<code>plays.changes</code>, <code>play.decided</code>, <code>scan.started</code>, <code>scan.failed</code>, '
