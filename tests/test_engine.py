@@ -204,9 +204,12 @@ def test_strategy_panel_switches_setups_live_and_remembers_only_changes(engine):
 def test_autopilot_is_part_of_the_snapshot_and_remembered(engine):
     snap = engine.snapshot()
     assert "trade_types" in snap["autopilot"] and snap["scan"]["fast"] is False
+    # the status strip: what it is doing now and why, and today's closed trades by setup
+    assert snap["autopilot"]["headline"]["state"] == "off" and snap["autopilot"]["today"] == []
     out = engine.set_autopilot(enabled=True, trade_types=["INTRADAY", "SWING"])
     assert out["ok"] and out["autopilot"]["enabled"] is True
     assert set(out["autopilot"]["trade_types"]) == {"INTRADAY", "SWING"}
+    assert out["autopilot"]["headline"]["state"] != "off" and out["autopilot"]["headline"]["text"]
     assert engine.runtime.read()["autopilot"]["enabled"] is True
 
 

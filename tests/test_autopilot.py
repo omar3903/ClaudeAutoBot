@@ -1070,3 +1070,146 @@ def test_the_loser_settings_are_saved_and_restored():
     again.load_runtime(saved)
     assert again.skip_replay_losers == "all" and again.replay_loser_r == 0.1
     assert again.status()["skip_replay_losers"] == "all"
+
+
+# ---------------------------------------------------------------- the status strip: what it is doing now and why
+@pytest.fixture
+def session_open(monkeypatch):
+    """The regular session open, hours from the close - the clock-of-day states have a test of their own."""
+    from tos_bot.execution import autopilot as module
+
+    monkeypatch.setattr(module.clock, "is_market_open", lambda ts=None: True)
+    monkeypatch.setattr(module.clock, "minutes_to_close", lambda ts=None: 300.0)
+    return module
+
+
+def _headline(ap):
+    return ap.status()["headline"]
+
+
+def test_the_strip_says_off_paper_only_blind_and_stopped_before_anything_else(session_open):
+    assert _headline(AutoPilot(FakeEngine(), _cfg(enabled=False), bus=SILENT))["state"] == "off"
+    h = _headline(AutoPilot(FakeEngine(mode="live"), _cfg(), bus=SILENT))
+    assert h["state"] == "blocked" and "paper-only" in h["text"]
+    eng = FakeEngine()
+    eng.prices_refused = lambda: "the login is active somewhere else"
+    h = _headline(AutoPilot(eng, _cfg(), bus=SILENT))
+    assert h["state"] == "blind" and h["text"].endswith("the login is active somewhere else")
+    eng = FakeEngine(equity=10_000.0)
+    eng.repo._closed = [_closed("AAA", -250.0)]
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    _run(ap, mkplay(sym="BBB"))
+    h = _headline(ap)
+    assert h["state"] == "stopped" and "past the daily limit of 2% of equity" in h["text"]
+    assert "practice size" not in h["text"]                                  # it won't resume today
+
+
+def test_the_strip_says_done_once_the_days_entries_are_used(session_open):
+    eng = FakeEngine()
+    eng.fill_later = True
+    ap = AutoPilot(eng, _cfg(max_auto_trades_per_day=2, max_auto_positions=9), bus=SILENT)
+    first, second = mkplay(sym="AAA"), mkplay(sym="BBB")
+    _run(ap, first, second)
+    assert _headline(ap)["text"].startswith("Done for today: 2 of the 2 entries a day are used")
+    assert ap.entry_unfilled(first.id)                                       # it bought nothing: its slot is back
+    eng.working = [w for w in eng.working if w["play_id"] != first.id]
+    assert _headline(ap)["state"] == "taking"
+    _run(ap, mkplay(sym="CCC"))
+    h = _headline(ap)
+    assert h["state"] == "done" and "(1 more bought nothing and gave their slots back)" in h["text"]
+
+
+def test_the_strip_says_full_while_every_position_is_taken(session_open):
+    ap = AutoPilot(FakeEngine(), _cfg(max_auto_positions=1, max_auto_trades_per_day=5), bus=SILENT)
+    _run(ap, mkplay())
+    h = _headline(ap)
+    assert h["state"] == "full" and "1 of 1 positions taken" in h["text"]
+
+
+def test_the_strip_says_which_kind_is_full_under_the_split(session_open):
+    eng, ap = _split_pilot(70.0, trade_types=["SWING"])
+    _run(ap, *[mkplay(sym=f"S{i}", tf=Timeframe.SWING) for i in range(5)])
+    h = _headline(ap)
+    assert h["state"] == "kind-full" and h["text"].startswith("Swing trades hold 3 of the 3 positions")
+    ap.configure(trade_types=["INTRADAY", "SWING"])                           # the day trades still have room
+    h = _headline(ap)
+    assert h["state"] == "taking" and h["text"].startswith("Taking day trades")
+    assert "swing trades hold 3 of the 3 positions" in h["text"]
+
+
+def test_the_strip_says_when_the_clock_keeps_day_trades_out(monkeypatch):
+    from tos_bot.execution import autopilot as module
+
+    ap = AutoPilot(FakeEngine(), _cfg(min_minutes_to_close=30), bus=SILENT)
+    monkeypatch.setattr(module.clock, "is_market_open", lambda ts=None: True)
+    monkeypatch.setattr(module.clock, "minutes_to_close", lambda ts=None: 20.0)
+    h = _headline(ap)
+    assert h["state"] == "late" and h["text"].startswith("No new day trades in the last 30 minutes")
+    monkeypatch.setattr(module.clock, "is_market_open", lambda ts=None: False)
+    monkeypatch.setattr(module.clock, "minutes_to_close", lambda ts=None: 1e9)
+    assert _headline(ap)["state"] == "closed"
+    ap.configure(trade_types=["INTRADAY", "SWING"])                           # swing trades don't wait for the open
+    h = _headline(ap)
+    assert h["state"] == "taking" and h["text"].startswith("Taking swing trades")
+    assert "day trades wait for the open" in h["text"]
+
+
+def test_the_strip_counts_down_to_the_next_entry_without_touching_the_entry_times(session_open, monkeypatch):
+    eng = FakeEngine()
+    eng.entry_pace_seconds = lambda timeframe: 60.0
+    ap = AutoPilot(eng, _cfg(max_new_per_cycle=1, max_auto_positions=9, max_auto_trades_per_day=9), bus=SILENT)
+    clock_ = {"t": 10_000.0}
+    monkeypatch.setattr(session_open.time, "monotonic", lambda: clock_["t"])
+    _run(ap, mkplay(sym="AAA"))
+    ap._entries_at.insert(0, clock_["t"] - 7200.0)                           # an old one the gate's own check drops
+    before = list(ap._entries_at)
+    clock_["t"] += 18.0
+    h = _headline(ap)
+    assert h["state"] == "pacing" and h["next_entry_in_s"] == 42 and "1 new entry per scan cycle" in h["text"]
+    assert ap._entries_at == before                                          # read, never pruned
+    clock_["t"] += 45.0
+    h = _headline(ap)
+    assert h["state"] == "taking" and h["next_entry_in_s"] == 0
+
+
+def test_the_strip_says_whether_unproven_setups_trade_at_practice_size(session_open):
+    ap = AutoPilot(FakeEngine(), _cfg(require_proven=False), bus=SILENT)
+    h = _headline(ap)
+    assert h["state"] == "taking" and h["practice"] and "unproven setups at practice size" in h["text"]
+    assert h["text"].startswith("Taking day trades - 0 of 2 positions, 0 of 3 entries today")
+    ap.configure(require_proven=True)
+    h = _headline(ap)
+    assert h["state"] == "taking" and not h["practice"] and "practice" not in h["text"]
+
+
+def test_the_strip_names_the_replay_losers_it_skips(session_open):
+    eng, ap = _practice(_losing())
+    eng.scanner = SimpleNamespace(strategies=[SimpleNamespace(key="opening_range_breakout", timeframe=Timeframe.INTRADAY)])
+    h = _headline(ap)
+    assert h["skipping"] == ["opening_range_breakout"]
+    assert "skipping the replay losers: opening_range_breakout" in h["text"]
+
+
+def test_todays_tally_groups_the_venues_closed_trades_by_setup():
+    eng = FakeEngine()
+    eng._venue = "ibkr-paper"
+
+    def closed(sym, strategy, pl, r, broker="ibkr-paper"):
+        return {"id": f"t_{sym}", "symbol": sym, "strategy": strategy, "status": "CLOSED", "realized_pl": pl,
+                "r_multiple": r, "broker": broker}
+
+    eng.repo._closed = [closed("AAA", "setup_a", 120.0, 1.2), closed("BBB", "setup_a", -50.0, -0.5),
+                        closed("CCC", "setup_b", -80.0, -1.0),
+                        closed("DDD", "setup_b", -500.0, -1.0, broker="paper"),              # another account
+                        {**closed("EEE", "pairs_x", 40.0, None), "pair_id": "p1"},          # one leg of a pair
+                        {**closed("FFF", "setup_c", 0.0, None), "status": "OPEN"}]
+    reads = []
+    trades_on = eng.repo.trades_on
+    eng.repo.trades_on = lambda day: reads.append(day) or trades_on(day)
+    ap = AutoPilot(eng, _cfg(), bus=SILENT)
+    st = ap.status()
+    assert st["today"] == [{"strategy": "setup_a", "closed": 2, "wins": 1, "r": 0.7, "pl": 70.0},
+                           {"strategy": "setup_b", "closed": 1, "wins": 0, "r": -1.0, "pl": -80.0}]
+    assert st["realized_today"] == 30.0                                       # the pair leg still counts in the P/L
+    ap.status()
+    assert len(reads) == 1                                                   # one read for both, kept 20 s

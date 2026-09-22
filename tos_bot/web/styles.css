@@ -83,6 +83,15 @@ body.locked .lockable{opacity:.4; pointer-events:none}
 .ap-btn.on{background:var(--long); color:var(--on-accent); border-color:transparent}
 .ap-btn.armed-paper{background:var(--warn-bg); color:var(--warn); border-color:var(--warn-line)}
 .autopilot-ctl.live-warn{outline:1px dashed var(--warn); outline-offset:2px; border-radius:8px}
+/* the strip under the header: green taking, amber waiting, red stopped or blind, grey off */
+.ap-strip{display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:5px 18px; font-size:12.5px;
+  background:var(--bg2); border-bottom:1px solid var(--line); border-left:4px solid var(--muted)}
+.ap-strip[data-state="taking"]{border-left-color:var(--long)}
+.ap-strip:is([data-state="pacing"],[data-state="closed"],[data-state="kind-full"],[data-state="late"],[data-state="full"],[data-state="done"]){border-left-color:var(--warn)}
+.ap-strip:is([data-state="blind"],[data-state="stopped"],[data-state="ceiling"],[data-state="blocked"]){border-left-color:var(--short)}
+.ap-today{display:inline-flex; gap:6px; flex-wrap:wrap; margin-left:auto}
+.ap-today .chip.good{color:var(--ok); border-color:var(--good-line)}
+.ap-today .chip.bad{color:var(--short); border-color:var(--bad-line)}
 .ap-badge{margin-left:5px; font-size:11px; vertical-align:middle; filter:grayscale(.3)}
 .ap-badge.acted{filter:none}
 tbody tr.ap-eligible{box-shadow:inset 3px 0 0 var(--long)}

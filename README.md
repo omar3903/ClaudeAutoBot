@@ -817,6 +817,17 @@ faded grey robot: hovering it gives the first check the play fails, in the
 words the entry gate itself uses (the badge and the gate share one set of
 checks). The play's detail panel says the same in one line.
 
+**The strip under the header** says what Autopilot is doing now and why, in one
+line: off, paper-only, no prices, stopped for the day, done (the day's entries
+used, and how many more bought nothing), the orders-sent ceiling, every position
+taken, then per kind - day trades waiting for the open or in the last minutes
+before the close, a kind holding its share of the day / swing split - and while
+a kind has room, pacing (with a countdown to the next entry) or taking, with how
+many plays pass every check. It adds when unproven setups trade at practice
+size and which replay losers are skipped, and ends with today's closed trades by
+setup - a chip per setup with won / closed and the R they made (pair legs aren't
+counted). Green is taking, amber waiting, red stopped or blind, grey off.
+
 **Proof, noise and size.** A day-trade setup must show up `min_confirmations`
 (2) times in a row, and plays carrying a flag in `skip_noise` are skipped. With
 `confirm_on_new_candle` (on) each of those is a newer 5-minute candle, whichever
