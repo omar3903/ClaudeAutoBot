@@ -93,7 +93,7 @@ function renderSectorsButton() {
 
 async function pickSectors() {
   let d;
-  try { d = await api("/api/filters"); } catch { toast("The app isn't reachable", "bad"); return; }
+  try { d = await api("/api/filters"); } catch (e) { toast(`Couldn't read the sectors - ${e.message}`, "bad"); return; }
   const all = d.all_sectors || [], selected = (d.filters || {}).sectors || [];
   const checked = new Set(selected.length ? selected : all);
   openModal({

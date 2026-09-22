@@ -148,7 +148,7 @@ export function renderCapital(c) {
 
 async function openCapital() {
   let d;
-  try { d = await api("/api/capital"); } catch { toast("The app isn't reachable", "bad"); return; }
+  try { d = await api("/api/capital"); } catch (e) { toast(`Couldn't read the trading capital - ${e.message}`, "bad"); return; }
   const c = d.capital;
   if (!c) { toast("No account data yet — connect IB Gateway first", "warn"); return; }
   const ccy = c.currency;

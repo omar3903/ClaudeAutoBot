@@ -1,7 +1,7 @@
 /* The bottom panel: open positions, active orders (see orders.js), trade history,
    P/L summary, the watchlist, and the trade-record drawer. */
 import {
-  $, $$, SECTOR_SHORT, VENUE_SHORT, api, escapeHtml, fmtTime, num, parseDate, pct, plural, positionList, post,
+  $, $$, SECTOR_SHORT, VENUE_SHORT, api, escapeHtml, fmtTime, markStale, num, parseDate, pct, plural, positionList, post,
   sectorTag, sideBadge, tfLabel, usd, fmtDay, fmtClock,
 } from "./util.js";
 import { S, on, refreshState, serverNow } from "./state.js";
@@ -17,6 +17,7 @@ const LOADERS = {
 };
 
 export const tabVisible = name => !$("#tab-" + name).classList.contains("hidden");
+const loadedAt = {};           // tab -> when it last drew from a good answer, for the "couldn't refresh" line
 const isLive = () => S.state.mode === "live";
 const hereVenue = () => (S.state.venue || {}).trading_on || "paper";
 
@@ -24,7 +25,8 @@ const hereVenue = () => (S.state.venue || {}).trading_on || "paper";
 export async function loadOpen() {
   if (S.stopped) return;
   let trades;
-  try { ({ trades } = await api("/api/trades?status=OPEN")); } catch { return; }
+  try { ({ trades } = await api("/api/trades?status=OPEN")); } catch (e) { markStale($("#tab-open"), loadedAt.open, e); return; }
+  loadedAt.open = new Date();
   const here = hereVenue(), el = $("#tab-open");
   $("#btn-exit-all").classList.toggle("hidden", !trades.some(t => (t.broker || "paper") === here));
   if (!trades.length) { el.innerHTML = `<p class="muted pad">No open positions.</p>` + untrackedHTML(); wireUntracked(el); return; }
@@ -245,7 +247,7 @@ function confirmExit(t, fromRecord = false) {
 
 async function exitAll() {
   let trades;
-  try { ({ trades } = await api("/api/trades?status=OPEN")); } catch { toast("The app isn't reachable", "bad"); return; }
+  try { ({ trades } = await api("/api/trades?status=OPEN")); } catch (e) { toast(`Couldn't read the open positions - ${e.message}`, "bad"); return; }
   const mine = trades.filter(t => (t.broker || "paper") === hereVenue());
   if (!mine.length) { toast("No open positions to exit", "warn"); return; }
   const venue = (S.state.venue || {}).trading_on_label || "your broker";
@@ -262,7 +264,8 @@ async function exitAll() {
 export async function loadHistory() {
   if (S.stopped) return;
   let trades;
-  try { ({ trades } = await api("/api/trades?limit=200")); } catch { return; }
+  try { ({ trades } = await api("/api/trades?limit=200")); } catch (e) { markStale($("#tab-history"), loadedAt.history, e); return; }
+  loadedAt.history = new Date();
   const closed = trades.filter(t => t.status === "CLOSED");
   const el = $("#tab-history");
   if (!closed.length) { el.innerHTML = `<p class="muted pad">No closed trades yet.</p>`; return; }
@@ -285,7 +288,8 @@ export async function loadHistory() {
 export async function loadStats() {
   if (S.stopped) return;
   let s;
-  try { s = await api("/api/pnl"); } catch { return; }
+  try { s = await api("/api/pnl"); } catch (e) { markStale($("#tab-stats"), loadedAt.stats, e); return; }
+  loadedAt.stats = new Date();
   const stat = (label, value, cls) => `<div class="stat"><label>${label}</label><b class="${cls || ""}">${value}</b></div>`;
   const sign = v => v >= 0 ? "pl-pos" : "pl-neg";
   $("#tab-stats").innerHTML = `<div class="stat-grid">

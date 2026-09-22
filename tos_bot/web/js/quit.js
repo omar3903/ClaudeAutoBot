@@ -93,8 +93,7 @@ export function initQuit() {
   on("state", renderLock);
   $("#btn-quit").onclick = async () => {
     let pv;
-    try { pv = await getLocal("/api/quit"); } catch { toast("The app isn't reachable", "bad"); return; }
-    if (pv.detail) { toast(pv.detail, "bad"); return; }
+    try { pv = await getLocal("/api/quit"); } catch (e) { toast(`Couldn't start quitting - ${e.message}`, "bad"); return; }
     openQuitDialog(pv);
   };
 }

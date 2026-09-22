@@ -13,6 +13,8 @@ export const S = {
   orders: { orders: [], ok: false },   // what's working at the broker (/api/orders, orders.updated)
   notes: [],          // Autopilot notes: why plays joined or left the board (plays.changes)
   stopped: false,     // the app has shut down
+  // the socket to the app: open or not, the last message (ms, 0 = none yet), closed since when (ms, null while open)
+  live: { open: false, lastAt: 0, downSince: Date.now() },
 };
 
 const listeners = new Map();

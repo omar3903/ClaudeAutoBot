@@ -62,6 +62,12 @@ th[data-term]{text-decoration:underline dotted var(--muted); text-underline-offs
 
 /* ---- lock while quitting: only exits stay usable ---- */
 body.locked .lockable{opacity:.4; pointer-events:none}
+/* ---- the app out of reach: the tables are the last it sent, and nothing can be sent to it ---- */
+body.offline :is(main, .blotter){opacity:.6}
+body.offline :is(.lockable, #btn-refresh, #btn-quit, #quit-cancel, #btn-exit-all, #modal-ok, #btn-reject, #rec-exit,
+  #orders-cancel-all, [data-exit], [data-untracked], [data-pair-close]){opacity:.4; pointer-events:none}
+.stale-note{background:var(--warn-bg); color:var(--warn); border:1px solid var(--warn-line); border-radius:6px;
+  padding:4px 10px; margin:6px 0; font-size:12px}
 
 /* ---- top bar ---- */
 .topbar{

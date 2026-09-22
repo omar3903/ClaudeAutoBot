@@ -207,8 +207,8 @@ function hoverRow(p, x, y) {
 
 async function explain(id) {
   let row;
-  // the app isn't reachable: the rationale stands, and the next visit asks again
-  try { row = await api(`/api/plays/${encodeURIComponent(id)}`); } catch { return; }
+  // the app isn't reachable, or failed: the rationale stands, and the next visit asks again
+  try { row = await api(`/api/plays/${encodeURIComponent(id)}`); } catch (e) { if (e.status !== 404) return; row = null; }
   const p = S.plays.find(x => x.id === id);
   if (!p) return;
   // a play that has left the board answers 404: the rationale stands, and isn't asked again while it reads the same

@@ -443,6 +443,8 @@ The app is built to be left running:
 * **An open dashboard tab updates itself.** After the app is updated and restarted, a tab that was already
   open reconnects - and would go on running the scripts it loaded before. The server stamps the dashboard's
   files in its first message; a tab that started on another stamp reloads (or, with a dialog open, asks you to).
+  While the app is away the tab says so (the **live** pill, then a banner - see *Dashboard controls*) and picks
+  up again by itself.
 * **Days on end** - candles and quotes nothing has asked for in half an hour are let go, the log
   rotates at 5 MB, and the scans, the reports, Autopilot's daily counts and the pairs roll over by date.
 * **Sleep.** While the app runs it asks Windows not to go to sleep (the screen can still turn off);
@@ -969,6 +971,12 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 * **Connection pill** — what orders go to and whether it's healthy: `Simulator`,
   `IBKR paper ●`, `IBKR live ✕`. Click it to open **Connections**. A banner
   appears when the Gateway needs you.
+* **Live pill** — whether this tab still hears the app: `live · 3 s` (the time since its last update; off
+  hours one comes about every 30 s) or `reconnecting · last update 48 s ago`. Once the link has been down for
+  10 s a red banner says since when nothing has come in, the tables dim, and the buttons that send orders or
+  change settings are off until it's back - the tab reconnects by itself and the app's first message brings it
+  up to date. A tab of the bottom panel that can't be refreshed keeps what it showed, under *Couldn't refresh -
+  showing data from 10:42* and the reason, and a request the app refuses shows its own reason.
 * **Connections** — paper platform, IB Gateway settings, **Test paper / Test
   live**, **Reconnect**.
 * **Settings** — the scan schedule and list sizes, the scan status, **Run full

@@ -14,7 +14,7 @@ export async function openChart(play) {
   $(".chart-body", box).innerHTML = `<p class="muted">Loading the chart…</p>`;
   box.classList.remove("hidden");
   let d;
-  try { d = await api(`/api/plays/${encodeURIComponent(play.id)}/chart`); } catch { d = { ok: false, reason: "The app isn't reachable." }; }
+  try { d = await api(`/api/plays/${encodeURIComponent(play.id)}/chart`); } catch (e) { d = { ok: false, reason: `No chart - ${e.message}.` }; }
   if (box.dataset.play !== play.id || box.classList.contains("hidden")) return;
   $(".chart-body", box).innerHTML = d.ok ? chartHTML(d) : `<p class="reasons">${escapeHtml(d.reason || "No chart for this play.")}</p>`;
 }

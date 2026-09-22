@@ -2,7 +2,7 @@
    ⏳ marker on plays whose stock has one - with a working entry's shares filled and its
    countdowns. The engine re-checks the broker every few seconds and pushes orders.updated
    when anything changed. */
-import { $, $$, api, count, escapeHtml, fmtClock, num, post, pretty } from "./util.js";
+import { $, $$, api, count, escapeHtml, fmtClock, markStale, num, post, pretty } from "./util.js";
 import { openModal, toastResult } from "./ui.js";
 import { S, emit, serverNow } from "./state.js";
 import { openRecord, tabVisible } from "./blotter.js";
@@ -80,13 +80,20 @@ function tickCountdowns() {
   if (!live) { clearInterval(ticker); ticker = null; }
 }
 
+let ordersAt = null;           // when the list last came in, by a request or a push
+
 export async function loadOrders(fresh = false) {
   if (S.stopped) return;
-  try { S.orders = await api("/api/orders" + (fresh ? "?fresh=true" : "")); } catch { return; }
+  try { S.orders = await api("/api/orders" + (fresh ? "?fresh=true" : "")); } catch (e) {
+    // the tab keeps the last list it heard of - a push may have brought it while the tab was hidden
+    if (tabVisible("orders")) { if (ordersAt) renderOrders(); markStale($("#tab-orders"), ordersAt, e); }
+    return;
+  }
   ordersChanged();
 }
 
 export function ordersChanged() {
+  ordersAt = new Date();
   const n = (S.orders.orders || []).length;
   $("#tab-orders-count").textContent = n ? ` · ${n}` : "";
   if (tabVisible("orders")) renderOrders();

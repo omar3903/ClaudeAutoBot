@@ -5,12 +5,13 @@ import { busy, drawerOpen, openDrawer, toast, toastResult, unbusy } from "./ui.j
 export async function openConnections() {
   if (!drawerOpen("connections")) openDrawer("connections", "Connections", `<p class="muted">Loading…</p>`);
   let d;
-  try { d = await getLocal("/api/setup"); } catch {
-    if (drawerOpen("connections")) $("#drawer-body").innerHTML = `<p class="reasons">Couldn't load the connection settings.</p>`;
+  try { d = await getLocal("/api/setup"); } catch (e) {
+    // a refusal (the same-machine guard's, say) is shown in the server's own words
+    if (drawerOpen("connections")) $("#drawer-body").innerHTML = `<p class="reasons">${escapeHtml(e.status
+      ? e.message : `Couldn't load the connection settings - ${e.message}.`)}</p>`;
     return;
   }
   if (!drawerOpen("connections")) return;                 // closed or replaced while loading
-  if (d.detail) { $("#drawer-body").innerHTML = `<p class="reasons">${escapeHtml(d.detail)}</p>`; return; }
   render(d);
 }
 
