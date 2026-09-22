@@ -464,6 +464,14 @@ def test_a_trade_keeps_the_setups_skipped_as_losers_when_it_was_taken(engine, mo
     assert "vwap_reclaim" in settings["replay_losers"] and settings["skip_replay_losers"] == "day"
 
 
+def test_with_proof_asked_for_a_trade_keeps_no_setups_skipped_as_losers(engine, monkeypatch):
+    engine.autopilot.configure(require_proven=True)                          # the proof gate governs, not the loser skip
+    losing = {"trades": 40, "expectancy_r": -0.10, "out_of_sample": {"trades": 12, "expectancy_r": -0.08}}
+    monkeypatch.setattr(engine.replay, "records", lambda *terms: {"vwap_reclaim": losing})
+    settings = engine._entry_context(_play(), "autopilot")["settings"]
+    assert settings["replay_losers"] == [] and settings["require_proven"] is True
+
+
 # ---------------------------------------------------------------- a restart
 def _started_again(tmp_path, gateway, port, before=None):
     again = _new_engine(tmp_path, gateway, port)

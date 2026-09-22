@@ -807,7 +807,9 @@ def _refused(status=None, noise=(), **over):
     ({}, _refused(status=PlayStatus.REJECTED), "not a fresh proposed play"),
     ({}, _refused(tf=Timeframe.SWING), "swing trades are switched off"),
     ({"min_confidence": 0.8}, _refused(conf=0.7), "confidence 0.70 < 0.80"),
+    ({}, _refused(conf=0.5996), "confidence 0.60 < 0.60"),                     # just under: a row rounds it to 0.6
     ({"min_reward_risk": 1.5}, _refused(target=102.4), "reward:risk 1.20 < 1.50"),
+    ({}, _refused(target=103.995), "reward:risk 2.00 < 2.00"),                 # 1.9975: a row rounds it to 2.0
     ({}, _refused(kind=StrategyKind.FUNDAMENTAL), "valuation plays"),
     ({"skip_noise": ["against_trend"]}, _refused(noise=["against_trend"]), "noise: against the daily trend"),
     ({"min_confirmations": 2}, _refused(), "seen on 1 of 2 five-minute candles in a row"),
@@ -823,24 +825,12 @@ def test_the_bar_gives_the_gates_own_reason_for_every_check_on_the_play(cfg, pla
     eng.records = dict(cfg.pop("records", {}))
     ap = AutoPilot(eng, _cfg(**cfg), bus=SILENT)
     gate = ap._pre_gate(play, 100_000.0)
-    bar = ap.decorate_play(play.to_row())["autopilot"]
+    bar = ap.decorate_play(play.to_row(), play)["autopilot"]                     # as engine._decorate asks
     assert bar["why_not"] == gate                                                # one set of checks, one wording
     if words is None:
         assert gate is None and bar["eligible"] and bar["waiting"] is None
     else:
         assert words in gate and not bar["eligible"] and bar["waiting"] is None
-
-
-@pytest.mark.parametrize("play", [
-    mkplay(target=103.996),                                                 # reward:risk 1.998 - a row shows 2.0
-    mkplay(conf=0.4996),                                                    # confidence a row shows as 0.5
-])
-def test_the_bar_judges_the_plays_own_numbers_not_the_rows_rounded_ones(play):
-    ap = AutoPilot(FakeEngine(), _cfg(min_confidence=0.5, min_reward_risk=2.0), bus=SILENT)
-    gate = ap._pre_gate(play, 100_000.0)
-    assert gate is not None
-    bar = ap.decorate_play(play.to_row(), play)["autopilot"]
-    assert bar["why_not"] == gate and not bar["eligible"]                    # not green while the gate says no
 
 
 def test_the_bar_says_when_autopilot_itself_is_why_not():
@@ -1016,6 +1006,7 @@ def test_a_day_setup_that_loses_in_the_replay_is_skipped_with_proof_off():
 @pytest.mark.parametrize("record, over", [
     (_losing(held_r=-0.01), {}),                                            # the held-out sessions don't lose
     (_losing(trades=29), {}),                                               # not enough trades to say
+    (_losing(held=9), {}),                                                  # too few in the held-out sessions to say
     (_losing(), {"skip_replay_losers": "off"}),
 ])
 def test_a_setup_without_evidence_it_loses_is_still_practised(record, over):
@@ -1023,6 +1014,13 @@ def test_a_setup_without_evidence_it_loses_is_still_practised(record, over):
     p = mkplay()
     _run(ap, p)
     assert eng.approved_ids() == [p.id]
+
+
+def test_the_loser_bar_is_the_replay_loser_r_setting():
+    eng, ap = _practice(_losing(r=-0.08, held_r=-0.06))
+    assert "loses in the replay" in ap._pre_gate(mkplay(), 100_000.0)      # past the 0.05R default
+    ap.configure(replay_loser_r=0.10)
+    assert ap._pre_gate(mkplay(), 100_000.0) is None                        # short of a 0.10R bar
 
 
 def test_swing_losers_are_skipped_only_when_asked():
@@ -1038,17 +1036,30 @@ def test_a_setup_losing_in_its_own_trades_is_skipped():
     eng.live["opening_range_breakout"] = {"trades": 10, "expectancy_r": -0.40}
     assert "is losing in the app's own trades" in ap._pre_gate(mkplay(), 100_000.0)
     assert "simulator" in ap._pre_gate(mkplay(), 100_000.0)
+    eng.live["opening_range_breakout"] = {"trades": 10, "expectancy_r": -0.30}
+    assert "is losing in the app's own trades" in ap._pre_gate(mkplay(), 100_000.0)   # at the bar counts
+    eng.live["opening_range_breakout"] = {"trades": 10, "expectancy_r": -0.20}
+    assert ap._pre_gate(mkplay(), 100_000.0) is None                        # losing, but short of the bar
     eng.live["opening_range_breakout"] = {"trades": 9, "expectancy_r": -0.40}
     assert ap._pre_gate(mkplay(), 100_000.0) is None
 
 
+def _one_setup():
+    return SimpleNamespace(strategies=[SimpleNamespace(key="opening_range_breakout", timeframe=Timeframe.INTRADAY)])
+
+
 def test_with_proof_asked_for_the_proof_message_wins():
     eng, ap = _practice(_losing(), require_proven=True)
+    eng.scanner = _one_setup()                                              # a setup for the settings' list to name
     assert "averaged -0.10R" in ap._pre_gate(mkplay(), 100_000.0)
     assert ap.status()["replay_losers"] == []
+    ap.configure(require_proven=False)
+    assert [row["strategy"] for row in ap.status()["replay_losers"]] == ["opening_range_breakout"]
     live = AutoPilot(FakeEngine(mode="live"), _cfg(allow_live=True, require_proven=False), bus=SILENT)
     live.engine.records["opening_range_breakout"] = _losing()
+    live.engine.scanner = _one_setup()
     assert "averaged -0.10R" in live._pre_gate(mkplay(), 100_000.0)
+    assert live.status()["replay_losers"] == []
 
 
 def test_the_badge_and_the_settings_name_the_skipped_setup():
