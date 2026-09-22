@@ -622,6 +622,29 @@ def test_a_quit_can_keep_the_swing_positions_that_have_a_stop_at_the_broker(engi
     assert closed_one not in [t["id"] for t in engine.repo.open_trades()]
 
 
+def test_right_after_a_start_the_stops_an_earlier_run_left_at_the_broker_let_a_quit_keep_the_positions(engine):
+    engine._venue = "ibkr-paper"
+    whole, short_of_shares, untagged = (_open(engine, s, venue="ibkr-paper", qty=100) for s in ("AAA", "BBB", "CCC"))
+    engine.executor.native_stops_on = lambda: True
+    engine.executor.protective_stops = lambda: []                          # the first pass hasn't taken them over yet
+
+    def resting(tid, qty, filled=0.0, tag=None):
+        return OrderResult(order_id=f"o-{tid}", status="SUBMITTED", symbol="", submitted_qty=qty, filled_qty=filled,
+                           side=Side.SHORT, tag=tag if tag is not None else f"stop:{tid}", order_type="STOP")
+
+    working = [resting(whole, 100), resting(short_of_shares, 100, filled=40), resting(untagged, 100, tag="")]
+    engine.executor.broker.list_orders = lambda status=None: working
+    assert [b["id"] for b in engine.quit_preview()["keepable"]] == [whole]  # all its shares, under its own tag
+
+    def unreadable(status=None):
+        raise RuntimeError("no answer")
+
+    engine.executor.broker.list_orders = unreadable                        # nothing known: nothing kept on its word
+    assert engine.quit_preview()["keepable"] == []
+    engine.executor.protective_stops = lambda: [{"trade_id": short_of_shares, "symbol": "BBB"}]
+    assert [b["id"] for b in engine.quit_preview()["keepable"]] == [short_of_shares]   # followed ones still count
+
+
 def test_without_stops_at_the_broker_nothing_can_be_kept(engine):
     _open(engine, "AAPL")
     closed = _closes_fill(engine)
