@@ -1009,10 +1009,15 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
   it: green when its stop (and target) rest at the broker - the orders the app placed and follows - amber when
   the app watches the price itself (the simulator), red for **no stop at the broker yet**. Under it a day trade
   counts down to its time stop, "out in 31 min unless working", amber in the last 5 minutes.
+* **Execute ✓ Yes** / **Dismiss** (a play's detail panel) — the click shows at once: the row says *sending…*,
+  or leaves the table, and a refusal puts it back as it was, with the app's reason. The answer comes as soon
+  as the order is out; the account is read and sent a moment later. The panel follows its play: once
+  Autopilot (or another tab) has sent it, Execute is gone and the panel says who sent it and when.
 * **Trading capital** — how much of the account the bot may use.
 * **Autopilot** + **⚙** — hands-off entry and its caps.
 * **Reset paper** (simulator only) — reset the balance.
-* **Exit** / **Exit all** — close one position, or all of them, at the market.
+* **Exit** / **Exit all** — close one position, or all of them, at the market. A position's Exit says
+  *Sending…* and stays off until the app answers.
 * **Quit** — close out, then shut down.
 * Bottom tabs: **Open positions**, **Active orders**, **Trade history**, **P/L summary**, **Watchlist**, **Pairs**.
 

@@ -223,11 +223,30 @@ function openRow(t, here) {
     <td class="num muted">${usd(t.mfe)} / ${usd(t.mae == null ? null : -t.mae)}</td>
     <td class="no-row-click"><label class="switch lockable"><input type="checkbox" data-managed="${escapeHtml(t.id)}" ${t.managed_exit ? "checked" : ""} ${t.pair_id ? "disabled" : ""}><span></span></label></td>
     <td class="no-row-click"><button class="danger mini" data-exit="${escapeHtml(t.id)}" ${parked
-      ? `disabled title="Switch back to ${VENUE_SHORT[venue] || escapeHtml(venue)} to exit this"` : 'title="Exit this position at the market"'}>Exit</button></td></tr>`;
+      ? `disabled title="Switch back to ${VENUE_SHORT[venue] || escapeHtml(venue)} to exit this"`
+      : exitsSending.has(t.id) ? `disabled title="${EXIT_SENDING_TIP}"`
+        : 'title="Exit this position at the market"'}>${exitsSending.has(t.id) ? "Sending…" : "Exit"}</button></td></tr>`;
+}
+
+/* Exits sent from here and not answered yet, by trade id: the position's Exit buttons say so and stay off until
+   the answer - the table redraws on every snapshot meanwhile, and keeps them so. A second click would only be
+   refused (an exit already working), but it shouldn't look possible. */
+const exitsSending = new Set();
+const EXIT_SENDING_TIP = "The exit has gone to the app - waiting for its answer";
+
+function markExit(id, sending) {
+  if (sending) exitsSending.add(id); else exitsSending.delete(id);
+  $$(`[data-exit="${CSS.escape(id)}"]`).forEach(b => {
+    b.disabled = sending;
+    b.textContent = sending ? "Sending…" : "Exit";
+    b.title = sending ? EXIT_SENDING_TIP : "Exit this position at the market";
+  });
+  const rec = $("#rec-exit");
+  if (rec && S.recordId === id) { rec.disabled = sending; rec.textContent = sending ? "Sending…" : "Exit position"; }
 }
 
 function confirmExit(t, fromRecord = false) {
-  if (!t) return;
+  if (!t || exitsSending.has(t.id)) return;
   const venue = (S.state.venue || {}).trading_on_label || "your broker";
   openModal({
     title: `Exit ${t.symbol}?`,
@@ -236,7 +255,9 @@ function confirmExit(t, fromRecord = false) {
       <p class="muted">Entered at ${num(t.entry_price)} · stop ${num(t.stop_price)} · target ${num(t.target_price)}.</p>`,
     okText: "Exit position", okClass: "danger",
     onOk: async () => {
+      markExit(t.id, true);
       const r = await post(`/api/trades/${t.id}/close`);
+      markExit(t.id, false);
       if (r.ok) toast(`Exit sent for ${t.symbol}${r.status && r.status !== "FILLED" ? ` (${r.status.toLowerCase()})` : ""}`, "good");
       else toast(`Exit for ${t.symbol} failed: ${r.reason || ""}`, "bad");
       loadOpen(); refreshState();
@@ -366,7 +387,7 @@ function renderRecord(rec) {
       orders.map(o => `<tr><td>${fmtTime(o.ts)}</td><td>${escapeHtml(o.action)}</td><td>${escapeHtml(orderSummary(o.request))}</td>
         <td><span class="badge ${o.ok ? "good" : "bad"}">${o.ok ? "ok" : "failed"}</span> ${escapeHtml(o.message || "")}</td></tr>`).join("")}</tbody></table></div>`
       : '<p class="muted">No broker orders stored.</p>'}
-    ${open ? `<div class="row-gap"><button class="danger" id="rec-exit" ${rec.on_current_venue ? "" : "disabled"}>Exit position</button></div>
+    ${open ? `<div class="row-gap"><button class="danger" id="rec-exit" ${rec.on_current_venue && !exitsSending.has(t.id) ? "" : "disabled"}>${exitsSending.has(t.id) ? "Sending…" : "Exit position"}</button></div>
       <p class="muted small">If this position is closed or removed outside the app, or the paper account is reset, this open-trade record is
       deleted once the broker confirms the position is gone.</p>` : ""}`;
   const exitBtn = $("#rec-exit");

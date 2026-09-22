@@ -214,6 +214,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._account: Optional[Account] = None
         self._account_at = 0.0
         self._account_warned_at = float("-inf")     # the last time a failing account read was logged
+        # set to have the snapshot loop read the account now rather than at its next turn - after an order
+        # sent from the dashboard, whose reply doesn't wait for that read
+        self._snapshot_wake = threading.Event()
         self._armed = False
 
         # hands-off entry (exits are always automatic)
@@ -280,6 +283,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def stop(self) -> None:
         self._stop.set()
         self._scan_wake.set()
+        self._snapshot_wake.set()
         self._day_changed(now=True)
         self.connections.close_all()
         log.info("engine stopped")
@@ -750,7 +754,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self._publish("account.snapshot", state=state)
             except Exception:  # noqa: BLE001
                 log.exception("snapshot failed")
-            self._stop.wait(10.0 if self._autopilot_day_active() else 30.0)
+            self._snapshot_wake.wait(10.0 if self._autopilot_day_active() else 30.0)
+            self._snapshot_wake.clear()
 
     def _orders_loop(self) -> None:
         """Keeps the dashboard's list of working orders current. It runs on its own, so a
@@ -1445,7 +1450,14 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             # sent: the executor has saved it SUBMITTED (or the fill FILLED) - and the sync loop may already
             # have saved how it ended, which a write here would overwrite
             self._publish("play.decided", play_id=p.id, decision="approved", result=out, play=self._decorate(p))
-            self._refresh_account()
+            if operator == "autopilot":
+                # on the scan thread: its next play, and the next pass, read the account this order changed
+                self._refresh_account()
+            else:
+                # a click waits for its reply, and the order is out: the snapshot loop reads the account and
+                # sends it a moment later - the loop is woken rather than a thread started, so no second read
+                # runs alongside its own
+                self._snapshot_wake.set()
             self._day_changed(now=True)                   # a restart mustn't offer this setup again today
             return {"ok": out.get("ok", False), **out}
 

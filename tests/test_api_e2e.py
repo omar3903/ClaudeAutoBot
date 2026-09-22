@@ -87,6 +87,9 @@ def test_scan_watchlist_approve_close(client):
         approved = client.post(f"/api/plays/{play['id']}/approve").json()
         if approved.get("status") == "FILLED":
             trade_id = approved["trade_id"]
+            # the reply comes once the order is out, and the board already says so
+            listed = {p["id"]: p for p in client.get("/api/plays").json()["plays"]}
+            assert listed[play["id"]]["status"] == "FILLED" and listed[play["id"]]["trade_id"] == trade_id
             break
     assert trade_id, "no play could be executed"
 

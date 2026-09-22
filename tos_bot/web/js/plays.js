@@ -1,5 +1,5 @@
 /* The plays table, and the detail panel: why, the numbers, and the order. */
-import { $, $$, api, escapeHtml, num, pct, pretty, post, sectorTag, sideBadge, tfLabel, usd } from "./util.js";
+import { $, $$, api, escapeHtml, fmtClock, num, pct, pretty, post, sectorTag, sideBadge, tfLabel, usd } from "./util.js";
 import { S, on } from "./state.js";
 import { openModal, toast } from "./ui.js";
 import { hideTip, showTipAt } from "./tooltips.js";
@@ -15,16 +15,29 @@ const isDone = p => DONE.has(p.status);
 const isNoisy = p => (p.noise || []).length > 0;
 const noiseLabel = flag => ((S.state.autopilot || {}).noise_labels || {})[flag] || flag.replace(/_/g, " ");
 
+/* Clicks waiting on the app, by play id: "sending" (Execute) or "dismissing". The screen shows the click at
+   once - the row says it's sending, or is gone - and S.plays is never touched until the answer, so a refusal
+   puts the row back exactly as it was, and a push arriving meanwhile can't undo the click on screen. */
+const pending = new Map();
+
+function setPending(id, what) {
+  if (what) pending.set(id, what); else pending.delete(id);
+  renderPlays();
+}
+
 export function mergePlay(row) {
   const i = S.plays.findIndex(x => x.id === row.id);
   if (i >= 0) { S.plays[i] = { ...S.plays[i], ...row }; renderPlays(); }
 }
 
+// a dismissed play stays on the app's board (its setup isn't offered again today), so the push still carries it
+const dismissed = p => p.status === "REJECTED" || pending.get(p.id) === "dismissing";
+
 function visiblePlays() {
   const f = S.state.filters || {};
   const sides = f.sides || ["LONG", "SHORT"], tfs = f.timeframes || ["INTRADAY", "SWING"];
-  return S.plays.filter(p => sides.includes(p.side) && tfs.includes(p.timeframe) && (!hideExecuted() || !isDone(p))
-    && (!hideNoisy() || isDone(p) || !isNoisy(p)));
+  return S.plays.filter(p => !dismissed(p) && sides.includes(p.side) && tfs.includes(p.timeframe)
+    && (!hideExecuted() || !isDone(p)) && (!hideNoisy() || isDone(p) || !isNoisy(p)));
 }
 
 function emptyText() {
@@ -40,10 +53,10 @@ function emptyText() {
 const shown = new Map();
 
 export function renderPlays() {
-  const rows = visiblePlays();
+  const rows = visiblePlays(), offered = S.plays.filter(p => !dismissed(p)).length;
   $("#plays-count").textContent = rows.length ? `(${rows.length})` : "";
-  $("#plays-empty").innerHTML = S.plays.length && !rows.length
-    ? `All ${S.plays.length} plays are hidden by the view options above — untick <b>Hide noise</b> or <b>Hide executed</b> to see them.`
+  $("#plays-empty").innerHTML = offered && !rows.length
+    ? `All ${offered} plays are hidden by the view options above — untick <b>Hide noise</b> or <b>Hide executed</b> to see them.`
     : emptyText();
   $("#plays-empty").classList.toggle("hidden", rows.length > 0);
   const body = $("#plays-body"), ids = new Set(rows.map(p => p.id));
@@ -62,6 +75,7 @@ export function renderPlays() {
     r.tr.classList.toggle("selected", p.id === S.selected);
     if (body.children[i] !== r.tr) body.insertBefore(r.tr, body.children[i] || null);
   });
+  followSelected();
 }
 
 /** A play whose score the insider or news signals moved: click for its stock on the Signals page. */
@@ -148,7 +162,8 @@ function switchOff(p) {
 
 /** A play's row: its class (the selected row's is added by renderPlays) and its cells. */
 function playRow(p) {
-  const done = isDone(p), ap = p.autopilot || {};
+  // one this tab is sending shows as sent until the answer - a refusal puts it back
+  const sending = pending.get(p.id) === "sending", done = isDone(p) || sending, ap = p.autopilot || {};
   // it tried the play and the engine's assessment or the order was refused: no bar, and a faded robot saying why
   const skipped = !!ap.skipped && !done;
   const cls = [done && "done", ap.eligible && !ap.waiting && !skipped && !done && "ap-eligible",
@@ -160,9 +175,10 @@ function playRow(p) {
     : ((ap.eligible || refused) && !done
       ? `<span class="ap-badge${ap.waiting && !skipped ? " waiting" : ""}${refused ? " refused" : ""}" data-term="autopilot" data-why="${escapeHtml(apLine(ap))}">🤖</span>`
       : "");
-  const last = done
-    ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
-    : `<span class="info-dot">i</span>`;
+  const last = sending ? `<span class="badge warn" title="Sent to the app - waiting for its answer">sending…</span>`
+    : done
+      ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
+      : `<span class="info-dot">i</span>`;
   const html = `
     <td class="sym">${escapeHtml(p.symbol)} ${sectorTag(p.sector)}${orderMark(p)}${signalMark(p)}${apMark}${p.extended_hours_ok ? '<span class="ext" data-term="ext">ext</span>' : ""}${isNoisy(p) && !done ? `<span class="badge warn" data-term="noise" title="${escapeHtml(p.noise.map(noiseLabel).join(", "))}">noisy</span>` : ""}</td>
     <td>${sideBadge(p.side)}</td>
@@ -227,6 +243,7 @@ function rowPlay(target) {
 /* ---------- detail / confirm ---------- */
 export async function selectPlay(id) {
   S.selected = id;
+  drawn = null;
   $$("#plays-body tr").forEach(tr => tr.classList.toggle("selected", tr.dataset.id === id));
   $("#detail-empty").classList.add("hidden");
   const body = $("#detail-body");
@@ -235,11 +252,48 @@ export async function selectPlay(id) {
   const a = await post(`/api/plays/${id}/assess`);
   if (S.selected !== id) return;
   if (!a.ok) { body.innerHTML = `<p class="reasons">${escapeHtml(a.reason || "unavailable")}</p>`; return; }
+  drawDetail(a);
+}
+
+/* The detail panel as last drawn: its play's assessment, and the status its row had then. A push or a decision
+   that moves the play on - Autopilot sent it, its order filled or was refused - draws the panel again, so it
+   never offers Execute for a play that has gone out (the app would refuse it as already sent). */
+let drawn = null;                    // {id, a, seen}
+
+function drawDetail(a) {
+  const id = a.play.id, body = $("#detail-body");
+  drawn = { id, a, seen: (S.plays.find(x => x.id === id) || a.play).status };
+  $("#detail-empty").classList.add("hidden");
+  body.classList.remove("hidden");
   body.innerHTML = detailHTML(a);
   const approveBtn = $("#btn-approve"); if (approveBtn) approveBtn.onclick = () => approve(id);
   const rejectBtn = $("#btn-reject"); if (rejectBtn) rejectBtn.onclick = () => reject(id);
   const recordBtn = $("#btn-goto-trade"); if (recordBtn) recordBtn.onclick = () => openRecord(a.play.trade_id);
   const offBtn = $("#btn-strat-off"); if (offBtn) offBtn.onclick = () => switchOff(a.play);
+  followSelected();                  // a push that came while it was being assessed
+}
+
+function hideDetail() {
+  $("#detail-body").classList.add("hidden");
+  $("#detail-empty").classList.remove("hidden");
+}
+
+/* Sent: drawn at once from the row over the assessment - play.decided brings the whole row, with who sent it and
+   when - with no request. Back on offer after it had gone out (its order was refused): assessed afresh, as Execute
+   needs. Dismissed in another tab: closed. A panel already showing the play as sent follows only the row's own
+   moves, never a row that lags the assessment - that would step a filled play back, or assess it again and again
+   until the next push. */
+function followSelected() {
+  if (!drawn || drawn.id !== S.selected || $("#detail-body").classList.contains("hidden")) return;
+  const row = S.plays.find(x => x.id === drawn.id);
+  if (!row) return;
+  const was = drawn.a.play, moved = row.status !== drawn.seen;
+  drawn.seen = row.status;
+  if (row.status === "REJECTED") { if (moved) hideDetail(); }
+  else if (isDone(row)) {
+    if ((moved || !isDone(was)) && row.status !== was.status)
+      drawDetail({ ...drawn.a, play: { ...was, ...row, evidence: { ...(was.evidence || {}), ...(row.evidence || {}) } } });
+  } else if (moved && isDone(was)) selectPlay(row.id);
 }
 
 /* How many times in a row a day play has shown: on 5-minute candles when Autopilot counts those
@@ -250,6 +304,18 @@ function seenText(p) {
     ? `seen on ${n} candle${n === 1 ? "" : "s"} in a row` : `seen in ${n} scan${n === 1 ? "" : "s"} in a row`;
 }
 
+/* Who sent a play's order and when - from what it was taken on (evidence.at_entry, in the whole row: the
+   assessment's, or the one play.decided brings) - and where the order stands. */
+const STANDS = { ACCEPTED: "going out", SUBMITTED: "working", WORKING: "working", PARTIAL: "part filled", FILLED: "filled" };
+
+function sentLine(p) {
+  const at = (p.evidence || {}).at_entry || {};
+  const who = at.by === "autopilot" || (!at.by && (p.autopilot || {}).acted) ? "Autopilot sent it"
+    : at.by ? "Sent from the dashboard" : "Sent";
+  return `✓ ${who}${at.at ? ` at ${fmtClock(at.at)}` : ""} · ${STANDS[p.status] || p.status.toLowerCase()}`
+    + (p.trade_id ? ` — trade <code>${escapeHtml(p.trade_id)}</code>` : "");
+}
+
 function detailHTML(a) {
   const p = a.play, op = a.order_preview, pdt = a.pdt || {}, em = S.state.exit_manager || {};
   const protection = { native: "broker OCO (TP + SL)", managed: "auto exit manager", none: "none" }[op.bracket_mode] || op.bracket_mode;
@@ -258,16 +324,16 @@ function detailHTML(a) {
     + (em.trail_start_r > 0 ? `, trail from ${num(em.trail_start_r, 1)}R (lock ${Math.round(em.trail_lock_ratio * 100)}%)` : "")
     + (p.timeframe === "INTRADAY" && em.flatten_intraday_before_close_min ? `, flatten ${em.flatten_intraday_before_close_min} min before the close` : "")
     : "OFF — you must close this manually";
-  const executed = a.already_executed || isDone(p);
+  const executed = a.already_executed || isDone(p), sending = pending.get(p.id) === "sending";
   const confirmBlock = executed
-    ? `<div class="reasons">${p.status === "ERROR" ? "⚠ the order errored — the setup isn't offered again today" : "✓ Already executed" + (p.trade_id ? ` — trade <code>${escapeHtml(p.trade_id)}</code>` : "")}</div>
+    ? `<div class="reasons">${p.status === "ERROR" ? "⚠ the order errored — the setup isn't offered again today" : sentLine(p)}</div>
        <div class="confirm-row">
          ${p.trade_id ? `<button id="btn-goto-trade">Show trade record</button>` : ""}
        </div>`
     : `${a.reasons && a.reasons.length ? `<div class="reasons">⚠ ${a.reasons.map(escapeHtml).join("<br>")}</div>` : ""}
        <div class="confirm-row">
-         <button class="${p.side === "LONG" ? "long" : "danger"} lockable" id="btn-approve" ${a.can_execute ? "" : "disabled"}>Execute &#10003; Yes</button>
-         <button class="ghost" id="btn-reject">Dismiss</button>
+         <button class="${p.side === "LONG" ? "long" : "danger"} lockable" id="btn-approve" ${a.can_execute && !sending ? "" : "disabled"}>${sending ? "Sending…" : "Execute &#10003; Yes"}</button>
+         <button class="ghost" id="btn-reject" ${sending ? "disabled" : ""}>Dismiss</button>
        </div>`;
   return `
     <h3>${escapeHtml(p.symbol)} ${sectorTag(p.sector)} ${sideBadge(p.side)}${executed ? ' <span class="badge good" data-term="executed">executed</span>' : ""}</h3>
@@ -370,31 +436,48 @@ function sparkSvg(values, p) {
     <polyline points="${points}"/></svg>`;
 }
 
+/* The panel drawn again from its last assessment, after a click the app refused - the button as it was. */
+function restoreDetail(id) {
+  if (S.selected === id && drawn && drawn.id === id) drawDetail(drawn.a);
+}
+
 async function approve(id) {
-  const btn = $("#btn-approve");
+  if (pending.has(id)) return;                        // one click at a time
+  const btn = $("#btn-approve"), dismiss = $("#btn-reject");
   if (btn) { btn.disabled = true; btn.textContent = "Sending…"; }
+  if (dismiss) dismiss.disabled = true;
+  setPending(id, "sending");                          // the row says so at once
   const symbol = (S.plays.find(x => x.id === id) || {}).symbol || "";
   const r = await post(`/api/plays/${id}/approve`);
+  pending.delete(id);
   if (r.ok) {
     const where = r.order_session === "EXTENDED" ? " (extended-hours limit)" : "";
     toast(`Order sent for ${symbol}: ${r.order_type || ""} ${r.status || "ok"}${where}`, "good");
     mergePlay({ id, status: r.status === "FILLED" ? "FILLED" : "SUBMITTED", trade_id: r.trade_id || null });
-    selectPlay(id);
+    if (S.selected === id) selectPlay(id);            // another play picked meanwhile stays shown
     loadOpen();
   } else {
     toast("Not sent: " + (r.reason || "rejected"), "bad");
-    if (r.already_executed) { mergePlay({ id, status: "FILLED", trade_id: r.trade_id || null }); selectPlay(id); }
-    else if (btn) { btn.disabled = false; btn.innerHTML = "Execute &#10003; Yes"; }
+    if (r.already_executed) {
+      mergePlay({ id, status: "FILLED", trade_id: r.trade_id || null });
+      if (S.selected === id) selectPlay(id);
+    } else { renderPlays(); restoreDetail(id); }      // the row and the panel back as they were
   }
 }
 
 async function reject(id) {
+  if (pending.has(id)) return;
+  setPending(id, "dismissing");                       // the row goes at once...
+  hideDetail();
   const r = await post(`/api/plays/${id}/reject`);
-  if (r && r.ok === false) { toast("Not dismissed: " + (r.reason || "refused"), "bad"); return; }
-  S.plays = S.plays.filter(p => p.id !== id);
-  renderPlays();
-  $("#detail-body").classList.add("hidden");
-  $("#detail-empty").classList.remove("hidden");
+  pending.delete(id);
+  if (r && r.ok === false) {
+    toast("Not dismissed: " + (r.reason || "refused"), "bad");
+    renderPlays();                                    // ...and comes back as it was, with its panel
+    restoreDetail(id);
+    return;
+  }
+  mergePlay({ id, status: "REJECTED" });              // as the app's board now has it
 }
 
 export function initPlays() {

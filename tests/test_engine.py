@@ -1320,6 +1320,49 @@ def test_a_play_already_sent_cant_be_dismissed_and_one_never_logged_is_logged_wh
                                                                                                     "autopilot")
 
 
+def test_a_click_is_answered_once_the_order_is_out_and_autopilot_still_reads_the_account_first(engine, monkeypatch):
+    """The dashboard's Yes doesn't wait for an account read: the snapshot loop is woken to read and send it.
+    Autopilot's approval, on the scan thread, still reads it before it goes on - its next play is sized on it."""
+    web, auto = _play("AAA"), _play("BBB")
+    engine.board.replace([web, auto])
+    monkeypatch.setattr(engine, "assess_play",
+                        lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
+    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen: None)
+    monkeypatch.setattr(engine.executor, "execute_play", lambda p, account, **kw: {"ok": True, "status": "SUBMITTED"})
+    reads, read_now = [], threading.Event()
+
+    def read():                                                             # a slow account read, as IBKR's can be
+        reads.append(threading.current_thread().name)
+        read_now.wait(10)
+        return False
+
+    monkeypatch.setattr(engine, "_refresh_account", read)
+    loop = threading.Thread(target=engine._snapshot_loop, name="snapshot-loop", daemon=True)
+    loop.start()
+    assert _until(lambda: reads == ["snapshot-loop"])                       # its own first pass, held up
+    started = time.monotonic()
+    assert engine.approve_play(web.id)["ok"]
+    assert time.monotonic() - started < 5 and reads == ["snapshot-loop"]    # answered without a read of its own
+    read_now.set()                                                          # the first pass finishes...
+    assert _until(lambda: reads == ["snapshot-loop"] * 2)                   # ...and the loop, woken, reads again at once
+
+    assert engine.approve_play(auto.id, operator="autopilot")["ok"]
+    assert reads[-1] == threading.current_thread().name != "snapshot-loop"   # read before it returned
+    engine._stop.set()
+    engine._snapshot_wake.set()
+    loop.join(5)
+    assert not loop.is_alive()
+
+
+def _until(check, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(0.02)
+    return False
+
+
 # ---------------------------------------------------------------- confirmations counted on candles
 def test_any_scan_on_a_newer_candle_confirms_a_day_play_and_the_setting_turns_it_off(engine, monkeypatch):
     import pandas as pd
