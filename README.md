@@ -1031,6 +1031,15 @@ is tested on simulated series whose answer is known.
 * **Mid-day size** — a day trade sized between 12 and 3 pm ET risks
   `risk.midday_size_pct` (60 %) of the usual: Aziz's thin, choppy hours, when
   he lowers his share size. Swing trades are untouched.
+* **Liquidity cap** — one order never takes more than `risk.max_adv_pct` (1 %)
+  of the stock's median daily volume over its last 20 completed sessions
+  (today's candle counts only once the session has closed, and the median
+  ignores a one-off spike day), so the entry and later the stop can fill
+  without moving a thin stock.
+  The order card lists it under *Size limited by*; a stock so thin that the cap
+  is under one share is refused with that reason. A stock with no daily history
+  isn't capped; `0` turns it off. Day and swing trades alike; pair legs are
+  sized by the pairs desk and are untouched.
 
 **Two statistical day trades** (`tos_bot/strategies/statistical.py`; on even when
 an older `config.yaml` doesn't list them):

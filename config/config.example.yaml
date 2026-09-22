@@ -25,6 +25,8 @@ risk:
   max_open_risk_pct: 4.0               # sum of open-trade risk not allowed to exceed this
   max_position_pct_of_equity: 12.0     # notional cap per trade
   max_symbol_pct_of_equity: 15.0       # cap per stock: shares already held + entries working + the new trade
+  max_adv_pct: 1.0                     # one order's shares, as % of the stock's median daily volume over its
+                                       # last 20 completed sessions, so thin stocks fill; 0 = off
   min_reward_risk: 1.5                 # discard plays whose target/stop R:R is below this
   round_lot: 1                         # share rounding
   midday_size_pct: 60                  # a day trade sized at Mid-day (12-3 pm ET) risks this % of the usual

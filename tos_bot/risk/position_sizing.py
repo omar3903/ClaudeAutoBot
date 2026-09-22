@@ -2,7 +2,8 @@
 
 Fixed-fractional risk: risk at most ``max_risk_per_trade_pct`` of equity
 between entry and the protective stop, then clip by a notional cap per trade,
-a cap on everything held in the same stock, and available buying power.
+a cap on everything held in the same stock, a slice of the stock's usual daily
+volume, and available buying power.
 """
 
 from __future__ import annotations
@@ -73,6 +74,13 @@ def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
             qty = math.floor(room_in_symbol / entry)
             caps.append("max exposure per stock")
 
+    # a slice of the stock's usual daily volume, so the order - and its stop - can fill without
+    # moving a thin stock (scanner/evaluator.py median_volume); unknown volume means no cap
+    liquidity = liquidity_cap(play, cfg)
+    if liquidity is not None and qty > liquidity:
+        qty = liquidity
+        caps.append(liquidity_label(cfg))
+
     # buying power
     bp = account.buying_power if account.buying_power else equity
     if qty * entry > bp:
@@ -96,6 +104,22 @@ def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
     if qty == 0:
         caps.append("risk budget too small for one share")
     return SizingResult(qty, round(rps, 4), round(dollar_risk, 2), round(notional, 2), caps)
+
+
+def liquidity_cap(play: Play, cfg) -> Optional[int]:
+    """The most shares one order may take: ``cfg.max_adv_pct`` percent of the stock's median daily
+    volume over its last 20 completed sessions, which the scan writes into the play's evidence.
+    None when the cap is off or the volume isn't known (a play saved before the scan wrote it)."""
+    pct = float(getattr(cfg, "max_adv_pct", 0.0) or 0.0)
+    adv = (play.evidence or {}).get("adv_shares")
+    if pct <= 0 or not adv or float(adv) <= 0:
+        return None
+    return math.floor(float(adv) * pct / 100.0)
+
+
+def liquidity_label(cfg) -> str:
+    """The cap's name in caps_hit, which the order preview lists under "Size limited by"."""
+    return f"liquidity: {float(cfg.max_adv_pct):g}% of its usual daily volume"
 
 
 def time_of_day_factor(play: Play, cfg, now=None) -> float:

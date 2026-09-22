@@ -192,6 +192,7 @@ function detailHTML(a) {
         <span>Protection</span><span>${protection}</span>
         <span>Est. cost</span><span>${usd(op.est_cost)}</span>
         <span data-term="risk">Est. risk</span><span>${usd(op.est_risk)}</span>
+        ${op.caps && op.caps.length ? `<span>Size limited by</span><span>${escapeHtml(op.caps.join("; "))}</span>` : ""}
       </div>
       ${op.note ? `<div class="muted" style="margin:6px 0">${escapeHtml(op.note)}</div>` : ""}
       <div class="exit-box"><b>Automatic exit strategy:</b> ${exitLine}<br>

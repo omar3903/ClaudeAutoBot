@@ -883,6 +883,22 @@ def test_trading_capital_shrinks_what_the_bot_uses_not_the_account(engine):
     assert engine.runtime.read()["capital"] == {}
 
 
+def test_an_order_is_capped_at_a_slice_of_the_stocks_usual_volume_and_a_too_thin_stock_is_refused(engine, monkeypatch):
+    engine._refresh_account()
+    monkeypatch.setattr(engine.settings.config.risk, "max_adv_pct", 1.0)
+    play = _tight_play("AAA")
+    play.evidence["adv_shares"] = 2_000                                    # 1% of it: 20 shares
+    thin = _tight_play("BBB")
+    thin.evidence["adv_shares"] = 50                                       # 1% of it: half a share
+    engine.board.replace([play, thin], None)
+    pre = engine.assess_play(play.id)
+    assert pre["order_preview"]["qty"] == 20
+    assert "liquidity: 1% of its usual daily volume" in pre["order_preview"]["caps"]
+    pre = engine.assess_play(thin.id)
+    assert not pre["can_execute"] and pre["order_preview"]["qty"] == 0
+    assert any(r.startswith("BBB is too thin to trade: it usually trades 50 shares a day") for r in pre["reasons"])
+
+
 def test_trading_capital_is_split_between_day_trades_and_swing_trades(engine):
     engine._refresh_account()
     risk = engine.settings.config.risk

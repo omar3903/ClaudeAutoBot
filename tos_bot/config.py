@@ -103,6 +103,8 @@ class RiskCfg(_Model):
     max_open_risk_pct: float = 4.0
     max_position_pct_of_equity: float = 12.0   # one trade's notional
     max_symbol_pct_of_equity: float = 15.0     # everything in one stock: shares held + entries working + this trade
+    max_adv_pct: float = 1.0                   # one order's shares, as % of the stock's median daily volume over its
+                                               # last 20 completed sessions, so thin stocks fill; 0 = off
     min_reward_risk: float = 1.5
     round_lot: int = 1
     midday_size_pct: float = 60.0              # a day trade sized at Mid-day (12-3 pm ET) risks this % of the usual
