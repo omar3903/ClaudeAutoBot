@@ -1621,6 +1621,42 @@ def test_every_topic_the_app_publishes_has_a_handler_in_the_dashboard():
     assert sorted(published - handled) == []
 
 
+#: every panel, popup or drawer about a stock: the script that draws it and the functions that open it
+PRICE_PANELS = {"plays.js": ["drawDetail"], "chart.js": ["openChart"], "movers.js": ["openMoverChart"],
+                "signals.js": ["openStock"], "blotter.js": ["renderRecord", "confirmExit", "confirmUntrackedExit"],
+                "pairs.js": ["openChart"]}
+
+
+def test_every_panel_about_a_stock_keeps_its_market_price_fresh():
+    """A play's panel and chart, its stock on the Signals page, an open trade's record, an exit's confirmation,
+    a mover's chart and a pair's chart each show the stock's price through the one shared helper, which asks
+    the route the server has for it."""
+    web = Path(__file__).resolve().parents[1] / "tos_bot" / "web" / "js"
+    helper = (web / "price.js").read_text(encoding="utf-8")
+    assert "/api/price/${" in helper and "export function watchPrice" in helper
+    assert '@app.get("/api/price/{symbol}")' in (web.parents[1] / "server" / "app.py").read_text(encoding="utf-8")
+    for script, openers in PRICE_PANELS.items():
+        source = (web / script).read_text(encoding="utf-8")
+        assert 'import { watchPrice } from "./price.js";' in source, script
+        for name in openers:
+            # the function's body, up to its closing brace at the start of a line
+            body = re.search(rf"^(?:export )?(?:async )?function {name}\(.*?^\}}", source, re.S | re.M)
+            assert body and "watchPrice(" in body.group(0), f"{script} {name}"
+
+
+def test_every_name_a_dashboard_script_imports_is_one_the_script_it_names_exports():
+    """The scripts load as ES modules: one missing export and the whole dashboard fails to start."""
+    web = Path(__file__).resolve().parents[1] / "tos_bot" / "web" / "js"
+    scripts = {f.name: f.read_text(encoding="utf-8") for f in web.glob("*.js")}
+    exports = {name: set(re.findall(r"^export (?:async )?(?:function|const) ([\w$]+)", src, re.M))
+               for name, src in scripts.items()}
+    imports = [(name, target, {n.strip() for n in names.split(",") if n.strip()}) for name, src in scripts.items()
+               for names, target in re.findall(r'^import \{([^}]*)\} from "\./([\w.]+)";', src, re.M)]
+    assert len(imports) > 80                                           # the search found the scripts' imports
+    assert [(name, target, sorted(wanted - exports[target])) for name, target, wanted in imports
+            if wanted - exports[target]] == []
+
+
 def test_a_click_that_wakes_the_snapshot_loop_leaves_the_position_check_to_its_usual_turn(engine, monkeypatch):
     from tos_bot.engine import engine as module
 

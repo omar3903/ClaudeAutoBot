@@ -81,6 +81,12 @@ export function fmtClock(s) {
   const d = parseDate(s);
   return isNaN(d) ? s : d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 }
+/** The clock time when it's today, the date too when it isn't - a price from before today says so. */
+export function fmtWhen(s) {
+  if (!s) return "–";
+  const d = parseDate(s);
+  return isNaN(d) ? s : d.toDateString() === new Date().toDateString() ? fmtClock(s) : fmtTime(s);
+}
 /** A market time, shown in New York time like the scan settings. */
 export function fmtEt(s) {
   if (!s) return "–";

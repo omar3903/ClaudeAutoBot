@@ -1001,10 +1001,15 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 * **Price** (plays table) — the latest price the app holds for the stock and how far it is past the entry
   in R; amber beyond `execution.max_chase_r` (0.25R), where an entry is refused. The tooltip says when the
   price is from. The positions' **Mark** is the app's own price when it fetched one in the last two minutes
-  (the exit manager's, or Refresh's), otherwise the broker's mark, which IBKR updates only every few minutes.
-  Prices fetched to be shown include pre-market and after-hours trades and are kept apart: the exits and the
-  entry checks read regular-hours prices only. `GET /api/price/{symbol}` gives one stock's latest price
-  with its time and session, asking IBKR at most every 15 s per stock.
+  (the exit manager's, Refresh's or an open panel's), otherwise the broker's mark, which IBKR updates only
+  every few minutes. Prices fetched to be shown include pre-market and after-hours trades and are kept apart:
+  the exits and the entry checks read regular-hours prices only. `GET /api/price/{symbol}` gives one stock's
+  latest price with its time and session, asking IBKR at most every 15 s per stock.
+* **Market price** (every panel about a stock) — a play's detail panel (with how far it is past the entry in
+  R until the play is sent) and its chart, the stock on the Signals page, an open trade's record, an exit's
+  confirmation ("Last trade"), a mover's chart (the price now) and a pair's chart (both legs) show the latest
+  price with its time, and the session outside regular hours. It is fetched as the panel opens and every 30 s
+  while it stays open and the tab is in view.
 * **Replay record** (plays table, beside the setup) — the setup's replayed average R a trade and how many
   trades, over the ones Autopilot would take: green proven, amber not proven yet, red losing, grey no replayed
   trades. The tooltip adds the held-out sessions and why it isn't proven. The play's detail panel sets what the

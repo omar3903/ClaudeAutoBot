@@ -3,6 +3,7 @@
    the setups it offered and the news on the session's candles. */
 import { $, $$, api, escapeHtml, num, shorten, usd } from "./util.js";
 import { chartModal } from "./chart.js";
+import { watchPrice } from "./price.js";
 import { stratLabel } from "./strategies.js";
 import { inR, pctOf, tone } from "./journal.js";
 
@@ -136,6 +137,9 @@ export async function openMoverChart(session, symbol) {
   $(".chart-title", box).textContent = `${symbol} · ${session}`;
   $(".chart-body", box).innerHTML = `<p class="muted">Loading the charts…</p>`;
   box.classList.remove("hidden");
+  // the charts are a past session's: the price line says where the stock is now
+  $(".chart-price", box).innerHTML = `Price now <span data-price></span>`;
+  watchPrice($(".chart-price [data-price]", box), symbol);
   let d;
   try { d = await api(`/api/journal/${encodeURIComponent(session)}/movers/${encodeURIComponent(symbol)}/chart`); } catch (e) { d = { ok: false, reason: `No chart - ${e.message}.` }; }
   if (box.dataset.play !== key || box.classList.contains("hidden")) return;
