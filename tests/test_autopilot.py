@@ -1147,7 +1147,7 @@ def _headline(ap):
     return ap.status()["headline"]
 
 
-def test_the_strip_says_off_paper_only_blind_and_stopped_before_anything_else(session_open):
+def test_the_strip_says_off_paper_only_blind_and_stopped(session_open):
     assert _headline(AutoPilot(FakeEngine(), _cfg(enabled=False), bus=SILENT))["state"] == "off"
     h = _headline(AutoPilot(FakeEngine(mode="live"), _cfg(), bus=SILENT))
     assert h["state"] == "blocked" and "paper-only" in h["text"]
@@ -1162,6 +1162,41 @@ def test_the_strip_says_off_paper_only_blind_and_stopped_before_anything_else(se
     h = _headline(ap)
     assert h["state"] == "stopped" and "past the daily limit of 2% of equity" in h["text"]
     assert "practice size" not in h["text"]                                  # it won't resume today
+
+
+def test_when_two_states_hold_the_strip_says_the_one_that_comes_first(session_open, monkeypatch):
+    # blind before done: prices refused on a day whose entries are all used
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(max_auto_trades_per_day=2, max_auto_positions=9), bus=SILENT)
+    _run(ap, mkplay(sym="AAA"), mkplay(sym="BBB"))
+    assert _headline(ap)["state"] == "done"
+    eng.prices_refused = lambda: "the login is active somewhere else"
+    assert _headline(ap)["state"] == "blind"
+
+    # stopped before full: the daily loss stop while every position is taken
+    eng = FakeEngine(equity=10_000.0)                                        # 2% of equity = 200
+    eng.repo._closed = [_closed("AAA", -250.0)]
+    eng.repo._open = [{"id": "t_BBB", "symbol": "BBB", "strategy": "opening_range_breakout",
+                       "timeframe": "INTRADAY", "entry_context": {"by": "autopilot"}}]  # taken before a restart
+    ap = AutoPilot(eng, _cfg(max_auto_positions=1, max_daily_loss_pct=2.0), bus=SILENT)
+    assert _headline(ap)["state"] == "full"
+    _run(ap, mkplay(sym="CCC"))                                              # the gate finds the loss
+    assert _headline(ap)["state"] == "stopped"
+    eng.prices_refused = lambda: "the login is active somewhere else"       # ...and blind before stopped
+    assert _headline(ap)["state"] == "blind"
+
+    # done before full: the day's entries used and every position taken
+    ap = AutoPilot(FakeEngine(), _cfg(max_auto_trades_per_day=1, max_auto_positions=1), bus=SILENT)
+    _run(ap, mkplay())
+    assert _headline(ap)["state"] == "done"
+    ap.configure(max_auto_trades_per_day=5)
+    assert _headline(ap)["state"] == "full"
+
+    # full before closed: every position taken while day trades wait for the open
+    monkeypatch.setattr(session_open.clock, "is_market_open", lambda ts=None: False)
+    assert _headline(ap)["state"] == "full"
+    ap.configure(max_auto_positions=2)
+    assert _headline(ap)["state"] == "closed"
 
 
 def test_the_strip_says_done_once_the_days_entries_are_used(session_open):
