@@ -647,6 +647,16 @@ def test_threads_asking_for_the_open_orders_at_once_share_one_request(threaded):
         c.join(timeout=5)
     assert len(asked) == 1
     assert [sorted(o.symbol for o in got[n]) for n in range(2)] == [["AAA", "BBB"]] * 2
+    # the answer is spent once both callers have it: the next call asks afresh and sees a newer order
+    assert threaded._orders_asked is None
+    threaded.place_order(OrderRequest(symbol="CCC", side=Side.LONG, quantity=5, order_type=OrderType.LIMIT,
+                                      limit_price=10.0))
+    later = threading.Thread(target=lambda: got.__setitem__("later", threaded.list_orders("WORKING")))
+    later.start()
+    _wait_for(lambda: len(asked) == 2)
+    threaded._session.call(lambda ib: asked[1].set_result(ib.trades()))
+    later.join(timeout=5)
+    assert sorted(o.symbol for o in got["later"]) == ["AAA", "BBB", "CCC"]
 
 
 def test_open_orders_that_never_arrive_raise_and_leave_nothing_waiting_on_the_loop(threaded, monkeypatch):
