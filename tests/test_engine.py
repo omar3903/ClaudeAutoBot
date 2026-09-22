@@ -364,6 +364,42 @@ def test_the_session_the_daily_replay_ran_for_survives_a_restart(engine, tmp_pat
         again.stop()
 
 
+def test_a_replay_a_restart_interrupted_is_resumed_once_and_an_older_one_is_dropped(engine, port, monkeypatch):
+    last = clock.prev_trading_day(clock.session_date())
+    checkpoint = engine.replay.checkpoint
+    checkpoint.begin({"fingerprint": "f", "last": last.isoformat(), "sessions": 7, "swing_sessions": 30, "jobs": 5},
+                     resume=False)
+    checkpoint.add(("swing", "T01"), [])
+    started, events = [], []
+    monkeypatch.setattr(engine.replay, "start", lambda **kw: started.append(kw) or {"ok": True, "note": "n"})
+    monkeypatch.setattr(engine, "_publish", lambda topic, **p: events.append((topic, p)))
+
+    engine._resume_replay()                                                  # no Gateway yet
+    _connect(engine, port)
+    engine._resume_replay()                                                  # no watchlist yet
+    engine.settings.config.replay.daily = False
+    engine._run_scan("full")
+    engine.quit_state = {"by": "operator"}
+    engine._resume_replay()                                                  # quitting
+    engine.quit_state = None
+    monkeypatch.setattr(type(engine.replay), "running", property(lambda self: True))
+    engine._resume_replay()                                                  # another replay running
+    monkeypatch.setattr(type(engine.replay), "running", property(lambda self: False))
+    assert started == [] and checkpoint.path.exists()
+
+    engine._resume_replay()
+    engine._resume_replay()
+    assert len(started) == 1 and started[0]["resume"]                        # once, as a resumed run...
+    assert (started[0]["sessions"], started[0]["swing_sessions"]) == (7, 30)  # ...of the interrupted run's sessions
+    assert [p for topic, p in events if topic == "replay.started"][-1]["resumed"]
+
+    engine._replay_resumed = False                                           # a later start, with an older run's file
+    checkpoint.begin({"fingerprint": "f", "last": clock.prev_trading_day(last).isoformat(), "sessions": 7,
+                      "swing_sessions": 30, "jobs": 5}, resume=False)
+    engine._resume_replay()
+    assert len(started) == 1 and not checkpoint.path.exists()                # deleted, nothing started
+
+
 # ---------------------------------------------------------------- the split, and changes made while it runs
 def test_entries_still_working_count_in_their_kinds_share_of_the_capital(engine, port):
     _connect(engine, port)

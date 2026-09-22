@@ -195,3 +195,39 @@ def test_the_runner_replays_day_trades_on_the_stocks_in_play_and_falls_back_when
     fallback.wait(60)
     state = fallback.state([], 1)
     assert state["ran_at"] and state["intraday_symbols"] == 1 and state["intraday_stock_days"] is None
+
+
+def test_a_resumed_replay_reads_its_candles_from_disk_and_downloads_none(tmp_path, monkeypatch):
+    from tos_bot.research import runner as runner_module
+
+    real = clock.session_date                    # "now" is the session after LAST, as in the test above
+    monkeypatch.setattr(clock, "session_date",
+                        lambda ts=None: real(ts) if ts is not None else clock.next_trading_day(LAST))
+    silent = SimpleNamespace(publish=lambda *a, **k: None)
+    daily = pd.DataFrame({"open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 3e6},
+                         index=pd.DatetimeIndex([pd.Timestamp(d, tz=NY) for d in SESSIONS]))
+    plan = {"AAA": [SESSIONS[-1], SESSIONS[-3]], "BBB": [SESSIONS[-2]]}
+    replay_job, calls = runner_module.replay_job, []
+
+    def stops_on_the_second(job):
+        calls.append(job)
+        if len(calls) == 2:
+            raise RuntimeError("the app stopped")
+        return replay_job(job)
+
+    def run(source, **kw):
+        runner = ReplayRunner(tmp_path / "replay.json", IntradayHistory(tmp_path / "bars"), bus=silent, workers=1)
+        runner.sessions_per_job = 1
+        runner.start(strategies=[_LongAtBar()], source=source, daily_frame=lambda s: daily, intraday_symbols=[],
+                     swing_symbols=[], sessions=5, swing_sessions=20, settings=EXACT, noise=QUIET,
+                     in_play=lambda progress: plan, benchmark="BMK", **kw)
+        runner.wait(60)
+        return runner
+
+    monkeypatch.setattr(runner_module, "replay_job", stops_on_the_second)
+    cut = run(_Candles(times_out={"BBB"}))                       # BBB's candles didn't come: asked again next time
+    assert cut.ran_at is None and len(cut.checkpoint.read()[1]) == 1
+    source = _Candles()
+    resumed = run(source, resume=True)
+    assert source.requests == [] and len(calls) == 3              # nothing downloaded, one job left to replay
+    assert resumed.ran_at and resumed.state([], 1)["intraday_requests_pending"] == 1

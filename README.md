@@ -440,7 +440,7 @@ The app is built to be left running:
   and no price is restored: the first cycle reads fresh candles within seconds, and an entry still
   needs a current quote. With today's watchlist on disk the full scan isn't repeated either; open
   positions and their resting stop and target orders are found again from the trade records and the
-  order tags.
+  order tags. A replay the restart cut short resumes from its last finished job (see *The replay*).
 * **An open dashboard tab updates itself.** After the app is updated and restarted, a tab that was already
   open reconnects - and would go on running the scripts it loaded before. The server stamps the dashboard's
   files in its first message; a tab that started on another stamp reloads (or, with a dialog open, asks you to).
@@ -1118,7 +1118,12 @@ fresh and the Gateway is free for the candles it downloads. So the records, the 
 half-Kelly sizes and the learned model are current for the session without anyone being awake for
 it; each morning also fetches another 20 minutes of past candles until the sixty sessions are
 covered. Once a session, never while a replay is already running or the app is quitting, and the
-session it ran for is remembered so a restart doesn't start a second one. A full scan *during*
+session it ran for is remembered so a restart doesn't start a second one. **A restart part way
+through picks the run up where it stopped**: each finished job is kept in
+`data/research/replay_partial.jsonl`, and once the Gateway is back the app resumes the same
+session's run, skipping those jobs and downloading no candles (the rest see the ones the finished
+jobs saw). A file from an earlier session is deleted; one made with other settings or other replay
+code is replayed afresh. A full scan *during*
 the session — a cold start at lunchtime, a widened filter — doesn't trigger it: the replay's
 downloads would be taking the Gateway from the cycles that need it, so it waits for the morning. **Run replay** in the
 Strategies panel still works whenever you want it.

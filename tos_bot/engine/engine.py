@@ -236,6 +236,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._last_scans: Dict[str, Dict[str, Any]] = {}
         self._gappers_session: Optional[dt.date] = None      # the session the gap check last ran for
         self._replay_session: Optional[dt.date] = None       # the session the daily replay was started for
+        self._replay_resumed = False                         # an interrupted replay was looked for (_resume_replay)
         self._last_cycle_at = float("-inf")
         self._last_fast_at = float("-inf")
         self._last_plays_at = float("-inf")
@@ -720,6 +721,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 if kind:
                     self._run_scan(kind)
                 self._save_day()
+                self._resume_replay()
             except Exception:  # noqa: BLE001
                 log.exception("scan loop pass failed")
             self._scan_wake.wait(5.0)

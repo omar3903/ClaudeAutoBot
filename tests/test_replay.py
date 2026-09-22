@@ -475,3 +475,75 @@ def test_the_replay_names_the_day_setups_it_only_ever_saw_on_one_candle(tmp_path
     runner._trades = [_t(1.0, strategy="once"), _t(-1.0, strategy="once"),
                       _t(1.0, strategy="twice"), _t(0.5, strategy="twice", entry_rule="second"), swing]
     assert runner.one_candle_setups() == ["once"]           # a swing trade has one way in, and isn't a day setup
+
+
+def _checkpointed_run(tmp_path, name, monkeypatch, *, fail_on=None, settings=EXACT, **kw):
+    """A replay of two stocks cut into eight jobs (three day-trade sessions each, a swing job each) on one
+    process; ``fail_on``: the job that raises, as a restart would cut it short. Returns the runner and
+    the jobs it replayed."""
+    from types import SimpleNamespace
+
+    import fakes
+    from tos_bot.research import runner as runner_module
+    from tos_bot.research.history import IntradayHistory
+
+    real, replayed = runner_module.replay_job, []
+
+    def counted(job):
+        replayed.append(runner_module.job_key(job))
+        if len(replayed) == fail_on:
+            raise RuntimeError("the app stopped")
+        return real(job)
+
+    monkeypatch.setattr(runner_module, "replay_job", counted)
+    runner = runner_module.ReplayRunner(tmp_path / name / "replay.json", IntradayHistory(tmp_path / "intraday"),
+                                        bus=SimpleNamespace(publish=lambda *a, **k: None), workers=1)
+    runner.sessions_per_job = 1
+    runner.start(strategies=[_LongAtBar()], source=fakes.FakeGateway(["RPA", "RPB"]), daily_frame=fakes.daily_bars,
+                 intraday_symbols=["RPA", "RPB"], swing_symbols=["RPA", "RPB"], sessions=3, swing_sessions=30,
+                 settings=settings, noise=QUIET, **kw)
+    runner.wait(60)
+    monkeypatch.setattr(runner_module, "replay_job", real)
+    return runner, replayed
+
+
+def test_a_replay_cut_short_picks_up_where_it_stopped_and_ends_where_a_clean_run_does(tmp_path, monkeypatch):
+    import dataclasses
+    import json
+
+    clean, jobs = _checkpointed_run(tmp_path, "clean", monkeypatch)
+    assert len(jobs) == 8 and clean._trades and not clean.checkpoint.path.exists()     # dropped once saved
+
+    cut, _ = _checkpointed_run(tmp_path, "cut", monkeypatch, fail_on=4)
+    lines = cut.checkpoint.path.read_text(encoding="utf-8").splitlines()
+    header = json.loads(lines[0])
+    assert cut.ran_at is None and len(lines) == 1 + 3                                   # the three finished jobs
+    assert (header["sessions"], header["swing_sessions"], header["jobs"]) == (3, 30, 8)
+    assert cut.checkpoint.header() == header and len(cut.checkpoint.read()[1]) == 3
+
+    with cut.checkpoint.path.open("a", encoding="utf-8") as f:
+        f.write('{"key": ["intraday", "RP')                                             # a line the crash cut short
+    resumed, replayed = _checkpointed_run(tmp_path, "cut", monkeypatch, resume=True)
+    assert replayed == jobs[3:]                                                         # only the jobs still to do
+    assert [dataclasses.asdict(t) for t in resumed._trades] == [dataclasses.asdict(t) for t in clean._trades]
+    assert not resumed.checkpoint.path.exists()
+
+
+def test_a_checkpoint_from_other_settings_or_code_is_replayed_afresh(tmp_path, monkeypatch):
+    import dataclasses
+
+    from tos_bot.research import runner as runner_module
+
+    dearer = dataclasses.replace(EXACT, slippage_bps=9.0)
+    _checkpointed_run(tmp_path, "cut", monkeypatch, fail_on=4)
+    _, replayed = _checkpointed_run(tmp_path, "cut", monkeypatch, settings=dearer, resume=True)
+    assert len(replayed) == 8                                                           # other costs: replayed afresh
+
+    _checkpointed_run(tmp_path, "cut", monkeypatch, fail_on=4)
+    _, replayed = _checkpointed_run(tmp_path, "cut", monkeypatch)
+    assert len(replayed) == 8                                                           # a run not resumed: afresh
+
+    _checkpointed_run(tmp_path, "cut", monkeypatch, fail_on=4)
+    monkeypatch.setattr(runner_module, "code_hash", lambda: "other code")
+    _, replayed = _checkpointed_run(tmp_path, "cut", monkeypatch, resume=True)
+    assert len(replayed) == 8                                                           # other replay code: afresh

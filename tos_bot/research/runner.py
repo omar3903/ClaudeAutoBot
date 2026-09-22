@@ -14,12 +14,18 @@ noise flags it skips, how many confirmations it wants) without replaying again.
 Every run also leaves a line in ``replay_runs.jsonl`` next to the results - its
 settings, each strategy's record and each noise check's verdict - so how the
 setups hold up can be followed from one run to the next.
+
+A run in progress keeps each finished job in ``replay_partial.jsonl`` (Checkpoint),
+so a restart part way through costs only the job in flight: the engine resumes the
+same session's run at start-up, on the candles already on disk. The file is dropped
+once the run is saved, and ignored when the settings or the replay code changed.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
@@ -43,6 +49,10 @@ from .replay import (HELD_OUT_FRACTION, ReplaySettings, SimTrade, held_out_from,
 log = logging.getLogger(__name__)
 
 HISTORY_FILE = "replay_runs.jsonl"
+#: the finished jobs of the run in progress, so a restart picks it up (see Checkpoint)
+CHECKPOINT_FILE = "replay_partial.jsonl"
+#: the code a replayed trade comes from, relative to the package: a checkpoint left by other code is ignored
+REPLAY_CODE = ("research/replay.py", "research/runner.py", "strategies/*.py", "scanner/noise.py", "pairs/backtest.py")
 SESSIONS_PER_JOB = 10
 #: sessions of 5-minute candles a day-trade context looks back over (replay.LIVE_INTRADAY_BARS)
 LOOKBACK_SESSIONS = 5
@@ -61,6 +71,7 @@ class ReplayRunner:
         self.workers = workers if workers else max(1, (os.cpu_count() or 2) - 2)
         #: sessions per day-trade job (see the module docstring)
         self.sessions_per_job = SESSIONS_PER_JOB
+        self.checkpoint = Checkpoint(results_path.parent / CHECKPOINT_FILE)
         self._thread: Optional[threading.Thread] = None
         self._progress: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()
@@ -88,8 +99,11 @@ class ReplayRunner:
               records: Optional[Mapping[str, Mapping[str, Any]]] = None,
               prepare: Optional[Callable[[Callable[[int, int], None]], Any]] = None,
               in_play: Optional[Callable[[Callable[[int, int], None]], Mapping[str, Sequence[dt.date]]]] = None,
-              download_budget_s: Optional[float] = None) -> Dict[str, Any]:
-        """``prepare``: called first, on the replay's thread, with a progress function - the engine
+              download_budget_s: Optional[float] = None, resume: bool = False) -> Dict[str, Any]:
+        """``resume``: pick up the run a restart interrupted (Checkpoint) - the jobs it had finished
+        aren't replayed again, and the stocks-in-play candles are read from disk with none downloaded,
+        so the rest see the ones the finished jobs saw.
+        ``prepare``: called first, on the replay's thread, with a progress function - the engine
         downloads the long daily history there; ``in_play``: called next, the same way, for the
         sessions each stock was in play on (research/in_play.py) - day-trade setups are then
         replayed on those stock-days instead of on ``intraday_symbols`` over every session, which
@@ -108,11 +122,12 @@ class ReplayRunner:
                 args=(list(strategies), source, daily_frame, list(intraday_symbols), list(swing_symbols),
                       sessions, swing_sessions, settings, noise, con_ids or {}, market, earnings,
                       held_out_fraction, pairs, news, benchmark, dict(records or {}), prepare, in_play,
-                      download_budget_s))
+                      download_budget_s, resume))
             self._thread.start()
         held = f"{held_out_fraction:.0%}"
         where = "the stocks in play each session" if in_play is not None else f"{len(intraday_symbols)} stocks"
-        return {"ok": True, "note": (f"Replaying the last {sessions} sessions of day-trade setups on "
+        return {"ok": True, "note": ("Picking up the replay a restart interrupted: " if resume else "") + (
+                                     f"Replaying the last {sessions} sessions of day-trade setups on "
                                      f"{where} and {swing_sessions} sessions of swing "
                                      f"setups on {len(swing_symbols)}, holding out the latest {held} to test "
                                      "them on. It runs in the background.")}
@@ -123,7 +138,7 @@ class ReplayRunner:
 
     def _run(self, strategies, source, daily_frame, intraday_symbols, swing_symbols, sessions, swing_sessions,
              settings, noise, con_ids, market, earnings, fraction, pairs=None, news=None, benchmark=None,
-             records=None, prepare=None, in_play=None, download_budget_s=None) -> None:
+             records=None, prepare=None, in_play=None, download_budget_s=None, resume=False) -> None:
         started = time.monotonic()
         try:
             self._optional("the long daily history", prepare,
@@ -136,9 +151,12 @@ class ReplayRunner:
             if days:
                 intraday_symbols = list(days)
                 report = lambda done, total: self._report("5-minute candles", done, total)   # noqa: E731
+                # a resumed run downloads nothing: the jobs it picks up were replayed on the candles on disk
                 if benchmark:                        # the market model reads the benchmark on every replayed session
-                    self.history.load_days(source, {benchmark: clock.last_n_sessions(last, sessions)}, con_ids)
-                bars = self.history.load_days(source, days, con_ids, progress=report, budget_s=download_budget_s)
+                    self.history.load_days(source, {benchmark: clock.last_n_sessions(last, sessions)}, con_ids,
+                                           budget_s=0.0 if resume else None)
+                bars = self.history.load_days(source, days, con_ids, progress=report,
+                                              budget_s=0.0 if resume else download_budget_s)
                 pending = self.history.pending
                 if benchmark and (held := self.history.stored(benchmark)) is not None:
                     bars[benchmark] = held
@@ -168,7 +186,11 @@ class ReplayRunner:
                 # the pair desk forms and trades its pairs on the live store's year, so its replay does too
                 frames = {s: f.tail(PAIR_BARS) for s in pairs["groups"] if (f := daily_frame(s)) is not None}
                 jobs.append(("pairs", pairs, frames, min(swing_sessions, PAIR_SESSIONS)))
-            trades = self._replay(jobs)
+            header = {"fingerprint": fingerprint(last, sessions, swing_sessions, split, settings, noise, strategies,
+                                                 benchmark),
+                      "last": last.isoformat(), "sessions": sessions, "swing_sessions": swing_sessions,
+                      "jobs": len(jobs)}
+            trades = self._replay(jobs, header, resume)
             data = {
                 "ran_at": dt.datetime.now(dt.timezone.utc).isoformat(), "sessions": sessions,
                 "swing_sessions": swing_sessions, "swing_symbols": len(swing_symbols),
@@ -184,6 +206,7 @@ class ReplayRunner:
                 "noise": noise_report(trades, split), "trades": [dataclasses.asdict(t) for t in trades],
             }
             self._save(data, trades)
+            self.checkpoint.clear()                  # saved in full: nothing left to pick up
             self._append_history(data, trades)
             if self.sink is not None:
                 try:
@@ -208,17 +231,33 @@ class ReplayRunner:
             log.warning("replay goes on without %s", what, exc_info=True)
             return None
 
-    def _replay(self, jobs: Sequence[tuple]) -> List[SimTrade]:
-        trades: List[SimTrade] = []
-        if self.workers <= 1 or len(jobs) <= 1:
-            for n, job in enumerate(jobs, 1):
-                trades += [SimTrade(**t) for t in replay_job(job)]
+    def _replay(self, jobs: Sequence[tuple], header: Dict[str, Any], resume: bool = False) -> List[SimTrade]:
+        """Replay the jobs, each one's trades kept in the checkpoint as it comes back - written from this
+        thread only, the worker processes never touch it. A resumed run takes the jobs the checkpoint
+        already holds from it instead of replaying them."""
+        done = self.checkpoint.begin(header, resume)
+        keyed = [(job_key(job), job) for job in jobs]
+        trades = [SimTrade(**t) for key, _ in keyed if key in done for t in done[key]]
+        todo = [(key, job) for key, job in keyed if key not in done]
+        n = len(jobs) - len(todo)
+        if n:
+            log.info("replay resumed: %d of %d jobs were done before the restart", n, len(jobs))
+            self._report("replaying setups", n, len(jobs))
+        if self.workers <= 1 or len(todo) <= 1:
+            for key, job in todo:
+                rows = replay_job(job)
+                self.checkpoint.add(key, rows)
+                trades += [SimTrade(**t) for t in rows]
+                n += 1
                 self._report("replaying setups", n, len(jobs))
         else:
             with ProcessPoolExecutor(max_workers=self.workers) as pool:
-                futures = [pool.submit(replay_job, job) for job in jobs]
-                for n, future in enumerate(as_completed(futures), 1):
-                    trades += [SimTrade(**t) for t in future.result()]
+                futures = {pool.submit(replay_job, job): key for key, job in todo}
+                for future in as_completed(futures):
+                    rows = future.result()
+                    self.checkpoint.add(futures[future], rows)
+                    trades += [SimTrade(**t) for t in rows]
+                    n += 1
                     self._report("replaying setups", n, len(jobs))
         return sorted(trades, key=lambda t: (t.exited_at, t.symbol, t.strategy))
 
@@ -341,6 +380,75 @@ class ReplayRunner:
             log.warning("could not add the replay to its history", exc_info=True)
 
 
+class Checkpoint:
+    """The finished jobs of the run in progress (CHECKPOINT_FILE): a header naming the run - its
+    fingerprint, the last session it replays, its sessions and how many jobs it has - then one line
+    per finished job, its key and its trades. A line is appended as each job comes back, so a crash
+    can cut only the last one short, and a line that can't be read is skipped."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def header(self) -> Optional[Dict[str, Any]]:
+        """The run it belongs to, from its first line alone - None with no file or no readable header."""
+        try:
+            with self.path.open(encoding="utf-8") as f:
+                head = json.loads(f.readline())
+        except (OSError, ValueError):
+            return None
+        return head if isinstance(head, dict) and "fingerprint" in head else None
+
+    def read(self) -> Tuple[Optional[Dict[str, Any]], Dict[tuple, List[Dict[str, Any]]]]:
+        """The header and each finished job's trades by its key."""
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except (OSError, ValueError):
+            return None, {}
+        rows = []
+        for line in lines:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+        if not rows or not isinstance(rows[0], dict) or "fingerprint" not in rows[0]:
+            return None, {}
+        jobs = [r for r in rows[1:] if isinstance(r, dict) and isinstance(r.get("key"), list)
+                and isinstance(r.get("trades"), list)]
+        return rows[0], {tuple(r["key"]): r["trades"] for r in jobs}
+
+    def begin(self, header: Dict[str, Any], resume: bool) -> Dict[tuple, List[Dict[str, Any]]]:
+        """Start the checkpoint of a run that has reached its jobs, and return the jobs already done: a
+        resumed run with the same fingerprint keeps them; anything else starts afresh. Written once in
+        full, so a line cut short before the restart can't run into the next one."""
+        saved, done = self.read() if resume else (None, {})
+        if saved is None or saved.get("fingerprint") != header["fingerprint"]:
+            if saved is not None:
+                log.info("the interrupted replay ran on other settings or code - replaying all of it")
+            done = {}
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            rows = [header] + [{"key": list(k), "trades": v} for k, v in done.items()]
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            tmp.replace(self.path)
+        except OSError:
+            log.warning("could not start the replay's checkpoint - a restart would replay it all", exc_info=True)
+        return done
+
+    def add(self, key: tuple, trades: List[Dict[str, Any]]) -> None:
+        try:
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"key": list(key), "trades": trades}) + "\n")
+        except OSError:
+            log.debug("could not add a job to the replay's checkpoint", exc_info=True)
+
+    def clear(self) -> None:
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError:
+            log.warning("could not remove %s", self.path, exc_info=True)
+
+
 PAIR_BARS, PAIR_SESSIONS = 300, 250
 
 
@@ -375,6 +483,41 @@ def day_chunks(bars: pd.DataFrame, days: Sequence[dt.date], size: int) -> List[T
             keep.update(held[max(0, at - LOOKBACK_SESSIONS):at])
         out.append((bars[[d in keep for d in bars.index.date]], tuple(chunk)))
     return out
+
+
+def job_key(job: tuple) -> Tuple[str, ...]:
+    """A job's name in the checkpoint, the same in a later run of the same replay: a day-trade job by
+    its stock and the sessions it replays, a swing job by its stock, the pairs job by itself."""
+    if job[0] == "pairs":
+        return ("pairs",)
+    kind, symbol, bars, sessions = job[0], job[2], job[3], job[7]
+    if kind == "swing":
+        return (kind, symbol)
+    days = sessions if isinstance(sessions, tuple) else sorted(set(bars.index.date))[-sessions:]
+    return (kind, symbol, *(d.isoformat() for d in days))
+
+
+def code_hash() -> str:
+    """A hash of the replay code's own source (REPLAY_CODE)."""
+    root, h = Path(__file__).resolve().parent.parent, hashlib.sha1()
+    for pattern in REPLAY_CODE:
+        for path in sorted(root.glob(pattern)):
+            h.update(path.relative_to(root).as_posix().encode())
+            h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def fingerprint(last: dt.date, sessions: int, swing_sessions: int, split: Mapping[str, Any], settings: ReplaySettings,
+                noise: NoiseSettings, strategies: Sequence[Strategy], benchmark: Optional[str]) -> str:
+    """Everything that decides a run's trades, hashed, so a checkpoint is only picked up by the same
+    replay: its sessions, the held-out split, the fills and exits, the noise checks, the setups and
+    their parameters, the benchmark and the replay code. The strategies' pooled records aren't in it -
+    they move during the day and only nudge the odds the replayed plays state."""
+    terms = {"last": last.isoformat(), "sessions": sessions, "swing_sessions": swing_sessions, "held_out_from": split,
+             "settings": dataclasses.asdict(settings), "noise": dataclasses.asdict(noise),
+             "strategies": {s.key: [s.params, s.weight] for s in strategies}, "benchmark": benchmark,
+             "code": code_hash()}
+    return hashlib.sha1(json.dumps(terms, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def replay_job(job: tuple) -> List[Dict[str, Any]]:

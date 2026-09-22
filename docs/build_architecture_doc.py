@@ -1202,6 +1202,8 @@ def build() -> str:
          "picks the day up from it (engine/day_state.py)"),
         ("paper_state.json", "JSON", "the simulator's cash, positions and round trips"),
         ("research/replay.json, replay_runs.jsonl", "JSON", "the latest replay's records and every run's summary"),
+        ("research/replay_partial.jsonl", "JSON lines", "the finished jobs of the replay in progress - a restart "
+         "resumes the run from it; removed once the run is saved (research/runner.py Checkpoint)"),
         ("research/training_set.csv", "CSV", "the exported training set (scripts/export_training_set.py)"),
         ("research/intraday/", "pickles", "5-minute history kept for the replay"),
         ("research/benchmark_spy.pkl", "pickle", "SPY daily returns and the fitted regime model"),
