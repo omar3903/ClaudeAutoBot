@@ -44,6 +44,32 @@ def test_trade_lifecycle_and_pnl(repo):
     assert abs(s["realized_total"] - before["realized_total"] - 40.0) < 1e-6
 
 
+def test_closed_trades_are_counted_by_type_as_a_profit_a_loss_or_even(repo):
+    before = repo.pnl_summary()["by_type"]          # other tests share this database: count what this one adds
+
+    def trade(exit_price, **kw):
+        p = _play(**kw)
+        repo.record_play(p)
+        tid = repo.open_trade(p, fill_price=100.0, fill_qty=10, broker="paper")
+        return tid if exit_price is None else repo.close_trade(tid, exit_price=exit_price, exit_reason="target")
+
+    trade(104.0, symbol="DAYW")
+    trade(98.0, symbol="DAYL")
+    trade(100.0, symbol="DAYE")
+    trade(103.0, symbol="SWW", timeframe=Timeframe.SWING)
+    trade(None, symbol="SWO", timeframe=Timeframe.SWING)                   # still open: not counted
+    trade(106.0, symbol="PRA", timeframe=Timeframe.SWING, pair_id="pair_1")
+    trade(97.0, symbol="PRB", timeframe=Timeframe.SWING, pair_id="pair_1")  # the pair: +60 and -30 = a profit
+    trade(99.0, symbol="PRC", timeframe=Timeframe.SWING, pair_id="pair_2")
+    trade(None, symbol="PRD", timeframe=Timeframe.SWING, pair_id="pair_2")  # a leg still open: the pair isn't in
+
+    after = repo.pnl_summary()["by_type"]
+    added = {k: {n: after[k][n] - before[k][n] for n in after[k]} for k in after}
+    assert added == {"INTRADAY": {"closed": 3, "profit": 1, "loss": 1, "even": 1},
+                     "SWING": {"closed": 1, "profit": 1, "loss": 0, "even": 0},
+                     "PAIRS": {"closed": 1, "profit": 1, "loss": 0, "even": 0}}
+
+
 def test_the_scale_out_math(repo):
     p = _play(symbol="MATH", entry=100.0, stop=98.0, targets=[104.0, 108.0])
     repo.record_play(p)
