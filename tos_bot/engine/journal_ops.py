@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import datetime as dt
 import time
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from ..research.replay import ReplaySettings
 from ..research.journal import ROLLING_SESSIONS, build_review, first_sightings, review_day
@@ -109,15 +109,14 @@ class JournalOps:
         if not trades and not opened and not plays and not pair_trades and not self._movers_ready(day):
             return {"ok": False, "reason": f"Nothing was offered or traded on {day.isoformat()}."}
         first = min(clock.last_n_sessions(day, ROLLING_SESSIONS))
-        ap = self.autopilot
-        skipped = ap.skipped_noise()
+        earlier = self.journal.get(day) or {}
+        gates = self._session_gates(opened, earlier.get("settings"))
         review = build_review(
             day, trades=trades, plays=plays, rolling=self.repo.closed_trades_between(first, day),
             replay_records=self.replay.records(*self._record_terms()), evidence=self.evidence_state(),
             regime=self.regime.reading(), bars=self._session_bars(day, plays),
             settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay, cfg.risk.min_reward_risk),
-            skip_noise=skipped,
-            min_confirmations=ap.min_confirmations, passes=self._passes_checks,
+            gates=gates, passes=lambda row: self._passes_checks(row, gates),
             styles={k: c.style for k, c in REGISTRY.items()}, titles={k: c.title for k, c in REGISTRY.items()},
             breakeven_at_r=float(cfg.exit_manager.breakeven_at_r), opened=opened, marks=self._review_marks(day, opened))
         if pair_trades:
@@ -128,8 +127,8 @@ class JournalOps:
             review["lessons"].append(f"{len(pair_trades)} pair trade{'s' if len(pair_trades) != 1 else ''} "
                                      f"closed: {total:+.2f}R in all.")
         if cfg.journal.movers > 0:
-            earlier = (self.journal.get(day) or {}).get("movers")
-            review["movers"] = self._movers(day, review, plays) or (earlier if movers_built({"movers": earlier})
+            built = earlier.get("movers")
+            review["movers"] = self._movers(day, review, plays) or (built if movers_built({"movers": built})
                                                                     else self._movers_pending())
             if not trades and not opened and not plays and not pair_trades and not movers_built(review):
                 return {"ok": False, "reason": f"Nothing was offered or traded on {day.isoformat()}."}
@@ -275,18 +274,48 @@ class JournalOps:
             log.warning("could not download the session's candles for the review", exc_info=True)
             return None
 
-    def _passes_checks(self, row: Mapping[str, Any]) -> bool:
+    GATES = ("skip_noise", "min_confidence", "min_swing_confidence", "min_reward_risk", "min_confirmations")
+
+    def _session_gates(self, opened: Sequence[Mapping[str, Any]],
+                       earlier: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+        """The checks Autopilot applied that session, so a rebuild never judges it by flags or floors
+        learned afterwards (the evening replay adds skipped flags): the latest Autopilot entry's record
+        of them, else the ones an earlier build of the review kept, else today's settings, labelled."""
+        entries = [e for t in opened
+                   if (e := ((t.get("play") or {}).get("evidence") or {}).get("at_entry") or {}).get("by") == "autopilot"
+                   and isinstance(e.get("settings"), Mapping) and "skipped_noise" in e]
+        if entries:
+            e = max(entries, key=lambda x: str(x.get("at") or ""))
+            gates = {"skip_noise": list(e["skipped_noise"]),
+                     **{k: e["settings"][k] for k in self.GATES[1:] if k in e["settings"]},
+                     "source": "at the last entry"}
+            if e["settings"].get("replay_losers") is not None:   # recorded by the builds that turn replay losers away
+                gates["replay_losers"] = list(e["settings"]["replay_losers"])
+            if all(k in gates for k in self.GATES):
+                return gates
+        if earlier and all(k in earlier for k in self.GATES):
+            return {k: earlier[k] for k in (*self.GATES, "replay_losers", "source") if k in earlier}
+        ap = self.autopilot
+        return {"skip_noise": ap.skipped_noise(), **{k: getattr(ap, k) for k in self.GATES[1:]},
+                "source": "at the rebuild"}
+
+    def _passes_checks(self, row: Mapping[str, Any], gates: Optional[Mapping[str, Any]] = None) -> bool:
         """Whether a recorded play clears Autopilot's checks on the play itself: its confidence floor for
-        the timeframe, its reward:risk floor, the skipped flags and, for day trades, the confirmations.
+        the timeframe, its reward:risk floor, the skipped flags, the replay losers it turned away (when the
+        session recorded them) and, for day trades, the confirmations. ``gates``: the checks in force that
+        session (see _session_gates); today's settings without them.
         Not the day / swing boxes or the account's caps - those say what Autopilot may take, not what
         the play was worth, and the review compares the plays its checks would pass against the rest
         whether or not the box for their kind is ticked."""
         ap = self.autopilot
+        g = gates or {"skip_noise": ap.skipped_noise(), **{k: getattr(ap, k) for k in self.GATES[1:]}}
         timeframe = str(row.get("timeframe") or "")
-        return (float(row.get("confidence") or 0) >= ap.confidence_floor(timeframe)
-                and float(row.get("reward_risk") or 0) >= ap.min_reward_risk
-                and not set(ap.skipped_noise()).intersection(row.get("noise") or [])
-                and (timeframe != "INTRADAY" or int(row.get("confirmations") or 1) >= ap.min_confirmations))
+        floor = g["min_confidence"] if timeframe == "INTRADAY" else g["min_swing_confidence"]
+        return (float(row.get("confidence") or 0) >= float(floor)
+                and float(row.get("reward_risk") or 0) >= float(g["min_reward_risk"])
+                and not set(g["skip_noise"]).intersection(row.get("noise") or [])
+                and str(row.get("strategy") or "") not in (g.get("replay_losers") or ())
+                and (timeframe != "INTRADAY" or int(row.get("confirmations") or 1) >= int(g["min_confirmations"])))
 
     def journal_state(self, limit: int = 60) -> Dict[str, Any]:
         cfg = self.settings.config.journal

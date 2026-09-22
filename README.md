@@ -1155,7 +1155,10 @@ can't see them, and the report says so.
   strategy without a proven record;
 * **the plays not taken**, each followed on the session's 5-minute candles as if
   it had been — grouped by noise flag and by whether Autopilot's checks passed
-  it, so every check is tested on live plays every day;
+  it, so every check is tested on live plays every day. The checks are the ones in
+  force that session, as the last Autopilot entry recorded them (a rebuild keeps
+  them; with no entry, the settings at the rebuild, and the review says so), so a
+  flag the evening replay learns later never re-judges the day;
 * **each strategy's real record** over the last 20 sessions against its replay,
   flagged when it falls more than 0.3R a trade short;
 * **how the orders filled** — the seconds from an order going out to the fill coming back, typically

@@ -1044,6 +1044,36 @@ def test_the_review_judges_a_play_on_autopilots_checks_not_on_its_type_boxes(eng
     assert engine._passes_checks(swing) and not engine._passes_checks({**swing, "confidence": ap.min_swing_confidence - 0.01})
 
 
+def _entered(at, skipped, by="autopilot", **settings):
+    gates = {"min_confidence": 0.5, "min_swing_confidence": 0.5, "min_reward_risk": 2.0, "min_confirmations": 1,
+             **settings}
+    return {"play": {"evidence": {"at_entry": {"at": at, "by": by, "skipped_noise": skipped, "settings": gates}}}}
+
+
+def test_the_review_judges_the_checks_with_the_gates_in_force_that_session(engine):
+    ap = engine.autopilot
+    ap.skip_noise, ap.min_confidence, ap.min_reward_risk, ap.min_confirmations = ["late_flag"], 0.5, 2.0, 1
+    opened = [_entered("2026-01-05T10:00:00-05:00", ["old_flag"], min_reward_risk=3.0),
+              _entered("2026-01-05T11:00:00-05:00", ["against_gap"]),       # the latest entry's gates win
+              _entered("2026-01-05T12:00:00-05:00", ["other"], by="operator")]
+    gates = engine._session_gates(opened, None)
+    assert gates["skip_noise"] == ["against_gap"] and gates["min_reward_risk"] == 2.0
+    assert gates["source"] == "at the last entry" and "replay_losers" not in gates
+    row = {"timeframe": "INTRADAY", "confidence": 0.6, "reward_risk": 2.5, "noise": ["late_flag"],
+           "confirmations": 1, "strategy": "s1"}
+    assert engine._passes_checks(row, gates)                  # a flag learned after the session doesn't count
+    assert not engine._passes_checks(row)                     # ...as it would on today's settings
+    assert not engine._passes_checks({**row, "noise": ["against_gap"]}, gates)
+    # the replay losers the session turned away, only when recorded
+    losers = engine._session_gates([_entered("2026-01-05T10:00:00-05:00", [], replay_losers=["s1"])], None)
+    assert not engine._passes_checks(row, losers) and engine._passes_checks({**row, "strategy": "s2"}, losers)
+    # no entry: the earlier build's gates, else today's settings, labelled
+    earlier = {**gates, "source": "at the last entry", "rolling_sessions": 20}
+    assert engine._session_gates([], earlier) == {k: v for k, v in earlier.items() if k != "rolling_sessions"}
+    now = engine._session_gates([], {"skip_noise": ["x"], "min_confirmations": 2})   # an old review lacks the floors
+    assert now["source"] == "at the rebuild" and "late_flag" in now["skip_noise"] and now["min_confidence"] == 0.5
+
+
 # ---------------------------------------------------------------- market prices on the dashboard
 def test_each_play_carries_the_latest_price_the_app_holds_and_when_its_from(engine):
     p = _play("AAPL")

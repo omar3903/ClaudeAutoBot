@@ -54,7 +54,8 @@ def _review(**over):
     kw = dict(trades=TRADES, plays=PLAYS, rolling=TRADES,
               replay_records={"s": {"trades": 40, "expectancy_r": 0.6, "out_of_sample": {"trades": 12, "expectancy_r": 0.4}}},
               evidence={"s": {"multiplier": 0.9}}, regime=TURBULENT, bars=BARS, settings=EXACT,
-              skip_noise=["against_trend"], min_confirmations=2, passes=lambda row: True, styles={"s": "momentum"},
+              gates={"skip_noise": ["against_trend"], "min_confirmations": 2, "source": "at the last entry"},
+              passes=lambda row: True, styles={"s": "momentum"},
               titles={"s": "Setup S"}, breakeven_at_r=1.3)
     kw.update(over)
     return build_review(DAY, **kw)

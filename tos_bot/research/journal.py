@@ -493,14 +493,16 @@ def execution_quality(trades: Sequence[Mapping[str, Any]], assumed_bps: float) -
 def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Sequence[Mapping[str, Any]],
                  rolling: Sequence[Mapping[str, Any]], replay_records: Mapping[str, Mapping[str, Any]],
                  evidence: Mapping[str, Mapping[str, Any]], regime: Optional[Mapping[str, Any]],
-                 bars: Optional[Mapping[str, pd.DataFrame]], settings: ReplaySettings, skip_noise: Sequence[str],
-                 min_confirmations: int, passes: Callable[[Mapping[str, Any]], bool], styles: Mapping[str, str],
+                 bars: Optional[Mapping[str, pd.DataFrame]], settings: ReplaySettings, gates: Mapping[str, Any],
+                 passes: Callable[[Mapping[str, Any]], bool], styles: Mapping[str, str],
                  titles: Mapping[str, str], breakeven_at_r: float, opened: Sequence[Mapping[str, Any]] = (),
                  marks: Optional[Mapping[str, float]] = None) -> Dict[str, Any]:
     """``bars``: the session's 5-minute candles for the plays not taken - None when they
     couldn't be had, and those plays aren't followed. ``opened``: the trades opened this session,
     closed or not - a session whose entries are all still open is not a session without trades;
-    ``marks``: where the open ones' stocks stood at the review."""
+    ``marks``: where the open ones' stocks stood at the review. ``gates``: Autopilot's checks in force that
+    session (skip_noise, the floors, min_confirmations) and where they were read (``source``)."""
+    skip_noise, min_confirmations = list(gates["skip_noise"]), int(gates["min_confirmations"])
     rs = [t.get("r_multiple") for t in trades]
     entered = opened_rows(opened, marks or {})
     standing = [row["open_r"] for row in entered if row["still_open"] and row["open_r"] is not None]
@@ -533,12 +535,15 @@ def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Se
         notes.insert(1, f"{n} position{'s' if n != 1 else ''} opened this session{where}.")
     if fills.get("note"):
         notes.append(fills["note"])
+    if gates.get("source") == "at the rebuild" and plays:
+        notes.append("No Autopilot entry recorded the checks in force this session, so its plays were judged "
+                     "on the settings at the rebuild.")
     return {
         "session": day.isoformat(), "created_at": dt.datetime.now(dt.timezone.utc).isoformat(), "regime": regime,
         "day": day_stats, "trades": trade_rows(trades), "opened": entered, "mistakes": mistakes, "shadows": shadows,
         "strategies": strategies, "plays_offered": len(plays), "execution": fills,
         "lessons": notes,
-        "settings": {"skip_noise": list(skip_noise), "min_confirmations": min_confirmations,
+        "settings": {**gates, "skip_noise": skip_noise, "min_confirmations": min_confirmations,
                      "costs_bps": {"slippage": settings.slippage_bps, "commission": settings.commission_bps},
                      "rolling_sessions": ROLLING_SESSIONS},
     }
