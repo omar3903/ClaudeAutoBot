@@ -81,12 +81,14 @@ function playRow(p) {
   tr.dataset.id = p.id;
   tr.classList.toggle("selected", p.id === S.selected);
   tr.classList.toggle("done", done);
-  tr.classList.toggle("ap-eligible", !!ap.eligible && !ap.waiting && !done);
-  tr.classList.toggle("ap-waiting", !!ap.eligible && !!ap.waiting && !done);
+  // a play it has acted on gets no bar: it won't look at it again today, whatever the caps say
+  tr.classList.toggle("ap-eligible", !!ap.eligible && !ap.waiting && !done && !ap.acted);
+  tr.classList.toggle("ap-waiting", !!ap.eligible && !!ap.waiting && !done && !ap.acted);
   // a play it won't take gets a faded robot too, only while Autopilot is on - off, every row would have one
   const refused = !ap.eligible && !!ap.why_not && !!(S.state.autopilot || {}).effective;
+  // acted on but not sent - the engine's assessment refused it - the robot says why, as apLine does
   const apMark = ap.acted
-    ? '<span class="ap-badge acted" data-term="autopilot">🤖</span>'
+    ? `<span class="ap-badge acted" data-term="autopilot"${done ? "" : ` data-why="${escapeHtml(apLine(ap))}"`}>🤖</span>`
     : ((ap.eligible || refused) && !done
       ? `<span class="ap-badge${ap.waiting ? " waiting" : ""}${refused ? " refused" : ""}" data-term="autopilot" data-why="${escapeHtml(apLine(ap))}">🤖</span>`
       : "");

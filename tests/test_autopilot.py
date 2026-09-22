@@ -846,6 +846,20 @@ def test_the_bar_says_when_autopilot_itself_is_why_not():
     assert "paper-only" in live.decorate_play(_row("INTRADAY"))["autopilot"]["why_not"]
 
 
+def test_a_play_the_engine_refused_says_why_on_the_bar_not_a_cap_it_would_wait_for():
+    eng = FakeEngine()
+    eng.can_execute = False                                                      # the engine's assessment refuses it
+    ap = AutoPilot(eng, _cfg(max_auto_trades_per_day=2), bus=SILENT)
+    p = mkplay()
+    _run(ap, p)
+    ap._count_today = ap.max_auto_trades_per_day                                 # and a cap fills up afterwards
+    bar = ap.decorate_play(p.to_row(), p)["autopilot"]
+    assert bar["acted"] and bar["why_not"] is None and bar["waiting"] is None
+    assert bar["reason"] == "not executable in this session"                     # the refusal, not the full cap
+    ap.settings_changed()                                                        # judged afresh: the cap shows again
+    assert "auto entries are used" in ap.decorate_play(p.to_row(), p)["autopilot"]["waiting"]
+
+
 def test_the_clock_and_what_is_held_reach_the_bar_as_the_last_passes_reason(monkeypatch):
     from tos_bot.execution import autopilot as module
 

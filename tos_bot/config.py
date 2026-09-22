@@ -232,9 +232,10 @@ class AutopilotCfg(_Model):
     min_replay_trades: int = 30
     min_replay_expectancy_r: float = 0.05
     skip_replay_losers: str = "day"       # with require_proven off (paper), still skip a setup with evidence it loses:
-                                          # its replay averages replay_loser_r or worse over min_replay_trades and over
-                                          # 10 held-out trades, or its own trades -0.30R or worse over 10. off / day /
-                                          # all - day only by default: skipping the swing losers didn't help in the replay
+                                          # its replay averages -replay_loser_r (-0.05R) or worse over min_replay_trades
+                                          # and over 10 held-out trades, or its own trades -0.30R or worse over 10.
+                                          # off / day / all - day only by default: skipping the swing losers didn't help
+                                          # in the replay
     replay_loser_r: float = 0.05          # ...the loss per trade, overall and held out, that counts as losing
     model_mode: str = "shadow"            # the learned model (research/model.py): shadow = its odds are logged with every
                                           # play and never acted on; gate = plays under model_min_p are refused; size =

@@ -181,7 +181,8 @@ FEATURE_NOTES = {
     "n_targets": ("1 or 2 (2 = scale-out at the first)", "geometry"),
     "noise": ("the flags raised: against_trend, news_driven_move, turbulent_market ...", "scanner/noise.py"),
     "n_noise": ("how many flags", "scanner/noise.py"),
-    "confirmations": ("scans in a row the setup showed", "the board"),
+    "confirmations": ("times in a row the setup showed: newer 5-minute candles for a day play once "
+                      "confirm_on_new_candle came in (scans before it, and for swing plays)", "the board"),
     "tags": ("gap, catalyst, earnings ...", "the strategy"),
     "has_catalyst": ("a gap or catalyst tag", "the strategy"),
     "minutes_since_open": ("when in the session the play was seen", "util/clock.py"),

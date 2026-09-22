@@ -190,6 +190,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._live_stats_at = float("-inf")
         self._risk_pct: Dict[str, Optional[float]] = {}
         self._risk_pct_for: Optional[tuple] = None
+        self._practice: set = set()                        # the strategies sized at practice size
         self._started_at = time.monotonic()
         #: pairs trading (pairs/): the watch list, and both legs of every pair trade
         self.pairs = PairDesk(self.repo, cfg.pairs, data_dir / "pairs" / "watch.json")
@@ -1330,7 +1331,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         # sized against the trading capital; the PDT rule and the floor see the real account
         sizing = size_play(p, self.sizing_account(p.timeframe) or acc, cfg.risk,
                            symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0),
-                           risk_pct=self._play_risk_pct(p))
+                           risk_pct=self._play_risk_pct(p), risk_why=self.strategy_risk_why(p.strategy))
         decision = self.pdt.assess(acc, p)
         session = clock.current_session()
         plan = plan_order(p, session, cfg.execution)

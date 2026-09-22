@@ -104,6 +104,23 @@ def test_a_position_never_exceeds_one_percent_of_the_stocks_usual_daily_volume()
     assert size_play(_thin(5_000), _acct(10000), cfg).qty == 10      # plenty of volume: risk decides, no cap named
     assert "liquidity: 1% of its usual daily volume" not in size_play(_thin(5_000), _acct(10000), cfg).caps_hit
     assert size_play(_thin(90), _acct(10000), cfg).qty == 0          # too thin for one share
+    # ...and the cap is named for it, not the risk budget, which would have bought 10
+    assert size_play(_thin(90), _acct(10000), cfg).caps_hit == ["liquidity: 1% of its usual daily volume"]
+
+
+def test_the_risk_budget_is_named_only_when_it_is_what_buys_nothing():
+    assert "risk budget too small for one share" in size_play(_play(100, 10), _acct(500), RISK_CFG).caps_hit
+    held = size_play(_play(100, 90), _acct(10000), SimpleNamespace(**vars(RISK_CFG), max_symbol_pct_of_equity=15.0),
+                     symbol_notional=1_600.0)
+    assert held.qty == 0 and held.caps_hit == ["max exposure per stock"]
+
+
+def test_practice_size_is_named_for_what_it_is_not_the_records_half_kelly():
+    practice = "practice size: a quarter of the usual risk until the replay proves the strategy"
+    r = size_play(_play(100, 90), _acct(100_000.0), RISK_CFG, risk_pct=0.25, risk_why=practice)
+    assert r.qty == 25 and r.caps_hit == [practice]
+    assert size_play(_play(100, 90), _acct(100_000.0), RISK_CFG, risk_pct=0.5).caps_hit == [
+        "half-Kelly from the strategy's record"]
 
 
 def test_no_known_volume_means_no_liquidity_cap():

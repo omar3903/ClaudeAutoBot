@@ -29,10 +29,13 @@ class SizingResult:
 
 
 def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
-              symbol_notional: float = 0.0, risk_pct: Optional[float] = None) -> SizingResult:
+              symbol_notional: float = 0.0, risk_pct: Optional[float] = None,
+              risk_why: Optional[str] = None) -> SizingResult:
     """``symbol_notional``: dollars already in this stock - shares held at the
     broker and entry orders still working. ``risk_pct``: the strategy's half-Kelly
-    risk per trade (see quant/sizing.py), which can only lower the configured one."""
+    risk per trade (see quant/sizing.py), which can only lower the configured one.
+    ``risk_why``: what set that risk, when it isn't the record's half-Kelly - the
+    practice size of a strategy the replay hasn't proven - as caps_hit names it."""
     entry = play.entry
     stop = play.stop
     rps = abs(entry - stop)
@@ -45,7 +48,7 @@ def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
     pct = float(cfg.max_risk_per_trade_pct)
     if risk_pct is not None and risk_pct < pct:
         pct = max(0.0, float(risk_pct))
-        caps.append("half-Kelly from the strategy's record")
+        caps.append(risk_why or "half-Kelly from the strategy's record")
     factor = time_of_day_factor(play, cfg)
     if factor < 1.0:
         pct *= factor
@@ -58,7 +61,7 @@ def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
         risk_budget = max(0.0, room)
         caps.append("portfolio open-risk ceiling")
 
-    qty = math.floor(risk_budget / rps)
+    by_risk = qty = math.floor(risk_budget / rps)
 
     # notional cap per name
     max_notional = equity * cfg.max_position_pct_of_equity / 100.0
@@ -101,7 +104,7 @@ def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
     dollar_risk = qty * rps
     notional = qty * entry
     _apply(play, qty, rps, dollar_risk, notional)
-    if qty == 0:
+    if qty == 0 and by_risk < lot:            # a cap that took it to nothing is named above instead
         caps.append("risk budget too small for one share")
     return SizingResult(qty, round(rps, 4), round(dollar_risk, 2), round(notional, 2), caps)
 

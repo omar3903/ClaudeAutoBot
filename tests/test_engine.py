@@ -17,6 +17,7 @@ import fakes
 from tos_bot.core.enums import Side, StrategyKind, Timeframe
 from tos_bot.core.models import Account, OrderResult, Play, Position
 from tos_bot.engine import TradingEngine
+from tos_bot.engine.research_ops import PRACTICE_LABEL
 from tos_bot.engine.reconcile import PositionCheck
 from tos_bot.engine.runtime import load_filters
 from tos_bot.risk.position_sizing import size_play
@@ -450,10 +451,17 @@ def test_a_strategy_the_replay_hasnt_proven_trades_at_a_quarter_of_the_risk(engi
     assert engine.autopilot.proof_missing("vwap_reclaim")                       # never replayed: not proven
     assert engine.strategy_risk_pct("vwap_reclaim") == 0.25 * cap
     assert engine._entry_context(_play(), "autopilot")["settings"]["proof_required"] == engine.autopilot.proof_required
+    # the order card names practice size - not the record's half-Kelly, which would have taken the full risk
+    engine._refresh_account()
+    engine.board.replace([_play()], None)
+    [p] = engine.board.plays.values()
+    caps = engine.assess_play(p.id)["order_preview"]["caps"]
+    assert PRACTICE_LABEL in caps and "half-Kelly from the strategy's record" not in caps
 
     monkeypatch.setattr(engine.autopilot, "proof_missing", lambda key: None)    # once it is proven...
     engine._risk_pct_for = None
     assert engine.strategy_risk_pct("vwap_reclaim") == cap                      # ...its record sizes it
+    assert engine.strategy_risk_why("vwap_reclaim") is None
 
 
 def test_a_trade_keeps_the_setups_skipped_as_losers_when_it_was_taken(engine, monkeypatch):
@@ -905,6 +913,7 @@ def test_an_order_is_capped_at_a_slice_of_the_stocks_usual_volume_and_a_too_thin
     pre = engine.assess_play(thin.id)
     assert not pre["can_execute"] and pre["order_preview"]["qty"] == 0
     assert any(r.startswith("BBB is too thin to trade: it usually trades 50 shares a day") for r in pre["reasons"])
+    assert "risk budget too small for one share" not in pre["order_preview"]["caps"]   # the cap did it, not the budget
 
 
 def test_trading_capital_is_split_between_day_trades_and_swing_trades(engine):

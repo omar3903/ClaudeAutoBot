@@ -34,7 +34,7 @@ Chan's rules for a backtest worth believing (*Quantitative Trading*, ch. 3):
 **Two ways in, for a day trade.** A setup is followed from the bar it first shows
 (``entry_rule`` "first": the record of every trade, and Autopilot's when it takes a
 play on sight) and, separately, from the bar after it has shown twice in a row
-("second": how Autopilot enters when it asks a day trade to be seen in two scans
+("second": how Autopilot enters when it asks a day trade to be seen on two candles
 running - one bar later, at another price, and only once a session per setup, the
 way the board settles a setup it has acted on). Autopilot's record is built from
 the way in it really uses; before, nearly every replayed trade was entered on

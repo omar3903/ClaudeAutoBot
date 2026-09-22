@@ -979,7 +979,7 @@ class AutoPilot:
         """Why a setup is skipped as a loser, if it is. Only while proof isn't asked for - on paper with
         require_proven off, where unproven setups are practised; proof_missing is stricter anyway. Not
         proven is one thing, evidence that it loses another: its replayed record the way Autopilot takes
-        it averages replay_loser_r (0.05R) a trade or worse over min_replay_trades, and its held-out
+        it averages -replay_loser_r (-0.05R) a trade or worse over min_replay_trades, and its held-out
         sessions say the same over MIN_HELD_OUT_TRADES - or its own closed trades (live_stats) average
         DRIFT_R or worse over MIN_LIVE. The records are read afresh, so a replay that recovers lifts it by
         itself. ``skip_replay_losers`` says which plays it covers: day trades by default - in the replay,
@@ -1046,8 +1046,9 @@ class AutoPilot:
         has it - its numbers are the gate's, where the row's are rounded."""
         pid = row.get("id")
         why_not = self._why_not(row, play)
+        # a play the engine's assessment refused waits for no cap: the refusal, in reason, is why
         waiting = (self._waiting_for(str(row.get("timeframe") or ""), str(row.get("strategy") or ""))
-                   if why_not is None else None)
+                   if why_not is None and pid not in self._refused else None)
         row["autopilot"] = {
             "eligible": why_not is None,
             # the first of Autopilot's checks the play fails (_play_check) - None when it passes them all
