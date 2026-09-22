@@ -967,6 +967,27 @@ def test_the_dashboard_lists_the_orders_working_at_the_broker(engine, monkeypatc
         ("AAPL", "entry", "play_waiting", 1.0)]
 
 
+def test_a_working_entrys_countdowns_are_sent_with_it_but_never_pushed_on_their_own(engine, monkeypatch):
+    """The browser counts down from the times sent with the order. The part-fill cut is worked out again at
+    each look; that alone isn't a change to push."""
+    from tos_bot.execution.executor import _Pending
+
+    play = Play(symbol="AAPL", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=100.0, stop=95.0, targets=[110.0])
+    engine.executor._pending["1"] = _Pending("1", play, "entry", qty=5, submitted_at=dt.datetime.now(dt.timezone.utc),
+                                             first_fill_at=time.monotonic())
+    working = [OrderResult(order_id="1", status="WORKING", symbol="AAPL", submitted_qty=5, filled_qty=2,
+                           side=Side.LONG, tag=play.id, order_type="LIMIT", limit_price=100.0)]
+    monkeypatch.setattr(engine.executor.broker, "list_orders", lambda status=None: list(working))
+    heard = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **payload: heard.append(topic))
+    engine._refresh_orders()
+    engine._refresh_orders()                                                # nothing the broker says has changed
+    (order,) = engine.active_orders()["orders"]
+    assert order["expires_at"] and order["cut_at"] and order["filled"] == 2
+    assert heard.count("orders.updated") == 1
+
+
 def test_the_session_review_keeps_each_trade_with_what_it_was_taken_on(engine):
     from tos_bot.util import clock
 

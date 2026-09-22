@@ -338,7 +338,9 @@ tr.clickable-row{cursor:pointer}
 .ap-noise{display:grid; grid-template-columns:1fr 1fr; gap:2px 12px}
 
 /* ---- active orders ---- */
-.order-mark{margin-left:5px; font-size:11px; cursor:pointer; vertical-align:middle}
+.order-mark{margin-left:5px; font-size:11px; cursor:pointer; vertical-align:middle; white-space:nowrap}
+.countdown{font-variant-numeric:tabular-nums; white-space:nowrap}
+.countdown.warn{color:var(--warn)}
 .orders-table .purpose{white-space:nowrap}
 
 /* ---- play chart ---- */

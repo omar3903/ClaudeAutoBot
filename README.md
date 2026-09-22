@@ -665,6 +665,11 @@ and the stop goes on in the same pass. Pair legs are left to the pairs desk. A
 cancel that doesn't take is sent again every 30 seconds, and if IBKR loses track
 of the order, the shares it was seen to buy are booked all the same.
 
+While an entry works, its play's ⏳ shows the shares filled of the order and the
+time left: to the time-out (amber in its last two minutes) or, after a part
+fill, to the cut (`cut in 18 s`), then `cancelling` until the broker confirms.
+The Active orders tab has the same countdown in its **Time left** column.
+
 **What became of each sent play** is saved to the play log with the reason -
 `CANCELED` (timed out, cancelled, or refused by IBKR, which reports refusals as
 cancellations) or `ERROR` (the broker lost it) - so the daily review follows an

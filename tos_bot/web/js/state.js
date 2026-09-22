@@ -26,10 +26,16 @@ export function emit(topic, payload) {
   (listeners.get(topic) || []).forEach(fn => fn(payload));
 }
 
+let clockSkew = 0;     // the server's clock less this browser's, as of the last snapshot
+
 export function setState(snapshot) {
   S.state = snapshot || {};
+  const ts = Date.parse(S.state.ts);
+  if (!isNaN(ts)) clockSkew = ts - Date.now();
   emit("state");
 }
+/** The server's time now (ms), for counting down to a time the server set - this browser's clock may be off. */
+export const serverNow = () => Date.now() + clockSkew;
 export async function refreshState() {
   if (S.stopped) return;
   try { setState(await api("/api/state")); } catch { /* server restarting - the websocket reconnect catches up */ }
