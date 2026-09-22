@@ -46,13 +46,13 @@ class QuitOps:
     def _keepable_ids(self) -> set:
         """Positions that may stay open while the app is off: swing trades (a day trade must be flat
         by the close), not pair legs (they have no stop of their own), each with its stop order
-        resting at the broker right now - that order is what protects it until the app is back."""
+        resting at the broker right now - that order is what protects it until the app is back. Right
+        after a start the app hasn't taken over the stops an earlier run left yet; those count too."""
         executor = self.executor
         if executor is None or not executor.native_stops_on():
             return set()
-        protected = {s["trade_id"] for s in executor.protective_stops()}
-        return {t["id"] for t in self._positions_here()
-                if t["id"] in protected and t.get("timeframe") == "SWING" and not t.get("pair_id")}
+        swing = [t for t in self._positions_here() if t.get("timeframe") == "SWING" and not t.get("pair_id")]
+        return executor.stops_protecting(swing)
 
     def begin_quit(self, close_all: bool = True, operator: str = "operator", keep: bool = False) -> Dict[str, Any]:
         """Paper: close everything, reset the simulator, shut down. Live: close

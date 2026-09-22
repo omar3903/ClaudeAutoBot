@@ -144,6 +144,26 @@ class ProtectiveStops:
         return [{"trade_id": s.trade_id, "symbol": s.symbol, "order_id": s.order_id, "qty": s.qty, "stop_price": s.price}
                 for s in list(self._stops.values())]
 
+    def stops_protecting(self, trades: List[Dict[str, Any]]) -> set:
+        """The ids of ``trades`` that a stop order resting at the broker protects: one this run follows, or - in
+        the minute after a start, before the first pass has taken them over - one an earlier run left, tagged
+        for the trade and still working for all its shares. The broker is asked only when a trade isn't
+        followed yet; when it can't be asked, only the followed ones count."""
+        ids = {t["id"] for t in trades}
+        protected = {s["trade_id"] for s in self.protective_stops()} & ids
+        rest = [t for t in trades if t["id"] not in protected]
+        if not rest:
+            return protected
+        working = self._orders_for_certain() or []
+        for t in rest:
+            need = abs(float(t.get("quantity") or 0.0))
+            closing = Side.SHORT if t.get("side") == "LONG" else Side.LONG
+            if need > 0 and any(o.tag == stop_tag(t["id"]) and (o.side is None or o.side is closing)
+                                and float(o.submitted_qty or 0.0) - float(o.filled_qty or 0.0) >= need - 1e-9
+                                for o in working):
+                protected.add(t["id"])
+        return protected
+
     def resting_targets(self) -> List[Dict[str, Any]]:
         return [{"trade_id": s.trade_id, "symbol": s.symbol, "order_id": s.order_id, "qty": s.qty, "limit_price": s.price}
                 for s in list(self._targets.values())]
