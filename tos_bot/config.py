@@ -20,7 +20,7 @@ from typing import Any, Dict
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -103,6 +103,8 @@ class RiskCfg(_Model):
     max_open_risk_pct: float = 4.0
     max_position_pct_of_equity: float = 12.0   # one trade's notional
     max_symbol_pct_of_equity: float = 15.0     # everything in one stock: shares held + entries working + this trade
+    max_adv_pct: float = 1.0                   # one order's shares, as % of the stock's median daily volume over its
+                                               # last 20 completed sessions, so thin stocks fill; 0 = off
     min_reward_risk: float = 1.5
     round_lot: int = 1
     midday_size_pct: float = 60.0              # a day trade sized at Mid-day (12-3 pm ET) risks this % of the usual
@@ -213,7 +215,12 @@ class AutopilotCfg(_Model):
     max_per_strategy: int = 2
     max_new_per_cycle: int = 1
     max_gross_exposure_pct: float = 100.0  # all positions together, as % of equity - 100 = never on margin
-    min_confirmations: int = 2            # a day-trade setup must show up in this many scans in a row
+    min_confirmations: int = 2            # a day-trade setup must show up this many times in a row
+    confirm_on_new_candle: bool = True    # ...each time on a newer 5-minute candle, not just another scan: the scans read
+                                          # one candle several times over, and the replay's proof enters a day setup once
+                                          # it has shown on two candles running. A setup that fires on one candle by its
+                                          # nature is then never taken - min_confirmations 1, or this off, brings those
+                                          # back. The replay models two at most, so 3 or more asks more than it tested
     min_minutes_to_close: int = 30        # no new day trades with fewer minutes than this to the close: Aziz keeps the
                                           # last half hour for closing, and the exit manager flattens day trades 10
                                           # minutes before the bell, so a late entry has no time to work (0 = off)
@@ -224,6 +231,12 @@ class AutopilotCfg(_Model):
     require_proven: bool = True           # only strategies whose replayed record is good enough
     min_replay_trades: int = 30
     min_replay_expectancy_r: float = 0.05
+    skip_replay_losers: str = "day"       # with require_proven off (paper), still skip a setup with evidence it loses:
+                                          # its replay averages -replay_loser_r (-0.05R) or worse over min_replay_trades
+                                          # and over 10 held-out trades, or its own trades -0.30R or worse over 10.
+                                          # off / day / all - day only by default: skipping the swing losers didn't help
+                                          # in the replay
+    replay_loser_r: float = 0.05          # ...the loss per trade, overall and held out, that counts as losing
     model_mode: str = "shadow"            # the learned model (research/model.py): shadow = its odds are logged with every
                                           # play and never acted on; gate = plays under model_min_p are refused; size =
                                           # gate, and the risk follows the odds (AFML ch. 10). gate and size act only
@@ -237,6 +250,14 @@ class AutopilotCfg(_Model):
     giveback_floor_pct: float = 0.25      # the give-back rule only counts a peak gain of at least this % of equity
     require_catalyst: bool = False
     dry_run: bool = False
+
+    @field_validator("skip_replay_losers", mode="before")
+    @classmethod
+    def _bare_off(cls, value: Any) -> Any:
+        """YAML reads a bare ``off`` (or ``on``) as a boolean, which would stop the app starting."""
+        if isinstance(value, bool):
+            return "day" if value else "off"
+        return value
 
 
 class NoiseCfg(_Model):

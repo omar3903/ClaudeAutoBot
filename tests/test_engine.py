@@ -17,6 +17,7 @@ import fakes
 from tos_bot.core.enums import Side, StrategyKind, Timeframe
 from tos_bot.core.models import Account, OrderResult, Play, Position
 from tos_bot.engine import TradingEngine
+from tos_bot.engine.research_ops import PRACTICE_LABEL
 from tos_bot.engine.reconcile import PositionCheck
 from tos_bot.engine.runtime import load_filters
 from tos_bot.risk.position_sizing import size_play
@@ -450,10 +451,33 @@ def test_a_strategy_the_replay_hasnt_proven_trades_at_a_quarter_of_the_risk(engi
     assert engine.autopilot.proof_missing("vwap_reclaim")                       # never replayed: not proven
     assert engine.strategy_risk_pct("vwap_reclaim") == 0.25 * cap
     assert engine._entry_context(_play(), "autopilot")["settings"]["proof_required"] == engine.autopilot.proof_required
+    # the order card names practice size - not the record's half-Kelly, which would have taken the full risk
+    engine._refresh_account()
+    engine.board.replace([_play()], None)
+    [p] = engine.board.plays.values()
+    caps = engine.assess_play(p.id)["order_preview"]["caps"]
+    assert PRACTICE_LABEL in caps and "half-Kelly from the strategy's record" not in caps
 
     monkeypatch.setattr(engine.autopilot, "proof_missing", lambda key: None)    # once it is proven...
     engine._risk_pct_for = None
     assert engine.strategy_risk_pct("vwap_reclaim") == cap                      # ...its record sizes it
+    assert engine.strategy_risk_why("vwap_reclaim") is None
+
+
+def test_a_trade_keeps_the_setups_skipped_as_losers_when_it_was_taken(engine, monkeypatch):
+    engine.autopilot.configure(require_proven=False)
+    losing = {"trades": 40, "expectancy_r": -0.10, "out_of_sample": {"trades": 12, "expectancy_r": -0.08}}
+    monkeypatch.setattr(engine.replay, "records", lambda *terms: {"vwap_reclaim": losing})
+    settings = engine._entry_context(_play(), "autopilot")["settings"]
+    assert "vwap_reclaim" in settings["replay_losers"] and settings["skip_replay_losers"] == "day"
+
+
+def test_with_proof_asked_for_a_trade_keeps_no_setups_skipped_as_losers(engine, monkeypatch):
+    engine.autopilot.configure(require_proven=True)                          # the proof gate governs, not the loser skip
+    losing = {"trades": 40, "expectancy_r": -0.10, "out_of_sample": {"trades": 12, "expectancy_r": -0.08}}
+    monkeypatch.setattr(engine.replay, "records", lambda *terms: {"vwap_reclaim": losing})
+    settings = engine._entry_context(_play(), "autopilot")["settings"]
+    assert settings["replay_losers"] == [] and settings["require_proven"] is True
 
 
 # ---------------------------------------------------------------- a restart
@@ -875,6 +899,23 @@ def test_trading_capital_shrinks_what_the_bot_uses_not_the_account(engine):
     assert engine.runtime.read()["capital"] == {}
 
 
+def test_an_order_is_capped_at_a_slice_of_the_stocks_usual_volume_and_a_too_thin_stock_is_refused(engine, monkeypatch):
+    engine._refresh_account()
+    monkeypatch.setattr(engine.settings.config.risk, "max_adv_pct", 1.0)
+    play = _tight_play("AAA")
+    play.evidence["adv_shares"] = 2_000                                    # 1% of it: 20 shares
+    thin = _tight_play("BBB")
+    thin.evidence["adv_shares"] = 50                                       # 1% of it: half a share
+    engine.board.replace([play, thin], None)
+    pre = engine.assess_play(play.id)
+    assert pre["order_preview"]["qty"] == 20
+    assert "liquidity: 1% of its usual daily volume" in pre["order_preview"]["caps"]
+    pre = engine.assess_play(thin.id)
+    assert not pre["can_execute"] and pre["order_preview"]["qty"] == 0
+    assert any(r.startswith("BBB is too thin to trade: it usually trades 50 shares a day") for r in pre["reasons"])
+    assert "risk budget too small for one share" not in pre["order_preview"]["caps"]   # the cap did it, not the budget
+
+
 def test_trading_capital_is_split_between_day_trades_and_swing_trades(engine):
     engine._refresh_account()
     risk = engine.settings.config.risk
@@ -1055,6 +1096,13 @@ def test_each_play_carries_the_latest_price_the_app_holds_and_when_its_from(engi
     assert row["last_price"] == engine.md.last_seen("AAPL")[0] and row["last_at"].startswith("20")
 
 
+def test_autopilots_badge_is_handed_the_play_itself_not_only_its_rounded_row(engine, monkeypatch):
+    p, handed = _play("AAA"), []
+    monkeypatch.setattr(engine.autopilot, "decorate_play", lambda row, play=None: handed.append(play) or row)
+    engine._decorate(p)
+    assert handed == [p]
+
+
 def test_refresh_prices_the_plays_and_the_positions_and_sends_the_plays_out_again(engine, monkeypatch):
     p = _play("MSFT")
     engine.board.replace([p])
@@ -1159,3 +1207,54 @@ def test_a_play_already_sent_cant_be_dismissed_and_one_never_logged_is_logged_wh
     assert not engine.reject_play(gone.id)["ok"]
     assert (engine.repo.get_play(gone.id)["status"], engine.repo.get_play(gone.id)["decided_by"]) == ("SUBMITTED",
                                                                                                     "autopilot")
+
+
+# ---------------------------------------------------------------- confirmations counted on candles
+def test_any_scan_on_a_newer_candle_confirms_a_day_play_and_the_setting_turns_it_off(engine, monkeypatch):
+    import pandas as pd
+    from tos_bot.scanner.scanner import ScanResult
+
+    engine.autopilot.enabled = False
+    opened = pd.Timestamp("2026-03-02 10:00", tz="America/New_York")
+
+    def seen(kind, minutes):
+        p = _play("AAA")
+        p.timeframe = Timeframe.INTRADAY
+        p.evidence["bar_at"] = (opened + pd.Timedelta(minutes=minutes)).isoformat()
+        return ScanResult(kind=kind, symbols=["AAA"], plays=[p])
+
+    candle = {"at": 0}
+    monkeypatch.setattr(engine.scanner, "run_cycle", lambda fast=False: seen("cycle", candle["at"]))
+    monkeypatch.setattr(engine.scanner, "run_plays", lambda symbols: seen("plays", candle["at"]))
+
+    def count():
+        [p] = engine.board.plays.values()
+        return p.confirmations
+
+    engine._run_scan("cycle")
+    engine._run_scan("cycle")                                  # the same candle read again
+    assert count() == 1
+    candle["at"] = 5
+    engine._run_scan("plays")                                  # a newer one, found by the quick re-check
+    assert count() == 2
+    engine._run_scan("cycle")
+    assert count() == 2
+
+    engine.set_autopilot(confirm_on_new_candle=False)          # counting scans, as before
+    candle["at"] = 10
+    engine._run_scan("plays")
+    assert count() == 2                                        # a quick re-check isn't a scan confirming it
+    engine._run_scan("cycle")
+    engine._run_scan("cycle")
+    assert count() == 4
+
+
+def test_the_strategies_panel_says_when_a_day_setup_fires_on_one_candle(engine, monkeypatch):
+    key = next(s.key for s in engine.scanner.strategies if s.timeframe is Timeframe.INTRADAY)
+    monkeypatch.setattr(engine.replay, "one_candle_setups", lambda: [key])
+    engine.autopilot.min_confirmations, engine.autopilot.confirm_on_new_candle = 2, True
+    assert "fires on one candle" in engine.replay_state()["proof"][key]
+    engine.autopilot.confirm_on_new_candle = False                        # counting scans: the usual proof text
+    assert "fires on one candle" not in engine.replay_state()["proof"][key]
+    engine.autopilot.confirm_on_new_candle, engine.autopilot.min_confirmations = True, 1
+    assert "fires on one candle" not in engine.replay_state()["proof"][key]

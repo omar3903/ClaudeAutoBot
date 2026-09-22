@@ -13,7 +13,8 @@ import pytest
 
 import fakes
 from tos_bot.config import get_settings
-from tos_bot.core.enums import Timeframe
+from tos_bot.core.enums import Side, StrategyKind, Timeframe
+from tos_bot.core.models import Play
 from tos_bot.data.bars import DailyBarStore
 from tos_bot.data.listings import UsListings, parse_directory
 from tos_bot.data.market_data import MarketData
@@ -21,7 +22,7 @@ from tos_bot.data.sec_edgar import SecEdgarFundamentals, annual_series, financia
 from tos_bot.data.sectors import SECTORS, sector_from_ibkr
 from tos_bot.data.symbols import SymbolMaster
 from tos_bot.scanner import schedule
-from tos_bot.scanner.evaluator import with_today
+from tos_bot.scanner.evaluator import evaluate, median_volume, with_today
 from tos_bot.scanner.heat import daily_metrics, intraday_metrics, liquid, rank_by_daily_heat
 from tos_bot.scanner.scanner import BENCHMARK, Scanner
 from tos_bot.scanner.schedule import ScanSettings
@@ -165,6 +166,46 @@ def test_todays_candle_is_built_from_the_intraday_bars():
     assert len(full) == len(daily) + 1 and full.index[-1].date() == intraday.index[-1].date()
     assert full["high"].iloc[-1] == today["high"].max() and full["volume"].iloc[-1] == today["volume"].sum()
     assert with_today(full, intraday) is full and with_today(daily, None) is daily
+
+
+def test_a_play_carries_the_stocks_median_volume_over_its_last_20_completed_sessions():
+    intraday = fakes.intraday_bars("AAA")
+    final = schedule.last_completed_session(clock.now_ny())               # the newest session whose candle is final
+    days = pd.bdate_range(end=pd.Timestamp(final), periods=30, tz="America/New_York")
+    volume = [10_000.0] * 10 + [120_000.0] * 9 + [100_000.0] * 10 + [5_000_000.0]    # older 10, then the last 20
+    daily = pd.DataFrame({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": volume}, index=days)
+    day, swing = evaluate("AAA", [_DayAndSwing()], daily, intraday, run_id="r", equity=0.0, params={})
+    assert day.evidence["adv_shares"] == swing.evidence["adv_shares"] == 110_000   # not the 30-session 100,000
+
+    calm = daily.assign(volume=volume[:-1] + [120_000.0])                   # the spike day made an ordinary one
+    assert median_volume(calm) == median_volume(daily) == 110_000
+    printing = pd.Timestamp(clock.next_trading_day(final), tz="America/New_York")
+    partial = pd.concat([daily, daily.iloc[-1:].set_axis([printing]).assign(volume=1.0)])
+    assert median_volume(partial) == 110_000                                # a candle still printing never counts
+    assert median_volume(daily.iloc[:0]) is None                            # no history: no cap
+    assert median_volume(daily.assign(volume=0.0)) is None                  # no volume is missing data
+    no_volume, _ = evaluate("AAA", [_DayAndSwing()], daily.assign(volume=0.0), intraday, run_id="r", equity=0.0, params={})
+    assert "adv_shares" not in no_volume.evidence
+
+
+class _DayAndSwing:
+    """One day play and one swing play on every stock it is shown."""
+    key, style, weight = "both", "momentum", 1.0
+
+    def generate(self, ctx):
+        return [Play(symbol=ctx.symbol, side=Side.LONG, strategy=self.key, kind=StrategyKind.TECHNICAL, timeframe=tf,
+                     entry=ctx.price, stop=ctx.price * 0.99, targets=[ctx.price * 1.03])
+                for tf in (Timeframe.INTRADAY, Timeframe.SWING)]
+
+
+def test_a_day_play_carries_the_last_closed_candle_it_was_seen_on():
+    daily, intraday = fakes.daily_bars("AAA").iloc[:-1], fakes.intraday_bars("AAA")
+    day, swing = evaluate("AAA", [_DayAndSwing()], daily, intraday, run_id="r", equity=0.0, params={})
+    assert day.evidence["bar_at"] == intraday.index[-2].isoformat()       # the newest candle is still printing
+    assert pd.Timestamp(day.evidence["bar_at"]).tzinfo is not None
+    assert "bar_at" not in swing.evidence                                 # swing plays count scans, as before
+    no_candles, _ = evaluate("AAA", [_DayAndSwing()], daily, None, run_id="r", equity=0.0, params={})
+    assert no_candles.is_day_trade and "bar_at" not in no_candles.evidence   # no candles, nothing to count by
 
 
 # ---------------------------------------------------------------- heat

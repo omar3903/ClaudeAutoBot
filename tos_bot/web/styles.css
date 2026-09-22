@@ -90,6 +90,7 @@ tbody tr.ap-eligible.selected{box-shadow:inset 3px 0 0 var(--accent)}
 tbody tr.ap-waiting{box-shadow:inset 3px 0 0 var(--warn)}
 tbody tr.ap-waiting.selected{box-shadow:inset 3px 0 0 var(--accent)}
 .ap-badge.waiting{opacity:.55}
+.ap-badge.refused{opacity:.35; filter:grayscale(1)}
 .ap-form{display:flex; flex-direction:column; gap:8px; font-size:12.5px}
 .ap-form input[type=range]{width:100%}
 .ap-form .ap-row{display:flex; gap:16px; flex-wrap:wrap}

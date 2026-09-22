@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tos_bot.core.enums import AssetClass, Side, StrategyKind, Timeframe
+from tos_bot.core.enums import AssetClass, PlayStatus, Side, StrategyKind, Timeframe
 from tos_bot.core.models import Account, Play, Position
 from tos_bot.execution.autopilot import AutoPilot
 
@@ -53,6 +53,7 @@ class FakeEngine:
         self.est_risk = 200.0
         self.gross = 0.0                        # dollars already in positions
         self.records = {}                       # replayed strategy records
+        self.live = {}                          # closed real trades by strategy (live_stats)
         self._plays = {}                        # pid -> Play, populated by _run
 
     def assess_play(self, pid):
@@ -69,6 +70,9 @@ class FakeEngine:
 
     def strategy_record(self, key):
         return self.records.get(key)
+
+    def live_stats(self):
+        return self.live
 
     def approve_play(self, pid, operator="operator"):
         self.approved.append((pid, operator))
@@ -450,6 +454,17 @@ def test_a_day_trade_setup_must_show_up_twice_before_autopilot_takes_it():
     assert eng.approved_ids() == [p.id]
 
 
+def test_counting_confirmations_on_candles_is_a_setting_that_is_remembered():
+    ap = AutoPilot(FakeEngine(), _cfg(), bus=SILENT)
+    assert ap.confirm_on_new_candle and ap.status()["confirm_on_new_candle"]     # on unless config says otherwise
+    ap.configure(confirm_on_new_candle=False)
+    assert ap.to_runtime()["confirm_on_new_candle"] is False and not ap.status()["confirm_on_new_candle"]
+    other = AutoPilot(FakeEngine(), _cfg(), bus=SILENT)
+    other.load_runtime(ap.to_runtime())
+    assert other.confirm_on_new_candle is False
+    assert AutoPilot(FakeEngine(), _cfg(confirm_on_new_candle=False), bus=SILENT).confirm_on_new_candle is False
+
+
 def test_autopilot_only_trades_strategies_the_replay_has_proven():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(require_proven=True, min_replay_trades=30, min_replay_expectancy_r=0.05), bus=SILENT)
@@ -779,6 +794,103 @@ def test_a_play_that_passes_but_finds_its_cap_full_says_what_it_waits_for():
     assert not off["eligible"] and off["waiting"] is None
 
 
+# ---------------------------------------------------------------- the play's bar says why not, in the gate's words
+def _refused(status=None, noise=(), **over):
+    p = mkplay(**over)
+    p.noise = list(noise)
+    if status is not None:
+        p.status = status
+    return p
+
+
+@pytest.mark.parametrize("cfg, play, words", [
+    ({}, _refused(status=PlayStatus.REJECTED), "not a fresh proposed play"),
+    ({}, _refused(tf=Timeframe.SWING), "swing trades are switched off"),
+    ({"min_confidence": 0.8}, _refused(conf=0.7), "confidence 0.70 < 0.80"),
+    ({}, _refused(conf=0.5996), "confidence 0.60 < 0.60"),                     # just under: a row rounds it to 0.6
+    ({"min_reward_risk": 1.5}, _refused(target=102.4), "reward:risk 1.20 < 1.50"),
+    ({}, _refused(target=103.995), "reward:risk 2.00 < 2.00"),                 # 1.9975: a row rounds it to 2.0
+    ({}, _refused(kind=StrategyKind.FUNDAMENTAL), "valuation plays"),
+    ({"skip_noise": ["against_trend"]}, _refused(noise=["against_trend"]), "noise: against the daily trend"),
+    ({"min_confirmations": 2}, _refused(), "seen on 1 of 2 five-minute candles in a row"),
+    ({"min_confirmations": 2, "confirm_on_new_candle": False}, _refused(), "seen in 1 of 2 scans in a row"),
+    ({"require_proven": True}, _refused(), "isn't proven yet"),
+    ({"records": {"opening_range_breakout": {"trades": 40, "expectancy_r": -0.10,
+                                             "out_of_sample": {"trades": 12, "expectancy_r": -0.08}}}},
+     _refused(), "loses in the replay"),
+    ({}, _refused(), None),
+])
+def test_the_bar_gives_the_gates_own_reason_for_every_check_on_the_play(cfg, play, words):
+    eng = FakeEngine()
+    eng.records = dict(cfg.pop("records", {}))
+    ap = AutoPilot(eng, _cfg(**cfg), bus=SILENT)
+    gate = ap._pre_gate(play, 100_000.0)
+    bar = ap.decorate_play(play.to_row(), play)["autopilot"]                     # as engine._decorate asks
+    assert bar["why_not"] == gate                                                # one set of checks, one wording
+    if words is None:
+        assert gate is None and bar["eligible"] and bar["waiting"] is None
+    else:
+        assert words in gate and not bar["eligible"] and bar["waiting"] is None
+
+
+def test_the_bar_says_when_autopilot_itself_is_why_not():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(), bus=SILENT)
+    ap.enabled = False
+    assert ap.decorate_play(_row("INTRADAY"))["autopilot"]["why_not"] == "Autopilot is off"
+    ap.enabled = True
+    ap._roll_day()
+    ap._loss_stop_day = ap._day                                                  # the daily loss limit was reached today
+    assert "stopped for the day" in ap.decorate_play(_row("INTRADAY"))["autopilot"]["why_not"]
+    live = AutoPilot(FakeEngine(mode="live"), _cfg(allow_live=False), bus=SILENT)
+    assert "paper-only" in live.decorate_play(_row("INTRADAY"))["autopilot"]["why_not"]
+
+
+def test_a_play_the_engine_refused_says_why_on_the_bar_not_a_cap_it_would_wait_for():
+    eng = FakeEngine()
+    eng.can_execute = False                                                      # the engine's assessment refuses it
+    ap = AutoPilot(eng, _cfg(max_auto_trades_per_day=2), bus=SILENT)
+    p = mkplay()
+    _run(ap, p)
+    ap._count_today = ap.max_auto_trades_per_day                                 # and a cap fills up afterwards
+    bar = ap.decorate_play(p.to_row(), p)["autopilot"]
+    assert bar["acted"] and bar["why_not"] is None and bar["waiting"] is None
+    assert bar["reason"] == "not executable in this session"                     # the refusal, not the full cap
+    ap.settings_changed()                                                        # judged afresh: the cap shows again
+    assert "auto entries are used" in ap.decorate_play(p.to_row(), p)["autopilot"]["waiting"]
+
+
+def test_the_clock_and_what_is_held_reach_the_bar_as_the_last_passes_reason(monkeypatch):
+    from tos_bot.execution import autopilot as module
+
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(trade_types=["INTRADAY", "SWING"], min_minutes_to_close=30), bus=SILENT)
+    monkeypatch.setattr(module.clock, "minutes_to_close", lambda ts=None: 20.0)
+    late, held = mkplay(sym="AAA"), mkplay(sym="BBB", tf=Timeframe.SWING)
+    eng.repo.held.add("BBB")
+    _run(ap, late, held)
+    assert eng.approved == []
+    late_bar, held_bar = ap.decorate_play(late.to_row())["autopilot"], ap.decorate_play(held.to_row())["autopilot"]
+    assert late_bar["why_not"] is None and "minutes to the close" in late_bar["reason"]
+    assert held_bar["why_not"] is None and held_bar["reason"] == "already holding BBB"
+
+
+def test_a_board_of_plays_reads_each_strategys_record_once_and_the_gate_every_time():
+    eng = FakeEngine()
+    reads = []
+    eng.strategy_record = lambda key: reads.append(key) or eng.records.get(key)
+    ap = AutoPilot(eng, _cfg(require_proven=True), bus=SILENT)
+    for i in range(5):
+        assert "isn't proven yet" in ap.decorate_play({**_row("INTRADAY"), "id": f"row_{i}"})["autopilot"]["why_not"]
+    assert reads == ["opening_range_breakout"]                                   # one read for the whole board
+    eng.records["opening_range_breakout"] = {"trades": 40, "expectancy_r": 0.30}
+    ap.settings_changed()                                                        # a new replay lands here
+    assert ap.decorate_play(_row("INTRADAY"))["autopilot"]["eligible"] and len(reads) == 2
+    p = mkplay()
+    assert ap._pre_gate(p, 100_000.0) is None and ap._pre_gate(p, 100_000.0) is None
+    assert len(reads) == 4                                                       # the gate reads it afresh each pass
+
+
 # ---------------------------------------------------------------- an entry that bought nothing hands its slot back
 def _two_a_day(**over):
     eng = FakeEngine()
@@ -879,3 +991,134 @@ def test_a_new_session_starts_the_slots_and_the_orders_sent_afresh():
     ap._day = "2000-01-03"                                                  # the session has turned over
     assert not ap.entry_unfilled(play.id)                                   # yesterday's entry hands back nothing today
     assert (ap._count_today, ap._sent_today, ap._counted) == (0, 0, {})
+
+
+# ---------------------------------------------------------------- setups that lose in the replay are skipped in practice too
+def _losing(trades=40, r=-0.10, held=12, held_r=-0.08):
+    return {"trades": trades, "expectancy_r": r, "out_of_sample": {"trades": held, "expectancy_r": held_r}}
+
+
+def _practice(record=None, **over):
+    eng = FakeEngine()
+    if record is not None:
+        eng.records["opening_range_breakout"] = record
+    return eng, AutoPilot(eng, _cfg(**{"require_proven": False, "trade_types": ["INTRADAY", "SWING"], **over}), bus=SILENT)
+
+
+def test_a_day_setup_that_loses_in_the_replay_is_skipped_with_proof_off():
+    eng, ap = _practice(_losing())
+    p = mkplay()
+    _run(ap, p)
+    assert eng.approved == [] and eng.assess_calls == []
+    assert "loses in the replay the way Autopilot takes it: -0.10R a trade over 40 trades, -0.08R over the 12"         in ap.verdict(p)
+    assert p.id not in ap._acted                                             # never cached: a new record lifts it
+    eng.records["opening_range_breakout"] = _losing(held_r=-0.01)
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]
+
+
+@pytest.mark.parametrize("record, over", [
+    (_losing(held_r=-0.01), {}),                                            # the held-out sessions don't lose
+    (_losing(trades=29), {}),                                               # not enough trades to say
+    (_losing(held=9), {}),                                                  # too few in the held-out sessions to say
+    (_losing(), {"skip_replay_losers": "off"}),
+])
+def test_a_setup_without_evidence_it_loses_is_still_practised(record, over):
+    eng, ap = _practice(record, **over)
+    p = mkplay()
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]
+
+
+def test_the_loser_bar_is_the_replay_loser_r_setting():
+    eng, ap = _practice(_losing(r=-0.08, held_r=-0.06))
+    assert "loses in the replay" in ap._pre_gate(mkplay(), 100_000.0)      # past the 0.05R default
+    ap.configure(replay_loser_r=0.10)
+    assert ap._pre_gate(mkplay(), 100_000.0) is None                        # short of a 0.10R bar
+
+
+def test_swing_losers_are_skipped_only_when_asked():
+    eng, ap = _practice(_losing())
+    swing = mkplay(tf=Timeframe.SWING)
+    assert ap._pre_gate(swing, 100_000.0) is None                           # 'day' by default
+    ap.configure(skip_replay_losers="all")
+    assert "loses in the replay" in ap._pre_gate(swing, 100_000.0)
+
+
+def test_a_setup_losing_in_its_own_trades_is_skipped():
+    eng, ap = _practice()
+    eng.live["opening_range_breakout"] = {"trades": 10, "expectancy_r": -0.40}
+    assert "is losing in the app's own trades" in ap._pre_gate(mkplay(), 100_000.0)
+    assert "simulator" in ap._pre_gate(mkplay(), 100_000.0)
+    eng.live["opening_range_breakout"] = {"trades": 10, "expectancy_r": -0.30}
+    assert "is losing in the app's own trades" in ap._pre_gate(mkplay(), 100_000.0)   # at the bar counts
+    eng.live["opening_range_breakout"] = {"trades": 10, "expectancy_r": -0.20}
+    assert ap._pre_gate(mkplay(), 100_000.0) is None                        # losing, but short of the bar
+    eng.live["opening_range_breakout"] = {"trades": 9, "expectancy_r": -0.40}
+    assert ap._pre_gate(mkplay(), 100_000.0) is None
+
+
+def _one_setup():
+    return SimpleNamespace(strategies=[SimpleNamespace(key="opening_range_breakout", timeframe=Timeframe.INTRADAY)])
+
+
+def test_with_proof_asked_for_the_proof_message_wins():
+    eng, ap = _practice(_losing(), require_proven=True)
+    eng.scanner = _one_setup()                                              # a setup for the settings' list to name
+    assert "averaged -0.10R" in ap._pre_gate(mkplay(), 100_000.0)
+    assert ap.status()["replay_losers"] == []
+    ap.configure(require_proven=False)
+    assert [row["strategy"] for row in ap.status()["replay_losers"]] == ["opening_range_breakout"]
+    live = AutoPilot(FakeEngine(mode="live"), _cfg(allow_live=True, require_proven=False), bus=SILENT)
+    live.engine.records["opening_range_breakout"] = _losing()
+    live.engine.scanner = _one_setup()
+    assert "averaged -0.10R" in live._pre_gate(mkplay(), 100_000.0)
+    assert live.status()["replay_losers"] == []
+
+
+def test_the_badge_and_the_settings_name_the_skipped_setup():
+    eng, ap = _practice(_losing())
+    eng.scanner = SimpleNamespace(strategies=[SimpleNamespace(key="opening_range_breakout", timeframe=Timeframe.INTRADAY),
+                                              SimpleNamespace(key="other_setup", timeframe=Timeframe.INTRADAY)])
+    bar = ap.decorate_play(mkplay().to_row())["autopilot"]
+    assert not bar["eligible"] and "loses in the replay" in bar["why_not"]
+    [row] = ap.status()["replay_losers"]
+    assert row["strategy"] == "opening_range_breakout" and "loses in the replay" in row["why"]
+
+
+def test_a_pass_reads_each_record_once():
+    eng, ap = _practice(_losing(held_r=-0.01), max_auto_positions=9, max_auto_trades_per_day=9)
+    reads = []
+    eng.strategy_record = lambda key: reads.append(key) or eng.records.get(key)
+    _run(ap, mkplay(sym="AAA"), mkplay(sym="BBB"), mkplay(sym="CCC"))
+    assert len(eng.approved) == 3 and reads == ["opening_range_breakout"]
+
+
+def test_the_loser_settings_are_saved_and_restored():
+    eng, ap = _practice()
+    assert ap.skip_replay_losers == "day" and ap.replay_loser_r == 0.05
+    ap.configure(skip_replay_losers="all", replay_loser_r=0.1)
+    ap.configure(skip_replay_losers="nonsense")                             # unknown -> the default scope
+    assert ap.skip_replay_losers == "day"
+    ap.configure(skip_replay_losers="all")
+    saved = ap.to_runtime()
+    assert saved["skip_replay_losers"] == "all" and saved["replay_loser_r"] == 0.1
+    again = AutoPilot(eng, _cfg(), bus=SILENT)
+    again.load_runtime(saved)
+    assert again.skip_replay_losers == "all" and again.replay_loser_r == 0.1
+    assert again.status()["skip_replay_losers"] == "all"
+
+
+def test_a_bare_off_in_config_yaml_means_off():
+    import yaml
+
+    from tos_bot.config import AutopilotCfg
+
+    cfg = AutopilotCfg(**yaml.safe_load("skip_replay_losers: off"))         # YAML reads a bare off as false
+    assert cfg.skip_replay_losers == "off"
+    assert AutopilotCfg(**yaml.safe_load("skip_replay_losers: on")).skip_replay_losers == "day"
+    eng, ap = _practice(skip_replay_losers=False)
+    assert ap.skip_replay_losers == "off"
+    ap.configure(skip_replay_losers="day")
+    ap.load_runtime({"skip_replay_losers": False})
+    assert ap.skip_replay_losers == "off"

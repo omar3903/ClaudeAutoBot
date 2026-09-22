@@ -43,7 +43,7 @@ function takenOn(t) {
   return [
     at.by ? `by ${escapeHtml(at.by)}` : "",
     at.unproven ? `<span title="${escapeHtml(String(at.unproven))}">practice - strategy not proven</span>` : "",
-    at.confirmations ? `${at.confirmations} scan${at.confirmations === 1 ? "" : "s"}` : "",
+    at.confirmations ? `${at.confirmations} ${t.timeframe === "INTRADAY" && (at.settings || {}).confirm_on_new_candle ? "candle" : "scan"}${at.confirmations === 1 ? "" : "s"}` : "",
     (at.noise || []).length ? `flags: ${escapeHtml(at.noise.join(", "))}` : "no flags",
     ch ? escapeHtml(ch.character) : "",
     reg.regime ? `market ${escapeHtml(reg.regime)}` : "",

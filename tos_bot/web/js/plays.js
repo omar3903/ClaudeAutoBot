@@ -65,17 +65,33 @@ function priceCell(p) {
   return `<td class="num" title="${escapeHtml(tip)}">${num(p.last_price)}${r == null ? "" : ` <span class="small ${cls}">${r >= 0 ? "+" : ""}${r.toFixed(1)}R</span>`}</td>`;
 }
 
+/* What Autopilot makes of a play, in one line: the first of its checks the play fails (the gate's own
+   words), the cap it waits for, what its last pass said, or that it would take it. The robot's tooltip
+   and the detail panel both show it. */
+function apLine(ap) {
+  if (ap.why_not) return `Won't take it: ${ap.why_not}`;
+  if (ap.waiting) return `Waiting: ${ap.waiting}`;
+  if (ap.reason) return `Last pass: ${ap.reason}`;
+  return ap.acted ? "Has acted on it" : "Would take it on its next pass";
+}
+
 function playRow(p) {
   const tr = document.createElement("tr");
   const done = isDone(p), ap = p.autopilot || {};
   tr.dataset.id = p.id;
   tr.classList.toggle("selected", p.id === S.selected);
   tr.classList.toggle("done", done);
-  tr.classList.toggle("ap-eligible", !!ap.eligible && !ap.waiting && !done);
-  tr.classList.toggle("ap-waiting", !!ap.eligible && !!ap.waiting && !done);
+  // a play it has acted on gets no bar: it won't look at it again today, whatever the caps say
+  tr.classList.toggle("ap-eligible", !!ap.eligible && !ap.waiting && !done && !ap.acted);
+  tr.classList.toggle("ap-waiting", !!ap.eligible && !!ap.waiting && !done && !ap.acted);
+  // a play it won't take gets a faded robot too, only while Autopilot is on - off, every row would have one
+  const refused = !ap.eligible && !!ap.why_not && !!(S.state.autopilot || {}).effective;
+  // acted on but not sent - the engine's assessment refused it - the robot says why, as apLine does
   const apMark = ap.acted
-    ? '<span class="ap-badge acted" data-term="autopilot">🤖</span>'
-    : (ap.eligible && !done ? `<span class="ap-badge${ap.waiting ? " waiting" : ""}" data-term="autopilot"${ap.waiting ? ` data-waiting="${escapeHtml(ap.waiting)}"` : ""}>🤖</span>` : "");
+    ? `<span class="ap-badge acted" data-term="autopilot"${done ? "" : ` data-why="${escapeHtml(apLine(ap))}"`}>🤖</span>`
+    : ((ap.eligible || refused) && !done
+      ? `<span class="ap-badge${ap.waiting ? " waiting" : ""}${refused ? " refused" : ""}" data-term="autopilot" data-why="${escapeHtml(apLine(ap))}">🤖</span>`
+      : "");
   const last = done
     ? `<span class="badge ${p.status === "ERROR" ? "bad" : "good"}" data-term="executed">${p.status === "FILLED" ? "✓ executed" : p.status.toLowerCase()}</span>`
     : `<span class="info-dot">i</span>`;
@@ -125,6 +141,14 @@ export async function selectPlay(id) {
   const recordBtn = $("#btn-goto-trade"); if (recordBtn) recordBtn.onclick = () => openRecord(a.play.trade_id);
 }
 
+/* How many times in a row a day play has shown: on 5-minute candles when Autopilot counts those
+   (a scan reading the same candle again isn't another sighting), otherwise in scans. */
+function seenText(p) {
+  const n = p.confirmations || 1;
+  return (S.state.autopilot || {}).confirm_on_new_candle && (p.evidence || {}).bar_at
+    ? `seen on ${n} candle${n === 1 ? "" : "s"} in a row` : `seen in ${n} scan${n === 1 ? "" : "s"} in a row`;
+}
+
 function detailHTML(a) {
   const p = a.play, op = a.order_preview, pdt = a.pdt || {}, em = S.state.exit_manager || {};
   const protection = { native: "broker OCO (TP + SL)", managed: "auto exit manager", none: "none" }[op.bracket_mode] || op.bracket_mode;
@@ -146,7 +170,8 @@ function detailHTML(a) {
        </div>`;
   return `
     <h3>${escapeHtml(p.symbol)} ${sectorTag(p.sector)} ${sideBadge(p.side)}${executed ? ' <span class="badge good" data-term="executed">executed</span>' : ""}</h3>
-    <div class="sub">${stratLabel(p.strategy)} · ${tfLabel(p.timeframe)} · conf ${num(p.confidence, 2)} · expected ${num((p.evidence || {}).expected_r, 2)}R · score ${num(p.score, 2)}${p.timeframe === "INTRADAY" ? ` · seen in ${p.confirmations || 1} scan${(p.confirmations || 1) === 1 ? "" : "s"} in a row` : ""} · session ${a.session}</div>
+    <div class="sub">${stratLabel(p.strategy)} · ${tfLabel(p.timeframe)} · conf ${num(p.confidence, 2)} · expected ${num((p.evidence || {}).expected_r, 2)}R · score ${num(p.score, 2)}${p.timeframe === "INTRADAY" ? ` · ${seenText(p)}` : ""} · session ${a.session}</div>
+    ${p.autopilot && !executed ? `<div class="muted" style="margin:6px 0" data-term="autopilot">🤖 ${escapeHtml(apLine(p.autopilot))}</div>` : ""}
     ${(a.noise || []).length && !executed ? `<div class="warn-box" data-term="noise">⚠ Probably noise right now: ${a.noise.map(escapeHtml).join(" · ")}. Autopilot won't take it; you still can.</div>` : ""}
     ${sparkSvg(p.evidence && p.evidence.spark, p)}
     <div class="explain">${escapeHtml(p.explanation || p.rationale)}</div>
@@ -169,6 +194,7 @@ function detailHTML(a) {
         <span>Protection</span><span>${protection}</span>
         <span>Est. cost</span><span>${usd(op.est_cost)}</span>
         <span data-term="risk">Est. risk</span><span>${usd(op.est_risk)}</span>
+        ${op.caps && op.caps.length ? `<span>Size limited by</span><span>${escapeHtml(op.caps.join("; "))}</span>` : ""}
       </div>
       ${op.note ? `<div class="muted" style="margin:6px 0">${escapeHtml(op.note)}</div>` : ""}
       <div class="exit-box"><b>Automatic exit strategy:</b> ${exitLine}<br>

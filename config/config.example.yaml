@@ -25,6 +25,8 @@ risk:
   max_open_risk_pct: 4.0               # sum of open-trade risk not allowed to exceed this
   max_position_pct_of_equity: 12.0     # notional cap per trade
   max_symbol_pct_of_equity: 15.0       # cap per stock: shares already held + entries working + the new trade
+  max_adv_pct: 1.0                     # one order's shares, as % of the stock's median daily volume over its
+                                       # last 20 completed sessions, so thin stocks fill; 0 = off
   min_reward_risk: 1.5                 # discard plays whose target/stop R:R is below this
   round_lot: 1                         # share rounding
   midday_size_pct: 60                  # a day trade sized at Mid-day (12-3 pm ET) risks this % of the usual
@@ -149,7 +151,10 @@ autopilot:
   max_per_strategy: 2                # at most this many concurrent auto trades from ONE strategy
   max_new_per_cycle: 1               # at most this many NEW auto entries per scan (no bursts)
   max_gross_exposure_pct: 100.0      # all positions together as % of equity - 100 = Autopilot never uses margin
-  min_confirmations: 2               # a day-trade setup must show up in this many scans in a row
+  min_confirmations: 2               # a day-trade setup must show up this many times in a row...
+  confirm_on_new_candle: true        # ...each on a newer 5-minute candle, as the replay enters - not the same candle
+                                     # read again by the next scan. Setups that fire on one candle (a reclaim, a flag)
+                                     # are then never taken: min_confirmations 1, or this false, brings them back
   skip_noise: [against_gap]          # the only flag that removed worse trades on both halves of a year's replay;
                                      # the other flags stay visible on the board, and the replay adds the checks it proves
                                      # noise flags Autopilot won't trade - see noise: below. It also skips
@@ -158,6 +163,10 @@ autopilot:
   require_proven: true               # only trade strategies the replay (Strategies panel) has proven...
   min_replay_trades: 30              # ...over at least this many replayed trades
   min_replay_expectancy_r: 0.05      # ...averaging at least this much per trade, in R
+  skip_replay_losers: day            # with require_proven off, still skip setups with evidence they lose: the replay
+                                     # averages -replay_loser_r or worse overall and held out, or their own trades
+                                     # -0.30R or worse over 10 (off / day / all)
+  replay_loser_r: 0.05               # ...the loss per trade that counts as losing
   cooldown_after_loss: true          # skip a ticker for the rest of the session after it stops out
   max_daily_loss_pct: 2.0            # Aziz's daily maximum loss: once today's closed trades have lost this
                                      # % of equity, no more entries until the next session (0 = off)

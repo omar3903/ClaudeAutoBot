@@ -31,6 +31,8 @@ log = logging.getLogger(__name__)
 
 #: the share of the usual risk a strategy is traded with until the replay has proven it
 PRACTICE_RISK = 0.25
+#: ...and how the order card's "Size limited by" names it
+PRACTICE_LABEL = "practice size: a quarter of the usual risk until the replay proves the strategy"
 
 class ResearchOps:
     # ------------------------------------------------------------------ #
@@ -101,9 +103,22 @@ class ResearchOps:
         cfg = self.settings.config.replay
         state = self.replay.state(*self._record_terms())
         proof = {s.key: self.autopilot.proof_missing(s.key) or "" for s in self.scanner.strategies}
+        proof.update(self._one_candle_proof(proof))
         return {**state, "evidence": self.evidence_state(), "proof": proof, "look_ahead_regime": self.regime.look_ahead,
                 "defaults": {"sessions": cfg.sessions, "swing_sessions": cfg.swing_sessions,
                              "held_out_fraction": cfg.held_out_fraction}}
+
+    def _one_candle_proof(self, proof: Dict[str, str]) -> Dict[str, str]:
+        """A day setup that fires on one candle by its nature - its trigger bar moves into its own look-back
+        on the next one - is never seen on two candles running, so with two confirmations counted on candles
+        its "0 of 30 trades" is how it is built, not a record still to come. Said so, with the way back."""
+        ap = self.autopilot
+        if ap.min_confirmations < 2 or not ap.confirm_on_new_candle:
+            return {}
+        return {key: (f"{key} fires on one candle - the replay never sees it on two in a row, so with "
+                      f"{ap.min_confirmations} confirmations Autopilot won't take it (with 1, it is judged on its "
+                      "entries on sight)")
+                for key in self.replay.one_candle_setups() if proof.get(key)}
 
     def train_model(self) -> Dict[str, Any]:
         """Retrain the meta-label model on every row the database holds - live, shadow and the
@@ -215,7 +230,7 @@ class ResearchOps:
         records_for = (self.replay.ran_at, tuple(skipped), ap.min_confirmations, self._live_stats_at,
                        ap.min_replay_trades, ap.min_replay_expectancy_r, ap.proof_p_value)
         if records_for != self._risk_pct_for:                  # sized once per strategy until a record changes
-            self._risk_pct, self._risk_pct_for = {}, records_for
+            self._risk_pct, self._risk_pct_for, self._practice = {}, records_for, set()
         if key not in self._risk_pct:
             cap = float(self.settings.config.risk.max_risk_per_trade_pct)
             live = stats.get(key, {}).get("r", [])
@@ -223,9 +238,16 @@ class ResearchOps:
             pct = half_kelly_risk_pct(rs, cap)
             if ap.proof_missing(key):
                 self._risk_pct[key] = PRACTICE_RISK * cap
+                self._practice.add(key)
             else:
                 self._risk_pct[key] = None if pct is None else max(pct, PRACTICE_RISK * cap)
         return self._risk_pct[key]
+
+    def strategy_risk_why(self, key: str) -> Optional[str]:
+        """What set strategy_risk_pct, for size_play's caps_hit: practice size for a strategy the replay
+        hasn't proven - its record isn't what sized it - or None, the record's own half-Kelly."""
+        self.strategy_risk_pct(key)                            # sized now, or already
+        return PRACTICE_LABEL if key in self._practice else None
 
     def _entry_context(self, p: Play, operator: str) -> Dict[str, Any]:
         """What a play was taken on, kept in its evidence for the journal."""
@@ -242,7 +264,10 @@ class ResearchOps:
                              # the split and the filters in force: what each kind of trade was allowed to hold
                              "day_trade_pct": self.day_trade_pct, "split_on": self._both_kinds(),
                              "timeframes": list(self.filters.timeframes),
+                             # the setups skipped as losers then, so a later review judges by these, not later replays
+                             "replay_losers": [row["strategy"] for row in self.autopilot.replay_losers()],
                              **{k: getattr(self.autopilot, k) for k in (
                     "require_proven", "min_confidence", "min_swing_confidence", "min_reward_risk",
-                    "min_confirmations", "model_mode", "max_auto_positions", "max_auto_trades_per_day")}},
+                    "min_confirmations", "confirm_on_new_candle", "model_mode", "max_auto_positions",
+                    "max_auto_trades_per_day", "skip_replay_losers", "replay_loser_r")}},
                 "data_delayed": bool(self.md.delayed)}

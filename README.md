@@ -812,11 +812,24 @@ the left of the row: **green** — Autopilot would take it on its next pass (it
 passes every check and a cap has room); **amber** — it passes the checks but a
 cap is full (the day's entries, the open positions, the day / swing slots, or
 the setup's own), and hovering the robot says which. A dim robot means it has
-already acted on the play.
+already acted on the play; on one still on offer (the engine's own check
+refused it, say as too thin to trade) hovering it says why. While Autopilot is
+on, a play it won't take gets a faded grey robot: hovering it gives the first
+check the play fails, in the words the entry gate itself uses (the badge and
+the gate share one set of checks). The play's detail panel says the same in one
+line.
 
-**Proof, noise and size.** A day-trade setup must show up in `min_confirmations`
-(2) scans in a row, and plays carrying a flag in `skip_noise` are skipped. With
-`require_proven` on, a strategy is auto-traded only once the replay (**Strategies
+**Proof, noise and size.** A day-trade setup must show up `min_confirmations`
+(2) times in a row, and plays carrying a flag in `skip_noise` are skipped. With
+`confirm_on_new_candle` (on) each of those is a newer 5-minute candle, whichever
+scan reads it - the scans read one candle several times over, and the replay
+enters once a setup has shown on two candles running; a sighting more than two
+candles after the last one counted starts the count again. A setup that fires on
+one candle by its nature (a reclaim, a flag) then never reaches two, and the
+Strategies panel says so: set 1 confirmation, or turn the setting off, to
+practise those again. The replay models two at most, so 3 or more asks live for
+more than it tested.
+With `require_proven` on, a strategy is auto-traded only once the replay (**Strategies
 → Run replay**) has at least `min_replay_trades` (30) trades Autopilot would have
 taken, averaging at least `min_replay_expectancy_r` (+0.05R) — **and** at least 10
 of them in the held-out latest third of the sessions, averaging more than 0R
@@ -837,6 +850,16 @@ that can't be told from luck is no reason to size up (Tharp, Aronson), and a
 setup never replayed is no reason to risk the full amount. Every trade keeps the
 settings it was taken on (`proof_required`, the floors, the caps) and whether
 its strategy was unproven, so practice trades are never mistaken for proven ones.
+
+**Losers are skipped even in practice.** With proof not asked for, Autopilot still
+skips a setup with evidence that it loses (`skip_replay_losers`, day trades by
+default; `off` / `day` / `all`): its replay the way Autopilot takes it averages
+-0.05R a trade or worse - a loss of `replay_loser_r` (0.05) per trade - over
+`min_replay_trades` (30) and over 10 held-out trades, or its own closed trades -
+the in-app simulator's count too - average -0.30R or worse over 10. The records
+are read afresh on every pass, so a replay that recovers lifts it. The threshold is fragile - a little lower and a
+setup flips - so set `off` to practise every setup again. The Autopilot dialog
+lists what is skipped now, and each trade keeps that list.
 
 **Faster loop while day-trading.** When Autopilot is armed with the **Intraday** filter on and
 the regular session is open, the hot list is rescanned every
@@ -1014,6 +1037,15 @@ is tested on simulated series whose answer is known.
 * **Mid-day size** — a day trade sized between 12 and 3 pm ET risks
   `risk.midday_size_pct` (60 %) of the usual: Aziz's thin, choppy hours, when
   he lowers his share size. Swing trades are untouched.
+* **Liquidity cap** — one order never takes more than `risk.max_adv_pct` (1 %)
+  of the stock's median daily volume over its last 20 completed sessions
+  (today's candle counts only once the session has closed, and the median
+  ignores a one-off spike day), so the entry and later the stop can fill
+  without moving a thin stock.
+  The order card lists it under *Size limited by*; a stock so thin that the cap
+  is under one share is refused with that reason. A stock with no daily history
+  isn't capped; `0` turns it off. Day and swing trades alike; pair legs are
+  sized by the pairs desk and are untouched.
 
 **Two statistical day trades** (`tos_bot/strategies/statistical.py`; on even when
 an older `config.yaml` doesn't list them):
@@ -1055,7 +1087,7 @@ asked again; a session IBKR really has nothing for is remembered and isn't.
 
 Every day setup is followed twice: **entered on sight** (the record of all trades) and **entered
 after it has shown two bars in a row**, one bar later and once a session per setup - which is how
-Autopilot enters when it asks a day trade to be seen in two scans running. Autopilot's record,
+Autopilot enters when it asks a day trade to be seen on two candles running. Autopilot's record,
 the one the proof rule reads, is built from the way in it really uses. Before, nearly every
 replayed day trade was entered on sight, so 27 of 1,466 counted and no day setup could ever
 reach the 30 trades proof asks for.

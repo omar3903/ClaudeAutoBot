@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 import pandas as pd
 
+from ..core.enums import Timeframe
 from ..core.eventbus import BUS
 from ..scanner.noise import NoiseSettings
 from ..strategies.base import Strategy
@@ -252,6 +253,15 @@ class ReplayRunner:
 
     def learned_skips(self) -> List[str]:
         return learned_skips(self._results.get("noise"))
+
+    def one_candle_setups(self) -> List[str]:
+        """The day setups the replay only ever saw on one candle: entered on sight, never on a second
+        candle running - how Autopilot enters when it asks for two, so it can't prove or take them."""
+        seen, twice = set(), set()
+        for t in self._trades:
+            if t.timeframe == Timeframe.INTRADAY.value:
+                (twice if t.entry_rule == "second" else seen).add(t.strategy)
+        return sorted(seen - twice)
 
     def _refresh(self, skip_noise: Iterable[str], min_confirmations: int, min_reward_risk: float = 0.0,
                  confidence_floors: Optional[Mapping[str, float]] = None) -> None:
