@@ -716,7 +716,10 @@ Two rules keep it safe:
   for the next pass. A partial exit first shrinks the stop to the shares that remain.
 * **Never a stop without a position.** A stop is placed only while the account shows
   the shares and the broker's orders could be read; a stop whose trade is no longer
-  open is cancelled; a stop an earlier run left is followed, never doubled.
+  open is cancelled; a stop an earlier run left is followed, never doubled. If it (or
+  its target) filled while the app was off, what it filled is booked first, from
+  IBKR's executions of that order and never more than the record holds beyond the
+  account, and the pair is placed afresh for the shares the record then holds.
 
 **And a target, in one group with it.** Beside the stop rests a good-till-cancelled
 **limit order at the target** (`execution.native_target`, on by default): for the part

@@ -26,7 +26,8 @@ Resting orders bring two dangers, and the rules here exist for them:
   certain; every pass cancels a tracked order whose trade record is no longer open; and a sweep
   cancels any ``stop:<trade id>`` / ``tgt:<trade id>`` order at the broker whose trade isn't open,
   or that duplicates another. Before placing, the broker's working orders are searched for orders
-  an earlier run left - they are adopted, never doubled.
+  an earlier run left - they are adopted, never doubled. One that filled while the app was off has
+  what it filled booked first, and is replaced by a fresh pair for what the record then holds.
 
 The trade record is the single source of truth: each pass compares the record's shares, stop and
 target with the orders at the broker. The stop's price is moved in place (the break-even and
@@ -297,6 +298,15 @@ class ProtectiveStops:
         if left:                                         # an earlier run's orders: follow them, never double them
             keep = left[0]
             targets = [o for o in working if o.tag == target_tag(tid)]
+            if self._book_filled_while_off(t, keep, targets[0] if targets else None):
+                # one that has filled isn't followed - finishing, it would report the shares just booked again: the
+                # pair is cancelled and, once the cancels have landed, placed afresh for what the record now holds
+                for oid in {o.order_id for o in left + targets}:
+                    self._cancel_quietly(oid)
+                self._stop_retry[tid] = time.monotonic() + self.SHARES_RETRY_S
+                log.info("the order(s) resting at the broker for %s filled while the app was off: booked, and "
+                         "replaced by a fresh pair for what the record holds", tid)
+                return
             self._stops[tid] = _Stop(keep.order_id, tid, symbol, float(keep.submitted_qty or qty),
                                      float(keep.stop_price or price), group="adopted" if targets else "")
             if targets:
@@ -541,3 +551,65 @@ class ProtectiveStops:
         st = self._stops.pop(tg.trade_id, None)          # the broker cancels it with the target; make sure
         if st is not None:
             self._cancel_quietly(st.order_id)
+
+    def _book_filled_while_off(self, t: Dict[str, Any], stop: OrderResult, target: Optional[OrderResult]) -> bool:
+        """Whether the stop or target an earlier run left at the broker has filled any shares. A resting order's
+        fills are booked once it is done, so what one still working has filled came while the app was off: it is
+        booked here, before the orders are judged against the record - the target first, from IBKR's executions
+        of each order (or the order's own count, where the executions don't reach back that far), and never more
+        than the records hold beyond what the account shows, so nothing is booked twice. The record then matches
+        the account. When the executions or the account can't be read nothing is booked and False is returned:
+        the orders are followed as before, and the share-count warning says what disagrees."""
+        tid, symbol = t["id"], t["symbol"]
+        get = getattr(self.broker, "get_fills", None)
+        try:
+            executions = list(get(symbol) or []) if callable(get) else []
+        except Exception:  # noqa: BLE001
+            log.debug("executions for %s unavailable", symbol, exc_info=True)
+            return False
+        long = t["side"] == "LONG"
+        exit_side = Side.SHORT if long else Side.LONG
+        found = []
+        for o, tag in ((target, target_tag(tid)), (stop, stop_tag(tid))):
+            if o is None:
+                continue
+            mine = [f for f in executions if str(f.order_id) == str(o.order_id) and f.side is exit_side
+                    and (getattr(f, "tag", "") or tag) == tag]
+            shares = sum(float(f.quantity) for f in mine)
+            qty = max(shares, float(o.filled_qty or 0.0))
+            if qty <= 1e-9:
+                continue
+            if shares >= qty - 1e-9:
+                price = sum(float(f.price) * float(f.quantity) for f in mine) / shares
+            else:
+                price = float(o.avg_fill_price or 0.0) or float(o.stop_price or o.limit_price or 0.0)
+            found.append((o, tag, qty, price))
+        if not found:
+            return False
+        held = self._held_quantity(symbol)
+        if held is None or self._broker_resyncing():
+            return False                                 # nothing to check a booking against: change nothing
+        recorded = sum(abs(float(x.get("quantity") or 0.0)) for x in self.repo.open_trades()
+                       if x["symbol"] == symbol and x["side"] == t["side"]
+                       and (x.get("broker") or "paper") == self.venue)
+        over = recorded - max(0.0, held if long else -held)       # shares on record that the account no longer holds
+        for o, tag, qty, price in found:
+            fresh = self.repo.get_trade(tid)
+            if not fresh or fresh.get("status") == "CLOSED":
+                break
+            on_record = abs(float(fresh.get("quantity") or 0.0))
+            take = min(qty, over, on_record)
+            if take <= 1e-9:
+                continue
+            partial = take < on_record - 1e-9
+            if tag == stop_tag(tid):
+                decision = float(o.stop_price or 0.0) or self._record_stop(fresh)
+                reason, after = stop_exit_reason(fresh.get("initial_stop_price"), decision), {}
+            else:
+                plan = scale_out_plan(fresh, getattr(self, "exit_cfg", None)) if partial else None
+                decision, reason, after = o.limit_price, ("target-1" if partial else "target"), (plan[1] if plan else {})
+            log.warning("%s AT BROKER FILLED WHILE THE APP WAS OFF  %s x%s @ %.4f (%s)",
+                        "STOP" if tag == stop_tag(tid) else "TARGET", symbol, take, price, reason)
+            self._book_exit(symbol, tid, price, take, reason, partial, after if partial else None, decision)
+            over -= take
+        return True
