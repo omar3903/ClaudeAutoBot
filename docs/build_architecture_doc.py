@@ -1005,15 +1005,21 @@ def build() -> str:
       '<li><b>Score.</b> <code>rank_score()</code> = expected value in R units times the strategy weight, plus '
       'small bumps for unusual volume, a gap and enough range.</li>'
       '<li><b>Board.</b> <code>PlayBoard.replace()</code> keeps the top 80, notes what joined and left, and '
-      'publishes <code>plays.updated</code>. The plays it took are logged to <code>play_logs</code> - not a '
-      'setup already acted on this session, and never over a row that was sent, filled or dismissed.</li>'
+      'publishes <code>plays.updated</code>. A day play counts a confirmation only when it is seen on a newer '
+      '5-minute candle (<code>evidence.bar_at</code>), whichever scan reads it; a sighting more than two candles '
+      'after the last one counted starts the count again. The plays it took are logged to <code>play_logs</code> '
+      '- not a setup already acted on this session, and never over a row that was sent, filled or dismissed.</li>'
       '<li><b>Autopilot.</b> <code>AutoPilot.consider()</code> walks the board highest score first and applies '
-      'the gates in the next table. The first failing gate is the reason shown on the dashboard.</li>'
+      'the gates in the next table. The first failing gate is the reason shown on the dashboard: the play\'s own '
+      'checks live in one <code>_play_check()</code>, which the gate and the play\'s robot badge both call.</li>'
       '<li><b>Assessment and sizing.</b> <code>engine.assess_play()</code> checks the session, the pattern-day-'
       'trader rule (live only), and calls <code>risk/position_sizing.py size_play()</code>: risk 1% of equity per '
       'trade, lowered by the strategy\'s half-Kelly (a quarter of the risk until the replay has proven the '
       'strategy), the mid-day factor, the open-risk ceiling (4%), the per-'
-      'position cap (12% of equity) and the per-symbol cap (15%).</li>'
+      'position cap (12% of equity), the per-symbol cap (15%) and the liquidity cap: one order takes at most 1% of '
+      'the stock\'s median daily volume over its last 20 completed sessions (<code>evidence.adv_shares</code>), and '
+      'a stock too thin for one share is refused with that reason. The order card lists the caps that bound under '
+      '"Size limited by".</li>'
       '<li><b>Order.</b> <code>Executor.execute_play()</code> builds a limit order (5 bps through the price) and, '
       'where the broker supports it, a native bracket with the stop and target attached. An immediate fill opens '
       'the trade; otherwise the order is tracked and <code>sync_open_orders()</code> books the fill later.</li>'
@@ -1039,13 +1045,20 @@ def build() -> str:
         ("reward-to-risk", ">= 2.0 (Aziz)", "min_reward_risk"),
         ("kind", "valuation plays are never auto-traded", "-"),
         ("noise", "none of the chosen flags, nor the ones the replay taught it to skip", "skip_noise + learned"),
-        ("confirmations", "a day-trade setup must appear in 2 scans in a row", "min_confirmations"),
+        ("confirmations", "a day-trade setup must be seen on 2 five-minute candles in a row: a scan reading the same "
+         "candle again isn't another sighting, a newer candle counts whichever scan reads it, and more than 2 candles "
+         "between sightings starts again (setting off: 2 scans in a row, as before)",
+         "min_confirmations, confirm_on_new_candle"),
         ("catalyst", "optional: a news or earnings tag", "require_catalyst"),
         ("already in it", "not holding the symbol, no entry working, not stopped out today (cooldown)", "-"),
         ("late in the day", "no new day trade with fewer than 30 minutes to the close", "min_minutes_to_close"),
         ("<b>proof</b>", "the strategy's replay record: >= 30 trades at >= +0.05R (also net of the stocks' own "
          "drift), a positive held-out sample of >= 10 trades, a reality-check p-value <= 0.10 across every setup "
          "tried, and costs within a third of the pre-cost edge", "require_proven, proof_p_value"),
+        ("replay losers", "only while proof isn't asked for (paper, require_proven off): a day setup whose replay the "
+         "way Autopilot takes it averages -0.05R or worse over >= 30 trades and over >= 10 held-out trades, or whose "
+         "own closed trades average -0.30R or worse over 10, is skipped; the records are read afresh each pass",
+         "skip_replay_losers (off / day / all), replay_loser_r"),
         ("the learned model", "in gate or size mode, and only while its own walk-forward verdict calls it usable: "
          "plays it gives under 55% are refused; shadow (the default) only logs its odds",
          "model_mode, model_min_p"),
@@ -1123,9 +1136,11 @@ def build() -> str:
         ("probability", "the odds the play pays, calibrated against the strategy's pooled record"),
         ("score", "the rank on the board (expected R times weight plus bumps)"),
         ("noise", "list of flags such as against_trend, news_driven_move, turbulent_market, not_trending"),
-        ("confirmations", "how many scans in a row showed this setup"),
+        ("confirmations", "how many times in a row this setup has shown: on newer 5-minute candles for a day play "
+         "(confirm_on_new_candle), otherwise in scans"),
         ("evidence", "a dict with the numbers behind the play: expected_r, vol_forecast, price_character, "
-         "market_regime, next_earnings, a sparkline"),
+         "market_regime, next_earnings, a sparkline, the candle a day play was seen on (bar_at) and the stock's "
+         "usual daily volume (adv_shares)"),
         ("suggested_qty, dollar_risk, notional", "the sizing result"),
         ("status, trade_id", "the state machine of figure 6 and the trade it became"),
     ]))
@@ -1219,7 +1234,7 @@ def build() -> str:
       'biggest opening gaps) - not on today\'s hot list, which is hot because of what it has just done and hands '
       'a momentum setup its own hindsight. Each day setup is followed twice: entered on sight '
       '(<code>entry_rule</code> first - the record of all trades) and entered once it has shown two bars in a row '
-      '(second - how Autopilot enters when it asks for two scans running); Autopilot\'s record, the one the '
+      '(second - how Autopilot enters when it asks for two candles running); Autopilot\'s record, the one the '
       'proof rule reads, uses the way in it really uses. The replay reads 5-minute candles with flat costs: it '
       'is good at throwing out a setup that loses, and a setup it likes still has to show it on paper.</p>')
     A('<p><b>Runner</b> (<code>research/runner.py</code>). Splits the work into jobs (one stock, or ten sessions '
@@ -1232,7 +1247,10 @@ def build() -> str:
       'why no swing trade was taken on 16 September: the records were negative or too thin. In <b>Live</b> the '
       'rule is in force whatever the setting says (<code>AutoPilot.proof_required</code>); on paper it is the '
       'user\'s choice, so unproven setups can be practised - at a quarter of the usual risk '
-      '(<code>research_ops.PRACTICE_RISK</code>), with the settings in force kept on every trade.</p>')
+      '(<code>research_ops.PRACTICE_RISK</code>), with the settings in force kept on every trade. Not proven is '
+      'one thing, evidence of losing another: with proof not asked for, a day setup whose replay and held-out '
+      'sessions both average -0.05R or worse is still skipped (<code>AutoPilot.replay_loser()</code>, '
+      '<code>skip_replay_losers</code>), and each trade keeps the list skipped when it was taken.</p>')
     A('<p><b>Evidence weights</b> (<code>research/weights.py</code>). Each strategy gets a multiplier between '
       '0.5 and 1.5 from its pooled record (live trades count double), applied to the rank score. '
       '<code>pooled_odds()</code> blends a play\'s own stated odds with the record so the probability shown is '
@@ -1364,8 +1382,19 @@ def build() -> str:
         ("execution/autopilot.py", "kind_slots(), _kind_full(), settings_changed()", "Autopilot's positions and daily "
          "entries divide between day and swing trades the way the trading capital's slider does; a settings change "
          "hands back the plays it had refused for the day"),
-        ("execution/autopilot.py", "decorate_play(), _waiting_for()", "the play's bar: green when Autopilot would take "
-         "it on its next pass, amber (with the cap's reason) when it passes the checks but a cap is full"),
+        ("execution/autopilot.py", "decorate_play(), _waiting_for(), _play_check()", "the play's bar: green when "
+         "Autopilot would take it on its next pass, amber (with the cap's reason) when it passes the checks but a cap "
+         "is full; a play it won't take says why in the gate's own words (_play_check, which _pre_gate calls too), "
+         "and one the engine's assessment refused says that refusal"),
+        ("execution/autopilot.py", "replay_loser(), replay_losers()", "with proof not asked for, a day setup with "
+         "evidence it loses - its replay and held-out sessions, or its own trades - is skipped; listed for the "
+         "settings and kept with each trade"),
+        ("engine/board.py", "PlayBoard.replace(new_candle=...), MAX_CANDLE_GAP", "a day play's confirmation counts "
+         "only on a newer 5-minute candle (evidence.bar_at), whichever scan reads it; more than 2 candles between "
+         "sightings starts the count again"),
+        ("risk/position_sizing.py", "liquidity_cap()", "one order's shares are at most risk.max_adv_pct (1%) of the "
+         "stock's median daily volume over 20 completed sessions (evidence.adv_shares); under one share the engine "
+         "refuses the play as too thin"),
         ("data/market_data.py", "last_seen(), refresh_prices()", "the newest price the app holds and when it's from, "
          "with no broker request; one batched fetch of one-minute candles for every play and position"),
         ("engine/engine.py", "refresh_prices(), _marks()", "Refresh prices the board and the positions; a position's "

@@ -80,7 +80,8 @@ class PlayLog(Base):
     explanation: Mapped[str] = mapped_column(sa.Text, default="")
     evidence: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     tags: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
-    #: the noise flags and the scans in a row that found it, when it was recorded (see scanner/noise.py)
+    #: the noise flags, and how many times in a row it had shown (a day play: on newer 5-minute candles, see
+    #: engine/board.py), when it was recorded (see scanner/noise.py)
     noise: Mapped[Optional[list]] = mapped_column(sa.JSON, nullable=True)
     confirmations: Mapped[Optional[int]] = mapped_column(sa.Integer, nullable=True, default=1)
     probability: Mapped[Optional[float]] = mapped_column(sa.Float, nullable=True)   # the odds the play stated

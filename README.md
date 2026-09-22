@@ -821,13 +821,14 @@ the left of the row: **green** — Autopilot would take it on its next pass (it
 passes every check and a cap has room); **amber** — it passes the checks but a
 cap is full (the day's entries, the open positions, the day / swing slots, or
 the setup's own), and hovering the robot says which. A dim robot means it has
-already acted on the play. While Autopilot is on, a play it won't take gets a
-faded grey robot: hovering it gives the first check the play fails, in the
-words the entry gate itself uses (the badge and the gate share one set of
-checks). The play's detail panel says the same in one line. A play Autopilot
-tried and was refused - by the engine's assessment or the broker - gets the
-faded robot with the refusal, and a note in **Autopilot notes**; it isn't tried
-again that day unless a setting changes.
+already acted on the play; on one still on offer hovering it says why. While
+Autopilot is on, a play it won't take gets a faded grey robot: hovering it gives
+the first check the play fails, in the words the entry gate itself uses (the
+badge and the gate share one set of checks). The play's detail panel says the
+same in one line. A play Autopilot tried and was refused - by the engine's
+assessment (say as too thin to trade) or the broker - gets the faded robot with
+the refusal, and a note in **Autopilot notes**; it isn't tried again that day
+unless a setting changes.
 
 **The strip under the header** says what Autopilot is doing now and why, in one
 line: off, paper-only, no prices, stopped for the day, done (the day's entries
@@ -877,10 +878,10 @@ its strategy was unproven, so practice trades are never mistaken for proven ones
 **Losers are skipped even in practice.** With proof not asked for, Autopilot still
 skips a setup with evidence that it loses (`skip_replay_losers`, day trades by
 default; `off` / `day` / `all`): its replay the way Autopilot takes it averages
-`replay_loser_r` (0.05R) a trade or worse over `min_replay_trades` (30) and over
-10 held-out trades, or its own closed trades - the in-app simulator's count too -
-average -0.30R or worse over 10. The records are read afresh on every pass, so a
-replay that recovers lifts it. The threshold is fragile - a little lower and a
+-0.05R a trade or worse - a loss of `replay_loser_r` (0.05) per trade - over
+`min_replay_trades` (30) and over 10 held-out trades, or its own closed trades -
+the in-app simulator's count too - average -0.30R or worse over 10. The records
+are read afresh on every pass, so a replay that recovers lifts it. The threshold is fragile - a little lower and a
 setup flips - so set `off` to practise every setup again. The Autopilot dialog
 lists what is skipped now, and each trade keeps that list.
 

@@ -166,12 +166,15 @@ function playRow(p) {
   const sending = pending.get(p.id) === "sending", done = isDone(p) || sending, ap = p.autopilot || {};
   // it tried the play and the engine's assessment or the order was refused: no bar, and a faded robot saying why
   const skipped = !!ap.skipped && !done;
-  const cls = [done && "done", ap.eligible && !ap.waiting && !skipped && !done && "ap-eligible",
-    ap.eligible && ap.waiting && !skipped && !done && "ap-waiting"].filter(Boolean).join(" ");
+  // a play it has acted on gets no bar either: it won't look at it again today, whatever the caps say
+  const bar = ap.eligible && !skipped && !done && !ap.acted;
+  const cls = [done && "done", bar && !ap.waiting && "ap-eligible", bar && ap.waiting && "ap-waiting"]
+    .filter(Boolean).join(" ");
   // a play it won't take gets a faded robot too, only while Autopilot is on - off, every row would have one
   const refused = (!ap.eligible && !!ap.why_not || skipped) && !!(S.state.autopilot || {}).effective;
+  // acted on and still on offer: the robot says why, as apLine does
   const apMark = ap.acted && !skipped
-    ? '<span class="ap-badge acted" data-term="autopilot">🤖</span>'
+    ? `<span class="ap-badge acted" data-term="autopilot"${done ? "" : ` data-why="${escapeHtml(apLine(ap))}"`}>🤖</span>`
     : ((ap.eligible || refused) && !done
       ? `<span class="ap-badge${ap.waiting && !skipped ? " waiting" : ""}${refused ? " refused" : ""}" data-term="autopilot" data-why="${escapeHtml(apLine(ap))}">🤖</span>`
       : "");

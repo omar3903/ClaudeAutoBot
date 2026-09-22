@@ -20,7 +20,7 @@ from typing import Any, Dict
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -232,9 +232,10 @@ class AutopilotCfg(_Model):
     min_replay_trades: int = 30
     min_replay_expectancy_r: float = 0.05
     skip_replay_losers: str = "day"       # with require_proven off (paper), still skip a setup with evidence it loses:
-                                          # its replay averages replay_loser_r or worse over min_replay_trades and over
-                                          # 10 held-out trades, or its own trades -0.30R or worse over 10. off / day /
-                                          # all - day only by default: skipping the swing losers didn't help in the replay
+                                          # its replay averages -replay_loser_r (-0.05R) or worse over min_replay_trades
+                                          # and over 10 held-out trades, or its own trades -0.30R or worse over 10.
+                                          # off / day / all - day only by default: skipping the swing losers didn't help
+                                          # in the replay
     replay_loser_r: float = 0.05          # ...the loss per trade, overall and held out, that counts as losing
     model_mode: str = "shadow"            # the learned model (research/model.py): shadow = its odds are logged with every
                                           # play and never acted on; gate = plays under model_min_p are refused; size =
@@ -249,6 +250,14 @@ class AutopilotCfg(_Model):
     giveback_floor_pct: float = 0.25      # the give-back rule only counts a peak gain of at least this % of equity
     require_catalyst: bool = False
     dry_run: bool = False
+
+    @field_validator("skip_replay_losers", mode="before")
+    @classmethod
+    def _bare_off(cls, value: Any) -> Any:
+        """YAML reads a bare ``off`` (or ``on``) as a boolean, which would stop the app starting."""
+        if isinstance(value, bool):
+            return "day" if value else "off"
+        return value
 
 
 class NoiseCfg(_Model):
