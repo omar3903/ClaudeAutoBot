@@ -27,6 +27,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -49,6 +50,8 @@ GAVE_BACK_R = 1.0                 # a trade up this much shouldn't end in a loss
 DRIFT_R = 0.3                     # real results this far under the replay's are drifting
 MIN_LIVE = 10
 MIN_GROUP = 5                     # plays on each side before a comparison is told
+NOISE_MARGIN_R = 0.10             # a check helped or cost only when the two sides differ by this much a play
+MIN_T = 1.0                       # ... and by a standard error or more (Welch's t), not one lucky play's worth
 TURBULENT = 0.7
 TAKEN = frozenset({"ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED"})
 LABELS = {**NOISE_LABELS, "unconfirmed": "seen in only one scan"}
@@ -249,16 +252,34 @@ def _seen_at(row: Mapping[str, Any]) -> Optional[pd.Timestamp]:
     return (stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp).tz_convert(NY)
 
 
+def _welch_t(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
+    """How many standard errors apart two groups' averages are (Welch's t, which doesn't assume the two
+    spreads are alike). None when either group has no spread to measure, so a difference must stand on its size."""
+    if len(a) < 2 or len(b) < 2:
+        return None
+    ma, mb = sum(a) / len(a), sum(b) / len(b)
+    se = math.sqrt(sum((x - ma) ** 2 for x in a) / (len(a) - 1) / len(a)
+                   + sum((x - mb) ** 2 for x in b) / (len(b) - 1) / len(b))
+    return (ma - mb) / se if se else None
+
+
 def _compare(flagged: Sequence[Mapping[str, Any]], rest: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     def avg(rows):
         return round(sum(r["r"] for r in rows) / len(rows), 3) if rows else None
-    out = {"flagged": len(flagged), "rest": len(rest), "flagged_avg_r": avg(flagged), "rest_avg_r": avg(rest)}
+    out = {"flagged": len(flagged), "rest": len(rest), "flagged_avg_r": avg(flagged), "rest_avg_r": avg(rest), "t": None}
     if len(flagged) < MIN_GROUP or len(rest) < MIN_GROUP:
         out["verdict"] = "too few plays to tell"
-    elif out["flagged_avg_r"] < out["rest_avg_r"]:
+        return out
+    f_rs, r_rs = [r["r"] for r in flagged], [r["r"] for r in rest]
+    diff, t = sum(f_rs) / len(f_rs) - sum(r_rs) / len(r_rs), _welch_t(f_rs, r_rs)
+    out["t"] = round(t, 2) if t is not None else None
+    # a few hundredths of an R, or a gap one lucky play could make, is a session's noise, not the check's doing
+    if abs(diff) < NOISE_MARGIN_R or (t is not None and abs(t) < MIN_T):
+        out["verdict"] = "no clear difference - the plays it flags did about as well as the rest"
+    elif diff < 0:
         out["verdict"] = "helped - the plays it flags did worse"
     else:
-        out["verdict"] = "cost - the plays it flags did as well or better"
+        out["verdict"] = "cost - the plays it flags did better"
     return out
 
 
@@ -290,10 +311,12 @@ def shadow_outcomes(plays: Sequence[Mapping[str, Any]], bars: Mapping[str, pd.Da
     if flags:
         by_noise["all_checks"] = _compare([r for r in filled if r["noise"]], [r for r in filled if not r["noise"]])
     ranked = sorted(filled, key=lambda r: r["r"])
+    passed, away = [r for r in filled if r["passed_checks"]], [r for r in filled if not r["passed_checks"]]
+    split = _compare(away, passed)                    # the checks "flag" the plays they turn away
     return {
         "followed": len(rows), "filled": len(filled), "summary": _stats(r["r"] for r in filled),
-        "checks": {"passed": _stats(r["r"] for r in filled if r["passed_checks"]),
-                   "turned_away": _stats(r["r"] for r in filled if not r["passed_checks"])},
+        "checks": {"passed": _stats(r["r"] for r in passed), "turned_away": _stats(r["r"] for r in away),
+                   "verdict": split["verdict"].split(" - ")[0], "t": split["t"]},
         "by_noise": by_noise,
         "by_strategy": {k: _stats(r["r"] for r in filled if r["strategy"] == k) for k in sorted({r["strategy"] for r in filled})},
         "best_missed": [r for r in reversed(ranked) if r["r"] > 0][:5],
@@ -365,15 +388,17 @@ def lessons(day: Mapping[str, Any], mistakes: Sequence[Mapping[str, Any]], shado
         out.append(f"{shadows['filled']} play{'s were' if many else ' was'} offered and not taken; taken as planned "
                    f"{'they' if many else 'it'} would have averaged {summary['expectancy_r']:+.2f}R "
                    f"({summary['total_r']:+.2f}R in all).")
-    passed, away = (shadows.get("checks") or {}).get("passed") or {}, (shadows.get("checks") or {}).get("turned_away") or {}
-    if passed.get("trades", 0) >= MIN_GROUP and away.get("trades", 0) >= MIN_GROUP:
-        better = passed["expectancy_r"] > away["expectancy_r"]
-        out.append(f"The plays that passed Autopilot's checks would have averaged {passed['expectancy_r']:+.2f}R, the ones "
-                   f"its checks turned away {away['expectancy_r']:+.2f}R - "
-                   + ("the checks did their job." if better else "the checks turned away the better plays today. One "
-                      "session proves little; keep watching it."))
+    checks = shadows.get("checks") or {}
+    passed, away, verdict = checks.get("passed") or {}, checks.get("turned_away") or {}, checks.get("verdict")
+    if verdict in ("helped", "cost", "no clear difference"):
+        out.append(f"The plays that passed Autopilot's checks would have averaged {passed['expectancy_r']:+.2f}R over "
+                   f"{passed['trades']}, the ones its checks turned away {away['expectancy_r']:+.2f}R over {away['trades']} - "
+                   + {"helped": "the checks did their job.",
+                      "cost": "the checks turned away the better plays today. One session proves little; keep watching it.",
+                      "no clear difference": "no clear difference; one session proves little."}[verdict])
     for flag, row in (shadows.get("by_noise") or {}).items():
-        if flag == "all_checks" or row["verdict"].startswith("too few"):
+        # a flag that made no clear difference today stays in the table without a sentence: it says nothing either way
+        if flag == "all_checks" or not row["verdict"].startswith(("helped", "cost")):
             continue
         out.append(f"Plays flagged \"{LABELS.get(flag, flag)}\" would have averaged {row['flagged_avg_r']:+.2f}R against "
                    f"{row['rest_avg_r']:+.2f}R for the rest - the check {'helped' if row['verdict'].startswith('helped') else 'cost'} today.")

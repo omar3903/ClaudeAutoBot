@@ -140,6 +140,45 @@ def test_fill_times_are_a_true_median_over_the_fills_they_say_and_a_slow_market_
     assert "orders typically filled in 9,000.0s coming out (1 exit, slowest 2.5 h (9,000s))" in only["latency_note"]
 
 
+def _plays_at(avg, n, spread=1.0):
+    """n plays averaging ``avg``R, spread ``spread``R either side of it."""
+    rs = [avg + (spread if i % 2 else -spread) for i in range(n - n % 2)] + [avg] * (n % 2)
+    return [{"r": r} for r in rs]
+
+
+def test_a_check_is_called_helped_or_cost_only_on_a_real_difference():
+    """A hundredth of an R between the two sides, or a gap well inside one standard error, is no clear
+    difference; a gap of tenths of an R with an ordinary spread is."""
+    from tos_bot.research.journal import _compare
+
+    same = _compare(_plays_at(0.257, 12), _plays_at(0.258, 101))
+    assert same["verdict"].startswith("no clear difference") and abs(same["t"]) < 0.01
+    wide = _compare(_plays_at(-0.1, 6, spread=2.0), _plays_at(0.1, 6, spread=2.0))       # 0.2R apart, t about -0.16
+    assert wide["verdict"].startswith("no clear difference")
+    helped = _compare(_plays_at(-0.3, 10, spread=0.5), _plays_at(0.3, 10, spread=0.5))
+    assert helped["verdict"].startswith("helped") and helped["t"] < -1
+    assert _compare(_plays_at(0.3, 10, spread=0.5), _plays_at(-0.3, 10, spread=0.5))["verdict"].startswith("cost")
+    assert _compare(_plays_at(0.3, 4), _plays_at(-0.3, 10))["verdict"] == "too few plays to tell"
+    assert _review()["shadows"]["checks"]["verdict"] == "too few plays to tell"      # one play followed
+
+
+def test_a_flag_that_made_no_clear_difference_gets_no_lesson():
+    from tos_bot.research.journal import lessons
+
+    shadows = {"filled": 113, "summary": {"trades": 113, "expectancy_r": 0.26, "total_r": 29.1},
+               "checks": {"passed": {"trades": 11, "expectancy_r": 0.30}, "turned_away": {"trades": 102, "expectancy_r": 0.25},
+                          "verdict": "no clear difference", "t": 0.15},
+               "by_noise": {"against_trend": {"flagged": 40, "rest": 73, "flagged_avg_r": 0.23, "rest_avg_r": 0.28,
+                                              "t": -0.2, "verdict": "no clear difference - about as well as the rest"},
+                            "volume_against": {"flagged": 20, "rest": 93, "flagged_avg_r": -0.3, "rest_avg_r": 0.4,
+                                               "t": -2.5, "verdict": "helped - the plays it flags did worse"}}}
+    text = " ".join(lessons({"trades": 0}, [], shadows, [], None, {}, 1.3))
+    assert "against the daily trend" not in text
+    assert "Plays flagged \"heavier volume against it\" would have averaged -0.30R" in text and "helped today" in text
+    assert ("passed Autopilot's checks would have averaged +0.30R over 11, the ones its checks turned away +0.25R "
+            "over 102 - no clear difference; one session proves little.") in text
+
+
 def _opened(tid, symbol, *, status="OPEN", noise=(), unproven=None, r=None):
     return {"id": tid, "symbol": symbol, "side": "LONG", "strategy": "s", "timeframe": "SWING", "broker": "paper",
             "status": status, "entry_time": f"{DAY}T18:00:00", "entry_price": 100.0, "initial_stop_price": 98.0,

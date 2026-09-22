@@ -96,7 +96,8 @@ function shadowsHTML(sh) {
     <p class="muted">${sh.followed} setup${sh.followed === 1 ? "" : "s"} followed on the session's candles as if taken; ${sh.filled} would have filled.
       ${s.trades ? `They would have averaged ${inR(s.expectancy_r)} (${inR(s.total_r)} in all, ${pctOf(s.win_rate)} winners).` : ""}
       ${checks.passed && checks.passed.trades ? ` Passing Autopilot's checks: ${inR(checks.passed.expectancy_r)} over ${checks.passed.trades}.` : ""}
-      ${checks.turned_away && checks.turned_away.trades ? ` Turned away by them: ${inR(checks.turned_away.expectancy_r)} over ${checks.turned_away.trades}.` : ""}</p>
+      ${checks.turned_away && checks.turned_away.trades ? ` Turned away by them: ${inR(checks.turned_away.expectancy_r)} over ${checks.turned_away.trades}.` : ""}
+      ${checks.verdict === "no clear difference" ? " No clear difference between the two." : ""}</p>
     ${noise.length ? `<table class="ev-table"><tr><th>Noise flag</th><th class="num">Flagged</th><th class="num">Their average</th><th class="num">The rest</th><th>Today</th></tr>
       ${noise.map(([flag, n]) => `<tr><td>${escapeHtml(flag === "all_checks" ? "any flag" : flag)}</td><td class="num">${n.flagged}</td>
         <td class="num">${inR(n.flagged_avg_r)}</td><td class="num">${inR(n.rest_avg_r)}</td><td>${escapeHtml(n.verdict)}</td></tr>`).join("")}</table>` : ""}

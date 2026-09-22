@@ -1158,7 +1158,10 @@ can't see them, and the report says so.
   it, so every check is tested on live plays every day. The checks are the ones in
   force that session, as the last Autopilot entry recorded them (a rebuild keeps
   them; with no entry, the settings at the rebuild, and the review says so), so a
-  flag the evening replay learns later never re-judges the day;
+  flag the evening replay learns later never re-judges the day. A check is said to
+  have helped or cost only when the two sides are at least 0.10R a play apart and
+  at least one standard error apart (Welch's t); anything less reads "no clear
+  difference", and a flag with no clear difference gets no lesson;
 * **each strategy's real record** over the last 20 sessions against its replay,
   flagged when it falls more than 0.3R a trade short;
 * **how the orders filled** — the seconds from an order going out to the fill coming back, typically
