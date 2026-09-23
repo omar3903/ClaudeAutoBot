@@ -310,13 +310,15 @@ data pill shows `data: IBKR (delayed)`; hover it for the detail.
   client, a `localhost`/`127.0.0.1` Host header and no foreign `Origin`; an
   `/api/` request made by another website's page is refused, and anything that
   changes something needs the dashboard's own request header (the Connections,
-  share-count and quit endpoints want it on reads too). So another website open
-  in your browser can't approve a play or close a position, and a device on
-  your network can't open the dashboard.
+  share-count and quit endpoints want it on reads too). The live feed's
+  WebSocket gets the same check before it opens. So another website open in
+  your browser can't approve a play, close a position or read your account and
+  positions, and a device on your network can't open the dashboard.
 - Only the IB Gateway settings can be written. Values are validated (no line
   breaks, ports in range), `.env` is replaced atomically with your comments and
   other lines preserved, and the account id is **never sent back** — the panel
-  only shows that it's set and its last four characters. `.env` is git-ignored.
+  and the live feed only show that it's set and its last four characters.
+  `.env` is git-ignored.
 
 ### MySQL (optional — SQLite is the default)
 

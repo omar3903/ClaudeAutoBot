@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from tos_bot.server import security
@@ -89,6 +89,10 @@ class _Engine:
     def price_of(self, symbol):
         return self._ok("price", symbol)
 
+    def current_plays(self):
+        self.calls.append(("plays",))
+        return []
+
 
 def _dashboard(monkeypatch, *, local_client=True):
     """The real app on a stub engine, TestClient's host allowed as this computer (and its client too,
@@ -154,6 +158,34 @@ def test_a_remote_client_is_refused_on_every_route(monkeypatch):
     assert client.get("/api/state").status_code == 403
     assert client.get("/").status_code == 403
     assert engine.calls == []
+
+
+# ---- the live feed: the WebSocket, which the HTTP middleware never sees ------------------------ #
+def test_the_dashboards_own_live_feed_opens(monkeypatch):
+    client, engine = _dashboard(monkeypatch)
+    with client.websocket_connect("/ws", headers={"Origin": "http://127.0.0.1:8787"}) as ws:
+        assert ws.receive_json()["topic"] == "hello"
+        assert ws.receive_json()["topic"] == "plays.updated"
+    assert engine.calls == [("snapshot",), ("plays",)]
+
+
+@pytest.mark.parametrize("headers", [{"Origin": "https://evil.example"},      # another website's page
+                                     {"Host": "rebind.evil:8787"}])           # a rebound domain
+def test_a_foreign_live_feed_is_refused_before_the_snapshot(monkeypatch, headers):
+    client, engine = _dashboard(monkeypatch)
+    with pytest.raises(WebSocketDisconnect) as refused:
+        with client.websocket_connect("/ws", headers=headers):
+            pass
+    assert refused.value.code == 1008
+    assert engine.calls == []
+
+
+def test_a_remote_live_feed_is_refused(monkeypatch):
+    client, engine = _dashboard(monkeypatch, local_client=False)
+    with pytest.raises(WebSocketDisconnect) as refused:
+        with client.websocket_connect("/ws"):
+            pass
+    assert refused.value.code == 1008 and engine.calls == []
 
 
 def test_an_ipv6_loopback_request_is_allowed():

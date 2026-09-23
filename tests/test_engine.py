@@ -113,6 +113,18 @@ def test_the_chosen_account_connects_once_the_gateway_answers(engine, port, gate
     assert engine.exit_manager.quote_fn("T01").last > 0               # exits are priced off the Gateway
 
 
+def test_the_snapshot_shows_only_the_end_of_the_account_id(engine, port, gateway, monkeypatch):
+    # every open tab gets the snapshot: the account id is masked there as on the Connections panel
+    status = gateway.session_status
+    monkeypatch.setattr(gateway, "session_status", lambda: {**status(), "account": "DU1234567"})
+    _connect(engine, port)
+    session = engine.snapshot()["venue"]["ibkr_session"]
+    assert session["account"] == "…4567" and session["market_data"] == "live"
+    assert gateway.session_status()["account"] == "DU1234567"          # the connection's own copy is untouched
+    monkeypatch.setattr(gateway, "session_status", status)
+    assert engine.snapshot()["venue"]["ibkr_session"]["account"] is None   # not known yet: nothing to show
+
+
 def test_the_simulator_takes_only_prices_from_the_gateway(engine, port, gateway):
     assert engine.set_paper_platform("simulator")["ok"]
     _connect(engine, port)

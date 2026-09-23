@@ -1,10 +1,11 @@
 """FastAPI app: REST + a WebSocket that streams engine events to the dashboard.
 
-Every request must come from the dashboard on this computer, and the endpoints
-that touch secrets, exit every position, fix a share count or quit the app check
-it again, header included (see :mod:`tos_bot.server.security`). Handlers
-that call into the engine are plain ``def``, so FastAPI runs them in its thread
-pool and a slow broker call never stalls the event loop that feeds the WebSocket.
+Every request, and the live feed's WebSocket, must come from the dashboard on
+this computer, and the endpoints that touch secrets, exit every position, fix a
+share count or quit the app check it again, header included (see
+:mod:`tos_bot.server.security`). Handlers that call into the engine are plain
+``def``, so FastAPI runs them in its thread pool and a slow broker call never
+stalls the event loop that feeds the WebSocket.
 """
 
 from __future__ import annotations
@@ -390,6 +391,12 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     # ---- websocket -------------------------------------------------------- #
     @app.websocket("/ws")
     async def ws(sock: WebSocket):
+        # the HTTP middleware doesn't see a WebSocket, and a browser lets any website open one here:
+        # the same check, before the snapshot is built. Closing before accept answers the handshake 403
+        client = sock.client.host if sock.client else ""
+        if refusal(client, sock.headers, "GET", sock.url.path):
+            await sock.close(code=1008)
+            return
         await sock.accept()
         q: asyncio.Queue = asyncio.Queue(maxsize=1000)
         BUS.add_queue(q)

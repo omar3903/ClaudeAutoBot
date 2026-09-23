@@ -145,6 +145,8 @@ def test_an_open_tab_is_told_when_the_dashboards_files_have_changed(client, monk
         hello = ws.receive_json()
     assert hello["topic"] == "hello" and hello["payload"]["web_build"] == server.web_build()
     assert "mode" in hello["payload"]                                  # the snapshot is still all there
+    account = (hello["payload"]["venue"]["ibkr_session"] or {}).get("account")
+    assert account is None or account.startswith("…")                 # never the whole account id
 
     (tmp_path / "web" / "js").mkdir(parents=True)
     (tmp_path / "web" / "js" / "main.js").write_text("// one", encoding="utf-8")

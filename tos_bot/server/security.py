@@ -1,12 +1,13 @@
 """The same-machine guard: only the dashboard, on this computer, drives the app.
 
 :func:`refusal` runs on every HTTP request (the app's middleware asks it before
-routing). It refuses a remote client, a foreign ``Host`` header (DNS
-rebinding), a foreign ``Origin`` (another website open in your browser), an
-``/api/`` request another site's page made (an image or script load needs no
-CORS), and any request that changes something without the dashboard's
-``X-ATB-Request`` header - a cross-site request can't add a custom header
-without a CORS preflight, which this app never grants.
+routing) and on the live feed's WebSocket before it is accepted. It refuses a
+remote client, a foreign ``Host`` header (DNS rebinding), a foreign ``Origin``
+(another website open in your browser), an ``/api/`` request another site's
+page made (an image or script load needs no CORS), and any request that
+changes something without the dashboard's ``X-ATB-Request`` header - a
+cross-site request can't add a custom header without a CORS preflight, which
+this app never grants.
 
 :func:`require_local` makes the same checks, header included even on a read,
 for the endpoints that touch secrets, exit every position, fix a share count or
