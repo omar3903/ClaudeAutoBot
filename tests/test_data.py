@@ -9,6 +9,7 @@ from tos_bot.data import symbols as symbols_module
 from tos_bot.data.bars import FULL_HISTORY, KEEP_SESSIONS, DailyBarStore
 from tos_bot.data.market_data import MarketData, NoDataSource
 from tos_bot.data.symbols import SymbolMaster
+from tos_bot.research.history import IntradayHistory
 from tos_bot.scanner import schedule
 from tos_bot.util import clock
 
@@ -48,6 +49,49 @@ def test_the_bar_store_never_keeps_an_unfinished_session(tmp_path):
     through = full.index[-2].date()
     store.merge("BBB", full, through)
     assert store.last_session("BBB") == through
+
+
+# ---------------------------------------------------------------- only a stock symbol names a candle file
+def _plant_outside(tmp_path):
+    """Candles where a name that isn't a symbol would reach from a store in tmp_path / "store",
+    and those names: a full path, a step up, a sub-folder, a dot, a drive and a network share."""
+    frame = fakes.daily_bars("AAA")
+    for where in (tmp_path / "ZZ.pkl", tmp_path / "store" / "ZZ" / "ZZ.pkl", tmp_path / "store" / "ZZ.B.pkl"):
+        where.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_pickle(where)
+    return [str(tmp_path / "ZZ"), "..\\ZZ", "../ZZ", "ZZ/ZZ", "ZZ.B", "C:\\ZZ", "\\\\ZZHOST\\S\\X"]
+
+
+def test_only_a_stock_symbol_names_a_candle_file(tmp_path):
+    store = DailyBarStore(tmp_path / "store")
+    assert store._path("AAA") == tmp_path / "store" / "AAA.pkl"
+    assert store._path("BRK B") == tmp_path / "store" / "BRK_B.pkl"
+    for name in _plant_outside(tmp_path):
+        assert store.frame(name) is None, name
+
+
+def test_a_download_for_a_name_that_isnt_a_symbol_saves_nothing_and_goes_on(tmp_path):
+    store = DailyBarStore(tmp_path / "store")
+    bars = fakes.daily_bars("AAA")
+    through = bars.index[-1].date()
+    for name in (str(tmp_path / "ZZ"), "../ZZ", "QQ/ZZ"):
+        assert len(store.merge(name, bars, through))                 # no error to stop the download loop
+        assert store.frame(name) is None
+    assert not [p for p in tmp_path.rglob("*") if p.is_file()]
+    store.merge("AAA", bars, through)
+    assert (tmp_path / "store" / "AAA.pkl").exists() and store.last_session("AAA") == through
+
+
+def test_the_replay_candle_store_only_names_files_after_stock_symbols(tmp_path):
+    history = IntradayHistory(tmp_path / "store")
+    for name in _plant_outside(tmp_path):
+        assert history.stored(name) is None, name
+    frame = fakes.daily_bars("AAA")
+    for name in (str(tmp_path / "YY"), "../YY", "QQ/YY"):
+        history._write(name, frame)                                  # no error to stop the download loop
+    assert not list(tmp_path.rglob("YY.*"))
+    history._write("BRK B", frame)
+    assert (tmp_path / "store" / "BRK_B.pkl").exists() and history.stored("BRK B").equals(frame)
 
 
 # ---------------------------------------------------------------- prices

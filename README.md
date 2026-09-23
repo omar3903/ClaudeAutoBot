@@ -323,6 +323,10 @@ data pill shows `data: IBKR (delayed)`; hover it for the detail.
   is **never sent back** — the panel
   and the live feed only show that it's set and its last four characters.
   `.env` is git-ignored.
+- A stock's candle file is only named after it when the name looks like a
+  stock symbol (capital letters and digits, a share class after a space), so a
+  symbol from outside data, such as an insider filing, can't point the app at
+  a file somewhere else.
 
 ### MySQL (optional — SQLite is the default)
 
