@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from fastapi import Depends, FastAPI, WebSocketDisconnect
 from fastapi.testclient import TestClient
@@ -176,6 +178,32 @@ def test_no_other_website_can_frame_the_dashboard(monkeypatch):
     # the answers' own headers are kept
     assert answers["/api/state"].headers["content-encoding"] == "gzip"
     assert answers["/"].headers["cache-control"] == answers["main.js"].headers["cache-control"] == "no-cache"
+
+
+def test_the_page_runs_only_the_dashboards_own_script_files(monkeypatch):
+    # a headline that ever reached the page unescaped couldn't run as script and drive the API
+    client, _ = _dashboard(monkeypatch)
+    policy = client.get("/").headers["content-security-policy"]
+    rules = dict(rule.strip().split(" ", 1) for rule in policy.split(";"))
+    assert rules["script-src"] == "'self'" and rules["object-src"] == "'none'"
+    assert rules["frame-ancestors"] == "'none'"
+    theme = client.get("/static/js/theme.js")                     # the theme is picked by a file now
+    assert theme.status_code == 200 and "javascript" in theme.headers["content-type"]
+
+
+def test_the_dashboard_has_no_inline_script():
+    # the policy blocks inline script, so any left behind would quietly stop working: the theme picked
+    # after first paint, or Enter in a settings field reloading the page and losing what was typed
+    from tos_bot.server.app import WEB_DIR
+
+    page = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    assert all(" src=" in tag for tag in re.findall(r"<script\b[^>]*>", page))
+    handler = re.compile(r"""\son[a-z]+\s*=\s*["'`]""")               # onsubmit="...", onclick='...'
+    files = [path for path in WEB_DIR.rglob("*") if path.suffix in {".html", ".js"}]
+    assert len(files) > 10
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        assert not handler.search(text) and "javascript:" not in text, path.name
 
 
 # ---- the live feed: the WebSocket, which the HTTP middleware never sees ------------------------ #

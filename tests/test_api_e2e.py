@@ -121,6 +121,7 @@ def test_settings_round_trip_and_the_dashboard_loads(client):
     assert "javascript" in main.headers["content-type"]
     assert main.headers["cache-control"] == "no-cache"             # an update never mixes with cached modules
     assert client.get("/").headers["cache-control"] == "no-cache"
+    assert "script-src 'self'" in client.get("/").headers["content-security-policy"]
     journal = client.get("/api/journal").json()
     assert journal["review_at"] and isinstance(journal["days"], list)
     assert client.get("/api/journal/2020-01-02").status_code == 404

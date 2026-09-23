@@ -315,7 +315,9 @@ data pill shows `data: IBKR (delayed)`; hover it for the detail.
   your browser can't approve a play, close a position or read your account and
   positions, and a device on your network can't open the dashboard. No other
   website can show the dashboard inside a frame either, so a hidden page can't
-  line your clicks up with its buttons.
+  line your clicks up with its buttons. And the page only runs the dashboard's
+  own script files (a Content-Security-Policy), so a headline or filing that
+  ever reached it unescaped still couldn't run as script.
 - Only the IB Gateway settings can be written. Values are validated (no line
   breaks or hidden characters, no `$`, ports in range), `.env` is read without
   expanding `${...}` so one setting can't show another's value, it is replaced

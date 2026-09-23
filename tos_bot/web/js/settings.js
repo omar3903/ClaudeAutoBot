@@ -30,7 +30,7 @@ function render(scan) {
       <p class="muted">Once a day before the open every US stock is ranked by how in play it is. The hottest become the day's
         <b data-term="hot">hot list</b>; the next best in each sector wait in a <b data-term="buffer">buffer</b>. During the
         session the hot list and a couple of buffer names per sector are rescanned on a cycle, so few IBKR requests are used.</p>
-      <form class="field-grid" id="form-settings" onsubmit="return false">
+      <form class="field-grid" id="form-settings">
         <label for="set-premarket_time">Full scan at (ET)</label>
         <div><input type="time" id="set-premarket_time" data-key="premarket_time" min="${earliest}" max="${latest}" step="300" value="${escapeHtml(s.premarket_time)}">
           <div class="help">Pre-market, ${earliest}–${latest} ET, so it's finished at least half an hour before the open.</div></div>

@@ -37,7 +37,7 @@ function render(d) {
       <h4>Interactive Brokers <span class="muted">· the running IB Gateway is the login and the price feed</span></h4>
       <div class="status-line">${port("Paper", ib.ports.paper, ib.listening.paper)} ${port("Live", ib.ports.live, ib.listening.live)}
         ${ib.installed ? "" : '<span class="badge bad">ib_async not installed</span>'}</div>
-      <form class="field-grid" id="form-ibkr" onsubmit="return false">${d.fields.map(fieldHTML).join("")}</form>
+      <form class="field-grid" id="form-ibkr">${d.fields.map(fieldHTML).join("")}</form>
       <div class="row-gap">
         <button class="mini" id="ibkr-save">Save</button>
         <button class="ghost mini" data-probe="paper">Test paper</button>
@@ -51,7 +51,7 @@ function render(d) {
       <h4>Company news <span class="muted">· optional, for the signals</span></h4>
       <p class="muted small">Insider trades and 8-K filings come from SEC, and headlines from IBKR, without any key.
         A free Finnhub key adds more company news.</p>
-      <form class="field-grid" id="form-signals" onsubmit="return false">${(d.signal_fields || []).map(fieldHTML).join("")}</form>
+      <form class="field-grid" id="form-signals">${(d.signal_fields || []).map(fieldHTML).join("")}</form>
       <div class="row-gap"><button class="mini" id="signals-save">Save</button></div>
     </section>
 

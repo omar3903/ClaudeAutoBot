@@ -22,6 +22,9 @@ import { connect } from "./events.js";
 
 [initUi, initTooltips, initTopbar, initQuit, initAutopilot, initFilters, initScan, initPlays,
   initBlotter, initStrategies, initSettings, initNotes, initReports, initSignals].forEach(init => init());
+// the drawers' forms are saved by their buttons: Enter in a field mustn't reload the page and lose
+// what was typed. Here rather than inline onsubmit, which the Content-Security-Policy blocks
+document.addEventListener("submit", e => e.preventDefault());
 
 refreshState();
 loadStrategies().catch(() => { /* names fall back to their keys */ });

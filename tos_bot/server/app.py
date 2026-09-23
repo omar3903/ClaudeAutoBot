@@ -4,7 +4,8 @@ Every request, and the live feed's WebSocket, must come from the dashboard on
 this computer, and the endpoints that touch secrets, exit every position, fix a
 share count or quit the app check it again, header included (see
 :mod:`tos_bot.server.security`). Every answer also forbids framing by another
-website and content sniffing. Handlers that call into the engine are plain
+website and content sniffing, and lets the page run only the dashboard's own
+script files. Handlers that call into the engine are plain
 ``def``, so FastAPI runs them in its thread pool and a slow broker call never
 stalls the event loop that feeds the WebSocket.
 """
@@ -43,10 +44,18 @@ mimetypes.add_type("text/javascript", ".js")
 #: update mixes old and new code and the page stops working, so every load re-checks each file
 NO_CACHE = {"Cache-Control": "no-cache"}
 
+#: the page runs only the dashboard's own script files - no inline script, nothing from another website.
+#: Every outside text (a headline, a filing) is escaped as it's drawn; if one ever isn't, it still can't
+#: run as script and approve plays or close positions with the dashboard's own header. Inline styles stay
+#: allowed (the templates set widths with style="..."), and connect-src 'self' covers the live feed's ws://
+CONTENT_POLICY = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                  "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+                  "form-action 'self'; frame-ancestors 'none'")
+
 #: on every answer, refusals included. No other website may show the dashboard in a frame: a hidden
 #: frame can line the user's clicks up with Exit all or Quit, and those clicks are the dashboard's own,
 #: so no same-machine check can tell them apart. And a browser takes each file as the type it's served as
-FRAME_GUARD = {"X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'",
+FRAME_GUARD = {"X-Frame-Options": "DENY", "Content-Security-Policy": CONTENT_POLICY,
                "X-Content-Type-Options": "nosniff"}
 
 
