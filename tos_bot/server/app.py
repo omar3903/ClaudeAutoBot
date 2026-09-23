@@ -3,7 +3,8 @@
 Every request, and the live feed's WebSocket, must come from the dashboard on
 this computer, and the endpoints that touch secrets, exit every position, fix a
 share count or quit the app check it again, header included (see
-:mod:`tos_bot.server.security`). Handlers that call into the engine are plain
+:mod:`tos_bot.server.security`). Every answer also forbids framing by another
+website and content sniffing. Handlers that call into the engine are plain
 ``def``, so FastAPI runs them in its thread pool and a slow broker call never
 stalls the event loop that feeds the WebSocket.
 """
@@ -41,6 +42,12 @@ mimetypes.add_type("text/javascript", ".js")
 #: the dashboard is plain ES modules; a browser that reuses a cached copy of one of them after an
 #: update mixes old and new code and the page stops working, so every load re-checks each file
 NO_CACHE = {"Cache-Control": "no-cache"}
+
+#: on every answer, refusals included. No other website may show the dashboard in a frame: a hidden
+#: frame can line the user's clicks up with Exit all or Quit, and those clicks are the dashboard's own,
+#: so no same-machine check can tell them apart. And a browser takes each file as the type it's served as
+FRAME_GUARD = {"X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'",
+               "X-Content-Type-Options": "nosniff"}
 
 
 def web_build() -> str:
@@ -104,8 +111,13 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
         client = request.client.host if request.client else ""
         why = refusal(client, request.headers, request.method, request.url.path)
         if why:
-            return JSONResponse({"detail": why}, status_code=403)
-        return await call_next(request)
+            response = JSONResponse({"detail": why}, status_code=403)
+        else:
+            response = await call_next(request)
+        # added beside the answer's own headers (no-cache, gzip); one a route already set is left as it is
+        for name, value in FRAME_GUARD.items():
+            response.headers.setdefault(name, value)
+        return response
 
     def eng() -> TradingEngine:
         return app.state.engine

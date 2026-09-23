@@ -313,7 +313,9 @@ data pill shows `data: IBKR (delayed)`; hover it for the detail.
   share-count and quit endpoints want it on reads too). The live feed's
   WebSocket gets the same check before it opens. So another website open in
   your browser can't approve a play, close a position or read your account and
-  positions, and a device on your network can't open the dashboard.
+  positions, and a device on your network can't open the dashboard. No other
+  website can show the dashboard inside a frame either, so a hidden page can't
+  line your clicks up with its buttons.
 - Only the IB Gateway settings can be written. Values are validated (no line
   breaks, ports in range), `.env` is replaced atomically with your comments and
   other lines preserved, and the account id is **never sent back** — the panel

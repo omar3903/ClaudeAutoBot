@@ -160,6 +160,24 @@ def test_a_remote_client_is_refused_on_every_route(monkeypatch):
     assert engine.calls == []
 
 
+def test_no_other_website_can_frame_the_dashboard(monkeypatch):
+    # inside another site's hidden frame the user's clicks would be the dashboard's own, and pass every check
+    client, engine = _dashboard(monkeypatch)
+    engine.snapshot = lambda: {"ok": True, "rows": ["x" * 64] * 64}          # big enough to be gzipped
+    gzip = {"Accept-Encoding": "gzip"}
+    answers = {"/": client.get("/"), "main.js": client.get("/static/js/main.js"),
+               "/api/state": client.get("/api/state", headers=gzip),
+               "refused": client.post("/api/mode", json={"mode": "live"})}
+    for name, answer in answers.items():
+        assert answer.headers["x-frame-options"] == "DENY", name
+        assert "frame-ancestors 'none'" in answer.headers["content-security-policy"], name
+        assert answer.headers["x-content-type-options"] == "nosniff", name
+    assert answers["refused"].status_code == 403
+    # the answers' own headers are kept
+    assert answers["/api/state"].headers["content-encoding"] == "gzip"
+    assert answers["/"].headers["cache-control"] == answers["main.js"].headers["cache-control"] == "no-cache"
+
+
 # ---- the live feed: the WebSocket, which the HTTP middleware never sees ------------------------ #
 def test_the_dashboards_own_live_feed_opens(monkeypatch):
     client, engine = _dashboard(monkeypatch)
