@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import pathlib
+import unicodedata
 
 import pytest
 from dotenv import dotenv_values
@@ -59,10 +61,10 @@ def test_unchanged_value_reports_nothing(env):
     ({"DB_PASSWORD": "x"}, "can't be changed"),
     ({"SCHWAB_API_KEY": "x"}, "can't be changed"),
     ({"IBKR_HOST": "abc\nPAPER_PLATFORM=live"}, "line breaks"),
-    ({"FINNHUB_API_KEY": "abcd IBKR_HOST=6.6.6.6"}, "line breaks"),   # splitlines() breaks on these
+    ({"FINNHUB_API_KEY": "abcd\u2028IBKR_HOST=6.6.6.6"}, "line breaks"),   # splitlines() breaks on these
     ({"IBKR_ACCOUNT_ID": "ab\x0bcd"}, "line breaks"),
     ({"IBKR_ACCOUNT_ID": "ab\x85cd"}, "line breaks"),
-    ({"FINNHUB_API_KEY": "abcd​1234efgh"}, "hidden characters"),       # zero-width space
+    ({"FINNHUB_API_KEY": "abcd\u200b1234efgh"}, "hidden characters"),       # zero-width space
     ({"IBKR_HOST": "${FINNHUB_API_KEY}"}, r"\$ isn't allowed"),
     ({"IBKR_PAPER_PORT": "abc"}, "whole number"),
     ({"IBKR_PAPER_PORT": "70000"}, "between"),
@@ -120,7 +122,7 @@ def test_a_dollar_reference_is_shown_as_written_never_expanded_into_a_secret(env
 def test_a_quoted_value_with_a_unicode_line_separator_stays_one_line(env, monkeypatch):
     # written by hand: the dashboard now refuses these characters, but a file may hold them
     monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
-    odd = "abcd IBKR_HOST=6.6.6.6\x85DATABASE_URL=sqlite:///x.db"
+    odd = "abcd\u2028IBKR_HOST=6.6.6.6\x85DATABASE_URL=sqlite:///x.db"
     env.write_text(env.read_text(encoding="utf-8") + f'FINNHUB_API_KEY="{odd}"\n', encoding="utf-8")
     before = dotenv_values(env, interpolate=False)
     ss.write({"IBKR_CLIENT_ID": 21}, path=env)                  # saving another key keeps it whole
@@ -138,3 +140,11 @@ def test_the_news_key_has_its_own_group_and_stays_secret(env, monkeypatch):
     assert ss.write({"FINNHUB_API_KEY": "abcd1234efgh5678"}, env) == ["FINNHUB_API_KEY"]
     [row] = ss.describe(env, fields=ss.SIGNAL_FIELDS)
     assert row["secret"] and row["set"] and row["hint"] == "…5678" and "abcd1234" not in repr(row)
+
+
+def test_the_hidden_characters_these_tests_use_are_written_as_escapes():
+    # a raw line separator or zero-width space can't be seen in a diff, and an editor may drop one
+    # unasked - a case above would then quietly test a plain string
+    source = pathlib.Path(__file__).read_text(encoding="utf-8")
+    raw = sorted({f"U+{ord(ch):04X}" for ch in source if unicodedata.category(ch) in ("Zl", "Zp", "Cf")})
+    assert raw == []
