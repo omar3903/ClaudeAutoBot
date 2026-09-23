@@ -176,7 +176,8 @@ def fig_components() -> str:
     srv = s.box(20, 100, 680, 58, "FastAPI app  (tos_bot/server/app.py  +  security.py)",
                 ["GET/POST /api/*  ->  engine methods           /ws  ->  EventBus queue  ->  JSON events        "
                  "/static  ->  the dashboard files",
-                 "same-machine guard on the secrets, quit and setup routes (client, Host, Origin, X-ATB-Request)"],
+                 "same-machine check on every request and on /ws (client, Host, Origin, cross-site /api/, "
+                 "X-ATB-Request on writes)"],
                 fill="#f5f9ff", title_fill="#dbe7fb")
     connect(s, ui, srv, "HTTP + WebSocket", start=None, end="arr", offset=-120)
     s.line(360 + 120, 158, 360 + 120, 73, end="arr")
@@ -902,7 +903,8 @@ def build() -> str:
         ("Language / runtime", "Python 3.10, one process", "Started by <code>run.py</code>; "
          "<code>scripts/run_24_7.bat</code> keeps it up"),
         ("Web server", "FastAPI + uvicorn, WebSocket", "REST routes call the engine in a thread pool; "
-         "<code>security.py</code> restricts sensitive routes to the same machine"),
+         "<code>security.py</code> refuses every request, and the WebSocket, that isn't the dashboard on "
+         "this machine"),
         ("Broker / prices", "ib_async against IB Gateway", "Paper on port 4002, live on 4001. The only price "
          "source; delayed data is accepted"),
         ("Simulator", "<code>brokers/paper_adapter.py</code>", "Fills on IBKR prices; its state is in "
@@ -1322,12 +1324,18 @@ def build() -> str:
         ("/api/mode, /api/paper/reset, /api/capital[/split]", "POST", "set_mode(), reset_paper(), set_capital(), "
          "set_capital_split()"),
         ("/api/setup[/secrets|/reconnect|/ibkr/test|/paper-platform], /api/quit", "GET/POST",
-         "same-machine only: setup_state(), save_secrets(), reconnect(), probe_ibkr(), begin_quit()"),
-        ("/ws", "WebSocket", "a queue on the EventBus; first message is a full snapshot, then the plays as slim "
-         "rows, like every later plays push"),
+         "the dashboard's header even on a read: setup_state(), save_secrets(), reconnect(), probe_ibkr(), "
+         "begin_quit()"),
+        ("/ws", "WebSocket", "closed with 1008 before accept when the client, Host or Origin is foreign; otherwise "
+         "a queue on the EventBus; first message is a full snapshot (the account id shows only its end), then "
+         "the plays as slim rows, like every later plays push"),
     ]))
     A('<p>Answers over 2 KB go gzipped (FastAPI\'s <code>GZipMiddleware</code>); the WebSocket does not pass '
       'through it.</p>')
+    A('<p>Every request passes <code>security.py</code>\'s check first (a refusal is a 403), and every answer '
+      'carries <code>X-Frame-Options: DENY</code>, <code>X-Content-Type-Options: nosniff</code> and a '
+      '<code>Content-Security-Policy</code> that runs only the dashboard\'s own script files (no inline script '
+      'or <code>onclick=</code>; inline styles are allowed) and lets no other site frame the page.</p>')
     A('<h3>Events on the bus (core/eventbus.py)</h3>')
     A('<p><code>engine.started</code>, <code>account.snapshot</code>, <code>plays.updated</code>, '
       '<code>plays.changes</code>, <code>play.decided</code>, <code>scan.started</code>, <code>scan.failed</code>, '

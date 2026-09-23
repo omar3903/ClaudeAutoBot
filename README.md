@@ -306,14 +306,29 @@ data pill shows `data: IBKR (delayed)`; hover it for the detail.
 
 ### Security of settings
 
-- The Connections endpoints only answer **this computer**: a loopback client, a
-  `localhost`/`127.0.0.1` Host header, no foreign `Origin`, and the dashboard's
-  own request header. Another website open in your browser, or a device on your
-  network when the server runs with `--host 0.0.0.0`, is refused.
+- The app only answers **this computer**. Every request needs a loopback
+  client, a `localhost`/`127.0.0.1` Host header and no foreign `Origin`; an
+  `/api/` request made by another website's page is refused, and anything that
+  changes something needs the dashboard's own request header (the Connections,
+  share-count and quit endpoints want it on reads too). The live feed's
+  WebSocket gets the same check before it opens. So another website open in
+  your browser can't approve a play, close a position or read your account and
+  positions, and a device on your network can't open the dashboard. No other
+  website can show the dashboard inside a frame either, so a hidden page can't
+  line your clicks up with its buttons. And the page only runs the dashboard's
+  own script files (a Content-Security-Policy), so a headline or filing that
+  ever reached it unescaped still couldn't run as script.
 - Only the IB Gateway settings can be written. Values are validated (no line
-  breaks, ports in range), `.env` is replaced atomically with your comments and
-  other lines preserved, and the account id is **never sent back** — the panel
-  only shows that it's set and its last four characters. `.env` is git-ignored.
+  breaks or hidden characters, no `$`, ports in range), `.env` is read without
+  expanding `${...}` so one setting can't show another's value, it is replaced
+  atomically with your comments and other lines preserved, and the account id
+  is **never sent back** — the panel
+  and the live feed only show that it's set and its last four characters.
+  `.env` is git-ignored.
+- A stock's candle file is only named after it when the name looks like a
+  stock symbol (capital letters and digits, a share class after a space), so a
+  symbol from outside data, such as an insider filing, can't point the app at
+  a file somewhere else.
 
 ### MySQL (optional — SQLite is the default)
 

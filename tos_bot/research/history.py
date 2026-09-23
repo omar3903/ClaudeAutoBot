@@ -18,6 +18,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional
 
 import pandas as pd
 
+from ..data.bars import symbol_path
 from ..util import clock
 
 log = logging.getLogger(__name__)
@@ -144,7 +145,7 @@ class IntradayHistory:
         return self._read(symbol)
 
     def _path(self, symbol: str) -> Path:
-        return self.directory / f"{symbol.replace(' ', '_')}.pkl"
+        return symbol_path(self.directory, symbol, ".pkl")
 
     def _read(self, symbol: str) -> Optional[pd.DataFrame]:
         try:
@@ -153,10 +154,14 @@ class IntradayHistory:
             return None
 
     def _write(self, symbol: str, frame: pd.DataFrame) -> None:
+        try:
+            path = self._path(symbol)
+        except ValueError:
+            return                                # not a stock symbol: nothing saved, the download goes on
         self.directory.mkdir(parents=True, exist_ok=True)
-        tmp = self._path(symbol).with_suffix(".tmp")
+        tmp = path.with_suffix(".tmp")
         frame.to_pickle(tmp)
-        tmp.replace(self._path(symbol))
+        tmp.replace(path)
 
 
 def _through_gateway_drops(source, request: Callable[[], Dict[str, pd.DataFrame]]) -> Dict[str, pd.DataFrame]:

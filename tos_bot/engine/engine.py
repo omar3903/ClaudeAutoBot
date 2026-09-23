@@ -2130,6 +2130,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def _venue_state(self) -> Dict[str, Any]:
         plan = plan_venue(self.mode, self.paper_platform)
         status = self.connections.session_status()
+        if status:
+            # the account id is a secret (the Connections panel shows only its end), and this goes to
+            # every open tab in every snapshot: it gets the same
+            status = {**status, "account": secrets_store.mask(status.get("account")) or None}
         connected = self.connections.connected
         return {
             "mode": self.mode, "paper_platform": self.paper_platform, "paper_platforms": PAPER_PLATFORMS,

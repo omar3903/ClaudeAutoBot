@@ -25,8 +25,13 @@ def client(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
     from tos_bot.engine import TradingEngine
     from tos_bot.scanner.scanner import BENCHMARK
+    from tos_bot.server import security
     from tos_bot.server.app import create_app
 
+    # every request must come from the dashboard on this computer: TestClient reports client
+    # "testclient" and Host "testserver", and sends the dashboard's header as its post() does
+    monkeypatch.setattr(security, "ALLOWED_CLIENTS", security.ALLOWED_CLIENTS | {"testclient"})
+    monkeypatch.setattr(security, "ALLOWED_HOSTS", security.ALLOWED_HOSTS | {"testserver"})
     runtime = tmp_path / "runtime.json"
     runtime.write_text(json.dumps({"paper_platform": "simulator"}), encoding="utf-8")
     gateway = fakes.FakeGateway(fakes.SYMBOLS + [BENCHMARK])
@@ -36,7 +41,7 @@ def client(monkeypatch, tmp_path):
                              broker_factory=fakes.broker_factory(gateway), port_check=lambda host, port: True,
                              listings=fakes.FakeListings(fakes.SYMBOLS), fundamentals=fakes.NoFundamentals())
 
-    with TestClient(create_app(engine)) as c:
+    with TestClient(create_app(engine), headers={"X-ATB-Request": "1"}) as c:
         yield c
 
 
@@ -116,6 +121,7 @@ def test_settings_round_trip_and_the_dashboard_loads(client):
     assert "javascript" in main.headers["content-type"]
     assert main.headers["cache-control"] == "no-cache"             # an update never mixes with cached modules
     assert client.get("/").headers["cache-control"] == "no-cache"
+    assert "script-src 'self'" in client.get("/").headers["content-security-policy"]
     journal = client.get("/api/journal").json()
     assert journal["review_at"] and isinstance(journal["days"], list)
     assert client.get("/api/journal/2020-01-02").status_code == 404
@@ -140,6 +146,8 @@ def test_an_open_tab_is_told_when_the_dashboards_files_have_changed(client, monk
         hello = ws.receive_json()
     assert hello["topic"] == "hello" and hello["payload"]["web_build"] == server.web_build()
     assert "mode" in hello["payload"]                                  # the snapshot is still all there
+    account = (hello["payload"]["venue"]["ibkr_session"] or {}).get("account")
+    assert account is None or account.startswith("…")                 # never the whole account id
 
     (tmp_path / "web" / "js").mkdir(parents=True)
     (tmp_path / "web" / "js" / "main.js").write_text("// one", encoding="utf-8")
