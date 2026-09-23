@@ -25,8 +25,13 @@ def client(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
     from tos_bot.engine import TradingEngine
     from tos_bot.scanner.scanner import BENCHMARK
+    from tos_bot.server import security
     from tos_bot.server.app import create_app
 
+    # every request must come from the dashboard on this computer: TestClient reports client
+    # "testclient" and Host "testserver", and sends the dashboard's header as its post() does
+    monkeypatch.setattr(security, "ALLOWED_CLIENTS", security.ALLOWED_CLIENTS | {"testclient"})
+    monkeypatch.setattr(security, "ALLOWED_HOSTS", security.ALLOWED_HOSTS | {"testserver"})
     runtime = tmp_path / "runtime.json"
     runtime.write_text(json.dumps({"paper_platform": "simulator"}), encoding="utf-8")
     gateway = fakes.FakeGateway(fakes.SYMBOLS + [BENCHMARK])
@@ -36,7 +41,7 @@ def client(monkeypatch, tmp_path):
                              broker_factory=fakes.broker_factory(gateway), port_check=lambda host, port: True,
                              listings=fakes.FakeListings(fakes.SYMBOLS), fundamentals=fakes.NoFundamentals())
 
-    with TestClient(create_app(engine)) as c:
+    with TestClient(create_app(engine), headers={"X-ATB-Request": "1"}) as c:
         yield c
 
 

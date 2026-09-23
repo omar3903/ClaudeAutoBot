@@ -3,7 +3,7 @@
 
     python run.py                 # normal
     python run.py --no-browser
-    python run.py --host 0.0.0.0 --port 9000
+    python run.py --port 9000
 
 Ctrl+C doesn't walk away from open positions: in paper it closes them, resets
 the simulator and exits; in live with positions open it asks you to choose in

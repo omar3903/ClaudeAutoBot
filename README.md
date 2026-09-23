@@ -306,10 +306,13 @@ data pill shows `data: IBKR (delayed)`; hover it for the detail.
 
 ### Security of settings
 
-- The Connections endpoints only answer **this computer**: a loopback client, a
-  `localhost`/`127.0.0.1` Host header, no foreign `Origin`, and the dashboard's
-  own request header. Another website open in your browser, or a device on your
-  network when the server runs with `--host 0.0.0.0`, is refused.
+- The app only answers **this computer**. Every request needs a loopback
+  client, a `localhost`/`127.0.0.1` Host header and no foreign `Origin`; an
+  `/api/` request made by another website's page is refused, and anything that
+  changes something needs the dashboard's own request header (the Connections,
+  share-count and quit endpoints want it on reads too). So another website open
+  in your browser can't approve a play or close a position, and a device on
+  your network can't open the dashboard.
 - Only the IB Gateway settings can be written. Values are validated (no line
   breaks, ports in range), `.env` is replaced atomically with your comments and
   other lines preserved, and the account id is **never sent back** — the panel

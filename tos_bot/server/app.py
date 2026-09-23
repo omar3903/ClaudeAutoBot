@@ -1,7 +1,8 @@
 """FastAPI app: REST + a WebSocket that streams engine events to the dashboard.
 
-Endpoints that touch secrets, exit every position, fix a share count or quit
-the app are same-machine only (see :mod:`tos_bot.server.security`). Handlers
+Every request must come from the dashboard on this computer, and the endpoints
+that touch secrets, exit every position, fix a share count or quit the app check
+it again, header included (see :mod:`tos_bot.server.security`). Handlers
 that call into the engine are plain ``def``, so FastAPI runs them in its thread
 pool and a slow broker call never stalls the event loop that feeds the WebSocket.
 """
@@ -17,7 +18,7 @@ import mimetypes
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -27,7 +28,7 @@ from ..core.eventbus import BUS
 from ..data.sectors import SECTORS
 from ..engine import TradingEngine
 from ..scanner.filters import SIDES, TIMEFRAMES
-from .security import require_local
+from .security import refusal, require_local
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +93,18 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     # the snapshot and the plays are tens of KB of JSON, fetched all session: gzipped they're a fraction of
     # that. A small answer isn't worth compressing, and the WebSocket doesn't pass through here
     app.add_middleware(GZipMiddleware, minimum_size=2048)
+
+    # every request, not only the LOCAL_ONLY routes: otherwise another website open in the browser
+    # could approve a play or close a position with a plain form POST, and a rebound domain could
+    # read and drive the whole API. The refusal is returned, not raised - an HTTPException raised
+    # in a middleware isn't turned into an answer
+    @app.middleware("http")
+    async def local_only(request: Request, call_next):
+        client = request.client.host if request.client else ""
+        why = refusal(client, request.headers, request.method, request.url.path)
+        if why:
+            return JSONResponse({"detail": why}, status_code=403)
+        return await call_next(request)
 
     def eng() -> TradingEngine:
         return app.state.engine
