@@ -24,8 +24,9 @@ import math
 import re
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, TimeoutError as FutureTimeout
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -56,6 +57,17 @@ _SERVERS_BACK = {1101, 1102}
 _FARMS_OK = {2104, 2106, 2158}
 # connection chatter, not failures
 _INFO_ERRS = {2104, 2106, 2107, 2108, 2158, 2100, 2150, 202}
+# part of a stock's real-time data isn't subscribed
+_PARTIAL_DATA_ERRS = {10090, 10091}
+# a stream refused for its stock (354 / 10089 / 10167 / 10168 not subscribed, 10090 / 10091 partly, 200 no such
+# stock): the stock is quoted by snapshot instead, and only a burst of them counts against the login's data
+_STREAM_REFUSALS = {354, 10089, 10167, 10168, 200} | _PARTIAL_DATA_ERRS
+# the refusals that leave the request running - on part of the data, or on delayed data - and so holding a line
+_REFUSED_BUT_OPEN = {10167} | _PARTIAL_DATA_ERRS
+# every market-data line in use (101); a cancel of a request IBKR had already dropped (300)
+_LINES_FULL, _UNKNOWN_TICKER = 101, 300
+# what a new stream clears off a Ticker it shares with earlier requests, so none of their prices is taken for its own
+_STREAM_RESET_FIELDS = ("bid", "ask", "last", "close", "bidSize", "askSize", "lastSize", "halted")
 
 
 class _QuietDataErrors(logging.Filter):
@@ -64,7 +76,7 @@ class _QuietDataErrors(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
-        return not any(msg.startswith(f"Error {code},") for code in _DELAYED_ERRS)
+        return not any(msg.startswith(f"Error {code},") for code in _DELAYED_ERRS | _PARTIAL_DATA_ERRS)
 
 
 logging.getLogger("ib_async.wrapper").addFilter(_QuietDataErrors())
@@ -145,6 +157,18 @@ class Candles(dict):
         self.failed = set(failed)
 
 
+class _Stream:
+    """One stock's real-time stream: its contract, the Ticker ib_async keeps up to date, the request's id,
+    when it was asked for, and whether a full quote (bid, ask and a trade) has arrived since - until then the
+    Ticker may still hold nothing, or only yesterday's close, which must never pass for a price."""
+
+    __slots__ = ("contract", "ticker", "req_id", "subscribed_at", "ready")
+
+    def __init__(self, contract: Any, ticker: Any, req_id: int) -> None:
+        self.contract, self.ticker, self.req_id = contract, ticker, req_id
+        self.subscribed_at, self.ready = time.monotonic(), False
+
+
 class IbkrBroker(BrokerAdapter):
     name = "ibkr"
     # The ExitManager owns exits and sends real close orders. No native bracket
@@ -167,6 +191,20 @@ class IbkrBroker(BrokerAdapter):
     #: seconds the account's open orders may take to arrive before the request is called off - the list is
     #: then unknown, never empty
     OPEN_ORDERS_TIMEOUT_S = 10.0
+    #: real-time streams held at most, whatever the settings ask: the account has about 100 market-data lines,
+    #: and the snapshots still asked for need some of them
+    STREAM_LINES_MAX = 90
+    #: lines given back when IBKR says every one is in use (error 101)
+    STREAM_BACKOFF = 10
+    #: new streams asked for (and contracts looked up) per call: ib_async sends at most 45 messages a second,
+    #: and an order would queue behind a longer burst
+    STREAM_ADDS_PER_CALL = 20
+    #: how long a stock whose stream was refused, or that IBKR has no contract for, is quoted by snapshot instead
+    UNSTREAMABLE_S = 1800.0
+    #: this many streams refused within this many seconds is the login's data, not a stock or two: the whole app
+    #: falls back to delayed data as it would for a refused snapshot
+    STREAM_REFUSAL_BURST = 5
+    STREAM_REFUSAL_WINDOW_S = 60.0
 
     def __init__(
         self,
@@ -218,6 +256,28 @@ class IbkrBroker(BrokerAdapter):
         self._orders_lock = threading.Lock()
         self._orders_asked: Optional[Future] = None
 
+        # real-time streams (set_streams). The loop thread changes them; any thread reads them. Everything below
+        # is under _stream_lock, which is never held while waiting on the loop or calling on_tick
+        self._stream_lock = threading.Lock()
+        self._streams: Dict[str, _Stream] = {}           # symbol -> its stream
+        self._by_ticker: Dict[Any, str] = {}             # Ticker -> symbol (a Ticker hashes by identity)
+        self._stream_reqs: Dict[int, str] = {}           # request id -> symbol
+        #: the ids of streams ended lately: IBKR's late answers to them are no news
+        self._ended_reqs: Deque[int] = deque(maxlen=512)
+        self._latest: Dict[str, Tuple[Quote, float]] = {}   # symbol -> its latest streamed quote, time.monotonic()
+        #: the priority order last asked for, and how many streams may be held (lowered by error 101)
+        self._stream_order: List[str] = []
+        self._stream_cap = self.STREAM_LINES_MAX
+        #: request ids below this were sent before the last cut for error 101: their 101s are that same burst
+        self._cut_below = -1
+        self._unstreamable: Dict[str, float] = {}        # symbol -> when it may be tried again (time.monotonic)
+        self._refusals: Deque[float] = deque()           # when streams were refused lately
+        #: real-time data proven on this connection: the connect probe went through, or a recheck did
+        self._live_verified = False
+        self._tick_failed = False
+        #: called on the IB loop with the symbols whose streamed quote changed; it must only note them
+        self.on_tick: Optional[Callable[[FrozenSet[str]], None]] = None
+
     # ---- connection --------------------------------------------------- #
     @property
     def _ib(self):
@@ -245,6 +305,15 @@ class IbkrBroker(BrokerAdapter):
             raise
 
     def _do_connect(self, first: bool = False) -> None:
+        # nothing streams until this connection's data has been proven real-time (_check_data_entitlement); a
+        # new connection has all its lines, and a stock refused on the last one may be covered now
+        self._live_verified = False
+        with self._stream_lock:
+            self._stream_cap, self._cut_below = self.STREAM_LINES_MAX, -1
+            self._unstreamable.clear()
+            self._refusals.clear()
+            self._ended_reqs.clear()                  # request ids start again with the connection
+
         async def _connect(ib):
             await ib.connectAsync(self.host, self.port, clientId=self.client_id, timeout=8,
                                   readonly=self.readonly)
@@ -258,6 +327,10 @@ class IbkrBroker(BrokerAdapter):
             try:
                 self._ib.disconnectedEvent += self._on_disconnect
                 self._ib.errorEvent += self._on_error
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._ib.pendingTickersEvent += self._on_tickers
             except Exception:  # noqa: BLE001
                 pass
         if self._md_pref == "auto":
@@ -291,15 +364,18 @@ class IbkrBroker(BrokerAdapter):
         """One quick live quote at connect. Without a real-time subscription IBKR
         refuses at once, which switches to delayed data (see _on_error), so the
         dashboard's data label is right from the start."""
-        if self._md_pref != "auto" or self._data_is_delayed:
-            return
-        self._live_checked_at = time.monotonic()
-        try:
-            probe = self._contract("SPY")             # IBKR only refuses a qualified contract
-            self._session.run_coro(lambda ib: ib.reqTickersAsync(probe), timeout=4)
-            self._session.run_coro(lambda ib: _sleep(0.3), timeout=2)    # let the refusal land
-        except Exception:  # noqa: BLE001
-            pass
+        if self._md_pref == "auto" and not self._data_is_delayed:
+            self._live_checked_at = time.monotonic()
+            try:
+                probe = self._contract("SPY")             # IBKR only refuses a qualified contract
+                self._session.run_coro(lambda ib: ib.reqTickersAsync(probe), timeout=4)
+                self._session.run_coro(lambda ib: _sleep(0.3), timeout=2)    # let the refusal land
+            except Exception:  # noqa: BLE001
+                pass
+        # streams wait for this: a refused probe has switched to delayed data by now. Only real-time data
+        # streams - a chosen "frozen" or delayed type never does
+        if self._data_type == 1 and not self._data_is_delayed:
+            self._live_verified = True
 
     #: how often a login that fell back to delayed data asks for real-time data again
     LIVE_RECHECK_S = 300.0
@@ -320,6 +396,9 @@ class IbkrBroker(BrokerAdapter):
             refused = -1                                  # couldn't tell: stay on delayed data
         if refused == self._data_refusals:
             self._data_type, self._data_is_delayed, self._data_refused_code = 1, False, 0
+            self._live_verified = True
+            with self._stream_lock:
+                self._unstreamable.clear()               # stocks refused before may be covered now
             log.warning("IBKR: real-time market data is available again")
             return True
         try:
@@ -388,6 +467,12 @@ class IbkrBroker(BrokerAdapter):
             pass
 
     def _on_disconnect(self) -> None:
+        try:
+            # the streams went with the socket: forget them without a word to IBKR. ib_async forgets its side
+            # just before or just after this, depending on which end closed the socket - either is fine
+            self._drop_streams(self._ib, cancel=False)
+        except Exception:  # noqa: BLE001
+            pass
         self._connected = False
         self.down_since = self.down_since or time.monotonic()
         if self._want_connected:
@@ -462,6 +547,8 @@ class IbkrBroker(BrokerAdapter):
             return
         if errorCode in _INFO_ERRS:
             return
+        if self._stream_error(reqId, errorCode, errorString):
+            return
         if errorCode in _DELAYED_ERRS:
             self._data_refusals += 1
             self._data_refused_code = errorCode
@@ -472,12 +559,14 @@ class IbkrBroker(BrokerAdapter):
                             errorCode, errorString)
             self._data_is_delayed = True
             self._data_type = 3
+            self._live_verified = False
             try:
                 # this runs on the IB loop thread, so call directly: session.call()
                 # would wait on this same thread and time out
                 self._ib.reqMarketDataType(3)
             except Exception:  # noqa: BLE001
                 pass
+            self._drop_streams(self._ib, cancel=True)      # delayed prices never stream
             return
         if errorCode in (1100, 2110):
             if self._servers_lost_at is None:
@@ -500,6 +589,10 @@ class IbkrBroker(BrokerAdapter):
     def _servers_back(self, code: int) -> None:
         """IB Gateway reached IBKR's servers again. Runs on the loop thread, so it calls ib_async directly."""
         was_lost, self._servers_lost_at, self._servers_lost_code = self._servers_lost_at, None, 0
+        if code == 1101:
+            # IBKR dropped the market-data lines with its connection (with or without a 1100 first): forget the
+            # streams, so the next set_streams asks for them afresh. After 1102 they carry on
+            self._drop_streams(self._ib, cancel=True)
         if not self._socket_up() or (self._connected and was_lost is None):
             return
         if code == 1101:
@@ -606,22 +699,245 @@ class IbkrBroker(BrokerAdapter):
             raise AuthError("IBKR not connected")
         contract = self._contract(symbol)
 
-        async def _ticker(ib):
+        async def _quote(ib):
             tickers = await ib.reqTickersAsync(contract)
-            return tickers[0] if tickers else None
+            if not tickers:
+                raise RuntimeError(f"IBKR returned no ticker for {symbol}")
+            # read here, on the loop thread: a stream of the same stock shares the Ticker and writes to it there
+            return _quote_from_ticker(symbol, tickers[0], "snapshot")
 
-        tk = self._session.run_coro(_ticker, timeout=12)
-        if tk is None:
-            raise RuntimeError(f"IBKR returned no ticker for {symbol}")
-        last = _price(tk.last) or _price(tk.close) or _price(getattr(tk, "marketPrice", None))
-        bid, ask = _price(tk.bid), _price(tk.ask)
-        if not (last or bid or ask):
+        q = self._session.run_coro(_quote, timeout=12)
+        if q is None:
             raise RuntimeError(f"IBKR has no price for {symbol} "
                                f"({'delayed' if self._data_is_delayed else 'real-time'} data)")
-        spread = max(0.01, (last or bid or ask) * 0.0005)
-        bid = bid or round(last - spread, 2)
-        ask = ask or round(last + spread, 2)
-        return Quote(symbol=symbol, bid=bid, ask=ask, last=last or (bid + ask) / 2, volume=_price(tk.volume))
+        return q
+
+    # ---- real-time streams ------------------------------------------------ #
+    @property
+    def can_stream(self) -> bool:
+        """Streams are held only on real-time data this connection has proven - never delayed or frozen data,
+        and not before the connect probe is through."""
+        return self.is_connected and self._data_type == 1 and not self._data_is_delayed and self._live_verified
+
+    def set_streams(self, symbols: Sequence[str], limit: int) -> List[str]:
+        """Hold real-time streams for the first ``limit`` of ``symbols`` (in priority order) that can stream -
+        never more than STREAM_LINES_MAX, or than error 101 has left room for - and end the others. Returns the
+        symbols streaming now; asking for the same again sends nothing. It waits on the loop, so never call it
+        from the loop thread."""
+        if not self.is_connected:
+            return []                                 # the streams already went with the connection
+        if not self.can_stream or limit <= 0:
+            with self._stream_lock:
+                held = bool(self._streams)
+            if held:
+                try:
+                    self._session.call(lambda ib: self._drop_streams(ib, cancel=True), timeout=10)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("IBKR streams not ended: %s", e)
+            return []
+        now = time.monotonic()
+        with self._stream_lock:
+            self._unstreamable = {s: t for s, t in self._unstreamable.items() if t > now}
+            n = min(int(limit), self.STREAM_LINES_MAX, self._stream_cap)
+            wanted = [s for s in dict.fromkeys(symbols) if s and s not in self._unstreamable][:n]
+        # a stream needs a qualified contract (ib_async keys its Tickers by the contract id): look up the
+        # missing ones here, off the loop, most wanted first
+        todo = [s for s in wanted if not _qualified(self._contracts.get(s))][:self.STREAM_ADDS_PER_CALL]
+        if todo:
+            from ib_async import Stock
+
+            stocks = [Stock(s, "SMART", "USD") for s in todo]
+            try:
+                self._session.run_coro(lambda ib: ib.qualifyContractsAsync(*stocks), timeout=15)
+                answered = True
+            except Exception as e:  # noqa: BLE001
+                log.debug("IBKR contracts for streaming not found: %s", e)
+                answered = False
+            with self._stream_lock:
+                for s, stock in zip(todo, stocks):
+                    # a contract is qualified in place; ib_async answers None for one IBKR doesn't know
+                    if _qualified(stock):
+                        self._contracts[s] = stock
+                    elif answered:
+                        self._unstreamable[s] = now + self.UNSTREAMABLE_S
+        order = [s for s in wanted if _qualified(self._contracts.get(s))]
+        try:
+            return self._session.call(lambda ib: self._sync_streams(ib, order), timeout=10)
+        except Exception as e:  # noqa: BLE001
+            log.debug("IBKR streams not updated: %s", e)
+            with self._stream_lock:
+                return [s for s in order if s in self._streams]
+
+    def streamed_quote(self, symbol: str) -> Optional[Tuple[Quote, float]]:
+        """The latest streamed quote for ``symbol`` and how many seconds ago it arrived - None when it isn't
+        streaming, or the data isn't proven real-time right now."""
+        if not self.can_stream:
+            return None
+        with self._stream_lock:
+            got = self._latest.get(symbol)
+        if got is None:
+            return None
+        return got[0], max(0.0, time.monotonic() - got[1])
+
+    def _sync_streams(self, ib, order: List[str]) -> List[str]:
+        """Make the streams held match ``order``. Runs on the loop thread - the one that changes them, and the
+        one _on_error runs on, so a refusal can't land between the check below and a request."""
+        if not (self.can_stream and ib.isConnected()):
+            self._drop_streams(ib, cancel=True)
+            return []
+        with self._stream_lock:
+            self._stream_order = list(order)
+            keep = set(order)
+            gone = [s for s in self._streams if s not in keep]
+            new = [s for s in order if s not in self._streams]
+        for s in gone:
+            self._end_stream(ib, s, cancel=True)
+        added = 0
+        for s in new:
+            if added >= self.STREAM_ADDS_PER_CALL:
+                break
+            contract = self._contracts.get(s)
+            try:
+                tk = ib.ticker(contract)
+                if tk is not None:
+                    if tk in ib.wrapper.ticker2ReqId["snapshot"]:
+                        continue              # a snapshot of it is out and would land on the cleared fields: next pass
+                    if tk in ib.wrapper.ticker2ReqId["mktData"]:
+                        ib.cancelMktData(contract)      # left over: a second request on it would hold a line for good
+                    for field in _STREAM_RESET_FIELDS:
+                        setattr(tk, field, math.nan)
+                tk = ib.reqMktData(contract, "", False, False)
+                req_id = ib.wrapper.ticker2ReqId["mktData"][tk]
+            except ConnectionError:
+                break
+            except Exception as e:  # noqa: BLE001
+                log.debug("IBKR stream for %s not started: %s", s, e)
+                continue
+            with self._stream_lock:
+                self._streams[s] = _Stream(contract, tk, req_id)
+                self._by_ticker[tk] = s
+                self._stream_reqs[req_id] = s
+            added += 1
+        with self._stream_lock:
+            return [s for s in order if s in self._streams]
+
+    def _end_stream(self, ib, symbol: str, cancel: bool) -> None:
+        """Forget ``symbol``'s stream, and with ``cancel`` tell IBKR to stop it. Without, only ib_async's own
+        bookkeeping is closed - for a stream IBKR has already dropped or refused. Runs on the loop thread."""
+        with self._stream_lock:
+            st = self._streams.pop(symbol, None)
+            self._latest.pop(symbol, None)
+            if st is None:
+                return
+            self._by_ticker.pop(st.ticker, None)
+            self._stream_reqs.pop(st.req_id, None)
+            self._ended_reqs.append(st.req_id)
+        try:
+            if cancel and ib.isConnected() and st.ticker in ib.wrapper.ticker2ReqId["mktData"]:
+                ib.cancelMktData(st.contract)
+            else:
+                ib.wrapper.endTicker(st.ticker, "mktData")
+        except Exception as e:  # noqa: BLE001
+            log.debug("IBKR stream for %s not ended cleanly: %s", symbol, e)
+        # reqId2Ticker keeps the id: a late tick on an id ib_async doesn't know is logged as an error
+
+    def _drop_streams(self, ib, cancel: bool) -> None:
+        """End every stream (see _end_stream). Runs on the loop thread."""
+        with self._stream_lock:
+            symbols = list(self._streams)
+            self._stream_order = []
+        for s in symbols:
+            self._end_stream(ib, s, cancel)
+
+    def _on_tickers(self, tickers) -> None:
+        """ib_async's word that Tickers changed, on the loop thread after each packet: keep each stream's quote.
+        It only notes them - on_tick is told once the lock is let go."""
+        moved = []
+        try:
+            with self._stream_lock:
+                for tk in tickers:                    # a set ib_async replaces with every packet: never kept
+                    symbol = self._by_ticker.get(tk)
+                    st = self._streams.get(symbol) if symbol else None
+                    if st is None or st.ticker is not tk or getattr(tk, "marketDataType", 1) != 1:
+                        continue                      # not a stream, or not real-time data
+                    if getattr(tk, "halted", None) in (1, 2):
+                        self._latest.pop(symbol, None)       # a halted stock has no price to act on
+                        continue
+                    if not st.ready:
+                        # the first full quote since the request - a close alone is yesterday's price
+                        if not (_price(tk.bid) and _price(tk.ask) and _price(tk.last)):
+                            continue
+                        st.ready = True
+                    q = _quote_from_ticker(symbol, tk, "stream")
+                    if q is not None:
+                        self._latest[symbol] = (q, time.monotonic())
+                        moved.append(symbol)
+        except Exception:  # noqa: BLE001 - raised to eventkit, it would log a traceback for every packet
+            if not self._tick_failed:
+                self._tick_failed = True
+                log.exception("IBKR: a streamed price couldn't be read (later failures are not logged)")
+        listener = self.on_tick
+        if moved and listener is not None:
+            try:
+                listener(frozenset(moved))
+            except Exception:  # noqa: BLE001
+                log.debug("IBKR: the stream listener failed", exc_info=True)
+
+    def _stream_error(self, req_id: int, code: int, text: str) -> bool:
+        """IBKR's errors about the streams; True when handled here. Runs on the loop thread, from _on_error."""
+        if code not in _STREAM_REFUSALS and code not in (_LINES_FULL, _UNKNOWN_TICKER):
+            return False
+        with self._stream_lock:
+            symbol = self._stream_reqs.get(req_id)
+            ended = req_id in self._ended_reqs
+            streaming = bool(self._streams)
+        if code == _UNKNOWN_TICKER:
+            return symbol is not None or ended        # a cancel of a stream IBKR had already dropped
+        if code == _LINES_FULL:
+            if symbol is None and not ended and not streaming:
+                return False                          # not about streams: as before
+            self._lines_full(req_id, symbol)
+            return True
+        if ended:
+            return True                               # a late answer about a stream already given up
+        if symbol is None or not self._live_verified:
+            return False
+        now = time.monotonic()
+        with self._stream_lock:
+            while self._refusals and now - self._refusals[0] > self.STREAM_REFUSAL_WINDOW_S:
+                self._refusals.popleft()
+            if code != 200:                           # no such stock says nothing about the login's data
+                self._refusals.append(now)
+            if len(self._refusals) >= self.STREAM_REFUSAL_BURST:
+                return False                          # the login's data, not a stock or two: as before
+            self._unstreamable[symbol] = now + self.UNSTREAMABLE_S
+        self._end_stream(self._ib, symbol, cancel=code in _REFUSED_BUT_OPEN)
+        log.warning("IBKR: no real-time stream for %s (%s: %s) - it's quoted by snapshot for the next %d min",
+                    symbol, code, text, self.UNSTREAMABLE_S // 60)
+        return True
+
+    def _lines_full(self, req_id: int, symbol: Optional[str]) -> None:
+        """Error 101: every market-data line the account has is in use. Give STREAM_BACKOFF of the held streams
+        back from the end of the priority order - plays go, positions stay - and hold no more than that until
+        the next connection. The rest of a burst of 101s - requests sent before the cut - cuts nothing more."""
+        ib = self._ib
+        if symbol is not None:
+            self._end_stream(ib, symbol, cancel=False)    # refused: IBKR holds no line for it
+        with self._stream_lock:
+            if req_id < self._cut_below:
+                return
+            self._stream_cap = max(0, min(self._stream_cap, len(self._streams) - self.STREAM_BACKOFF))
+            keep = set([s for s in self._stream_order if s in self._streams][:self._stream_cap])
+            tail = [s for s in self._streams if s not in keep]
+            cap = self._stream_cap
+            try:
+                self._cut_below = int(ib.client._reqIdSeq)     # the id the next request will get
+            except Exception:  # noqa: BLE001
+                self._cut_below = req_id + 1
+        for s in tail:
+            self._end_stream(ib, s, cancel=True)
+        log.warning("IBKR: every market-data line is in use (error 101) - streaming at most %d stocks "
+                    "until the next connection", cap)
 
     def history_many(self, requests: Mapping[str, Tuple[str, str]],
                      con_ids: Optional[Mapping[str, int]] = None,
@@ -926,6 +1242,34 @@ def _price(value) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return v if 0 < v < 1e300 else None
+
+
+def _quote_from_ticker(symbol: str, tk: Any, source: str) -> Optional[Quote]:
+    """The quote a Ticker holds - the one reading a snapshot and a stream both go through, so the two give the
+    same price. Call it on the loop thread, where ib_async writes the Ticker: read from another thread, the
+    price could come from one packet and the spread from the next. None when there is no price to give."""
+    last = _price(tk.last) or _price(tk.close) or _price(getattr(tk, "marketPrice", None))
+    bid, ask = _price(tk.bid), _price(tk.ask)
+    if not last and not (bid and ask):
+        return None                   # no price at all, or one side of the book and no trade to make up the other
+    spread = max(0.01, (last or bid or ask) * 0.0005)
+    bid = bid or round(last - spread, 2)
+    ask = ask or round(last + spread, 2)
+    when = getattr(tk, "time", None)
+    if not isinstance(when, dt.datetime):
+        when = dt.datetime.now(dt.timezone.utc)
+    elif when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return Quote(symbol=symbol, bid=bid, ask=ask, last=last or (bid + ask) / 2, volume=_price(tk.volume),
+                 ts=when, source=source)
+
+
+def _qualified(contract: Any) -> bool:
+    """IBKR knows the contract: it carries IBKR's contract id."""
+    try:
+        return int(getattr(contract, "conId", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _norm_status(s: str) -> str:

@@ -42,6 +42,9 @@ class Quote:
     last: float
     volume: float = 0.0
     ts: datetime = field(default_factory=_utcnow)
+    #: where the broker's quote came from: "stream" or "snapshot" (empty for a price read off a candle).
+    #: Not part of its value: the same prices are the same quote wherever they came from
+    source: str = field(default="", compare=False)
 
     @property
     def mid(self) -> float:
