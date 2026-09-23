@@ -56,6 +56,10 @@ export function moversHTML(m, capture) {
   </section>`;
 }
 
+/* Whether an offered play was a day trade or a swing trade - blank for a report saved before plays carried it. */
+const TYPE = { INTRADAY: "day", SWING: "swing" };
+const typeBadge = tf => TYPE[tf] ? `<span class="badge">${TYPE[tf]}</span>` : "";
+
 function rowsHTML(rows) {
   if (!rows.length) return `<tr><td colspan="5" class="muted">None this session.</td></tr>`;
   return rows.map((r, i) => {
@@ -71,7 +75,8 @@ function rowsHTML(rows) {
         <div class="muted small nowrap">${how}</div></td>
       <td class="why"><span class="badge ${catCls}">${catLabel}</span>${r.catalyst.before_open ? ` <span class="badge">before the open</span>` : ""}
         ${NEWS.has(r.catalyst.kind) ? `<div class="small">${escapeHtml(shorten(r.catalyst.label, 120))}</div>` : ""}</td>
-      <td><span class="badge ${stCls}">${stLabel}</span> <span class="small ${tone(r.bot.r)}">${result}</span></td>
+      <td><span class="badge ${stCls}">${stLabel}</span> ${[...new Set(r.bot.plays.map(p => p.timeframe))].map(typeBadge).join(" ")}
+        <span class="small ${tone(r.bot.r)}">${result}</span></td>
       <td class="row-tools"><button class="chart-btn" data-chart="${escapeHtml(r.symbol)}" title="Charts: the session and the days around it" aria-label="Chart">📈</button></td>
     </tr>
     <tr class="mover-detail hidden" data-detail="${i}"><td colspan="5">${detailHTML(r)}</td></tr>`;
@@ -91,7 +96,7 @@ function detailHTML(r) {
       <td>${stratLabel(t.strategy)}</td><td>${etTime(t.entry_time)} → ${t.exit_time ? etTime(t.exit_time) : "still open"}</td>
       <td class="num">${num(t.entry)} → ${t.exit != null ? num(t.exit) : "–"}</td><td class="num ${tone(t.r)}">${inR(t.r)}</td><td class="num ${tone(t.pl)}">${usd(t.pl)}</td></tr>`).join("")}</table>` : "";
   const plays = b.plays.length ? `<table class="ev-table"><tr><th>Setup offered</th><th>First seen (ET)</th><th class="num">Entry / stop</th><th>Status</th><th class="num">Taken as planned</th></tr>
-    ${b.plays.map(p => `<tr><td>${stratLabel(p.strategy)} · ${escapeHtml(p.side.toLowerCase())} <span class="badge ${p.with_move ? "good" : "bad"}">${p.with_move ? "with the move" : "against it"}</span></td>
+    ${b.plays.map(p => `<tr><td>${stratLabel(p.strategy)} · ${escapeHtml(p.side.toLowerCase())} ${typeBadge(p.timeframe)} <span class="badge ${p.with_move ? "good" : "bad"}">${p.with_move ? "with the move" : "against it"}</span></td>
       <td>${etTime(p.seen_at)}</td><td class="num">${num(p.entry)} / ${num(p.stop)}</td>
       <td>${p.sent ? `<span class="badge accent">sent ${etTime(p.sent_at)}, not filled</span> <span class="muted small">${escapeHtml((p.status || "").toLowerCase())}</span>`
         : escapeHtml((p.status || "").toLowerCase())}</td>
