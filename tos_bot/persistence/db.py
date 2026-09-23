@@ -11,7 +11,7 @@ import contextlib
 import logging
 from typing import Iterator, Optional
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, literal
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -79,6 +79,9 @@ class _DB:
             existing_tables = set(insp.get_table_names())
         except Exception:  # noqa: BLE001
             return
+        dialect = self.engine.dialect
+        # quotes a name only when it needs it (an SQL keyword such as "by"), the database's own way
+        q = dialect.identifier_preparer.quote
         for table in Base.metadata.sorted_tables:
             if table.name not in existing_tables:
                 continue
@@ -86,13 +89,16 @@ class _DB:
             for col in table.columns:
                 if col.name in have:
                     continue
-                coltype = col.type.compile(dialect=self.engine.dialect)
-                default = ""
-                if col.default is not None and getattr(col.default, "is_scalar", False):
-                    val = col.default.arg
-                    default = f" DEFAULT {val!r}" if isinstance(val, str) else f" DEFAULT {val}"
-                ddl = f'ALTER TABLE {table.name} ADD COLUMN {col.name} {coltype}{default}'
                 try:
+                    coltype = col.type.compile(dialect=dialect)
+                    default = ""
+                    if col.default is not None and getattr(col.default, "is_scalar", False):
+                        # SQLAlchemy writes the value the database's way ('it''s', 1/0 or true/false),
+                        # which Python's repr() doesn't; one it can't write is logged below, not fatal
+                        lit = literal(col.default.arg).compile(dialect=dialect,
+                                                               compile_kwargs={"literal_binds": True})
+                        default = f" DEFAULT {lit}"
+                    ddl = f"ALTER TABLE {q(table.name)} ADD COLUMN {q(col.name)} {coltype}{default}"
                     with self.engine.begin() as conn:
                         conn.exec_driver_sql(ddl)
                     log.info("migrated: %s", ddl)

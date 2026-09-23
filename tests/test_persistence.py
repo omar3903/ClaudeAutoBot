@@ -114,3 +114,35 @@ def test_day_trade_counter(repo):
         tid = repo.open_trade(p, 100.0, 1, "paper")
         repo.close_trade(tid, 101.0, "target")
     assert repo.count_day_trades(5) >= 2
+
+
+def test_the_startup_migration_quotes_names_and_writes_defaults_the_databases_way(tmp_path, monkeypatch):
+    """An older database missing a column gets it at start-up with its default in place, even when the
+    name is an SQL keyword and the default holds both kinds of quote."""
+    import types
+
+    import sqlalchemy as sa
+
+    from tos_bot.persistence import db as dbmod
+
+    now = sa.MetaData()                              # the table as the models describe it today
+    sa.Table("group", now, sa.Column("id", sa.Integer, primary_key=True),
+             sa.Column("order", sa.String(16), default='it\'s "ok"'),
+             sa.Column("done", sa.Boolean, default=True))
+    older = sa.MetaData()                            # the same table in a database made before those columns
+    sa.Table("group", older, sa.Column("id", sa.Integer, primary_key=True))
+    eng = sa.create_engine("sqlite:///" + (tmp_path / "older.sqlite").as_posix())
+    older.create_all(eng)
+
+    monkeypatch.setattr(dbmod, "Base", types.SimpleNamespace(metadata=now))
+    db = dbmod._DB()
+    db.engine = eng
+    db._add_missing_columns()
+
+    live = sa.Table("group", sa.MetaData(), autoload_with=eng)
+    assert set(live.columns.keys()) == {"id", "order", "done"}
+    with eng.begin() as conn:                        # read back from the file, the table has no Python-side
+        conn.execute(sa.insert(live).values(id=1))   # defaults: the database fills them in
+        row = conn.execute(sa.select(live)).one()
+    assert row._asdict() == {"id": 1, "order": 'it\'s "ok"', "done": True}
+    eng.dispose()
