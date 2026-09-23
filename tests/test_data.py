@@ -65,7 +65,7 @@ def _plant_outside(tmp_path):
 def test_only_a_stock_symbol_names_a_candle_file(tmp_path):
     store = DailyBarStore(tmp_path / "store")
     assert store._path("AAA") == tmp_path / "store" / "AAA.pkl"
-    assert store._path("BRK B") == tmp_path / "store" / "BRK_B.pkl"
+    assert store._path("BBB B") == tmp_path / "store" / "BBB_B.pkl"
     for name in _plant_outside(tmp_path):
         assert store.frame(name) is None, name
 
@@ -90,8 +90,8 @@ def test_the_replay_candle_store_only_names_files_after_stock_symbols(tmp_path):
     for name in (str(tmp_path / "YY"), "../YY", "QQ/YY"):
         history._write(name, frame)                                  # no error to stop the download loop
     assert not list(tmp_path.rglob("YY.*"))
-    history._write("BRK B", frame)
-    assert (tmp_path / "store" / "BRK_B.pkl").exists() and history.stored("BRK B").equals(frame)
+    history._write("BBB B", frame)
+    assert (tmp_path / "store" / "BBB_B.pkl").exists() and history.stored("BBB B").equals(frame)
 
 
 # ---------------------------------------------------------------- prices

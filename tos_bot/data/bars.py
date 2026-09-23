@@ -28,14 +28,14 @@ log = logging.getLogger(__name__)
 FULL_HISTORY = "1 Y"
 KEEP_SESSIONS = 300           # enough for a 200-day average and a 52-week range
 _FRAMES_IN_MEMORY = 800       # the hot list, the buffers and the swing leaders
-#: a stock symbol as IBKR writes it ("AAPL", "BRK B"). Only these name a candle file: a symbol can
+#: a stock symbol as IBKR writes it ("AAA", "BBB B"). Only these name a candle file: a symbol can
 #: come from outside data (an insider filing), and one holding a drive letter or backslashes would
 #: point the read at a file elsewhere - and reading a pickle runs whatever code it carries.
 _SYMBOL = re.compile(r"[A-Z0-9]{1,6}( [A-Z0-9]{1,3})?")
 
 
 def symbol_path(directory: Path, symbol: str, suffix: str) -> Path:
-    """The file in ``directory`` named after ``symbol`` ("BRK B" -> BRK_B.pkl). Raises ValueError
+    """The file in ``directory`` named after ``symbol`` ("BBB B" -> BBB_B.pkl). Raises ValueError
     for anything that isn't a stock symbol, so it gets no file. The check is on the text alone:
     resolving the path to compare folders would itself open a network path on Windows."""
     if not isinstance(symbol, str) or not _SYMBOL.fullmatch(symbol):
