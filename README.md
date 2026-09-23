@@ -317,8 +317,10 @@ data pill shows `data: IBKR (delayed)`; hover it for the detail.
   website can show the dashboard inside a frame either, so a hidden page can't
   line your clicks up with its buttons.
 - Only the IB Gateway settings can be written. Values are validated (no line
-  breaks, ports in range), `.env` is replaced atomically with your comments and
-  other lines preserved, and the account id is **never sent back** — the panel
+  breaks or hidden characters, no `$`, ports in range), `.env` is read without
+  expanding `${...}` so one setting can't show another's value, it is replaced
+  atomically with your comments and other lines preserved, and the account id
+  is **never sent back** — the panel
   and the live feed only show that it's set and its last four characters.
   `.env` is git-ignored.
 

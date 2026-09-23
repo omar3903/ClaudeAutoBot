@@ -1,7 +1,9 @@
 """Read and update the machine-local ``.env`` from the dashboard.
 
 Only a fixed allow-list - the IB Gateway settings and the signals' news key - can be written. Values are
-validated (no line breaks, so nothing can smuggle extra lines into the file),
+validated (no line breaks or other hidden characters, so nothing can smuggle
+extra lines into the file, and no ``$``), the file is read without ``${VAR}``
+expansion, so one setting can't show another's value,
 the file is replaced atomically with comments and unrelated lines preserved,
 and secret values are never sent back to the browser - only whether they're
 set and their last four characters.
@@ -11,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -61,7 +64,9 @@ _MARKER = "# ---- saved from the AutoTradeBot dashboard ----"
 def read_env(path: Path = ENV_PATH) -> Dict[str, str]:
     if not path.exists():
         return {}
-    return {k: (v or "") for k, v in dotenv_values(path).items()}
+    # no ${VAR} expansion: a value written as "${FINNHUB_API_KEY}" in a shown
+    # field would otherwise come back to the browser as the secret itself
+    return {k: (v or "") for k, v in dotenv_values(path, interpolate=False).items()}
 
 
 def describe(path: Path = ENV_PATH, fields: Tuple[EnvField, ...] = FIELDS) -> List[Dict[str, Any]]:
@@ -96,8 +101,14 @@ def validate(updates: Mapping[str, Any]) -> Dict[str, str]:
         if raw is None:
             continue
         v = ("1" if raw else "0") if isinstance(raw, bool) else str(raw).strip()
-        if any(c in v for c in "\r\n\x00"):
-            raise ValueError(f"{f.label}: line breaks aren't allowed")
+        # any space but a plain one, and any control or invisible format character:
+        # besides \r and \n, Python splits lines on \x0b, \x85, U+2028 and others,
+        # and a pasted key can carry a zero-width character nobody can see
+        if any(c != " " and (c.isspace() or unicodedata.category(c).startswith("C")) for c in v):
+            raise ValueError(f"{f.label}: line breaks and hidden characters aren't allowed")
+        # python-dotenv expands ${VAR}, and none of these settings ever needs a $
+        if "$" in v:
+            raise ValueError(f"{f.label}: $ isn't allowed")
         if len(v) > _MAX_LEN:
             raise ValueError(f"{f.label}: too long")
         clean[key] = _check(f, v) if v else v
@@ -129,7 +140,12 @@ def write(updates: Mapping[str, Any], path: Path = ENV_PATH) -> List[str]:
     if not clean:
         return []
     before = read_env(path)
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    # split on \n only, as python-dotenv does (read_text already turns \r\n into \n):
+    # splitlines() would also break a quoted value at \x0b, \x85 or U+2028 and
+    # write the pieces back as lines of their own
+    lines = path.read_text(encoding="utf-8").split("\n") if path.exists() else [""]
+    if lines[-1] == "":                       # the final newline, not a blank line
+        lines.pop()
 
     out: List[str] = []
     done = set()
