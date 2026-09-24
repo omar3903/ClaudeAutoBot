@@ -366,23 +366,25 @@ def test_an_exit_a_tick_pass_sends_writes_the_excursions_first_as_a_full_pass_wo
         assert {k: round(repo._t["t1"][k], 6) for k in want} == want, reason
 
 
-def test_a_quote_printed_before_the_entry_filled_marks_no_excursion():
+def test_a_quote_printed_before_the_entry_filled_is_skipped_whole():
     # the first pass after a fill can get the last print from before it (the quote cache, a snapshot's Ticker): a
-    # best point the trade never saw. It marks nothing, on a full pass or a tick; the next quote from the trade's
-    # life marks as before
+    # price the trade never saw. Nothing is read off it - not the excursions, not the stop or target, not the
+    # ratchet - on a full pass or a tick; the next quote from the trade's life is handled as before
     filled = dt.datetime(2026, 9, 3, 13, 40, 30, tzinfo=dt.timezone.utc)
     before, after = filled - dt.timedelta(seconds=20), filled + dt.timedelta(seconds=5)
-    for first in ("full", "tick"):
-        trade = _trade(entry_time=filled.replace(tzinfo=None).isoformat())          # the record keeps naive UTC
-        prices = {"AAA": (101.8, before)}                                            # +0.9R, printed before the fill
-        em, repo, ex, events, _ = _ticking([trade], prices)
-        em.run_once() if first == "full" else em.run_once(only={"AAA"})
-        assert repo.writes == [], first
-        prices["AAA"] = (100.5, after)
-        em.run_once()
-        [(_, wrote)] = repo.writes
-        assert (wrote["hwm_price"], wrote["mfe"], wrote["mae"]) == (100.5, 0.5, 0.0), first
-        assert ex.closed == [] and events == []
+    for stale in (103.0, 97.5):                 # +1.5R would move the stop to break-even; under the stop would exit
+        for first in ("full", "tick"):
+            trade = _trade(entry_time=filled.replace(tzinfo=None).isoformat())      # the record keeps naive UTC
+            prices = {"AAA": (stale, before)}
+            em, repo, ex, events, _ = _ticking([trade], prices)
+            em.run_once() if first == "full" else em.run_once(only={"AAA"})
+            assert repo.writes == [] and ex.closed == [] and events == [], (stale, first)
+            assert repo._t["t1"]["stop_price"] == 98.0, (stale, first)
+            prices["AAA"] = (100.5, after)
+            em.run_once()
+            [(_, wrote)] = repo.writes
+            assert (wrote["hwm_price"], wrote["mfe"], wrote["mae"]) == (100.5, 0.5, 0.0), (stale, first)
+            assert ex.closed == [] and events == []
     # a quote from the very second of the fill is the trade's; one that doesn't say when it was printed counts
     for quote_fn in (lambda s: Quote(symbol=s, bid=101.0, ask=101.0, last=101.0, ts=filled),
                      lambda s: SimpleNamespace(last=101.0, mid=101.0)):

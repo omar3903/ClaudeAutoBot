@@ -1,10 +1,10 @@
 """Automatic exit strategy - runs on every sync tick with no manual input.
 
 For each OPEN trade it:
-  1. marks the position to the current quote and records MAE / MFE - on a quote printed
-     since the entry filled: the first pass after a fill can still get the last print from
-     before it, a price the trade never saw. The exit fill joins them when the trade closes
-     (Repository.close_trade);
+  1. marks the position to the current quote and records MAE / MFE. A quote printed before
+     the entry filled is skipped whole - the first pass after a fill can still get the last
+     print from before it, a price the trade never saw - and the exit fill joins the
+     excursions when the trade closes (Repository.close_trade);
   2. closes it at the working stop (cut losses) or target (take profit) - or, at the
      first target of a play that has a second, takes ``scale_out_pct`` of it off, moves
      the stop to break-even and lets the rest run to the second target (Aziz: sell
@@ -241,6 +241,13 @@ class ExitManager:
         px, at = self._quote(sym)
         if px is None:
             return None
+        if not _since_entry(at, t.get("entry_time")):
+            # a quote printed before the entry filled is a price the trade never saw - the first pass after a fill
+            # can still get the last print from before it, from the quote cache or a snapshot's Ticker. Nothing is
+            # read off it: not the excursions, not the stop or target, not the ratchet. The next quote is the trade's
+            log.debug("exit manager: %s quote of %s is from before the entry at %s - skipped",
+                      sym, at, t.get("entry_time"))
+            return None
 
         sign = 1.0 if side == "LONG" else -1.0
         init_stop = t.get("initial_stop_price") or t.get("stop_price")
@@ -253,15 +260,11 @@ class ExitManager:
         # a tick pass keeps the low and high it saw in memory; the next full pass (or the tick pass that sends an
         # exit) folds them in and writes the record, only when something changed - not a database write per
         # position every second
-        # a quote printed before the entry filled is a price the trade never saw - the first pass after a fill can
-        # still get the last print from before it, from the quote cache or a snapshot's Ticker - so it marks
-        # nothing: the entry, which the trade did see, stands in for it. The exit checks and the ratchet below
-        # read the quote as before. The exit fill joins the excursions when the trade closes (Repository.close_trade)
-        mark = px if _since_entry(at, t.get("entry_time")) else entry
-        fav = max(0.0, (mark - entry) * sign)
-        adv = max(0.0, (entry - mark) * sign)
-        low, high = self._extreme.pop(t["id"], (mark, mark))
-        low, high = min(low, mark), max(high, mark)
+        # (the exit fill joins the excursions when the trade closes: Repository.close_trade)
+        fav = max(0.0, (px - entry) * sign)
+        adv = max(0.0, (entry - px) * sign)
+        low, high = self._extreme.pop(t["id"], (px, px))
+        low, high = min(low, px), max(high, px)
         best, worst = (high, low) if side == "LONG" else (low, high)
         mfe = max(float(t.get("mfe") or 0.0), fav, (best - entry) * sign)
         mae = max(float(t.get("mae") or 0.0), adv, (entry - worst) * sign)
@@ -411,7 +414,7 @@ class ExitManager:
 
 def _since_entry(at: Optional[dt.datetime], entry_time: Any) -> bool:
     """Whether a quote printed at ``at`` is from the trade's life - at or after its entry fill. A quote with no
-    usable time, or a trade with no entry time, counts."""
+    usable time, or a trade with no entry time, counts - a trade is never left unmanaged for want of a time."""
     if at is None or not entry_time:
         return True
     try:
