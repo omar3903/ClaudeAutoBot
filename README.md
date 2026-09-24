@@ -299,6 +299,16 @@ still serves historical candles, so scans run on IBKR's candles, and prices for
 stops, targets and simulator fills come from the latest one-minute candle. The
 data pill shows `data: IBKR (delayed)`; hover it for the detail.
 
+**Real-time streams.** Once the connection has proven real-time data, the app
+holds IBKR streams for the stocks that matter most: the open positions and
+working entries first, then the plays still on offer - the ones you opened in
+the detail panel in the last 5 minutes, then the ones Autopilot would take, then
+the best of the rest (a play keeps its stream at least a minute) - up to
+`execution.stream_lines` (60 of the account's ~100 market-data lines; 0 = none).
+A stock whose stream ticked in the last 2 seconds is priced off it; a quieter
+one, or one past the budget, gets a one-off snapshot as before - an entry never
+waits for a stream. Delayed data never streams.
+
 > The app manages exits itself (it doesn't attach a native OCO bracket at IBKR,
 > so two exit managers never fight over one position). That means **no stop is
 > resting at IBKR if the app isn't running** — keep it running while positions
@@ -675,7 +685,8 @@ play was judged on is gone and the entry is refused. Within that, a limit entry
 is priced off the quote so it fills now instead of waiting for the price to come
 back through the entry — which is the move failing. A day-trade entry still
 working after `execution.entry_timeout_min` (10) minutes is cancelled for the
-same reason; swing entries keep their DAY life.
+same reason; swing entries keep their DAY life. The log says which quote each
+check read (a stream's, a snapshot or a candle) and how old it was.
 
 **Part fills get their stop.** Until an entry order is done, the shares it has
 bought have no trade record, so no stop at the broker. An entry (day or swing)
@@ -804,6 +815,12 @@ held on the active platform — **entries need your click, exits never do**:
 The stop only ever ratchets in your favour and never through the last price. R
 is measured against the **original** stop. Each open position has an **Auto
 exit** toggle in the blotter if you want to hand-manage it.
+
+In regular hours a streamed tick on a stock held (see **Real-time streams**)
+runs its stop and target checks, and moves its stop, within about a second. The
+note on the record and the message about a moved stop wait for the next full
+pass a few seconds later (or the exit, if one goes out first), and so do the time
+exits.
 
 Every strategy also declares how long its trade *should* take. The blotter shows
 an **Age / Expected** bar per position (green → amber **aging** → red **⏰
@@ -1038,7 +1055,9 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
   (the exit manager's, Refresh's or an open panel's), otherwise the broker's mark, which IBKR updates only
   every few minutes. Prices fetched to be shown include pre-market and after-hours trades and are kept apart:
   the exits and the entry checks read regular-hours prices only. `GET /api/price/{symbol}` gives one stock's
-  latest price with its time and session, asking IBKR at most every 15 s per stock.
+  latest price with its time and session, asking IBKR at most every 15 s per stock. While a stock streams
+  (see **Real-time streams**) its Price, Mark, Unrealized, R now, the header's Unrealized and its Market price
+  in any panel follow each move in place, at most once a second (`prices.tick`).
 * **Market price** (every panel about a stock) — a play's detail panel (with how far it is past the entry in
   R until the play is sent) and its chart, the stock on the Signals page, an open trade's record, an exit's
   confirmation ("Last trade"), a mover's chart (the price now) and a pair's chart (both legs) show the latest

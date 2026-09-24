@@ -155,6 +155,9 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
 
     @app.post("/api/plays/{play_id}/assess")
     def assess(play_id: str):
+        # the play on the screen streams first, so its Execute click is priced off the stream - here and not in
+        # assess_play, which Autopilot calls for every play it looks at
+        eng().watch_play(play_id)
         return eng().assess_play(play_id)
 
     @app.post("/api/plays/{play_id}/approve")

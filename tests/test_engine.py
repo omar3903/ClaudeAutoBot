@@ -1624,6 +1624,279 @@ def test_a_stocks_price_says_when_its_from_and_the_session_it_traded_in(engine, 
     assert asked[-1] == 1234                                                    # the stock's contract when it's known
 
 
+def test_the_streams_go_to_the_positions_first_then_the_plays_still_on_offer(engine, monkeypatch):
+    from tos_bot.core.enums import PlayStatus
+
+    gateway = fakes.StreamingGateway(fakes.SYMBOLS)
+    gateway.connect()
+    engine.md.attach(gateway)
+    _open(engine, "T01")                                                        # a trade on this venue
+    working = {"order_id": "o1", "play_id": "p1", "symbol": "T05", "strategy": "vwap_reclaim",
+               "timeframe": "SWING", "qty": 1, "notional": 100.0, "risk": 5.0}
+    monkeypatch.setattr(engine, "working_entries", lambda: [working])         # an entry not filled yet
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="T02", quantity=10, avg_price=50.0, market_price=50.0)]
+    offered, taken, held = _play("T03"), _play("T04"), _play("T01")
+    offered.score, taken.score, held.score = 0.5, 0.9, 0.4
+    engine.board.replace([offered, taken, held], None)
+    taken.status = PlayStatus.ACCEPTED
+    assert engine._stream_wanted() == (["T01", "T05", "T02"], ["T03", "T01"])
+
+    execution = engine.settings.config.execution
+    monkeypatch.setattr(execution, "stream_lines", 3)
+    assert engine._resync_streams() == ["T01", "T05", "T02"]                   # the positions take every line
+    monkeypatch.setattr(execution, "stream_lines", 5)
+    assert engine._resync_streams() == ["T01", "T05", "T02", "T03"]            # T01 counts once
+
+    gateway.tick("T02", 55.0)
+    assert engine._marks()["T02"][0] == 55.0                                    # the position's mark is the stream's
+    [pos] = engine.snapshot()["positions"]
+    assert pos["unrealized_pl"] == round((55.0 - 50.0) * 10, 2)
+
+    monkeypatch.setattr(execution, "stream_lines", 0)
+    monkeypatch.setattr(engine, "_stream_wanted", lambda: pytest.fail("nothing is looked up with the streams off"))
+    assert engine._resync_streams() == [] and gateway.streams == []
+
+
+def test_new_plays_and_an_approval_wake_the_stream_loop_and_stopping_ends_it(engine, monkeypatch):
+    engine._stream_wake.clear()
+    engine._publish_plays()
+    assert engine._stream_wake.is_set()
+
+    p = _play("T06")
+    engine.board.replace([p])
+    monkeypatch.setattr(engine, "assess_play",
+                        lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
+    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen: None)
+    monkeypatch.setattr(engine.executor, "execute_play", lambda p, account, **kw: {"ok": True, "status": "SUBMITTED"})
+    engine._stream_wake.clear()
+    assert engine.approve_play(p.id)["ok"] and engine._stream_wake.is_set()   # its stock streams from the next pass
+
+    loop = threading.Thread(target=engine._stream_loop, daemon=True)
+    loop.start()
+    engine.stop()
+    loop.join(2.0)
+    assert not loop.is_alive()
+
+
+def test_an_entry_is_priced_off_a_fresh_stream_else_a_snapshot_and_the_log_says_which(engine, monkeypatch, caplog):
+    import logging
+
+    gateway = fakes.StreamingGateway(fakes.SYMBOLS, delayed=True)
+    gateway.connect()
+    engine.md.attach(gateway)
+    p = _play("T01")                                                        # entry 100, stop 95: 1R is 5
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    seen = {}
+    engine._chase_check(p, plan, seen)                                      # delayed data: a candle, as before
+    assert (seen["quote_source"], seen["live"], gateway.snapshots) == ("candle", False, 0)
+
+    gateway.delayed = False
+    assert engine.md.streams.sync(["T01"], [], 5) == ["T01"]
+    gateway.tick("T01", 100.5, age_s=0.5)
+    seen = {}
+    with caplog.at_level(logging.INFO, logger="tos_bot.engine.engine"):
+        assert engine._chase_check(p, plan, seen) is None
+    assert plan["limit_price"] == 100.55 and gateway.snapshots == 0         # priced off the stream: no round trip
+    assert seen["quote_source"] == "stream" and seen["live"] and 500 <= seen["quote_age_ms"] < 2000
+    assert "entry check for T01 on a stream quote" in caplog.text
+
+    # the order goes out on it: the limit, and the quote the fill is measured against, are the stream's
+    engine.board.replace([p])
+    monkeypatch.setattr(engine, "assess_play", lambda pid: {"ok": True, "can_execute": True, "reasons": [],
+                                                            "order_plan": {**plan, "limit_price": 100.05}})
+    sent = {}
+    monkeypatch.setattr(engine.executor, "execute_play",
+                        lambda play, account, **kw: sent.update(kw) or {"ok": True, "status": "SUBMITTED"})
+    gateway.tick("T01", 100.5)
+    assert engine.approve_play(p.id)["ok"]
+    assert sent["plan"]["limit_price"] == 100.55 and sent["decision"]["quote_source"] == "stream"
+    assert gateway.snapshots == 0
+
+    gateway.tick("T01", 100.5, age_s=2.5)                                   # quiet for over 2 s: never waited on
+    seen = {}
+    engine._chase_check(p, plan, seen)
+    assert seen["quote_source"] == "snapshot" and gateway.snapshots == 1
+
+
+def test_the_play_opened_on_the_dashboard_streams_first_but_one_autopilot_assesses_doesnt(engine, monkeypatch):
+    from fastapi.testclient import TestClient
+    from tos_bot.core.enums import PlayStatus
+    from tos_bot.server import security
+    from tos_bot.server.app import create_app
+
+    gateway = fakes.StreamingGateway(fakes.SYMBOLS)
+    gateway.connect()
+    engine.md.attach(gateway)
+    monkeypatch.setattr(engine.settings.config.execution, "stream_lines", 2)
+    best, next_, last, taken = _play("T03"), _play("T04"), _play("T05"), _play("T06")
+    best.score, next_.score, last.score, taken.score = 0.9, 0.5, 0.3, 0.1
+    engine.board.replace([best, next_, last, taken], None)
+    taken.status = PlayStatus.ACCEPTED
+    assert engine._resync_streams() == ["T03", "T04"]
+
+    engine._stream_wake.clear()
+    engine.assess_play(last.id)                                             # how Autopilot looks at a play
+    engine.watch_play(taken.id)                                             # a play already sent isn't on offer
+    assert engine.md.streams.preferred() == [] and not engine._stream_wake.is_set()
+    assert engine._resync_streams() == ["T03", "T04"]
+
+    monkeypatch.setattr(security, "ALLOWED_CLIENTS", security.ALLOWED_CLIENTS | {"testclient"})
+    monkeypatch.setattr(security, "ALLOWED_HOSTS", security.ALLOWED_HOSTS | {"testserver"})
+    app = create_app(lambda settings: None)
+    app.state.engine = engine
+    client = TestClient(app, headers={"X-ATB-Request": "1"})
+    assert client.post(f"/api/plays/{last.id}/assess").status_code == 200   # the operator opens it
+    assert engine.md.streams.preferred() == ["T05"] and engine._stream_wake.is_set()
+    assert engine._resync_streams() == ["T05", "T03"]                       # ahead of plays streaming under a minute
+
+
+def test_the_plays_autopilot_would_take_stream_ahead_of_the_rest_while_on_offer(engine, monkeypatch):
+    from tos_bot.core.enums import PlayStatus
+
+    gateway = fakes.StreamingGateway(fakes.SYMBOLS)
+    gateway.connect()
+    engine.md.attach(gateway)
+    monkeypatch.setattr(engine.settings.config.execution, "stream_lines", 2)
+    plays = [_play(s) for s in ("T03", "T04", "T05", "T06")]
+    for p, score in zip(plays, (0.9, 0.7, 0.5, 0.3)):
+        p.score = score
+    engine.board.replace(plays, None)
+    verdicts = {"T05": {"eligible": True, "acted": False},                  # Autopilot would take T05...
+                "T06": {"eligible": True, "acted": True}}                   # ...and has tried T06 already
+    monkeypatch.setattr(engine.autopilot, "decorate_play",
+                        lambda row, play=None: {**row, "autopilot": verdicts.get(row["symbol"], {"eligible": False})})
+    engine._publish_plays()
+    assert engine._ap_candidates == ("T05",)
+    assert engine._resync_streams() == ["T05", "T03"]
+
+    plays[2].status = PlayStatus.ACCEPTED                                   # sent since: no longer a play on offer
+    assert engine._resync_streams() == ["T03", "T04"]
+
+
+def _streaming_position(engine, symbol="T01"):
+    """A position here whose stock streams, next to a play's stock (T03) that streams too."""
+    gateway = fakes.StreamingGateway(fakes.SYMBOLS)
+    gateway.connect()
+    engine.md.attach(gateway)
+    tid = _open(engine, symbol)
+    assert engine.md.streams.sync([symbol], ["T03"], 5) == [symbol, "T03"]
+    return gateway, tid
+
+
+def test_a_tick_wakes_the_exits_only_for_a_stock_held_and_only_in_regular_hours(engine):
+    gateway, _ = _streaming_position(engine)
+    engine.exit_manager.watched = frozenset({"T01"})                  # what the last full pass managed
+    engine._tick_exits_on = True
+    gateway.tick("T03", 50.0)                                           # a play's stock: not the exits' business
+    assert not engine._exit_wake.is_set() and engine._take_ticked() == frozenset()
+    gateway.tick("T01", 101.0)
+    assert engine._exit_wake.is_set() and engine._take_ticked() == frozenset({"T01"})
+    engine._exit_wake.clear()
+    engine._tick_exits_on = False                                       # outside regular hours
+    gateway.tick("T01", 101.5)
+    assert not engine._exit_wake.is_set() and engine._take_ticked() == frozenset()
+
+
+def test_a_tick_pass_comes_a_second_after_the_last_exits_at_the_soonest_and_asks_for_no_snapshot(engine):
+    from tos_bot.engine.engine import tick_exit_wait
+
+    wait, go = tick_exit_wait(now=10.3, last_exit=10.0, deadline=14.0, gap=1.0)
+    assert go and abs(wait - 0.7) < 1e-9                                # 0.3 s after the last pass: 0.7 s more
+    assert tick_exit_wait(now=11.5, last_exit=10.0, deadline=14.0, gap=1.0) == (0.0, True)
+    wait, go = tick_exit_wait(now=13.2, last_exit=13.0, deadline=14.0, gap=1.0)
+    assert not go and abs(wait - 0.8) < 1e-9                            # the full pass is due first: wait for it
+
+    gateway, tid = _streaming_position(engine)
+    gateway.tick("T01", 107.0)                                          # +1.4R: the stop goes to break-even and a bit
+    engine._run_exits(only=frozenset({"T01"}))
+    t = engine.repo.get_trade(tid)
+    assert t["stop_price"] == 101.55 and "stop->" not in (t["notes"] or "")
+    assert gateway.snapshots == 0                                       # priced off the stream
+
+
+def test_the_sync_loop_runs_the_exits_on_a_tick_between_its_full_passes_and_stops_promptly(engine, monkeypatch):
+    from tos_bot.engine import engine as module
+
+    passes, session = [], {"now": clock.Session.REGULAR}
+    monkeypatch.setattr(engine, "_sync_orders", lambda: None)
+    monkeypatch.setattr(engine, "_check_quit_progress", lambda: None)
+    monkeypatch.setattr(engine, "_run_exits", lambda only=None: passes.append((only, time.monotonic())))
+    monkeypatch.setattr(module.clock, "current_session", lambda ts=None: session["now"])
+    monkeypatch.setattr(engine, "SYNC_S", 0.6)
+    monkeypatch.setattr(engine, "EXIT_TICK_GAP_S", 0.2)
+    engine.exit_manager.watched = frozenset({"T01"})
+    loop = threading.Thread(target=engine._sync_loop, daemon=True)
+    loop.start()
+    assert _until(lambda: len(passes) == 1) and engine._tick_exits_on   # a full pass, in regular hours
+    engine._on_stream_ticks(frozenset({"T01", "T03"}))
+    assert _until(lambda: len(passes) == 2)
+    (full, t0), (only, t1) = passes
+    assert full is None and only == frozenset({"T01"}) and t1 - t0 >= 0.2 - 0.02
+    assert _until(lambda: len(passes) == 3)
+    assert passes[2][0] is None and passes[2][1] - t0 >= 0.6 - 0.02      # the full pass keeps its turn
+    session["now"] = clock.Session.POST
+    monkeypatch.setattr(engine, "SYNC_S", 30.0)
+    assert _until(lambda: len(passes) == 4) and not engine._tick_exits_on
+    engine._on_stream_ticks(frozenset({"T01"}))                         # after hours the full pass reads it
+    engine.stop()
+    loop.join(2.0)                                                      # not the 30 s to the next full pass
+    assert not loop.is_alive() and [only for only, _ in passes[3:]] == [None]
+
+
+def test_a_tick_pass_comes_a_second_after_the_last_tick_pass_too_not_just_the_last_full_pass(engine, monkeypatch):
+    from tos_bot.engine import engine as module
+
+    passes = []
+    monkeypatch.setattr(engine, "_sync_orders", lambda: None)
+    monkeypatch.setattr(engine, "_check_quit_progress", lambda: None)
+    monkeypatch.setattr(engine, "_run_exits", lambda only=None: passes.append((only, time.monotonic())))
+    monkeypatch.setattr(module.clock, "current_session", lambda ts=None: clock.Session.REGULAR)
+    monkeypatch.setattr(engine, "SYNC_S", 5.0)                          # room for two tick passes before a full one
+    monkeypatch.setattr(engine, "EXIT_TICK_GAP_S", 0.4)
+    engine.exit_manager.watched = frozenset({"T01"})
+    loop = threading.Thread(target=engine._sync_loop, daemon=True)
+    loop.start()
+    assert _until(lambda: len(passes) == 1)                             # the full pass
+    engine._on_stream_ticks(frozenset({"T01"}))
+    assert _until(lambda: len(passes) == 2)                             # a tick pass, the gap after the full pass
+    engine._on_stream_ticks(frozenset({"T01"}))                         # a busy tape: another tick straight away
+    assert _until(lambda: len(passes) == 3)
+    engine.stop()
+    loop.join(2.0)
+    (full, _), (first, t1), (second, t2) = passes
+    assert full is None and first == second == frozenset({"T01"})
+    assert t2 - t1 >= 0.4 - 0.05                                        # the gap counts from the tick pass as well
+
+
+def test_the_streamed_prices_that_moved_go_to_the_dashboard_at_most_once_a_second(engine, monkeypatch):
+    from tos_bot.engine.engine import SESSION_WORDS
+
+    gateway, _ = _streaming_position(engine)
+    sent = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **payload: sent.append((topic, payload, time.monotonic())))
+    monkeypatch.setattr(engine, "PRICE_PUSH_S", 0.5)
+    loop = threading.Thread(target=engine._price_push_loop, daemon=True)
+    loop.start()
+    time.sleep(0.1)
+    assert sent == []                                                   # nothing streamed: nothing sent
+    q = gateway.tick("T01", 101.0)
+    assert _until(lambda: len(sent) == 1)
+    topic, payload, t0 = sent[0]
+    assert topic == "prices.tick" and payload == {"prices": {"T01": {
+        "price": 101.0, "at": q.ts.isoformat(), "session": SESSION_WORDS[clock.current_session(q.ts)]}}}
+    gateway.tick("T01", 101.5)
+    gateway.tick("T03", 50.0)
+    gateway.tick("T01", 102.0)
+    assert _until(lambda: len(sent) == 2)
+    prices, t1 = sent[1][1]["prices"], sent[1][2]
+    assert t1 - t0 >= 0.5 - 0.02                                        # one message a second at the most...
+    assert {s: p["price"] for s, p in prices.items()} == {"T01": 102.0, "T03": 50.0}   # ...with each stock's latest
+    engine.stop()
+    loop.join(2.0)
+    assert not loop.is_alive() and len(sent) == 2
+
+
 # ---------------------------------------------------------------- open positions on the dashboard
 def test_each_open_position_says_what_rests_at_the_broker_to_close_it(engine):
     """The Open positions tab's protection chip reads the orders the executor placed and follows

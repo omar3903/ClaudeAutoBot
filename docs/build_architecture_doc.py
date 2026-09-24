@@ -185,7 +185,7 @@ def fig_components() -> str:
 
     # engine
     s.rect(20, 185, 680, 300, "#fbfbf6", "#333", rx=6)
-    s.text(360, 203, "TradingEngine  (tos_bot/engine/engine.py + mixins)  -  one object, 7 background threads",
+    s.text(360, 203, "TradingEngine  (tos_bot/engine/engine.py + mixins)  -  one object, 9 background threads",
            11, "middle", "bold")
     s.text(360, 217, "ResearchOps · JournalOps · PairsOps · CapitalOps · QuitOps  (mixins)      "
                      "EventBus (core/eventbus.py) carries every change to the dashboard", 8.5, "middle", fill="#444")
@@ -213,7 +213,7 @@ def fig_components() -> str:
     s.text(360, 400, "shared services inside the engine", 8.5, "middle", italic=True, fill="#555")
     md = s.box(40, 408, 200, 62, "MarketData + DailyBarStore", ["data/market_data.py, data/bars.py",
                                                                "daily candles cached as data/bars/*.pkl",
-                                                               "5-min candles, quotes, pre-market"], lsize=8.5)
+                                                               "5-min candles, quotes, streams, pre-market"], lsize=8.5)
     rep = s.box(260, 408, 200, 62, "Repository  (persistence/)", ["SQLAlchemy ORM: trades, fills, plays,",
                                                                   "reviews, news, pair trades ...",
                                                                   "auto ADD COLUMN migration"], lsize=8.5)
@@ -512,7 +512,8 @@ def fig_sequence() -> str:
     msg(8, 7, "OrderResult (FILLED or WORKING)", ret=True)
     msg(7, 9, "open_trade(...)  -> trades row + fill")
     msg(7, 11, "autopilot.entered, play.decided")
-    note("from here the sync loop (every 4 s) owns the position: order sync, then the exit manager")
+    note("from here the sync loop (every 4 s, and about 1 s after a streamed tick in regular hours) owns the "
+         "position: order sync, then the exit manager")
     msg(10, 8, "get_quote(symbol)")
     msg(10, 10, "_manage(): stop? target? time? trail?")
     msg(10, 7, "close_trade(id, reason[, qty])")
@@ -531,8 +532,8 @@ def fig_sequence() -> str:
 #  Figure 5 - threads and loops
 # ----------------------------------------------------------------------------------------------
 def fig_threads(journal_s, pairs_s) -> str:
-    s = Svg(720, 470)
-    s.rect(15, 15, 690, 440, "#fbfbfb", "#333", rx=6)
+    s = Svg(720, 530)
+    s.rect(15, 15, 690, 500, "#fbfbfb", "#333", rx=6)
     s.text(360, 33, "One process:  python run.py  ->  uvicorn (asyncio main thread)  ->  create_app()  ->  "
                     "TradingEngine.start()", 10.5, "middle", "bold")
     main = s.box(30, 48, 320, 60, "Main thread - uvicorn / asyncio",
@@ -544,7 +545,8 @@ def fig_threads(journal_s, pairs_s) -> str:
     rows = [
         ("scan-loop", "every 5 s: _due_scan() -> run the scan that is due (full / gappers / cycle / fast / plays); "
                       "a scan runs on this thread"),
-        ("sync-loop", "every 4 s: executor.sync_open_orders(), exit_manager.run_once(), quit progress"),
+        ("sync-loop", "every 4 s: executor.sync_open_orders(), exit_manager.run_once(), quit progress; in regular "
+                      "hours the exits again ~1 s after a tick"),
         ("snapshot-loop", "every 30 s (10 s while day-trading): connections.refresh(), Gateway watch, "
                           "get_account(), reconcile records, publish account.snapshot"),
         ("orders-loop", "every 5 s: the list of orders working at the broker, for the dashboard"),
@@ -553,6 +555,10 @@ def fig_threads(journal_s, pairs_s) -> str:
                          "when due (+ the movers report)"),
         ("pairs-loop", f"every {pairs_s:.0f} s: refresh the pair list after a new session, watch z-scores, "
                        "manage open pairs"),
+        ("stream-loop", "every 5 s, and on a new board or order: IBKR streams on the positions, then the plays, "
+                        "within execution.stream_lines"),
+        ("price-push", "woken by a streamed tick: the prices that moved, to the dashboard as prices.tick, "
+                       "at most once a second"),
     ]
     y = 125
     s.text(30, y - 4, "Engine daemon threads (engine.start())", 9.5, weight="bold")
@@ -568,7 +574,7 @@ def fig_threads(journal_s, pairs_s) -> str:
         lsize=8.5, fill="#f3f0ff")
     s.box(370, y + 12, 320, 62, "shared state and locks", [
         "_scan_lock, _orders_lock, _quit_lock, _switch_lock (RLock);", "the board and watchlist under their "
-        "own locks; every loop", "sleeps on the one _stop Event, so stop() ends them together"], lsize=8.5)
+        "own locks; each loop sleeps", "on _stop or a wake event, and stop() sets them all"], lsize=8.5)
     return s.render("Figure 3 - Threads: everything runs in one Python process; the engine's loops are "
                     "daemon threads, the replay uses worker processes.")
 
@@ -880,7 +886,7 @@ def build() -> str:
       'and listens on a WebSocket for events.</li>'
       '<li><b>Server</b> (<code>tos_bot/server/app.py</code>): a FastAPI app whose routes are thin wrappers over '
       'engine methods; <code>/ws</code> streams the event bus.</li>'
-      '<li><b>Engine</b> (<code>tos_bot/engine/</code>): the conductor. Owns every service, runs seven daemon '
+      '<li><b>Engine</b> (<code>tos_bot/engine/</code>): the conductor. Owns every service, runs nine daemon '
       'threads, and is the only writer of the runtime state.</li>'
       '<li><b>Scanner and strategies</b> (<code>scanner/</code>, <code>strategies/</code>): turn candles into '
       'plays on a schedule.</li>'
@@ -957,10 +963,11 @@ def build() -> str:
     A('<h2>3. The runtime: process, threads and loops</h2>')
     A('<p><code>python run.py</code> builds the FastAPI app, which constructs one <code>TradingEngine</code> '
       'and calls <code>start()</code>. Start binds the broker chosen by the routing (<code>brokers/venues.py</code>: '
-      'IBKR paper, IBKR live, or the simulator on IBKR prices), reads the account once, and launches the seven '
-      'daemon threads below. Every thread sleeps on the same <code>threading.Event</code>, so <code>stop()</code> '
-      'ends them together. Ctrl+C goes through the quit rules: in paper it closes positions and exits; in live with '
-      'positions open it asks in the dashboard first.</p>')
+      'IBKR paper, IBKR live, or the simulator on IBKR prices), reads the account once, and launches the nine '
+      'daemon threads below. Every thread sleeps on the same <code>threading.Event</code>, or on a wake event '
+      'that <code>stop()</code> sets as well, so <code>stop()</code> ends them together. Ctrl+C goes through the '
+      'quit rules: in paper it closes positions and exits; in live with positions open it asks in the dashboard '
+      'first.</p>')
     A(fig_threads(journal_s, pairs_s))
     A('<h3>The scan schedule (scanner/schedule.py)</h3>')
     A(table(["Scan kind", "When", "What it reads", "What it produces"], [
@@ -1026,7 +1033,9 @@ def build() -> str:
       'where the broker supports it, a native bracket with the stop and target attached. An immediate fill opens '
       'the trade; otherwise the order is tracked and <code>sync_open_orders()</code> books the fill later.</li>'
       '<li><b>Exit.</b> The sync loop runs <code>ExitManager.run_once()</code> every 4 s on every open trade '
-      'of this venue (figure 5).</li>'
+      'of this venue (figure 5), and in regular hours <code>run_once(only=...)</code> about a second after a '
+      'streamed tick on a stock held: the stop and target checks and the stop\'s ratchet, with the note on the '
+      'record and the time exits left to the next full pass.</li>'
       '<li><b>A stop that outlives the app.</b> On IBKR the executor also keeps a good-till-cancelled stop order '
       'resting at the broker for every open trade (<code>execution/protective_stops.py</code>), made to match the '
       'trade record on every pass. It is cancelled, and the cancel confirmed, before the app sends any exit of its '
@@ -1066,7 +1075,8 @@ def build() -> str:
          "model_mode, model_min_p"),
         ("engine assessment", "session valid, PDT ok, size > 0, R:R ok, open-risk and gross-exposure ceilings",
          "risk.*, max_gross_exposure_pct"),
-        ("the last look", "at the live quote: refused when the spread is over 0.10R of the risk or the price has "
+        ("the last look", "at the live quote (a stream's when it ticked in the last 2 s, else a snapshot - the log "
+         "says which, and how old): refused when the spread is over 0.10R of the risk or the price has "
          "run 0.25R past the entry; within that the limit is priced off the quote; a day-trade entry unfilled "
          "after 10 minutes is cancelled; any entry filled in part 30 seconds ago and still working has the rest "
          "cancelled, so the shares bought get their record and stop", "execution.max_spread_r, max_chase_r, "
@@ -1306,8 +1316,8 @@ def build() -> str:
          "with its time and session (asks IBKR at most every 15 s per stock)"),
         ("/api/plays[?full=1], /api/plays/{id}, /api/plays/{id}/assess | approve | reject | chart", "GET/POST",
          "current_plays() (slim rows - what the table shows - unless full=1), play_row() (one play whole, for "
-         "the row's hover; 404 once it has left the board), assess_play(), approve_play(), reject_play(), "
-         "play_chart()"),
+         "the row's hover; 404 once it has left the board), assess_play() (after watch_play(): the play opened "
+         "streams ahead of the other plays), approve_play(), reject_play(), play_chart()"),
         ("/api/trades, /api/trades/{id}/close | managed | record, /api/trades/close-all", "GET/POST",
          "trade lists, close_position(), set_trade_managed(), trade_record(), close_all_positions()"),
         ("/api/positions/untracked/{symbol}/close", "POST", "close_untracked()"),
@@ -1337,7 +1347,8 @@ def build() -> str:
       '<code>Content-Security-Policy</code> that runs only the dashboard\'s own script files (no inline script '
       'or <code>onclick=</code>; inline styles are allowed) and lets no other site frame the page.</p>')
     A('<h3>Events on the bus (core/eventbus.py)</h3>')
-    A('<p><code>engine.started</code>, <code>account.snapshot</code>, <code>plays.updated</code>, '
+    A('<p><code>engine.started</code>, <code>account.snapshot</code>, <code>prices.tick</code> (the streamed '
+      'prices that moved, at most once a second), <code>plays.updated</code>, '
       '<code>plays.changes</code>, <code>play.decided</code>, <code>scan.started</code>, <code>scan.failed</code>, '
       '<code>watchlist.updated</code>, <code>orders.updated</code>, <code>trade.closed</code>, '
       '<code>trades.removed</code>, <code>exit.triggered</code>, <code>exit.scaled</code>, '
@@ -1355,7 +1366,7 @@ def build() -> str:
     A('<h2>9. The functions that matter most</h2>')
     A('<p>If you read only thirty things in the code, read these. Paths are relative to <code>tos_bot/</code>.</p>')
     fns = [
-        ("engine/engine.py", "TradingEngine.start()", "binds the broker, reads the account, launches the seven loops"),
+        ("engine/engine.py", "TradingEngine.start()", "binds the broker, reads the account, launches the nine loops"),
         ("engine/engine.py", "_due_scan()", "decides which scan is due (full / gappers / cycle / fast / plays)"),
         ("engine/engine.py", "_run_scan(kind)", "runs it, records the scan_runs row, replaces the board, notes changes, "
          "hands the board to Autopilot"),
@@ -1386,7 +1397,7 @@ def build() -> str:
         ("execution/executor.py", "execute_play(), close_trade(), sync_open_orders(), adopt_working_orders()",
          "orders in and out, fills booked, orders already at the broker followed after a restart"),
         ("execution/exit_manager.py", "ExitManager.run_once() -> _manage()", "stop, target, scale-out, EOD flatten, "
-         "time stop, break-even, trailing (figure 5)"),
+         "time stop, break-even, trailing (figure 5); run_once(only=...) re-checks the stocks a streamed tick moved"),
         ("execution/protective_stops.py", "_protect_positions(), _stand_down(), _watch_stops(), _book_target_fill()",
          "the stop and the target resting at IBKR for each open trade, in one one-cancels-all group: placed, moved with "
          "the record, rebuilt after the scale-out, stood down before the app's own exits, booked when they fill, swept "
@@ -1417,6 +1428,16 @@ def build() -> str:
          "position, pre-market and after-hours included, kept apart from the quotes the exits act on"),
         ("engine/engine.py", "refresh_prices(), _marks()", "Refresh prices the board and the positions; a position's "
          "mark is the app's own price when fetched in the last APP_MARK_S (120 s), else the broker's"),
+        ("data/streams.py", "StreamManager.sync(), fresh(), prefer(), take_moves()", "the line budget: IBKR streams "
+         "for at most execution.stream_lines stocks (60; 0 = none) - the positions and working entries, then the plays "
+         "the operator opened in the last 5 minutes, the plays Autopilot would take and the best of the rest; "
+         "quote() serves a stream that ticked in the last 2 s, else a snapshot as before"),
+        ("brokers/ibkr_adapter.py", "IbkrBroker.set_streams(), streamed_quote(), _on_tickers()", "the streams on the "
+         "IB loop thread: only on proven real-time data, a stock's quote kept once its bid, ask and last have all "
+         "come; a refusal of lines (101) lowers the budget, a stock IBKR won't stream is dropped"),
+        ("engine/engine.py", "_stream_loop(), _price_push_loop(), watch_play()", "points the streams at what matters "
+         "every 5 s, or at once on a new board, an order or a play opened on the dashboard; sends the streamed "
+         "prices that moved as prices.tick, at most once a second"),
         ("execution/executor.py", "expire_entries(), _on_unfilled(), on_entry_unfilled", "calls off a day entry "
          "unfilled after 10 minutes and any entry part-filled 30 s ago (the rest cancelled, the part booked); an "
          "entry that bought nothing is saved CANCELED/ERROR with why (_note -> repo.settle_play) and Autopilot is "

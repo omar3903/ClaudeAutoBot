@@ -18,9 +18,9 @@ import { initNotes } from "./notes.js";
 import { initSettings } from "./settings.js";
 import { initReports } from "./reports.js";
 import { initSignals } from "./signals.js";
-import { connect } from "./events.js";
+import { connect, initTicks } from "./events.js";
 
-[initUi, initTooltips, initTopbar, initQuit, initAutopilot, initFilters, initScan, initPlays,
+[initUi, initTooltips, initTicks, initTopbar, initQuit, initAutopilot, initFilters, initScan, initPlays,
   initBlotter, initStrategies, initSettings, initNotes, initReports, initSignals].forEach(init => init());
 // the drawers' forms are saved by their buttons: Enter in a field mustn't reload the page and lose
 // what was typed. Here rather than inline onsubmit, which the Content-Security-Policy blocks

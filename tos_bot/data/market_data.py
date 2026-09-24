@@ -19,6 +19,7 @@ import pandas as pd
 
 from ..core.models import Quote
 from .bars import DailyBarStore
+from .streams import StreamManager
 
 log = logging.getLogger(__name__)
 
@@ -87,11 +88,14 @@ class MarketData:
         self._pruned_at = 0.0
         #: the morning scan and the movers report can want the same download; the second then finds it done
         self._daily_lock = threading.Lock()
+        #: the real-time streams the source holds, when it can (streams.py) - quote() serves a fresh one
+        self.streams = StreamManager(self)
 
     # ---- the source --------------------------------------------------- #
     def attach(self, source: PriceSource) -> None:
         with self._lock:
             self._source = source
+        self.streams.reset()
 
     def detach(self) -> None:
         with self._lock:
@@ -100,6 +104,7 @@ class MarketData:
             self._quotes.clear()
             self._shown.clear()
             self._shown_asked.clear()
+        self.streams.reset()
 
     @property
     def source(self) -> PriceSource:
@@ -278,10 +283,13 @@ class MarketData:
         return out
 
     def quote(self, symbol: str) -> Quote:
-        """The broker's quote when it has real-time data, otherwise the close of
-        the latest one-minute candle."""
+        """The broker's quote when it has real-time data - its stream's latest when that came in the last
+        StreamManager.FRESH_S seconds, a snapshot otherwise - else the close of the latest one-minute candle."""
         src = self.source
         if not src.quotes_from_bars:
+            q = self.streams.fresh(symbol, src)
+            if q is not None:
+                return q                    # never kept in _quotes: the fallback below serves snapshots only
             try:
                 q = src.get_quote(symbol)
                 if q.last or q.bid or q.ask:
@@ -305,20 +313,23 @@ class MarketData:
 
     # ---- the latest price, and when it's from ---------------------------- #
     def last_seen(self, symbol: str) -> Optional[Tuple[float, dt.datetime, float]]:
-        """The newest price the app holds for ``symbol`` - its latest quote, its latest price fetched to be
-        shown or the close of its latest 5-minute candle, whichever is from later - as (price, when it's from,
-        how many seconds ago it was fetched). None when it holds none. Asks nothing of the broker. For the
-        dashboard only: it can be a pre-market or after-hours price, which nothing may act on."""
+        """The newest price the app holds for ``symbol`` - its latest quote, its latest streamed quote, its
+        latest price fetched to be shown or the close of its latest 5-minute candle, whichever is from later -
+        as (price, when it's from, how many seconds ago it was fetched). None when it holds none. Asks nothing
+        of the broker. For the dashboard only: it can be a pre-market or after-hours price, which nothing may
+        act on."""
         now, best = time.monotonic(), None
-        for hit in (self._quotes.get(symbol), self._shown.get(symbol)):
-            if hit is None:
-                continue
-            q = hit[1]
+        seen = [(hit[1], now - hit[0]) for hit in (self._quotes.get(symbol), self._shown.get(symbol))
+                if hit is not None]
+        streamed = self.streams.latest(symbol)
+        if streamed is not None:
+            seen.append(streamed)                         # its age: since the stream's last tick
+        for q, age in seen:
             price = float(q.last or q.mid or 0.0)
             at = q.ts if q.ts.tzinfo else q.ts.replace(tzinfo=dt.timezone.utc)
             # the same candle fetched twice: the later fetch, so the age says how fresh it really is
-            if price > 0 and (best is None or at > best[1] or (at == best[1] and now - hit[0] < best[2])):
-                best = (price, at, now - hit[0])
+            if price > 0 and (best is None or at > best[1] or (at == best[1] and age < best[2])):
+                best = (price, at, age)
         bars = self._intraday.get(symbol)
         if bars is not None and bars[1] is not None and len(bars[1]):
             at = _candle_time(bars[1])

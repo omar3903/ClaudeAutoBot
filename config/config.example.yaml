@@ -119,6 +119,8 @@ execution:
   limit_offset_bps: 5                  # cross the spread by this when marketable-limit
   time_in_force: "DAY"
   bracket_orders: true                # attach stop + target as an OCO child (regular hours)
+  stream_lines: 60                    # real-time streams for the positions, then the best plays; the rest of
+                                      # IBKR's ~100 market-data lines stay free for snapshots (0-90; 0 = off)
 
 exit_manager:
   # Automatic exit strategy - runs every few seconds, no manual input.

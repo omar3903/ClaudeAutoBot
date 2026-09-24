@@ -246,6 +246,26 @@ def test_refresh_shows_extended_hours_prices_but_the_quote_the_exits_read_stays_
     assert regular != pytest.approx(shown, abs=1e-4)
 
 
+def test_on_real_time_data_a_newer_price_to_show_never_reaches_the_quote_either(tmp_path):
+    import datetime as dt
+    import time
+
+    from tos_bot.data.market_data import quote_from_price
+
+    gateway, md = fakes.StreamingGateway(["AAA"]), MarketData(DailyBarStore(tmp_path))
+    gateway.connect()
+    md.attach(gateway)
+    md.streams.sync(["AAA"], [], 5)
+    streamed = gateway.tick("AAA", 10.0)
+    late = streamed.ts + dt.timedelta(minutes=5)
+    md._shown["AAA"] = (time.monotonic(), quote_from_price("AAA", 11.0, ts=late))
+    assert md.last_seen("AAA")[:2] == (11.0, late)                              # shown on the dashboard...
+    assert md.quote("AAA").last == 10.0                                         # ...the exits read the stream
+    gateway.tick("AAA", 10.0, age_s=3.0)                                        # the stream gone quiet: a snapshot
+    regular = float(fakes.intraday_bars("AAA")["close"].iloc[-1])
+    assert md.quote("AAA").last == pytest.approx(regular, abs=1e-4) and gateway.snapshots == 1
+
+
 def test_the_latest_price_is_the_newer_of_a_price_to_show_and_the_quote(tmp_path):
     import datetime as dt
     import time

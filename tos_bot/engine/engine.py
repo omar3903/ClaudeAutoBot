@@ -7,8 +7,13 @@ background loops:
     scan loop      the daily full scan before the open, the intraday cycles over
                    the hot list and sector buffers, and fast hot-list cycles while
                    Autopilot is day-trading (see scanner/schedule.py)
-    sync loop      every few seconds: fills, automatic exits, quit progress
+    sync loop      every few seconds: fills, automatic exits, quit progress - and in
+                   regular hours the exits again within a second of a streamed
+                   tick on a stock held
     snapshot loop  every 10-30 s: account, broker-vs-database check, broadcast
+    stream loop    points IBKR's real-time streams at the positions, then the plays
+    price push     the streamed prices that moved, to the dashboard at most once a
+                   second (prices.tick)
 
 Whatever the user changes on the dashboard applies straight away, is
 remembered in data/runtime.json (runtime.py) and is broadcast to every tab.
@@ -28,7 +33,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 from .. import secrets_store
 from ..brokers import get_broker
@@ -97,6 +102,15 @@ ORDERS_MAX_AGE_S = 8.0
 SESSION_WORDS = {clock.Session.PRE: "pre-market", clock.Session.REGULAR: "regular",
                  clock.Session.POST: "after-hours", clock.Session.CLOSED: "closed"}
 
+
+def tick_exit_wait(now: float, last_exit: float, deadline: float, gap: float) -> Tuple[float, bool]:
+    """Once a streamed tick wakes the sync loop: how long it waits, then whether an exits-only pass follows. That
+    comes ``gap`` after the last exit pass at the soonest, and not at all when the full pass is due by then - the
+    full pass reads every price afresh anyway, and keeps its turn (``deadline``)."""
+    ready = max(now, last_exit + gap)
+    if ready >= deadline:
+        return max(0.0, deadline - now), False
+    return ready - now, True
 
 
 class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayStateOps):
@@ -223,6 +237,19 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         # set to have the snapshot loop read the account now rather than at its next turn - after an order
         # sent from the dashboard, whose reply doesn't wait for that read
         self._snapshot_wake = threading.Event()
+        # set to have the stream loop point the streams at what changed now - a new position, a new board
+        self._stream_wake = threading.Event()
+        # the stocks of the plays Autopilot would take, as of the last board push: they stream ahead of the rest
+        self._ap_candidates: Tuple[str, ...] = ()
+        # a streamed tick on a stock the exits manage: the stocks, and the sync loop's wake (_on_stream_ticks)
+        self._exit_wake = threading.Event()
+        self._ticked: set = set()
+        self._ticked_lock = threading.Lock()
+        self._tick_exits_on = False                 # regular hours - each full pass of the sync loop sets it
+        self.md.streams.add_listener(self._on_stream_ticks)
+        # a streamed tick has the price push send the dashboard what moved (_price_push_loop)
+        self._price_wake = threading.Event()
+        self.md.streams.add_listener(lambda symbols: self._price_wake.set())
         self._reconciled_at = float("-inf")         # the loop's last position check (see _reconcile_if_due)
         self._armed = False
 
@@ -284,7 +311,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._threads = [threading.Thread(target=loop, name=name, daemon=True) for name, loop in (
             ("scan-loop", self._scan_loop), ("sync-loop", self._sync_loop), ("snapshot-loop", self._snapshot_loop),
             ("orders-loop", self._orders_loop), ("signals-loop", self._signals_loop),
-            ("journal-loop", self._journal_loop), ("pairs-loop", self._pairs_loop))]
+            ("journal-loop", self._journal_loop), ("pairs-loop", self._pairs_loop),
+            ("stream-loop", self._stream_loop), ("price-push", self._price_push_loop))]
         for t in self._threads:
             t.start()
         self._publish("engine.started", state=self.snapshot())
@@ -293,6 +321,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._stop.set()
         self._scan_wake.set()
         self._snapshot_wake.set()
+        self._stream_wake.set()
+        self._exit_wake.set()
+        self._price_wake.set()
         self._day_changed(now=True)
         self.connections.close_all()
         log.info("engine stopped")
@@ -729,23 +760,69 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._scan_wake.wait(5.0)
             self._scan_wake.clear()
 
+    #: the order sync and a full pass of the exits come this often
+    SYNC_S = 4.0
+    #: in regular hours a streamed tick on a stock held runs its exits this long after their last pass at the soonest
+    EXIT_TICK_GAP_S = 1.0
+
     def _sync_loop(self) -> None:
         steps = ((self._sync_orders, "order sync"), (self._run_exits, "automatic exits"),
                  (self._check_quit_progress, "quit progress check"))
         while not self._stop.is_set():
+            # ticks drive the exits in regular hours only; after-hours prints are read by the full pass, as before
+            self._tick_exits_on = clock.current_session() is clock.Session.REGULAR
+            self._exit_wake.clear()
+            self._take_ticked()                     # the full pass reads every price afresh
             for step, what in steps:
                 try:
                     step()
                 except Exception:  # noqa: BLE001
                     log.exception("%s failed", what)
-            self._stop.wait(4.0)
+            self._exits_on_ticks(time.monotonic())
+
+    def _exits_on_ticks(self, last_exit: float) -> None:
+        """Until the next full pass is due, run the exits on the stocks held whose streamed price moved -
+        EXIT_TICK_GAP_S apart at the most. Here on the sync thread, so an exit pass never runs beside another
+        or beside the order sync."""
+        deadline = last_exit + self.SYNC_S
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or self._stop.is_set() or not self._exit_wake.wait(left) or self._stop.is_set():
+                return                              # the full pass is due, or the engine is stopping
+            self._exit_wake.clear()
+            wait, tick_pass = tick_exit_wait(time.monotonic(), last_exit, deadline, self.EXIT_TICK_GAP_S)
+            if (wait > 0 and self._stop.wait(wait)) or not tick_pass:
+                return
+            only = self._take_ticked()
+            if only:
+                try:
+                    self._run_exits(only=only)
+                except Exception:  # noqa: BLE001
+                    log.exception("automatic exits on ticks failed")
+                last_exit = time.monotonic()
+
+    def _on_stream_ticks(self, symbols: FrozenSet[str]) -> None:
+        """StreamManager's word that ``symbols`` ticked - on the IB loop thread, so it only notes the stocks the
+        exits manage and wakes the sync loop."""
+        em = self.exit_manager
+        hit = em.watched.intersection(symbols) if em is not None and self._tick_exits_on else frozenset()
+        if hit:
+            with self._ticked_lock:
+                self._ticked |= hit
+            self._exit_wake.set()
+
+    def _take_ticked(self) -> FrozenSet[str]:
+        with self._ticked_lock:
+            hit, self._ticked = frozenset(self._ticked), set()
+        return hit
 
     def _sync_orders(self) -> None:
         if self.executor:
             self.executor.sync_open_orders()
 
-    def _run_exits(self) -> None:
-        if self.exit_manager and self.exit_manager.run_once():
+    def _run_exits(self, only: Optional[FrozenSet[str]] = None) -> None:
+        """A full pass of the exits, or with ``only`` a tick pass on just those stocks (ExitManager.run_once)."""
+        if self.exit_manager and self.exit_manager.run_once(only):
             self._refresh_account()
             self._publish("account.snapshot", state=self.snapshot())
 
@@ -791,6 +868,68 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             except Exception:  # noqa: BLE001
                 log.exception("working orders check failed")
             self._stop.wait(ORDERS_POLL_S)
+
+    #: the streams are pointed at the stocks that matter this often, and sooner when the positions or plays change
+    STREAM_RESYNC_S = 5.0
+
+    def _stream_loop(self) -> None:
+        """Keeps IBKR's real-time streams on the stocks that matter most (see data/streams.py). A thread of its
+        own: a resync waits on the Gateway, and must never hold up the exits or a scan."""
+        while not self._stop.is_set():
+            try:
+                self._resync_streams()
+            except Exception:  # noqa: BLE001
+                log.debug("stream resync failed", exc_info=True)
+            self._stream_wake.wait(self.STREAM_RESYNC_S)
+            self._stream_wake.clear()
+
+    def _resync_streams(self) -> List[str]:
+        """Stream the stocks held, then the plays on offer - the ones the operator opened and the ones
+        Autopilot would take first - within execution.stream_lines (0 = none, and every price is a snapshot
+        as before). Returns the symbols streaming now."""
+        lines = int(self.settings.config.execution.stream_lines or 0)
+        held, plays = self._stream_wanted() if lines > 0 else ([], [])
+        return self.md.streams.sync(held, plays, lines, candidates=self._ap_candidates)
+
+    def _stream_wanted(self) -> Tuple[List[str], List[str]]:
+        """The stocks to stream, most needed first: those held - this venue's open trades, the entries still
+        working, then anything else the account holds - and the stocks of the plays still on offer, best first."""
+        held = [t["symbol"] for t in self._positions_here()]
+        held += [w["symbol"] for w in self.working_entries()]
+        held += [p.symbol for p in (self._account.positions if self._account else [])]
+        try:
+            plays = [p.symbol for p in self.board.ranked() if p.status is PlayStatus.PROPOSED]
+        except Exception:  # noqa: BLE001 - ranked() reads the board without its lock, and a scan may change it then
+            plays = []                        # the positions still stream; the plays wait for the next pass
+        return list(dict.fromkeys(held)), list(dict.fromkeys(plays))
+
+    #: the dashboard is sent the streamed prices that moved at most this often
+    PRICE_PUSH_S = 1.0
+
+    def _price_push_loop(self) -> None:
+        """Sends the dashboard the streamed prices that moved (prices.tick), woken by a tick: one message with
+        each stock's latest, then PRICE_PUSH_S before the next - so a busy tape costs one message a second,
+        and nothing streaming costs none. Only shown: the exits and the entry checks read their own prices."""
+        while not self._stop.is_set():
+            self._price_wake.wait()
+            self._price_wake.clear()
+            if self._stop.is_set():
+                return
+            try:
+                self._push_prices()
+            except Exception:  # noqa: BLE001
+                log.debug("price push failed", exc_info=True)
+            self._stop.wait(self.PRICE_PUSH_S)
+
+    def _push_prices(self) -> int:
+        """One prices.tick with the streamed prices the dashboard hasn't been sent, in /api/price's words: the
+        price, when it's from and the session it traded in. Returns how many went."""
+        moved = self.md.streams.take_moves()
+        if moved:
+            self._publish("prices.tick", prices={
+                symbol: {"price": price, "at": at.isoformat(), "session": SESSION_WORDS[clock.current_session(at)]}
+                for symbol, (price, at) in moved.items()})
+        return len(moved)
 
     # ------------------------------------------------------------------ #
     #  Scans                                                             #
@@ -1056,8 +1195,15 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _publish_plays(self) -> None:
         records: Dict[str, Dict[str, Any]] = {}                # each setup's record read once for the board
-        self._publish("plays.updated",
-                      plays=[self._slim(self._decorate(p, records)) for p in self.board.ranked()[:self.BOARD_ROWS]])
+        rows = [self._slim(self._decorate(p, records)) for p in self.board.ranked()[:self.BOARD_ROWS]]
+        self._publish("plays.updated", plays=rows)
+        # the plays Autopilot would take - its badge's reading: on offer, passing its checks, not tried yet -
+        # stream ahead of the rest, so an entry it sends is priced off the stream
+        self._ap_candidates = tuple(dict.fromkeys(
+            r["symbol"] for r in rows
+            if r.get("status") == PlayStatus.PROPOSED.value and (ap := r.get("autopilot") or {}).get("eligible")
+            and not ap.get("acted")))
+        self._stream_wake.set()                                 # the streams follow the new ranking
 
     #: stocks the quick re-check looks at, best plays first
     PLAYS_REFRESH_MAX = 25
@@ -1594,6 +1740,16 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     # ------------------------------------------------------------------ #
     #  Plays and positions                                               #
     # ------------------------------------------------------------------ #
+    def watch_play(self, play_id: str) -> None:
+        """The operator opened a play (the dashboard's assess): its stock streams ahead of the other plays for
+        a while (StreamManager.prefer), so an Execute click is priced off the stream. Only the web route calls
+        it - Autopilot assesses every play it gets to, and would crowd out the one on the screen. Nothing waits
+        for the stream: until it ticks, the entry check asks for a snapshot as before."""
+        p = self.board.get(play_id)
+        if p is not None and p.status is PlayStatus.PROPOSED:
+            self.md.streams.prefer(p.symbol)
+            self._stream_wake.set()
+
     def assess_play(self, play_id: str) -> Dict[str, Any]:
         p = self.board.get(play_id)
         if p is None:
@@ -1700,6 +1856,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             # sent: the executor has saved it SUBMITTED (or the fill FILLED) - and the sync loop may already
             # have saved how it ended, which a write here would overwrite
             self._publish("play.decided", play_id=p.id, decision="approved", result=out, play=self._decorate(p))
+            self._stream_wake.set()                       # a working entry or a new position streams ahead of the plays
             if operator == "autopilot":
                 # on the scan thread: its next play, and the next pass, read the account this order changed
                 self._refresh_account()
@@ -1776,7 +1933,11 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
           pullback under the entry is not a chase.
 
         With no price source attached there is nothing to check (and no plays to take). With one
-        attached, an entry whose price can't be read is refused - an order is never sent blind."""
+        attached, an entry whose price can't be read is refused - an order is never sent blind.
+
+        The quote is quote()'s: a stream's latest when it ticked in the last 2 s, else a snapshot - an
+        entry never waits for a stream. Where it came from and how old it was are logged, and kept in
+        ``seen`` as quote_source / quote_age_ms (the trade record keeps only the mid and the spread)."""
         cfg = self.settings.config.execution
         risk = abs(float(p.entry) - float(p.stop))
         if risk <= 0 or not self.md.attached:
@@ -1795,9 +1956,14 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         bid, ask = float(q.bid or 0.0), float(q.ask or 0.0)
         spread = ask - bid if 0 < bid < ask else 0.0
         mid = (bid + ask) / 2.0 if spread else px
+        source, age_ms = _quote_origin(q)
+        log.info("entry check for %s on a %s quote %s old: last %.4f, bid %.4f, ask %.4f (%s data)", p.symbol,
+                 source, f"{age_ms} ms" if age_ms is not None else "of unknown age", px, bid, ask,
+                 "live" if live else "delayed")
         if seen is not None:
             seen.update(mid=round(mid, 4), bid=bid or None, ask=ask or None, live=live,
-                        spread_bps=round(spread / mid * 1e4, 2) if spread and mid else None)
+                        spread_bps=round(spread / mid * 1e4, 2) if spread and mid else None,
+                        quote_source=source, quote_age_ms=age_ms)
         max_spread = float(getattr(cfg, "max_spread_r", 0.0) or 0.0)
         if live and max_spread > 0 and spread / risk > max_spread:
             return (f"the spread ({bid:.2f} x {ask:.2f}) is {spread / risk:.2f}R of this trade's risk - too dear to "
@@ -2205,6 +2371,14 @@ def _utc(value: Any) -> Optional[dt.datetime]:
     if not isinstance(value, dt.datetime):
         return None
     return value.replace(tzinfo=dt.timezone.utc) if value.tzinfo is None else value.astimezone(dt.timezone.utc)
+
+
+def _quote_origin(q: Any) -> Tuple[str, Optional[int]]:
+    """Where a quote came from - "stream", "snapshot", or "candle" for a price read off a candle (Quote.source
+    empty) - and how many milliseconds old it is by its own time; None when it has no time."""
+    at = _utc(getattr(q, "ts", None))
+    age = None if at is None else max(0, round((dt.datetime.now(dt.timezone.utc) - at).total_seconds() * 1000))
+    return getattr(q, "source", "") or "candle", age
 
 
 def _order_signature(orders: List[Dict[str, Any]]) -> tuple:

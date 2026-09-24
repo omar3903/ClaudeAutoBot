@@ -5,8 +5,10 @@ Prices are a seeded random walk per symbol, so every run sees the same candles.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import functools
+import time
 import zlib
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -191,6 +193,61 @@ class FakeGateway:
 
     def get_fills(self, symbol: Optional[str] = None) -> list:
         return [f for f in self.fills if not symbol or f.symbol == symbol]
+
+
+class StreamingGateway(FakeGateway):
+    """A FakeGateway that holds real-time streams the way IbkrBroker does (set_streams, streamed_quote and
+    on_tick), with prices sent by tick(). ``snapshots`` counts the one-off quotes asked for."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.on_tick: Optional[Callable[[frozenset], None]] = None
+        self.streams: List[str] = []                        # streaming now, in the order asked
+        self.stream_calls: List[Tuple[List[str], int]] = []   # every set_streams: (symbols, limit)
+        self.refuse: set = set()                            # stocks IBKR won't stream
+        self.snapshots = 0
+        self._latest: Dict[str, Tuple[Quote, float]] = {}
+
+    @property
+    def can_stream(self) -> bool:
+        return self.connected and not self.delayed
+
+    def set_streams(self, symbols: Sequence[str], limit: int) -> List[str]:
+        self.stream_calls.append((list(symbols), limit))
+        if not self.connected:
+            return []                                       # the streams went with the connection
+        if not self.can_stream or limit <= 0:
+            self.streams, self._latest = [], {}
+            return []
+        self.streams = [s for s in dict.fromkeys(symbols) if s not in self.refuse][:limit]
+        self._latest = {s: hit for s, hit in self._latest.items() if s in self.streams}
+        return list(self.streams)
+
+    def streamed_quote(self, symbol: str) -> Optional[Tuple[Quote, float]]:
+        if not self.can_stream:
+            return None
+        hit = self._latest.get(symbol)
+        return None if hit is None else (hit[0], max(0.0, time.monotonic() - hit[1]))
+
+    def tick(self, symbol: str, price: float, age_s: float = 0.0,
+             bid: Optional[float] = None, ask: Optional[float] = None) -> Quote:
+        """A streamed trade at ``price`` for a stock that is streaming, as if it came ``age_s`` seconds ago."""
+        assert symbol in self.streams, f"{symbol} isn't streaming - set_streams first"
+        q = Quote(symbol=symbol, bid=round(price - 0.01, 2) if bid is None else bid,
+                  ask=round(price + 0.01, 2) if ask is None else ask, last=price,
+                  ts=dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=age_s), source="stream")
+        self._latest[symbol] = (q, time.monotonic() - age_s)
+        if self.on_tick is not None:
+            self.on_tick(frozenset([symbol]))
+        return q
+
+    def get_quote(self, symbol: str) -> Quote:
+        self.snapshots += 1
+        return dataclasses.replace(super().get_quote(symbol), source="snapshot")   # marked as IbkrBroker marks it
+
+    def close(self) -> None:
+        super().close()
+        self.streams, self._latest = [], {}                 # a dropped connection takes its streams along
 
 
 def broker_factory(gateway: FakeGateway) -> Callable[..., object]:

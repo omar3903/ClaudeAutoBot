@@ -3,7 +3,8 @@
 Covers the translation layer: interval -> barSize, order action (an order's
 side is its direction, exits included), order states and IBKR's rejection
 reasons, account parsing, quote NaN fallback, the delayed-data downgrade,
-bar-frame shaping, and connection state. The real Gateway path is not tested
+bar-frame shaping, connection state, and real-time streams (the lines held,
+when a stream's quote can be trusted, and IBKR's refusals). The real Gateway path is not tested
 here (it needs a running IB Gateway). Where the app's threads overlap, the real
 session's loop runs around the fake (ThreadedSession).
 """
@@ -14,6 +15,7 @@ import asyncio
 import datetime as dt
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import TimeoutError as FutureTimeout
 from types import SimpleNamespace
 
@@ -31,12 +33,63 @@ from tos_bot.execution.order_builder import build_exit_order
 # --------------------------------------------------------------------------- #
 #  fakes
 # --------------------------------------------------------------------------- #
+class FakeTicker:
+    """Like ib_async's Ticker: one per contract, shared by its stream and its snapshots, hashing by identity.
+    A price it hasn't had is NaN."""
+
+    def __init__(self, contract):
+        self.contract, self.marketDataType, self.time = contract, 1, None
+        self.bid = self.ask = self.last = self.close = self.volume = self.halted = float("nan")
+        self.bidSize = self.askSize = self.lastSize = float("nan")
+
+
+class FakeWrapper:
+    """ib_async's bookkeeping of market-data requests: a Ticker per contract, and its request ids by kind."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):                                   # what ib_async does when the socket closes
+        self.tickers, self.reqId2Ticker, self.ticker2ReqId = {}, {}, defaultdict(dict)
+
+    def startTicker(self, req_id, contract, kind):
+        tk = self.tickers.setdefault(contract.conId, FakeTicker(contract))
+        self.reqId2Ticker[req_id] = tk
+        self.ticker2ReqId[kind][tk] = req_id
+        return tk
+
+    def endTicker(self, tk, kind):
+        return self.ticker2ReqId[kind].pop(tk, 0)
+
+
+class _FakeEvent:
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def emit(self, *args):
+        for handler in self.handlers:
+            handler(*args)
+
+
 class FakeIB:
     def __init__(self):
         self._connected = False
         self.market_data_type = None
         self.placed = []
         self.history_requests = []
+        # streams: every request and cancel, by symbol, and each batch of contracts looked up
+        self.wrapper, self.client = FakeWrapper(), SimpleNamespace(_reqIdSeq=100)
+        self.pendingTickersEvent, self.errorEvent, self.disconnectedEvent = _FakeEvent(), _FakeEvent(), _FakeEvent()
+        self.subscribed, self.cancelled, self.stray_cancels, self.qualified, self.con_ids = [], [], [], [], {}
+        self.last_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        self.clock = None                          # a wall clock to stamp packets by instead (see ticks_arrived)
+        # snapshots: the ticks one sends, and the error IBKR refuses one with instead (0: none)
+        self.snapshot = dict(bid=100.0, ask=100.1, last=float("nan"), close=99.9, volume=1234.0)
+        self.refuse_snapshots = 0
 
     # connection
     def isConnected(self):
@@ -44,6 +97,7 @@ class FakeIB:
 
     async def connectAsync(self, host, port, clientId, timeout, readonly):
         self._connected = True
+        self.client._reqIdSeq = 100                    # like ib_async's, request ids start again with the connection
 
     def disconnect(self):
         self._connected = False
@@ -75,12 +129,58 @@ class FakeIB:
         return []
 
     # contracts / data
-    async def qualifyContractsAsync(self, c):
-        return [c]
+    async def qualifyContractsAsync(self, *contracts):
+        # like ib_async 2.1: a contract IBKR knows is filled in place and handed back; an unknown one is None
+        self.qualified.append([c.symbol for c in contracts])
+        out = []
+        for c in contracts:
+            if c.symbol != "NOPE":
+                c.conId = self.con_ids.setdefault(c.symbol, 1000 + len(self.con_ids))
+            out.append(c if c.conId else None)
+        return out
+
+    def ticker(self, contract):
+        return self.wrapper.tickers.get(contract.conId)
+
+    def reqMktData(self, contract, genericTickList="", snapshot=False, regulatorySnapshot=False):
+        if not self._connected:
+            raise ConnectionError("Not connected")
+        req_id, self.client._reqIdSeq = self.client._reqIdSeq, self.client._reqIdSeq + 1
+        self.subscribed.append(contract.symbol)
+        return self.wrapper.startTicker(req_id, contract, "mktData")
+
+    def cancelMktData(self, contract):
+        tk = self.ticker(contract)
+        req_id = self.wrapper.endTicker(tk, "mktData") if tk else 0
+        # a cancel with no request behind it is an error ib_async logs: the broker fixture fails the test on one
+        (self.cancelled if req_id else self.stray_cancels).append(contract.symbol)
+        return bool(req_id)
+
+    def ticks_arrived(self, *tickers):
+        """A packet's ticks landing, as ib_async's wrapper.tcpDataProcessed hands them on: each Ticker that got one
+        is stamped with the packet's time - a new datetime for each packet, as ib_async's datetime.now() gives -
+        then pendingTickersEvent. The fake's packet times always move on, unless a test sets ``clock`` to stamp
+        them as a coarse or reset wall clock would."""
+        self.last_time = (self.clock() if self.clock else
+                          max(dt.datetime.now(dt.timezone.utc), self.last_time + dt.timedelta(microseconds=1)))
+        for tk in tickers:
+            tk.time = self.last_time
+        self.pendingTickersEvent.emit(set(tickers))
 
     async def reqTickersAsync(self, c):
-        return [SimpleNamespace(bid=100.0, ask=100.1, last=float("nan"),
-                                close=99.9, volume=1234.0, marketPrice=100.0)]
+        # like ib_async 2.1: a snapshot lands on the stock's one Ticker - the one its stream and earlier snapshots
+        # share - and a refusal ends the request with no error raised, so the Ticker comes back all the same, as
+        # the last ticks to reach it left it
+        req_id, self.client._reqIdSeq = self.client._reqIdSeq, self.client._reqIdSeq + 1
+        tk = self.wrapper.startTicker(req_id, c, "snapshot")
+        if self.refuse_snapshots:
+            self.errorEvent.emit(req_id, self.refuse_snapshots, "Snapshot refused", c)
+        else:
+            for name, value in self.snapshot.items():
+                setattr(tk, name, value)
+            self.ticks_arrived(tk)
+        self.wrapper.endTicker(tk, "snapshot")
+        return [tk]
 
     async def reqContractDetailsAsync(self, contract):
         if contract.symbol == "NOPE":
@@ -184,7 +284,8 @@ def broker(monkeypatch):
     monkeypatch.setattr(mod, "_sleep", _fast)
     b = mod.IbkrBroker(port=4002, mode="paper", session_factory=FakeSession)
     b.connect()
-    return b
+    yield b
+    assert b._session.ib.stray_cancels == []
 
 
 # --------------------------------------------------------------------------- #
@@ -277,7 +378,7 @@ def test_a_slow_answer_raises_instead_of_reading_as_an_empty_account(broker):
 def test_quote_falls_back_to_close_when_last_is_nan(broker):
     q = broker.get_quote("AAPL")
     assert q.last == pytest.approx(99.9)              # last was NaN -> close
-    assert q.bid == 100.0 and q.ask == 100.1
+    assert q.bid == 100.0 and q.ask == 100.1 and q.source == "snapshot"
 
 
 def test_history_for_many_symbols_at_once(broker):
@@ -449,19 +550,20 @@ def test_without_an_exchange_rate_nothing_can_be_sized(broker):
 #  no market-data subscription
 # --------------------------------------------------------------------------- #
 def test_a_quote_with_no_price_raises_so_the_next_feed_answers(broker):
-    async def empty(c):
-        return [SimpleNamespace(bid=-1.0, ask=-1.0, last=float("nan"), close=float("nan"),
-                                volume=float("nan"), marketPrice=float("nan"))]
-
-    broker._session.ib.reqTickersAsync = empty
+    broker._session.ib.snapshot = dict(bid=-1.0, ask=-1.0, last=float("nan"), close=float("nan"),
+                                       volume=float("nan"))
     with pytest.raises(RuntimeError):
         broker.get_quote("AAPL")
 
 
 def test_real_time_data_comes_back_once_the_competing_session_logs_out(broker, monkeypatch):
+    broker.set_streams(["AAA"], 1)
+    broker._on_error(broker._streams["AAA"].req_id, 354, "Requested market data is not subscribed.", None)
+    assert "AAA" in broker._unstreamable                                   # one stock refused a stream, on live data
     broker._on_error(4, 10197, "No market data during competing live session", None)
     status = broker.session_status()
     assert status["market_data"] == "delayed" and "logged in somewhere else" in status["market_data_reason"]
+    assert not broker.can_stream
 
     ib = broker._session.ib
     real = ib.reqTickersAsync
@@ -474,13 +576,15 @@ def test_real_time_data_comes_back_once_the_competing_session_logs_out(broker, m
     assert broker._data_is_delayed and ib.market_data_type == 3
     broker._live_checked_at -= broker.LIVE_RECHECK_S
     broker.refresh_if_needed()
-    assert broker._data_is_delayed and ib.market_data_type == 3
+    assert broker._data_is_delayed and ib.market_data_type == 3 and not broker.can_stream
 
     ib.reqTickersAsync = real                                              # logged out there
     broker._live_checked_at -= broker.LIVE_RECHECK_S
     broker._competing_at -= 2 * broker.LIVE_RECHECK_S
     broker.refresh_if_needed()
     assert not broker._data_is_delayed and ib.market_data_type == 1 and broker.session_status()["market_data_reason"] == ""
+    # the recheck's probe proved the data real-time: streams again, the stock refused before among them
+    assert broker.can_stream and broker.set_streams(["AAA"], 1) == ["AAA"]
 
 
 def test_every_connection_tries_real_time_data_again(broker):
@@ -695,3 +799,409 @@ def test_a_request_that_outlasts_its_wait_is_cancelled_on_the_loop():
         assert cancelled.wait(timeout=5)
     finally:
         session.stop()
+
+
+# --------------------------------------------------------------------------- #
+#  real-time streams
+# --------------------------------------------------------------------------- #
+FULL = dict(bid=10.0, ask=10.02, last=10.01)          # a bid, an ask and a trade: a quote a stream can be trusted on
+
+
+def _tick(broker, symbol, **fields):
+    """A packet for ``symbol``'s Ticker, handed on as ib_async does: the fields set, then the Ticker stamped and
+    pendingTickersEvent."""
+    ib = broker._session.ib
+    tk = ib.ticker(broker._contracts[symbol])
+    for name, value in fields.items():
+        setattr(tk, name, value)
+    ib.ticks_arrived(tk)
+    return tk
+
+
+def test_the_first_symbols_stream_in_order_and_the_others_are_ended(broker):
+    ib = broker._session.ib
+    assert broker.can_stream
+    assert broker.set_streams(["AAA", "BBB", "AAA", "CCC", "DDD"], 3) == ["AAA", "BBB", "CCC"]
+    assert ib.subscribed == ["AAA", "BBB", "CCC"]
+    assert broker.set_streams(["AAA", "BBB", "CCC"], 3) == ["AAA", "BBB", "CCC"]
+    assert ib.subscribed == ["AAA", "BBB", "CCC"] and ib.cancelled == []          # the same again sends nothing
+    assert broker.set_streams(["DDD", "AAA"], 3) == ["DDD", "AAA"]
+    assert ib.subscribed[-1] == "DDD" and sorted(ib.cancelled) == ["BBB", "CCC"]
+    assert set(ib.wrapper.ticker2ReqId["mktData"]) == {broker._streams[s].ticker for s in ("DDD", "AAA")}
+    assert broker.set_streams(["DDD", "AAA"], 0) == [] and not ib.wrapper.ticker2ReqId["mktData"]
+
+
+def test_new_streams_come_twenty_at_a_time_and_never_more_than_ninety(broker):
+    ib = broker._session.ib
+    symbols = [f"T{i:03d}" for i in range(120)]
+    for _ in range(6):
+        asked = len(ib.subscribed)
+        held = broker.set_streams(symbols, 200)
+        assert len(ib.subscribed) - asked <= broker.STREAM_ADDS_PER_CALL
+    assert held == symbols[:90] and len(ib.subscribed) == 90
+    assert max(len(batch) for batch in ib.qualified) <= broker.STREAM_ADDS_PER_CALL
+
+
+def test_a_stock_ibkr_has_no_contract_for_is_left_to_snapshots(broker):
+    ib = broker._session.ib
+    assert broker.set_streams(["NOPE", "AAA"], 1) == []
+    assert broker.set_streams(["NOPE", "AAA"], 1) == ["AAA"]                    # its line goes to the next one
+    assert ib.qualified[1:] == [["NOPE"], ["AAA"]]                              # after the connect probe's
+
+
+def test_a_new_stream_publishes_nothing_until_it_has_a_full_quote(broker):
+    moved = []
+    broker.on_tick = moved.append
+    broker.set_streams(["AAA"], 1)
+    _tick(broker, "AAA", close=9.5)                               # yesterday's close comes first
+    _tick(broker, "AAA", bid=10.0, ask=10.02)                     # a book, but no trade yet
+    assert broker.streamed_quote("AAA") is None and moved == []
+    _tick(broker, "AAA", last=10.01)
+    q, age = broker.streamed_quote("AAA")
+    assert (q.bid, q.ask, q.last, q.source) == (10.0, 10.02, 10.01, "stream") and 0 <= age < 5
+    assert moved == [frozenset({"AAA"})]
+
+
+def test_a_stream_asked_for_again_ignores_the_prices_its_ticker_held_before(broker):
+    broker.set_streams(["AAA"], 1)
+    _tick(broker, "AAA", **FULL)
+    broker.set_streams([], 1)                                     # ended - but ib_async keeps the Ticker
+    assert broker.set_streams(["AAA"], 1) == ["AAA"]
+    _tick(broker, "AAA", close=9.5)
+    assert broker.streamed_quote("AAA") is None                   # the old bid, ask and trade don't count
+    _tick(broker, "AAA", bid=10.5, ask=10.52, last=10.51)
+    assert broker.streamed_quote("AAA")[0].last == 10.51
+
+
+def test_a_streamed_quote_is_the_quote_a_snapshot_gives(broker):
+    ib = broker._session.ib
+    broker.set_streams(["AAA"], 1)
+    _tick(broker, "AAA", bid=100.0, ask=100.1, last=100.05, volume=1234.0)
+
+    async def snapshot(c):
+        # a snapshot of the stock shares its Ticker: its answer is a packet the stream hears too
+        return [_tick(broker, "AAA", last=float("nan"), close=99.9)]          # IBKR cleared the last trade
+
+    ib.reqTickersAsync = snapshot
+    snap = broker.get_quote("AAA")
+    streamed, _ = broker.streamed_quote("AAA")
+    assert streamed == snap and streamed.last == 99.9             # the same fallbacks: no trade -> the close
+    assert (streamed.source, snap.source) == ("stream", "snapshot")
+
+
+def test_one_side_of_the_book_and_no_trade_is_no_price(broker):
+    broker._session.ib.snapshot = dict(bid=-1.0, ask=100.1, last=float("nan"), close=float("nan"), volume=0.0)
+    with pytest.raises(RuntimeError, match="no price"):
+        broker.get_quote("AAA")
+
+
+@pytest.mark.parametrize("code", [101, 10089])
+def test_a_refused_snapshot_never_passes_off_an_ended_streams_prices(broker, code):
+    # IBKR refused it (every line in use, or not subscribed), yet ib_async hands back the stock's Ticker all the
+    # same - still holding what the stream left on it
+    ib = broker._session.ib
+    broker.set_streams(["AAA"], 1)
+    _tick(broker, "AAA", **FULL)
+    broker.set_streams([], 1)
+    ib.refuse_snapshots = code
+    with pytest.raises(RuntimeError, match="no price"):
+        broker.get_quote("AAA")
+    assert ib.ticker(broker._contracts["AAA"]).last == 10.01                     # the old prices are still there
+
+
+def test_a_refused_snapshot_never_passes_off_an_earlier_snapshots_prices(broker):
+    ib = broker._session.ib
+    first = broker.get_quote("AAA")
+    assert (first.bid, first.ask, first.last, first.source) == (100.0, 100.1, 99.9, "snapshot")
+    ib.snapshot = dict(bid=101.0, ask=101.1, last=101.05)
+    assert broker.get_quote("AAA").last == 101.05                                # each answer is read afresh
+    ib.refuse_snapshots = 101
+    with pytest.raises(RuntimeError, match="no price"):
+        broker.get_quote("AAA")                                                   # not the 101.05 left on the Ticker
+    ib.refuse_snapshots = 0
+    again = broker.get_quote("AAA")
+    assert (again.last, again.source) == (101.05, "snapshot")
+
+
+@pytest.mark.parametrize("step_s", [0, -2])
+def test_a_snapshot_is_read_though_the_wall_clock_stamped_it_no_later_than_the_last_ticks(broker, step_s):
+    # ib_async stamps a packet with datetime.now(): on a coarse clock an answer that comes back at once shares the
+    # last packet's time, and a clock set back gives it an earlier one - it answered all the same
+    ib = broker._session.ib
+    broker.set_streams(["AAA"], 1)
+    at = _tick(broker, "AAA", **FULL).time
+    ib.clock = lambda: at + dt.timedelta(seconds=step_s)                         # a new datetime each packet
+    ib.snapshot = dict(bid=14.0, ask=14.02, last=14.01)
+    q = broker.get_quote("AAA")
+    assert (q.bid, q.ask, q.last, q.source) == (14.0, 14.02, 14.01, "snapshot")
+    ib.refuse_snapshots = 101
+    with pytest.raises(RuntimeError, match="no price"):
+        broker.get_quote("AAA")                                                   # nothing came: still no price
+
+
+def test_a_refused_snapshot_is_priced_as_a_failed_one_from_the_quote_kept_or_the_latest_candle(broker, tmp_path):
+    from tos_bot.data.bars import DailyBarStore
+    from tos_bot.data.market_data import _QUOTE_TTL_S, MarketData
+
+    ib, md = broker._session.ib, MarketData(DailyBarStore(tmp_path))
+    md.attach(broker)
+    ib.snapshot = dict(bid=11.0, ask=11.02, last=11.01)
+    kept = md.quote("AAA")
+    assert (kept.last, kept.source) == (11.01, "snapshot")
+    assert md.streams.sync(["AAA"], [], 1) == ["AAA"]
+    _tick(broker, "AAA", **FULL)                                                  # 10.01 - then the stream ends
+    assert md.streams.sync([], [], 1) == []
+    ib.refuse_snapshots = 101
+    assert md.quote("AAA") is kept                                                # not the stream's 10.01
+    at, q = md._quotes["AAA"]
+    md._quotes["AAA"] = (at - _QUOTE_TTL_S, q)                                    # too old to serve
+    candle = md.quote("AAA")
+    assert candle.source == "" and candle.last == pytest.approx(102.1)           # the latest one-minute candle's close
+    assert ib.history_requests[-1][1]["barSizeSetting"] == "1 min"
+
+
+def test_delayed_ticks_are_ignored_and_a_halt_takes_the_price_away(broker):
+    broker.set_streams(["AAA"], 1)
+    _tick(broker, "AAA", marketDataType=3, **FULL)
+    assert broker.streamed_quote("AAA") is None
+    _tick(broker, "AAA", marketDataType=1)
+    assert broker.streamed_quote("AAA")[0].last == 10.01
+    _tick(broker, "AAA", halted=1.0)
+    assert broker.streamed_quote("AAA") is None
+
+
+def test_nothing_streams_before_the_connect_probe_is_through_or_on_frozen_data(monkeypatch):
+    monkeypatch.setattr(mod, "port_is_open", lambda *a, **k: True)
+
+    async def _fast(*_a):
+        return None
+
+    monkeypatch.setattr(mod, "_sleep", _fast)
+    seen = []
+    probe = mod.IbkrBroker._check_data_entitlement
+
+    def probing(self):
+        seen.append((self.is_connected, self.can_stream, self.set_streams(["AAA"], 1)))
+        probe(self)
+
+    monkeypatch.setattr(mod.IbkrBroker, "_check_data_entitlement", probing)
+    auto = mod.IbkrBroker(port=4002, mode="paper", session_factory=FakeSession)
+    auto.connect()
+    assert seen == [(True, False, [])] and auto._session.ib.subscribed == [] and auto.can_stream
+    frozen = mod.IbkrBroker(port=4002, mode="paper", market_data="frozen", session_factory=FakeSession)
+    frozen.connect()
+    assert not frozen.can_stream and frozen.set_streams(["AAA"], 1) == [] and frozen._session.ib.subscribed == []
+    live = mod.IbkrBroker(port=4002, mode="paper", market_data="live", session_factory=FakeSession)
+    live.connect()
+    assert live.set_streams(["AAA"], 1) == ["AAA"]                # real-time data chosen outright streams
+
+
+def test_a_competing_session_ends_every_stream(broker):
+    ib = broker._session.ib
+    broker.set_streams(["AAA", "BBB"], 2)
+    _tick(broker, "AAA", **FULL)
+    broker._on_error(broker._streams["AAA"].req_id, 10197, "No market data during competing live session", None)
+    assert broker._data_is_delayed and not broker.can_stream
+    assert sorted(ib.cancelled) == ["AAA", "BBB"] and broker.streamed_quote("AAA") is None
+    asked = len(ib.subscribed)
+    assert broker.set_streams(["AAA", "BBB"], 2) == [] and len(ib.subscribed) == asked
+
+
+def test_a_refused_snapshot_still_turns_the_whole_app_delayed(broker):
+    ib = broker._session.ib
+    broker.set_streams(["AAA"], 1)
+    broker._on_error(7, 354, "Requested market data is not subscribed.", None)       # not a stream's request
+    assert broker._data_is_delayed and ib.market_data_type == 3
+    assert ib.cancelled == ["AAA"] and not broker.can_stream
+
+
+def test_error_101_gives_lines_back_from_the_end_once_per_burst(broker):
+    ib = broker._session.ib
+    broker._on_error(5, 101, "Max number of tickers has been reached", None)         # nothing streaming: as before
+    assert broker._stream_cap == broker.STREAM_LINES_MAX and broker._last_error.startswith("101")
+    symbols = [f"T{i:02d}" for i in range(1, 26)]
+    broker.set_streams(symbols, 25)
+    broker.set_streams(symbols, 25)
+    ids = {s: broker._streams[s].req_id for s in symbols}
+    broker._on_error(ids["T25"], 101, "Max number of tickers has been reached", None)
+    # refused, so forgotten without a cancel; then ten more lines given back from the end of the list
+    assert "T25" not in ib.cancelled and ids["T25"] not in ib.wrapper.ticker2ReqId["mktData"].values()
+    assert broker._stream_cap == 14 and sorted(ib.cancelled) == symbols[14:24]
+    assert list(broker._streams) == symbols[:14]
+    # the rest of the burst - refusals of requests sent before the cut, a snapshot's among them - cuts no more
+    for req_id in (ids["T24"], ids["T20"], ids["T03"], 7):
+        broker._on_error(req_id, 101, "Max number of tickers has been reached", None)
+    assert broker._stream_cap == 14 and "T03" not in ib.cancelled
+    assert list(broker._streams) == [s for s in symbols[:14] if s != "T03"]
+    assert broker.set_streams(symbols, 25) == symbols[:14]                            # asked again, within the cap
+    # a request sent after the cut is news: the lines are still short
+    broker._on_error(ib.client._reqIdSeq, 101, "Max number of tickers has been reached", None)
+    assert broker._stream_cap == 4 and sorted(broker._streams) == symbols[:4]
+
+
+def test_a_stock_refused_a_stream_is_quoted_by_snapshot_and_only_a_burst_turns_the_data_delayed(broker):
+    ib = broker._session.ib
+    symbols = [f"T{i:02d}" for i in range(1, 8)]
+    broker.set_streams(symbols, 7)
+    ids = {s: broker._streams[s].req_id for s in symbols}
+    broker._on_error(ids["T01"], 354, "Requested market data is not subscribed.", None)
+    assert not broker._data_is_delayed and broker.can_stream                          # still real-time data
+    assert "T01" not in broker._streams and len(broker._streams) == 6 and ib.cancelled == []
+    assert broker.set_streams(symbols, 7) == symbols[1:]                              # snapshots for a while
+    # a late answer about a stream already ended changes nothing
+    broker._on_error(ids["T01"], 354, "Requested market data is not subscribed.", None)
+    broker._on_error(ids["T01"], 300, "Can't find EId with tickerId", None)
+    assert not broker._data_is_delayed and broker._last_error == ""
+    # five refused within a minute is the login's data, not a stock or two
+    for s in symbols[1:4]:
+        broker._on_error(ids[s], 10089, "Requested market data requires additional subscription for API.", None)
+    assert not broker._data_is_delayed and len(broker._streams) == 3
+    broker._on_error(ids["T05"], 10089, "Requested market data requires additional subscription for API.", None)
+    assert broker._data_is_delayed and not broker._streams and not broker.can_stream
+
+
+def test_a_stream_refused_only_in_part_is_cancelled_so_its_line_comes_back(broker):
+    ib = broker._session.ib
+    broker.set_streams(["AAA", "BBB"], 2)
+    broker._on_error(broker._streams["AAA"].req_id, 10090, "Part of requested market data is not subscribed.", None)
+    broker._on_error(broker._streams["BBB"].req_id, 354, "Requested market data is not subscribed.", None)
+    assert ib.cancelled == ["AAA"] and not broker._streams and not ib.wrapper.ticker2ReqId["mktData"]
+    assert not broker._data_is_delayed
+
+
+@pytest.mark.parametrize("reset_first", [True, False])
+def test_a_dropped_connection_forgets_the_streams_without_a_word_to_ibkr(broker, monkeypatch, reset_first):
+    monkeypatch.setattr(broker, "_start_reconnect", lambda: None)
+    ib, symbols = broker._session.ib, [f"T{i:02d}" for i in range(1, 26)]
+    broker.set_streams(symbols, 25)
+    broker.set_streams(symbols, 25)
+    # on this connection error 101 cut the lines to 14, and four stocks were refused a stream
+    broker._on_error(broker._streams["T25"].req_id, 101, "Max number of tickers has been reached", None)
+    for s in symbols[:4]:
+        broker._on_error(broker._streams[s].req_id, 354, "Requested market data is not subscribed.", None)
+    assert broker._stream_cap == 14 and sorted(broker._unstreamable) == symbols[:4] and not broker._data_is_delayed
+    _tick(broker, "T05", **FULL)
+    cancelled = list(ib.cancelled)
+    ib.disconnect()
+    # ib_async forgets its requests before or after it says so, depending on which end closed the socket
+    if reset_first:
+        ib.wrapper.reset()
+    broker._on_disconnect()
+    ib.wrapper.reset()
+    assert ib.cancelled == cancelled and not broker._streams and not broker._latest and not broker._stream_reqs
+    assert broker.streamed_quote("T05") is None and broker.set_streams(symbols, 25) == []
+
+    # the new connection streams nothing until its own probe is through...
+    seen, probe = [], broker._check_data_entitlement
+
+    def probing():
+        seen.append((broker.can_stream, broker.set_streams(symbols, 25)))
+        probe()
+
+    monkeypatch.setattr(broker, "_check_data_entitlement", probing)
+    asked = len(ib.subscribed)
+    broker._do_connect()
+    assert seen == [(False, [])] and len(ib.subscribed) == asked
+    # ...then has every line again, the stocks refused on the last one included, all asked for afresh
+    broker.set_streams(symbols, 25)
+    assert broker.set_streams(symbols, 25) == symbols and ib.subscribed[asked:] == symbols
+    # its request ids start again, and IBKR's answers are about this connection's requests: a 101 cuts the lines
+    # afresh, and a stock refused is that stock's alone - the refusals on the last connection don't count
+    broker._on_error(broker._streams["T25"].req_id, 101, "Max number of tickers has been reached", None)
+    assert broker._stream_cap == 14 and list(broker._streams) == symbols[:14]
+    broker._on_error(broker._streams["T01"].req_id, 354, "Requested market data is not subscribed.", None)
+    assert list(broker._streams) == symbols[1:14] and "T01" in broker._unstreamable
+    assert not broker._data_is_delayed and broker.can_stream
+
+
+def test_after_ibkrs_servers_come_back_the_streams_are_asked_for_again_unless_ibkr_kept_them(broker, monkeypatch):
+    monkeypatch.setattr(broker, "_start_reconnect", lambda: None)
+    ib = broker._session.ib
+    broker.set_streams(["AAA"], 1)
+    _tick(broker, "AAA", **FULL)
+    broker._on_error(-1, 1100, "Connectivity between IBKR and Trader Workstation has been lost.")
+    assert broker.streamed_quote("AAA") is None and broker.set_streams(["AAA"], 1) == []
+    assert "AAA" in broker._streams and ib.cancelled == []                            # kept, in case of a 1102
+    broker._on_error(-1, 1102, "Connectivity between IBKR and Trader Workstation has been restored - data maintained.")
+    assert broker.streamed_quote("AAA") is not None
+    assert broker.set_streams(["AAA"], 1) == ["AAA"] and ib.subscribed == ["AAA"]
+    for lost_first in (True, False):
+        if lost_first:
+            broker._on_error(-1, 1100, "Connectivity between IBKR and Trader Workstation has been lost.")
+        broker._on_error(-1, 1101, "Connectivity between IBKR and Trader Workstation has been restored - data lost.")
+        assert broker.streamed_quote("AAA") is None
+        assert broker.set_streams(["AAA"], 1) == ["AAA"]
+    assert ib.subscribed == ["AAA"] * 3
+
+
+def test_a_stream_waits_for_a_snapshot_of_the_same_stock_to_finish(broker):
+    ib = broker._session.ib
+    tk = ib.wrapper.startTicker(7, broker._contract("AAA"), "snapshot")               # a snapshot is out
+    assert broker.set_streams(["AAA"], 1) == [] and ib.subscribed == []
+    ib.wrapper.endTicker(tk, "snapshot")                                               # and answered
+    assert broker.set_streams(["AAA"], 1) == ["AAA"] and broker._streams["AAA"].ticker is tk
+
+
+def test_a_request_left_on_the_ticker_is_cancelled_before_a_new_one(broker):
+    ib = broker._session.ib
+    ib.wrapper.startTicker(8, broker._contract("AAA"), "mktData")                     # left over
+    broker.set_streams(["AAA"], 1)
+    assert ib.cancelled == ["AAA"] and ib.subscribed == ["AAA"]
+    assert list(ib.wrapper.ticker2ReqId["mktData"].values()) == [broker._streams["AAA"].req_id]
+
+
+def test_a_snapshot_quote_is_read_on_the_loop_thread(threaded, monkeypatch):
+    # a stream of the same stock writes to the same Ticker on the loop: read anywhere else, a quote could tear
+    read_on = []
+    real = mod._quote_from_ticker
+
+    def reading(*args):
+        read_on.append(threading.current_thread().name)
+        return real(*args)
+
+    monkeypatch.setattr(mod, "_quote_from_ticker", reading)
+    assert threaded.get_quote("AAA").source == "snapshot"
+    assert read_on == ["ibkr-loop"]
+
+
+def test_streams_change_from_another_thread_while_ticks_arrive(threaded):
+    ib, symbols = threaded._session.ib, [f"T{i:02d}" for i in range(1, 31)]
+    seen = []
+    threaded.on_tick = lambda moved: seen.extend(threaded.streamed_quote(s) for s in moved)   # on the loop
+    stop, failed = threading.Event(), []
+
+    def packet(ib, n):
+        live = list(ib.wrapper.ticker2ReqId["mktData"])
+        for tk in live:
+            tk.bid, tk.ask, tk.last = 10.0 + n / 100, 10.02 + n / 100, 10.01 + n / 100
+            tk.time = dt.datetime.now(dt.timezone.utc)
+        ib.pendingTickersEvent.emit(set(live))
+
+    def ticking():
+        n = 0
+        try:
+            while not stop.is_set():
+                n += 1
+                threaded._session.call(lambda ib: packet(ib, n), timeout=5)
+        except Exception as e:  # noqa: BLE001
+            failed.append(e)
+
+    def resyncing():
+        try:
+            for k in range(30):
+                threaded.set_streams(symbols[k % 10:], 20)
+        except Exception as e:  # noqa: BLE001
+            failed.append(e)
+
+    workers = [threading.Thread(target=ticking, daemon=True), threading.Thread(target=resyncing, daemon=True)]
+    for w in workers:
+        w.start()
+    workers[1].join(timeout=20)
+    stop.set()
+    workers[0].join(timeout=5)
+    assert not any(w.is_alive() for w in workers) and failed == []
+    assert seen and all(got is not None for got in seen)
+    # nothing leaked: every request ib_async holds is a stream the adapter knows about
+    streams = threaded._streams
+    assert {ib.wrapper.ticker2ReqId["mktData"][st.ticker] for st in streams.values()} == set(threaded._stream_reqs)
+    assert len(ib.wrapper.ticker2ReqId["mktData"]) == len(streams) == 20

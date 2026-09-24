@@ -23,6 +23,10 @@ const isLive = () => S.state.mode === "live";
 const hereVenue = () => (S.state.venue || {}).trading_on || "paper";
 
 /* ---------- open positions ---------- */
+// the open trades as the table last drew them, and the platform it drew them for - a streamed price redraws
+// their live cells (tickOpen)
+let openTrades = [], openHere = "paper";
+
 export async function loadOpen() {
   if (S.stopped) return;
   let trades;
@@ -30,6 +34,8 @@ export async function loadOpen() {
   loadedAt.open = new Date();
   $("#tab-open-count").textContent = trades.length ? ` · ${trades.length}` : "";   // as Active orders counts its own
   const here = hereVenue(), el = $("#tab-open");
+  openTrades = trades;
+  openHere = here;
   $("#btn-exit-all").classList.toggle("hidden", !trades.some(t => (t.broker || "paper") === here));
   if (!trades.length) { el.innerHTML = `<p class="muted pad">No open positions.</p>` + untrackedHTML(); wireUntracked(el); return; }
   el.innerHTML = exposureHTML(trades) +
@@ -174,19 +180,51 @@ function rNow(t, pos, parked) {
   return { r: (pos.market_price - t.entry_price) * (t.side === "SHORT" ? -1 : 1) / risk, first, risk };
 }
 
-function openRow(t, here) {
-  const venue = t.broker || "paper", parked = venue !== here;
-  const pos = (S.state.positions || []).find(x => x.symbol === t.symbol) || {};
+/* The cells a streamed price redraws in place (tickOpen), each tagged data-live: the Mark, the record's own
+   Unrealized and its R now, at the position's mark as the tab holds it. */
+const livePosition = t => (S.state.positions || []).find(x => x.symbol === t.symbol) || {};
+
+function markCell(pos, parked) {
+  return `<td class="num" data-live="mark"${pos.price_at ? ` title="As of ${escapeHtml(fmtWhen(pos.price_at))} - the app's own latest price, pre-market and after-hours included (the exits act on regular-hours prices)"` : ""}>${parked ? "–" : num(pos.market_price)}</td>`;
+}
+
+function uplCell(t, pos, parked) {
   // this record's own open P/L - the broker's figure covers every share of the stock, recorded or not
   const upl = parked || pos.market_price == null ? null
     : (pos.market_price - t.entry_price) * Math.abs(t.quantity) * (t.side === "SHORT" ? -1 : 1);
-  const moved = t.initial_stop_price != null && Math.abs((t.stop_price ?? 0) - t.initial_stop_price) > 0.01;
-  const stopCell = moved ? `<span title="moved from ${num(t.initial_stop_price)}">${num(t.stop_price)} ▲</span>` : num(t.stop_price);
+  return `<td class="num ${upl >= 0 ? "pl-pos" : "pl-neg"}" data-live="upl">${usd(upl)}${t.banked_pl
+    ? ` <span class="muted" title="realized on the part already taken off">+${usd(t.banked_pl)} banked</span>` : ""}</td>`;
+}
+
+function rCell(t, pos, parked) {
   const rn = rNow(t, pos, parked), rules = S.state.exit_manager || {};
-  const rCell = !rn ? `<td class="num muted">–</td>`
-    : `<td class="num ${rn.r >= 0 ? "pl-pos" : "pl-neg"}" title="${escapeHtml(`(mark − entry) ÷ ${num(rn.risk)} a share, the risk it was opened with (entry to the original stop, ${num(rn.first)})`
+  return !rn ? `<td class="num muted" data-live="r">–</td>`
+    : `<td class="num ${rn.r >= 0 ? "pl-pos" : "pl-neg"}" data-live="r" title="${escapeHtml(`(mark − entry) ÷ ${num(rn.risk)} a share, the risk it was opened with (entry to the original stop, ${num(rn.first)})`
       + (rules.breakeven_at_r ? `. At +${rules.breakeven_at_r}R the stop moves to lock a small profit` : "")
       + (rules.trail_start_r ? `; from +${rules.trail_start_r}R it trails` : ""))}">${rn.r >= 0 ? "+" : ""}${rn.r.toFixed(2)}R</td>`;
+}
+
+/* A streamed price (events.js): the live cells of the open positions in `symbols` drawn again from the marks the
+   tab holds now - the rows stay the same elements, so a click on one isn't lost, and the rest waits for the next
+   load. A position on another platform shows no mark, so it's left alone. */
+export function tickOpen(symbols) {
+  const want = new Set(symbols), el = $("#tab-open");
+  openTrades.forEach(t => {
+    const tr = want.has(t.symbol) && (t.broker || "paper") === openHere && $(`tr[data-record="${CSS.escape(t.id)}"]`, el);
+    if (!tr) return;
+    const pos = livePosition(t);
+    [["mark", markCell(pos, false)], ["upl", uplCell(t, pos, false)], ["r", rCell(t, pos, false)]].forEach(([key, html]) => {
+      const td = $(`td[data-live="${key}"]`, tr);
+      if (td) td.outerHTML = html;
+    });
+  });
+}
+
+function openRow(t, here) {
+  const venue = t.broker || "paper", parked = venue !== here;
+  const pos = livePosition(t);
+  const moved = t.initial_stop_price != null && Math.abs((t.stop_price ?? 0) - t.initial_stop_price) > 0.01;
+  const stopCell = moved ? `<span title="moved from ${num(t.initial_stop_price)}">${num(t.stop_price)} ▲</span>` : num(t.stop_price);
   const status = t.time_status || "on_track";
   const barCls = status === "overdue" ? "bad" : status === "aging" ? "warn" : "ok";
   // when the setup usually exits, when it is due a look, and - for a swing trade - the day the time stop closes it
@@ -215,10 +253,7 @@ function openRow(t, here) {
     <td class="num">${num(t.quantity, 0)}${t.initial_quantity && Math.abs(t.initial_quantity - t.quantity) > 1e-9
       ? ` <span class="muted" title="part of the position was taken off at the first target">of ${num(t.initial_quantity, 0)}</span>` : ""}</td>
     <td class="num">${num(t.entry_price)}</td>
-    <td class="num"${pos.price_at ? ` title="As of ${escapeHtml(fmtWhen(pos.price_at))} - the app's own latest price, pre-market and after-hours included (the exits act on regular-hours prices)"` : ""}>${parked ? "–" : num(pos.market_price)}</td>
-    <td class="num ${upl >= 0 ? "pl-pos" : "pl-neg"}">${usd(upl)}${t.banked_pl
-      ? ` <span class="muted" title="realized on the part already taken off">+${usd(t.banked_pl)} banked</span>` : ""}</td>
-    ${rCell}
+    ${markCell(pos, parked)}${uplCell(t, pos, parked)}${rCell(t, pos, parked)}
     <td class="num">${stopCell}</td>
     <td class="num">${num(t.target_price)}${t.target2_price
       ? ` <span class="muted" title="part comes off at the first target, the rest runs to the second">→ ${num(t.target2_price)}</span>` : ""}</td>
