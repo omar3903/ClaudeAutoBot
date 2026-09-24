@@ -21,10 +21,12 @@ be sent, or that the broker rejects or cancels, is sent again - waiting a
 little longer after each try (``RETRY_DELAYS_S``).
 
 Between full passes, a streamed tick on a stock held runs a tick pass on just that
-stock (``run_once(only=...)``, engine._sync_loop): steps 1 and 5 on the fresh price.
-It moves the stop on the record at once, but keeps the excursions in memory and leaves
-the note and the message about the move to the next full pass - or to the exit, if one
-goes out first: they're written just before it.
+stock (``run_once(only=...)``, engine._sync_loop): steps 1, 2 and 5 on the fresh
+price - the stop and target checks (and the first-target scale-out) and the ratchet;
+the time exits (3, 4) and the overdue note wait for the next full pass. It closes at
+the stop or target and moves the stop on the record at once, but keeps the excursions
+in memory and leaves the note and the message about the move to the next full pass -
+or to the exit, if one goes out first: they're written just before it.
 
 Entries always need your click; exits never do.
 """
