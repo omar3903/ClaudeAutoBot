@@ -239,6 +239,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._snapshot_wake = threading.Event()
         # set to have the stream loop point the streams at what changed now - a new position, a new board
         self._stream_wake = threading.Event()
+        # the stocks of the plays Autopilot would take, as of the last board push: they stream ahead of the rest
+        self._ap_candidates: Tuple[str, ...] = ()
         # a streamed tick on a stock the exits manage: the stocks, and the sync loop's wake (_on_stream_ticks)
         self._exit_wake = threading.Event()
         self._ticked: set = set()
@@ -882,11 +884,12 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._stream_wake.clear()
 
     def _resync_streams(self) -> List[str]:
-        """Stream the stocks held, then the plays on offer, within execution.stream_lines (0 = none, and
-        every price is a snapshot as before). Returns the symbols streaming now."""
+        """Stream the stocks held, then the plays on offer - the ones the operator opened and the ones
+        Autopilot would take first - within execution.stream_lines (0 = none, and every price is a snapshot
+        as before). Returns the symbols streaming now."""
         lines = int(self.settings.config.execution.stream_lines or 0)
         held, plays = self._stream_wanted() if lines > 0 else ([], [])
-        return self.md.streams.sync(held, plays, lines)
+        return self.md.streams.sync(held, plays, lines, candidates=self._ap_candidates)
 
     def _stream_wanted(self) -> Tuple[List[str], List[str]]:
         """The stocks to stream, most needed first: those held - this venue's open trades, the entries still
@@ -1192,8 +1195,14 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _publish_plays(self) -> None:
         records: Dict[str, Dict[str, Any]] = {}                # each setup's record read once for the board
-        self._publish("plays.updated",
-                      plays=[self._slim(self._decorate(p, records)) for p in self.board.ranked()[:self.BOARD_ROWS]])
+        rows = [self._slim(self._decorate(p, records)) for p in self.board.ranked()[:self.BOARD_ROWS]]
+        self._publish("plays.updated", plays=rows)
+        # the plays Autopilot would take - its badge's reading: on offer, passing its checks, not tried yet -
+        # stream ahead of the rest, so an entry it sends is priced off the stream
+        self._ap_candidates = tuple(dict.fromkeys(
+            r["symbol"] for r in rows
+            if r.get("status") == PlayStatus.PROPOSED.value and (ap := r.get("autopilot") or {}).get("eligible")
+            and not ap.get("acted")))
         self._stream_wake.set()                                 # the streams follow the new ranking
 
     #: stocks the quick re-check looks at, best plays first
@@ -1731,6 +1740,16 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     # ------------------------------------------------------------------ #
     #  Plays and positions                                               #
     # ------------------------------------------------------------------ #
+    def watch_play(self, play_id: str) -> None:
+        """The operator opened a play (the dashboard's assess): its stock streams ahead of the other plays for
+        a while (StreamManager.prefer), so an Execute click is priced off the stream. Only the web route calls
+        it - Autopilot assesses every play it gets to, and would crowd out the one on the screen. Nothing waits
+        for the stream: until it ticks, the entry check asks for a snapshot as before."""
+        p = self.board.get(play_id)
+        if p is not None and p.status is PlayStatus.PROPOSED:
+            self.md.streams.prefer(p.symbol)
+            self._stream_wake.set()
+
     def assess_play(self, play_id: str) -> Dict[str, Any]:
         p = self.board.get(play_id)
         if p is None:
@@ -1914,7 +1933,11 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
           pullback under the entry is not a chase.
 
         With no price source attached there is nothing to check (and no plays to take). With one
-        attached, an entry whose price can't be read is refused - an order is never sent blind."""
+        attached, an entry whose price can't be read is refused - an order is never sent blind.
+
+        The quote is quote()'s: a stream's latest when it ticked in the last 2 s, else a snapshot - an
+        entry never waits for a stream. Where it came from and how old it was are logged, and kept in
+        ``seen`` as quote_source / quote_age_ms (the trade record keeps only the mid and the spread)."""
         cfg = self.settings.config.execution
         risk = abs(float(p.entry) - float(p.stop))
         if risk <= 0 or not self.md.attached:
@@ -1933,9 +1956,14 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         bid, ask = float(q.bid or 0.0), float(q.ask or 0.0)
         spread = ask - bid if 0 < bid < ask else 0.0
         mid = (bid + ask) / 2.0 if spread else px
+        source, age_ms = _quote_origin(q)
+        log.info("entry check for %s on a %s quote %s old: last %.4f, bid %.4f, ask %.4f (%s data)", p.symbol,
+                 source, f"{age_ms} ms" if age_ms is not None else "of unknown age", px, bid, ask,
+                 "live" if live else "delayed")
         if seen is not None:
             seen.update(mid=round(mid, 4), bid=bid or None, ask=ask or None, live=live,
-                        spread_bps=round(spread / mid * 1e4, 2) if spread and mid else None)
+                        spread_bps=round(spread / mid * 1e4, 2) if spread and mid else None,
+                        quote_source=source, quote_age_ms=age_ms)
         max_spread = float(getattr(cfg, "max_spread_r", 0.0) or 0.0)
         if live and max_spread > 0 and spread / risk > max_spread:
             return (f"the spread ({bid:.2f} x {ask:.2f}) is {spread / risk:.2f}R of this trade's risk - too dear to "
@@ -2343,6 +2371,14 @@ def _utc(value: Any) -> Optional[dt.datetime]:
     if not isinstance(value, dt.datetime):
         return None
     return value.replace(tzinfo=dt.timezone.utc) if value.tzinfo is None else value.astimezone(dt.timezone.utc)
+
+
+def _quote_origin(q: Any) -> Tuple[str, Optional[int]]:
+    """Where a quote came from - "stream", "snapshot", or "candle" for a price read off a candle (Quote.source
+    empty) - and how many milliseconds old it is by its own time; None when it has no time."""
+    at = _utc(getattr(q, "ts", None))
+    age = None if at is None else max(0, round((dt.datetime.now(dt.timezone.utc) - at).total_seconds() * 1000))
+    return getattr(q, "source", "") or "candle", age
 
 
 def _order_signature(orders: List[Dict[str, Any]]) -> tuple:

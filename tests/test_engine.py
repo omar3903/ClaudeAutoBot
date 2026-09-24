@@ -1679,6 +1679,101 @@ def test_new_plays_and_an_approval_wake_the_stream_loop_and_stopping_ends_it(eng
     assert not loop.is_alive()
 
 
+def test_an_entry_is_priced_off_a_fresh_stream_else_a_snapshot_and_the_log_says_which(engine, monkeypatch, caplog):
+    import logging
+
+    gateway = fakes.StreamingGateway(fakes.SYMBOLS, delayed=True)
+    gateway.connect()
+    engine.md.attach(gateway)
+    p = _play("T01")                                                        # entry 100, stop 95: 1R is 5
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    seen = {}
+    engine._chase_check(p, plan, seen)                                      # delayed data: a candle, as before
+    assert (seen["quote_source"], seen["live"], gateway.snapshots) == ("candle", False, 0)
+
+    gateway.delayed = False
+    assert engine.md.streams.sync(["T01"], [], 5) == ["T01"]
+    gateway.tick("T01", 100.5, age_s=0.5)
+    seen = {}
+    with caplog.at_level(logging.INFO, logger="tos_bot.engine.engine"):
+        assert engine._chase_check(p, plan, seen) is None
+    assert plan["limit_price"] == 100.55 and gateway.snapshots == 0         # priced off the stream: no round trip
+    assert seen["quote_source"] == "stream" and seen["live"] and 500 <= seen["quote_age_ms"] < 2000
+    assert "entry check for T01 on a stream quote" in caplog.text
+
+    # the order goes out on it: the limit, and the quote the fill is measured against, are the stream's
+    engine.board.replace([p])
+    monkeypatch.setattr(engine, "assess_play", lambda pid: {"ok": True, "can_execute": True, "reasons": [],
+                                                            "order_plan": {**plan, "limit_price": 100.05}})
+    sent = {}
+    monkeypatch.setattr(engine.executor, "execute_play",
+                        lambda play, account, **kw: sent.update(kw) or {"ok": True, "status": "SUBMITTED"})
+    gateway.tick("T01", 100.5)
+    assert engine.approve_play(p.id)["ok"]
+    assert sent["plan"]["limit_price"] == 100.55 and sent["decision"]["quote_source"] == "stream"
+    assert gateway.snapshots == 0
+
+    gateway.tick("T01", 100.5, age_s=2.5)                                   # quiet for over 2 s: never waited on
+    seen = {}
+    engine._chase_check(p, plan, seen)
+    assert seen["quote_source"] == "snapshot" and gateway.snapshots == 1
+
+
+def test_the_play_opened_on_the_dashboard_streams_first_but_one_autopilot_assesses_doesnt(engine, monkeypatch):
+    from fastapi.testclient import TestClient
+    from tos_bot.core.enums import PlayStatus
+    from tos_bot.server import security
+    from tos_bot.server.app import create_app
+
+    gateway = fakes.StreamingGateway(fakes.SYMBOLS)
+    gateway.connect()
+    engine.md.attach(gateway)
+    monkeypatch.setattr(engine.settings.config.execution, "stream_lines", 2)
+    best, next_, last, taken = _play("T03"), _play("T04"), _play("T05"), _play("T06")
+    best.score, next_.score, last.score, taken.score = 0.9, 0.5, 0.3, 0.1
+    engine.board.replace([best, next_, last, taken], None)
+    taken.status = PlayStatus.ACCEPTED
+    assert engine._resync_streams() == ["T03", "T04"]
+
+    engine._stream_wake.clear()
+    engine.assess_play(last.id)                                             # how Autopilot looks at a play
+    engine.watch_play(taken.id)                                             # a play already sent isn't on offer
+    assert engine.md.streams.preferred() == [] and not engine._stream_wake.is_set()
+    assert engine._resync_streams() == ["T03", "T04"]
+
+    monkeypatch.setattr(security, "ALLOWED_CLIENTS", security.ALLOWED_CLIENTS | {"testclient"})
+    monkeypatch.setattr(security, "ALLOWED_HOSTS", security.ALLOWED_HOSTS | {"testserver"})
+    app = create_app(lambda settings: None)
+    app.state.engine = engine
+    client = TestClient(app, headers={"X-ATB-Request": "1"})
+    assert client.post(f"/api/plays/{last.id}/assess").status_code == 200   # the operator opens it
+    assert engine.md.streams.preferred() == ["T05"] and engine._stream_wake.is_set()
+    assert engine._resync_streams() == ["T05", "T03"]                       # ahead of plays streaming under a minute
+
+
+def test_the_plays_autopilot_would_take_stream_ahead_of_the_rest_while_on_offer(engine, monkeypatch):
+    from tos_bot.core.enums import PlayStatus
+
+    gateway = fakes.StreamingGateway(fakes.SYMBOLS)
+    gateway.connect()
+    engine.md.attach(gateway)
+    monkeypatch.setattr(engine.settings.config.execution, "stream_lines", 2)
+    plays = [_play(s) for s in ("T03", "T04", "T05", "T06")]
+    for p, score in zip(plays, (0.9, 0.7, 0.5, 0.3)):
+        p.score = score
+    engine.board.replace(plays, None)
+    verdicts = {"T05": {"eligible": True, "acted": False},                  # Autopilot would take T05...
+                "T06": {"eligible": True, "acted": True}}                   # ...and has tried T06 already
+    monkeypatch.setattr(engine.autopilot, "decorate_play",
+                        lambda row, play=None: {**row, "autopilot": verdicts.get(row["symbol"], {"eligible": False})})
+    engine._publish_plays()
+    assert engine._ap_candidates == ("T05",)
+    assert engine._resync_streams() == ["T05", "T03"]
+
+    plays[2].status = PlayStatus.ACCEPTED                                   # sent since: no longer a play on offer
+    assert engine._resync_streams() == ["T03", "T04"]
+
+
 def _streaming_position(engine, symbol="T01"):
     """A position here whose stock streams, next to a play's stock (T03) that streams too."""
     gateway = fakes.StreamingGateway(fakes.SYMBOLS)

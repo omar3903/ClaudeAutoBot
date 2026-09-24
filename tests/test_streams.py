@@ -82,6 +82,27 @@ def test_a_play_keeps_its_stream_a_minute_while_its_on_offer(tmp_path):
     assert md.streams.sync(held, ["T04"], 2) == ["T01", "T04"]              # T02 off the board: its line goes at once
 
 
+def test_the_plays_opened_on_the_dashboard_go_first_then_the_ones_autopilot_would_take(tmp_path):
+    gateway, md = _streaming(tmp_path, fakes.SYMBOLS)
+    plays = ["T02", "T03", "T04", "T05"]
+    assert md.streams.sync(["T01"], plays, 3) == ["T01", "T02", "T03"]
+    # Autopilot would take T05: it goes ahead of the plays streaming for under a minute; T09 is off the board
+    assert md.streams.sync(["T01"], plays, 3, candidates=["T05", "T09"]) == ["T01", "T05", "T02"]
+    md.streams.prefer("T04")                                                # the operator opened a play on T04...
+    md.streams.prefer("T09")                                                # ...one that has left the board since...
+    md.streams.prefer("T01")                                                # ...and one on a stock held
+    assert md.streams.sync(["T01"], plays, 3, candidates=["T05"]) == ["T01", "T04", "T05"]
+    assert gateway.stream_calls[-1] == (["T01", "T04", "T05", "T02", "T03"], 3)   # T01 once, T09 not at all
+
+    for symbol in ("T06", "T07", "T08", "T09", "T10", "T11"):
+        md.streams.prefer(symbol)
+    assert md.streams.preferred() == ["T11", "T10", "T09", "T08", "T07"]    # the five opened last, the latest first
+    md.streams._preferred["T11"] -= StreamManager.PREFER_S                  # five minutes on
+    assert md.streams.preferred() == ["T10", "T09", "T08", "T07"]
+    md.streams.prefer("T08")                                                # opened again: the latest
+    assert md.streams.preferred() == ["T08", "T10", "T09", "T07"]
+
+
 def test_a_dropped_connection_prices_as_before_and_the_streams_are_asked_for_again(tmp_path):
     gateway, md = _streaming(tmp_path)
     md.streams.sync(["AAA"], [], 5)

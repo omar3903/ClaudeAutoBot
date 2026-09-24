@@ -301,11 +301,13 @@ data pill shows `data: IBKR (delayed)`; hover it for the detail.
 
 **Real-time streams.** Once the connection has proven real-time data, the app
 holds IBKR streams for the stocks that matter most: the open positions and
-working entries first, then the best plays still on offer (a play keeps its
-stream at least a minute), up to `execution.stream_lines` (60 of the account's
-~100 market-data lines; 0 = none). A stock whose stream ticked in the last 2
-seconds is priced off it; a quieter one, or one past the budget, gets a one-off
-snapshot as before. Delayed data never streams.
+working entries first, then the plays still on offer - the ones you opened in
+the detail panel in the last 5 minutes, then the ones Autopilot would take, then
+the best of the rest (a play keeps its stream at least a minute) - up to
+`execution.stream_lines` (60 of the account's ~100 market-data lines; 0 = none).
+A stock whose stream ticked in the last 2 seconds is priced off it; a quieter
+one, or one past the budget, gets a one-off snapshot as before - an entry never
+waits for a stream. Delayed data never streams.
 
 > The app manages exits itself (it doesn't attach a native OCO bracket at IBKR,
 > so two exit managers never fight over one position). That means **no stop is
@@ -683,7 +685,8 @@ play was judged on is gone and the entry is refused. Within that, a limit entry
 is priced off the quote so it fills now instead of waiting for the price to come
 back through the entry — which is the move failing. A day-trade entry still
 working after `execution.entry_timeout_min` (10) minutes is cancelled for the
-same reason; swing entries keep their DAY life.
+same reason; swing entries keep their DAY life. The log says which quote each
+check read (a stream's, a snapshot or a candle) and how old it was.
 
 **Part fills get their stop.** Until an entry order is done, the shares it has
 bought have no trade record, so no stop at the broker. An entry (day or swing)

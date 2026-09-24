@@ -5,6 +5,7 @@ Prices are a seeded random walk per symbol, so every run sees the same candles.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import functools
 import time
@@ -242,7 +243,7 @@ class StreamingGateway(FakeGateway):
 
     def get_quote(self, symbol: str) -> Quote:
         self.snapshots += 1
-        return super().get_quote(symbol)
+        return dataclasses.replace(super().get_quote(symbol), source="snapshot")   # marked as IbkrBroker marks it
 
     def close(self) -> None:
         super().close()

@@ -29,6 +29,10 @@ class StreamManager:
     FRESH_S = 2.0
     #: a play's stream is kept this long while the play is on offer, so a re-rank doesn't trade lines back and forth
     PLAY_MIN_HOLD_S = 60.0
+    #: a play the operator opened streams ahead of the other plays this long, so an Execute click is priced off
+    #: the stream - and no more than this many at once, the latest opened kept
+    PREFER_S = 300.0
+    PREFER_MAX = 5
 
     def __init__(self, md: Any) -> None:
         """``md``: the MarketData it serves - its source is read afresh on every call, never kept."""
@@ -39,17 +43,20 @@ class StreamManager:
         self._since: Dict[str, float] = {}             # symbol -> when its stream started (time.monotonic)
         self._moved: Set[str] = set()                  # symbols that ticked since the dashboard last looked
         self._pushed: Dict[str, float] = {}            # symbol -> the price the dashboard was last sent (take_moves)
+        self._preferred: Dict[str, float] = {}         # symbol -> when the operator last opened a play on it
         self._listeners: List[Listener] = []
 
     def _source(self) -> Any:
         return self._md._source
 
     # ---- which stocks stream ---------------------------------------------- #
-    def sync(self, held: Sequence[str], plays: Sequence[str], lines: int) -> List[str]:
+    def sync(self, held: Sequence[str], plays: Sequence[str], lines: int,
+             candidates: Sequence[str] = ()) -> List[str]:
         """One resync: stream ``held`` (the positions and working entries) first, then ``plays`` (best first),
-        ``lines`` at most - 0 streams nothing. A play streaming for less than PLAY_MIN_HOLD_S keeps its line
-        ahead of the rest while it's still on offer. Returns the symbols streaming now. It waits on the source,
-        so never call it from the IB loop."""
+        ``lines`` at most - 0 streams nothing. Of the plays, the ones the operator opened lately (prefer) go
+        first, then ``candidates`` (the plays Autopilot would take), then the rest - where a play streaming for
+        less than PLAY_MIN_HOLD_S keeps its line ahead of the others while it's still on offer. Returns the
+        symbols streaming now. It waits on the source, so never call it from the IB loop."""
         src = self._source()
         if src is None or not hasattr(src, "set_streams"):
             self.reset()
@@ -57,6 +64,11 @@ class StreamManager:
         first = list(dict.fromkeys(s for s in held if s))
         taken = set(first)
         offered = [s for s in dict.fromkeys(plays) if s and s not in taken]
+        # only plays still on offer go ahead: one taken since streams with the positions, one gone not at all
+        on_offer = set(offered)
+        ahead = [s for s in dict.fromkeys([*self.preferred(), *candidates]) if s in on_offer]
+        put = set(ahead)
+        rest = [s for s in offered if s not in put]
         now = time.monotonic()
         with self._lock:
             if src is not self._src:
@@ -65,9 +77,9 @@ class StreamManager:
                 self._since.clear()
             if getattr(src, "on_tick", None) != self._on_ticks:
                 src.on_tick = self._on_ticks        # its ticks come to _on_ticks from here on
-            young = [s for s in offered if now - self._since.get(s, float("-inf")) < self.PLAY_MIN_HOLD_S]
+            young = [s for s in rest if now - self._since.get(s, float("-inf")) < self.PLAY_MIN_HOLD_S]
         kept = set(young)
-        order = first + young + [s for s in offered if s not in kept]
+        order = first + ahead + young + [s for s in rest if s not in kept]
         streaming = list(src.set_streams(order, lines))
         with self._lock:
             if self._src is src:
@@ -75,6 +87,25 @@ class StreamManager:
                 # a stock that stops streaming is sent afresh when it starts again: a snapshot may be shown meanwhile
                 self._pushed = {s: px for s, px in self._pushed.items() if s in self._since}
         return streaming
+
+    def prefer(self, symbol: str) -> None:
+        """The operator opened a play on ``symbol``: it streams ahead of the other plays for PREFER_S, so the
+        Execute click is priced off the stream. Only the dashboard's click calls it - Autopilot looks at every
+        play it passes, and would crowd out the one on the screen."""
+        if not symbol:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._preferred.pop(symbol, None)                   # opened again: it's the latest
+            self._preferred[symbol] = now
+            live = [(s, at) for s, at in self._preferred.items() if now - at < self.PREFER_S]
+            self._preferred = dict(live[-self.PREFER_MAX:])
+
+    def preferred(self) -> List[str]:
+        """The stocks of the plays the operator opened in the last PREFER_S, the latest first."""
+        now = time.monotonic()
+        with self._lock:
+            return [s for s, at in reversed(self._preferred.items()) if now - at < self.PREFER_S]
 
     def reset(self) -> None:
         """Forget the source and everything it streamed - a new connection, or none (MarketData.attach/detach).
