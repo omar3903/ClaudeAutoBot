@@ -1844,6 +1844,31 @@ def test_the_sync_loop_runs_the_exits_on_a_tick_between_its_full_passes_and_stop
     assert not loop.is_alive() and [only for only, _ in passes[3:]] == [None]
 
 
+def test_a_tick_pass_comes_a_second_after_the_last_tick_pass_too_not_just_the_last_full_pass(engine, monkeypatch):
+    from tos_bot.engine import engine as module
+
+    passes = []
+    monkeypatch.setattr(engine, "_sync_orders", lambda: None)
+    monkeypatch.setattr(engine, "_check_quit_progress", lambda: None)
+    monkeypatch.setattr(engine, "_run_exits", lambda only=None: passes.append((only, time.monotonic())))
+    monkeypatch.setattr(module.clock, "current_session", lambda ts=None: clock.Session.REGULAR)
+    monkeypatch.setattr(engine, "SYNC_S", 5.0)                          # room for two tick passes before a full one
+    monkeypatch.setattr(engine, "EXIT_TICK_GAP_S", 0.4)
+    engine.exit_manager.watched = frozenset({"T01"})
+    loop = threading.Thread(target=engine._sync_loop, daemon=True)
+    loop.start()
+    assert _until(lambda: len(passes) == 1)                             # the full pass
+    engine._on_stream_ticks(frozenset({"T01"}))
+    assert _until(lambda: len(passes) == 2)                             # a tick pass, the gap after the full pass
+    engine._on_stream_ticks(frozenset({"T01"}))                         # a busy tape: another tick straight away
+    assert _until(lambda: len(passes) == 3)
+    engine.stop()
+    loop.join(2.0)
+    (full, _), (first, t1), (second, t2) = passes
+    assert full is None and first == second == frozenset({"T01"})
+    assert t2 - t1 >= 0.4 - 0.05                                        # the gap counts from the tick pass as well
+
+
 def test_the_streamed_prices_that_moved_go_to_the_dashboard_at_most_once_a_second(engine, monkeypatch):
     from tos_bot.engine.engine import SESSION_WORDS
 
