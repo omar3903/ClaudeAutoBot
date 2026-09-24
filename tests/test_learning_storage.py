@@ -213,7 +213,7 @@ def test_the_training_set_joins_the_three_populations(repo, tmp_path):
     p.symbol = "SET"
     repo.record_play(p)
     tid = repo.open_trade(p, 100.0, 10, "paper", entry_context=play_features(p, now=dt.datetime.now(UTC), by="operator"))
-    repo.update_trade_risk(tid, mfe=3.0)
+    repo.update_trade_risk(tid, mfe=5.0)                      # the best point, past the fill that closes it
     repo.close_trade(tid, 104.0, "target")
     repo.save_shadow_trades(DAY, [_shadow("play_shadow_set"), _shadow("play_shadow_set2", filled=False)])
     run = repo.save_sim_trades("2031-01-05T10:00:00+00:00", [_sim("2030-12-20T10:00:00-05:00", 1.5)], None)
@@ -221,7 +221,7 @@ def test_the_training_set_joins_the_three_populations(repo, tmp_path):
     rows = dataset.training_rows(repo)
     by_id = {(r["source"], r["id"]): r for r in rows}
     live = by_id[("live", tid)]
-    assert (live["r"], live["win"], live["mfe_r"], live["confidence"], live["schema"]) == (2.0, True, 1.5, 0.7, FEATURE_SCHEMA)
+    assert (live["r"], live["win"], live["mfe_r"], live["confidence"], live["schema"]) == (2.0, True, 2.5, 0.7, FEATURE_SCHEMA)
     shadow = by_id[("shadow", "play_shadow_set")]
     assert shadow["r"] == 2.0 and shadow["win"] is True and ("shadow", "play_shadow_set2") not in by_id   # no fill, no row
     replay = [r for r in rows if r["source"] == "replay"]

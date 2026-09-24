@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
 
 import pytest
@@ -274,7 +275,8 @@ def _ticking(trades, prices, executor=None, **cfg):
 
     def quote(s):
         asked.append(s)
-        return Quote(symbol=s, bid=prices[s], ask=prices[s], last=prices[s])
+        px, at = prices[s] if isinstance(prices[s], tuple) else (prices[s], None)     # (price, printed at), or a price
+        return Quote(symbol=s, bid=px, ask=px, last=px, **({"ts": at} if at else {}))
 
     rules = dict(enabled=True, breakeven_at_r=1.0, breakeven_lock_r=0.3, breakeven_buffer_bps=5,
                  trail_start_r=1.5, trail_lock_ratio=0.5, flatten_intraday_before_close_min=10, max_swing_hold_days=0)
@@ -362,6 +364,58 @@ def test_an_exit_a_tick_pass_sends_writes_the_excursions_first_as_a_full_pass_wo
         assert ex.closed == [("t1", reason)]
         em.run_once()                                                    # closed: no pass folds anything in later
         assert {k: round(repo._t["t1"][k], 6) for k in want} == want, reason
+
+
+def test_a_quote_printed_before_the_entry_filled_marks_no_excursion():
+    # the first pass after a fill can get the last print from before it (the quote cache, a snapshot's Ticker): a
+    # best point the trade never saw. It marks nothing, on a full pass or a tick; the next quote from the trade's
+    # life marks as before
+    filled = dt.datetime(2026, 9, 3, 13, 40, 30, tzinfo=dt.timezone.utc)
+    before, after = filled - dt.timedelta(seconds=20), filled + dt.timedelta(seconds=5)
+    for first in ("full", "tick"):
+        trade = _trade(entry_time=filled.replace(tzinfo=None).isoformat())          # the record keeps naive UTC
+        prices = {"AAA": (101.8, before)}                                            # +0.9R, printed before the fill
+        em, repo, ex, events, _ = _ticking([trade], prices)
+        em.run_once() if first == "full" else em.run_once(only={"AAA"})
+        assert repo.writes == [], first
+        prices["AAA"] = (100.5, after)
+        em.run_once()
+        [(_, wrote)] = repo.writes
+        assert (wrote["hwm_price"], wrote["mfe"], wrote["mae"]) == (100.5, 0.5, 0.0), first
+        assert ex.closed == [] and events == []
+    # a quote from the very second of the fill is the trade's; one that doesn't say when it was printed counts
+    for quote_fn in (lambda s: Quote(symbol=s, bid=101.0, ask=101.0, last=101.0, ts=filled),
+                     lambda s: SimpleNamespace(last=101.0, mid=101.0)):
+        repo = _WritesRepo([_trade(entry_time=filled.replace(tzinfo=None).isoformat())])
+        em = ExitManager(repo, FakeExecutor(repo), quote_fn=quote_fn, cfg=_day_cfg(breakeven_at_r=0.0),
+                         bus=SimpleNamespace(publish=lambda *a, **k: None))
+        em.run_once()
+        assert [kw["mfe"] for _, kw in repo.writes] == [1.0]
+
+
+def test_the_exit_fill_joins_the_excursions_when_it_is_the_worst_or_the_best_point(repo):
+    # the passes mark the excursions from the quotes between them and never see the fill itself: a stop that fills
+    # through the worst point marked so far would leave the record's MAE short of the trade's own loss, a target that
+    # fills past the best point its MFE and high-water mark short. The fill is the last price the trade saw
+    from tos_bot.core.enums import Side, StrategyKind, Timeframe
+    from tos_bot.core.models import Play
+    cases = [  # (side, stop, target, what the passes marked, the fill, what the closed record keeps)
+        ("LONG", 98.0, 104.0, dict(hwm_price=100.6, mae=0.8, mfe=0.6), 97.4, dict(hwm_price=100.6, mae=2.6, mfe=0.6)),
+        ("LONG", 98.0, 104.0, dict(hwm_price=103.0, mae=0.8, mfe=3.0), 104.3, dict(hwm_price=104.3, mae=0.8, mfe=4.3)),
+        ("SHORT", 102.0, 96.0, dict(hwm_price=99.4, mae=0.8, mfe=0.6), 102.6, dict(hwm_price=99.4, mae=2.6, mfe=0.6)),
+        ("SHORT", 102.0, 96.0, dict(hwm_price=97.0, mae=0.8, mfe=3.0), 95.7, dict(hwm_price=95.7, mae=0.8, mfe=4.3)),
+        ("LONG", 98.0, 104.0, dict(hwm_price=101.0, mae=1.5, mfe=1.0), 99.5, dict(hwm_price=101.0, mae=1.5, mfe=1.0)),
+    ]
+    for side, stop, target, marked, fill, want in cases:
+        play = Play(symbol="EXCR", side=Side[side], strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                    timeframe=Timeframe.INTRADAY, entry=100.0, stop=stop, targets=[target])
+        tid = repo.open_trade(play, 100.0, 10, "paper")
+        repo.update_trade_risk(tid, **marked)
+        lost = (fill - 100.0) * (1 if side == "LONG" else -1) < 0
+        out = repo.close_trade(tid, fill, exit_reason="stop" if lost else "target")
+        assert {k: round(out[k], 6) for k in want} == want, (side, fill)
+        if want["mfe"] > marked["mfe"]:
+            assert out["mfe_at"] == out["exit_time"], (side, fill)      # the fill set the MFE, at the exit
 
 
 def test_a_stop_a_tick_moved_is_told_before_the_exit_that_closes_the_trade_first():
