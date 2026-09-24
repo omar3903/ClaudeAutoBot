@@ -1624,6 +1624,61 @@ def test_a_stocks_price_says_when_its_from_and_the_session_it_traded_in(engine, 
     assert asked[-1] == 1234                                                    # the stock's contract when it's known
 
 
+def test_the_streams_go_to_the_positions_first_then_the_plays_still_on_offer(engine, monkeypatch):
+    from tos_bot.core.enums import PlayStatus
+
+    gateway = fakes.StreamingGateway(fakes.SYMBOLS)
+    gateway.connect()
+    engine.md.attach(gateway)
+    _open(engine, "T01")                                                        # a trade on this venue
+    working = {"order_id": "o1", "play_id": "p1", "symbol": "T05", "strategy": "vwap_reclaim",
+               "timeframe": "SWING", "qty": 1, "notional": 100.0, "risk": 5.0}
+    monkeypatch.setattr(engine, "working_entries", lambda: [working])         # an entry not filled yet
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="T02", quantity=10, avg_price=50.0, market_price=50.0)]
+    offered, taken, held = _play("T03"), _play("T04"), _play("T01")
+    offered.score, taken.score, held.score = 0.5, 0.9, 0.4
+    engine.board.replace([offered, taken, held], None)
+    taken.status = PlayStatus.ACCEPTED
+    assert engine._stream_wanted() == (["T01", "T05", "T02"], ["T03", "T01"])
+
+    execution = engine.settings.config.execution
+    monkeypatch.setattr(execution, "stream_lines", 3)
+    assert engine._resync_streams() == ["T01", "T05", "T02"]                   # the positions take every line
+    monkeypatch.setattr(execution, "stream_lines", 5)
+    assert engine._resync_streams() == ["T01", "T05", "T02", "T03"]            # T01 counts once
+
+    gateway.tick("T02", 55.0)
+    assert engine._marks()["T02"][0] == 55.0                                    # the position's mark is the stream's
+    [pos] = engine.snapshot()["positions"]
+    assert pos["unrealized_pl"] == round((55.0 - 50.0) * 10, 2)
+
+    monkeypatch.setattr(execution, "stream_lines", 0)
+    monkeypatch.setattr(engine, "_stream_wanted", lambda: pytest.fail("nothing is looked up with the streams off"))
+    assert engine._resync_streams() == [] and gateway.streams == []
+
+
+def test_new_plays_and_an_approval_wake_the_stream_loop_and_stopping_ends_it(engine, monkeypatch):
+    engine._stream_wake.clear()
+    engine._publish_plays()
+    assert engine._stream_wake.is_set()
+
+    p = _play("T06")
+    engine.board.replace([p])
+    monkeypatch.setattr(engine, "assess_play",
+                        lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
+    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen: None)
+    monkeypatch.setattr(engine.executor, "execute_play", lambda p, account, **kw: {"ok": True, "status": "SUBMITTED"})
+    engine._stream_wake.clear()
+    assert engine.approve_play(p.id)["ok"] and engine._stream_wake.is_set()   # its stock streams from the next pass
+
+    loop = threading.Thread(target=engine._stream_loop, daemon=True)
+    loop.start()
+    engine.stop()
+    loop.join(2.0)
+    assert not loop.is_alive()
+
+
 # ---------------------------------------------------------------- open positions on the dashboard
 def test_each_open_position_says_what_rests_at_the_broker_to_close_it(engine):
     """The Open positions tab's protection chip reads the orders the executor placed and follows

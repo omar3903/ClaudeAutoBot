@@ -299,6 +299,14 @@ still serves historical candles, so scans run on IBKR's candles, and prices for
 stops, targets and simulator fills come from the latest one-minute candle. The
 data pill shows `data: IBKR (delayed)`; hover it for the detail.
 
+**Real-time streams.** Once the connection has proven real-time data, the app
+holds IBKR streams for the stocks that matter most: the open positions and
+working entries first, then the best plays still on offer (a play keeps its
+stream at least a minute), up to `execution.stream_lines` (60 of the account's
+~100 market-data lines; 0 = none). A stock whose stream ticked in the last 2
+seconds is priced off it; a quieter one, or one past the budget, gets a one-off
+snapshot as before. Delayed data never streams.
+
 > The app manages exits itself (it doesn't attach a native OCO bracket at IBKR,
 > so two exit managers never fight over one position). That means **no stop is
 > resting at IBKR if the app isn't running** — keep it running while positions

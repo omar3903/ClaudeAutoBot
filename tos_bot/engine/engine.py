@@ -223,6 +223,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         # set to have the snapshot loop read the account now rather than at its next turn - after an order
         # sent from the dashboard, whose reply doesn't wait for that read
         self._snapshot_wake = threading.Event()
+        # set to have the stream loop point the streams at what changed now - a new position, a new board
+        self._stream_wake = threading.Event()
         self._reconciled_at = float("-inf")         # the loop's last position check (see _reconcile_if_due)
         self._armed = False
 
@@ -284,7 +286,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._threads = [threading.Thread(target=loop, name=name, daemon=True) for name, loop in (
             ("scan-loop", self._scan_loop), ("sync-loop", self._sync_loop), ("snapshot-loop", self._snapshot_loop),
             ("orders-loop", self._orders_loop), ("signals-loop", self._signals_loop),
-            ("journal-loop", self._journal_loop), ("pairs-loop", self._pairs_loop))]
+            ("journal-loop", self._journal_loop), ("pairs-loop", self._pairs_loop),
+            ("stream-loop", self._stream_loop))]
         for t in self._threads:
             t.start()
         self._publish("engine.started", state=self.snapshot())
@@ -293,6 +296,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._stop.set()
         self._scan_wake.set()
         self._snapshot_wake.set()
+        self._stream_wake.set()
         self._day_changed(now=True)
         self.connections.close_all()
         log.info("engine stopped")
@@ -792,6 +796,39 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 log.exception("working orders check failed")
             self._stop.wait(ORDERS_POLL_S)
 
+    #: the streams are pointed at the stocks that matter this often, and sooner when the positions or plays change
+    STREAM_RESYNC_S = 5.0
+
+    def _stream_loop(self) -> None:
+        """Keeps IBKR's real-time streams on the stocks that matter most (see data/streams.py). A thread of its
+        own: a resync waits on the Gateway, and must never hold up the exits or a scan."""
+        while not self._stop.is_set():
+            try:
+                self._resync_streams()
+            except Exception:  # noqa: BLE001
+                log.debug("stream resync failed", exc_info=True)
+            self._stream_wake.wait(self.STREAM_RESYNC_S)
+            self._stream_wake.clear()
+
+    def _resync_streams(self) -> List[str]:
+        """Stream the stocks held, then the plays on offer, within execution.stream_lines (0 = none, and
+        every price is a snapshot as before). Returns the symbols streaming now."""
+        lines = int(self.settings.config.execution.stream_lines or 0)
+        held, plays = self._stream_wanted() if lines > 0 else ([], [])
+        return self.md.streams.sync(held, plays, lines)
+
+    def _stream_wanted(self) -> Tuple[List[str], List[str]]:
+        """The stocks to stream, most needed first: those held - this venue's open trades, the entries still
+        working, then anything else the account holds - and the stocks of the plays still on offer, best first."""
+        held = [t["symbol"] for t in self._positions_here()]
+        held += [w["symbol"] for w in self.working_entries()]
+        held += [p.symbol for p in (self._account.positions if self._account else [])]
+        try:
+            plays = [p.symbol for p in self.board.ranked() if p.status is PlayStatus.PROPOSED]
+        except Exception:  # noqa: BLE001 - ranked() reads the board without its lock, and a scan may change it then
+            plays = []                        # the positions still stream; the plays wait for the next pass
+        return list(dict.fromkeys(held)), list(dict.fromkeys(plays))
+
     # ------------------------------------------------------------------ #
     #  Scans                                                             #
     # ------------------------------------------------------------------ #
@@ -1058,6 +1095,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         records: Dict[str, Dict[str, Any]] = {}                # each setup's record read once for the board
         self._publish("plays.updated",
                       plays=[self._slim(self._decorate(p, records)) for p in self.board.ranked()[:self.BOARD_ROWS]])
+        self._stream_wake.set()                                 # the streams follow the new ranking
 
     #: stocks the quick re-check looks at, best plays first
     PLAYS_REFRESH_MAX = 25
@@ -1700,6 +1738,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             # sent: the executor has saved it SUBMITTED (or the fill FILLED) - and the sync loop may already
             # have saved how it ended, which a write here would overwrite
             self._publish("play.decided", play_id=p.id, decision="approved", result=out, play=self._decorate(p))
+            self._stream_wake.set()                       # a working entry or a new position streams ahead of the plays
             if operator == "autopilot":
                 # on the scan thread: its next play, and the next pass, read the account this order changed
                 self._refresh_account()
