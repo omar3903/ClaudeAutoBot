@@ -22,8 +22,9 @@ little longer after each try (``RETRY_DELAYS_S``).
 
 Between full passes, a streamed tick on a stock held runs a tick pass on just that
 stock (``run_once(only=...)``, engine._sync_loop): steps 1 and 5 on the fresh price.
-It moves the stop on the record at once, but keeps the excursions in memory and
-leaves the note and the message about the move to the next full pass.
+It moves the stop on the record at once, but keeps the excursions in memory - written
+before an exit it sends, else by the next full pass - and leaves the note and the
+message about the move to the next full pass.
 
 Entries always need your click; exits never do.
 """
@@ -241,8 +242,9 @@ class ExitManager:
         r_now = ((px - entry) * sign / risk_ps) if risk_ps else 0.0
 
         # --- excursions + high-water mark ------------------------------ #
-        # a tick pass keeps the low and high it saw in memory; the next full pass folds them in and writes the
-        # record, only when something changed - not a database write per position every second
+        # a tick pass keeps the low and high it saw in memory; the next full pass (or the tick pass that sends an
+        # exit) folds them in and writes the record, only when something changed - not a database write per
+        # position every second
         fav = max(0.0, (px - entry) * sign)
         adv = max(0.0, (entry - px) * sign)
         low, high = self._extreme.pop(t["id"], (px, px))
@@ -252,10 +254,22 @@ class ExitManager:
         mae = max(float(t.get("mae") or 0.0), adv, (entry - worst) * sign)
         hwm = t.get("hwm_price") or entry
         hwm = max(hwm, best) if side == "LONG" else min(hwm, best)
-        if not full:
+
+        def write_excursions() -> None:
+            if any(_changed(new, t.get(k)) for new, k in ((hwm, "hwm_price"), (mae, "mae"), (mfe, "mfe"))):
+                self.repo.update_trade_risk(t["id"], hwm_price=hwm, mae=mae, mfe=mfe)
+
+        def close(reason: str, **kw: Any) -> Optional[Dict[str, Any]]:
+            if not full:
+                # a trade whose exit goes out gets no next full pass - it's left alone while the exit works,
+                # then closed - so the record gets what the tick passes saw first, as a full pass writes it
+                write_excursions()
+            return self._close(t["id"], reason, seen=px, **kw)
+
+        if full:
+            write_excursions()
+        else:
             self._extreme[t["id"]] = (low, high)
-        elif any(_changed(new, t.get(k)) for new, k in ((hwm, "hwm_price"), (mae, "mae"), (mfe, "mfe"))):
-            self.repo.update_trade_risk(t["id"], hwm_price=hwm, mae=mae, mfe=mfe)
 
         managed = bool(t.get("managed_exit", True))
         overdue = t.get("time_status") == "overdue"
@@ -283,15 +297,15 @@ class ExitManager:
         if work_stop:
             if (side == "LONG" and px <= float(work_stop)) or (side == "SHORT" and px >= float(work_stop)):
                 moved = init_stop is not None and abs(float(work_stop) - float(init_stop)) > 1e-6
-                return self._close(t["id"], "trailing-stop" if moved else "stop", seen=px)
+                return close("trailing-stop" if moved else "stop")
         resting = getattr(self.executor, "target_resting", None)
         if target and not (callable(resting) and resting(t["id"])):
             # (a target order resting at the broker is the broker's to fill, on prices the app may see late)
             if (side == "LONG" and px >= float(target)) or (side == "SHORT" and px <= float(target)):
                 part = self._scale_out(t, managed, entry, sign, risk_ps)
                 if part is not None:
-                    return self._close(t["id"], "target-1", qty=part[0], after_fill=part[1], seen=px)
-                return self._close(t["id"], "target", seen=px)
+                    return close("target-1", qty=part[0], after_fill=part[1])
+                return close("target")
 
         # --- 2. time / session exits ------------------------------- #
         # (full passes only: a tick pass is about the price, and a time-stop goes out after the overdue note)

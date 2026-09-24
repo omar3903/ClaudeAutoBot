@@ -338,6 +338,23 @@ def test_tick_passes_keep_the_excursions_in_memory_and_a_full_pass_writes_them_o
     assert len(repo.writes) == 1
 
 
+def test_an_exit_a_tick_pass_sends_writes_the_excursions_first_as_a_full_pass_would():
+    # the trade gets no next full pass once its exit is out, so the record must already hold the price that set it off
+    for full_at, ticks, reason, want in (
+            (99.0, (97.5,), "stop", dict(mae=2.5, mfe=0.0, hwm_price=100.0)),
+            (105.0, (110.5,), "target", dict(mae=0.0, mfe=10.5, hwm_price=110.5)),
+            (100.0, (104.0, 101.9), "trailing-stop", dict(mae=0.0, mfe=4.0, hwm_price=104.0))):  # the high trailed it
+        prices = {"AAA": full_at}
+        em, repo, ex, events, _ = _ticking([_trade()], prices)
+        em.run_once()
+        for px in ticks:
+            prices["AAA"] = px
+            em.run_once(only={"AAA"})
+        assert ex.closed == [("t1", reason)]
+        em.run_once()                                                    # closed: no pass folds anything in later
+        assert {k: round(repo._t["t1"][k], 6) for k in want} == want, reason
+
+
 def test_a_stop_hit_on_a_tick_sends_one_exit_and_the_ticks_right_after_send_none(monkeypatch):
     from tos_bot.execution import exit_manager as module
 
