@@ -1,8 +1,10 @@
 /* The chart behind a play: its recent candles, the entry, stop and target, and every
    way the trade can end (see engine/chart.py). Opened from the chart button on a play. The
    same window shows a report's movers (movers.js), and the candle drawing here (candlesSVG)
-   also draws the chart behind a trade record (tradeChartHTML, in the record's panel: blotter.js). */
-import { $, api, escapeHtml, num } from "./util.js";
+   also draws the chart behind a trade record (tradeChartHTML, in the record's panel: blotter.js), which the
+   mouse can read: a crosshair with the price and the candle under it, and a drag that measures a move
+   (attachChartInteraction). */
+import { $, api, escapeHtml, num, pct, usd } from "./util.js";
 import { S } from "./state.js";
 import { watchPrice } from "./price.js";
 
@@ -105,19 +107,40 @@ function routesHTML(routes) {
     + `${r.r != null ? ` <span class="route-r">${r.r >= 0 ? "+" : ""}${num(r.r, 1)}R</span>` : ""} — ${escapeHtml(r.how)}</li>`).join("")}</ul>`;
 }
 
-/** Candles as an SVG, with optional price lines, time lines, markers and one shaded candle. A line with
-    `lighter` is drawn thinner and dimmer (a level that no longer applies); a mark of kind "best" is a
-    small dot. Clock labels carry the weekday once the candles span more than one session. */
-export function candlesSVG(c, { lines = [], vlines = [], marks = [], band = null, height = 320, clock = false }) {
+/** The frame a candle chart is drawn in: the viewBox, the plot's edges, one candle's width, and the scales
+    both ways - a candle's index to its x and a price to its y for the drawing, and a point on the chart back
+    to the price at it and the candle whose span holds it, for the mouse (attachChartInteraction). */
+function chartFrame(c, { lines = [], marks = [], height = 320 }) {
   const W = 860, H = height, top = 12, bottom = 22, left = 8, right = 96;
-  const plotW = W - left - right;
   const values = [...c.flatMap(k => [k.h, k.l]), ...lines.map(l => l.v), ...marks.map(m => m.v)].filter(v => v != null && isFinite(v));
   let lo = Math.min(...values), hi = Math.max(...values);
   const pad = (hi - lo) * 0.06 || hi * 0.01;
   lo -= pad; hi += pad;
-  const y = v => top + (hi - v) / (hi - lo) * (H - top - bottom);
-  const step = plotW / c.length, bodyW = Math.max(1, step * 0.65);
-  const x = i => left + i * step + step / 2;
+  const step = (W - left - right) / c.length, plotH = H - top - bottom;
+  return {
+    W, H, top, bottom, left, right, step, bodyW: Math.max(1, step * 0.65),
+    x: i => left + i * step + step / 2,
+    y: v => top + (hi - v) / (hi - lo) * plotH,
+    priceAt: py => hi - (py - top) / plotH * (hi - lo),
+    indexAt: px => Math.min(c.length - 1, Math.max(0, Math.floor((px - left) / step))),
+  };
+}
+
+/** How a candle's time reads on a chart: the clock for 5-minute candles, or the date for daily ones. The
+    clock alone can't tell one session's 9:30 from the next's, so once the candles span more than one session
+    the weekday goes with it (the candles' times are New York's, so their dates are the sessions'). */
+function timeLabel(c, clock) {
+  const days = clock && new Set(c.map(k => k.t.slice(0, 10))).size > 1;
+  return t => new Date(t).toLocaleString(undefined, clock
+    ? { ...(days ? { weekday: "short" } : {}), hour: "numeric", minute: "2-digit", timeZone: "America/New_York" }
+    : { month: "short", day: "numeric" });
+}
+
+/** Candles as an SVG, with optional price lines, time lines, markers and one shaded candle. A line with
+    `lighter` is drawn thinner and dimmer (a level that no longer applies); a mark of kind "best" is a
+    small dot. Clock labels carry the weekday once the candles span more than one session. */
+export function candlesSVG(c, { lines = [], vlines = [], marks = [], band = null, height = 320, clock = false }) {
+  const { W, H, top, bottom, left, right, step, bodyW, x, y } = chartFrame(c, { lines, marks, height });
   const starts = c.map(k => Date.parse(k.t)), span = starts.length > 1 ? starts[1] - starts[0] : 0;
   const xAt = iso => {                 // the candle a moment falls in, or null outside the candles
     const t = Date.parse(iso);
@@ -151,12 +174,7 @@ export function candlesSVG(c, { lines = [], vlines = [], marks = [], band = null
           : `<path d="M ${at} ${py + s} L ${at + s} ${py - s} L ${at - s} ${py - s} z"/>`;
     return `<g class="mark ${m.cls}">${shape}<title>${escapeHtml(m.title)}</title></g>`;
   }).join("");
-  // the clock alone can't tell one session's 9:30 from the next's: more than one session on the chart, and
-  // the weekday goes with it (the candles' times are New York's, so their dates are the sessions')
-  const days = clock && new Set(c.map(k => k.t.slice(0, 10))).size > 1;
-  const label = t => new Date(t).toLocaleString(undefined, clock
-    ? { ...(days ? { weekday: "short" } : {}), hour: "numeric", minute: "2-digit", timeZone: "America/New_York" }
-    : { month: "short", day: "numeric" });
+  const label = timeLabel(c, clock);
   const ticks = [...new Set([0, Math.floor(c.length / 2), c.length - 1])].map(i =>
     `<text class="tick" x="${x(i)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === c.length - 1 ? "end" : "middle"}">${escapeHtml(label(c[i].t))}</text>`).join("");
   return `<div class="chart-wrap"><svg class="play-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">
@@ -167,12 +185,12 @@ export function candlesSVG(c, { lines = [], vlines = [], marks = [], band = null
 const etTime = iso => new Date(iso).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" });
 const etWhen = iso => new Date(iso).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZone: "America/New_York" });
 
-/** The trade on its candles: the entry, stop and target lines (the first stop lighter once the stop has
-    moved), where the bot got in, took part off and got out, the best point it saw, a line at the entry time
-    so what led to the trade stands apart from what came after, and the ways it can still end. */
-export function tradeChartHTML(d) {
-  const c = d.candles, lv = d.levels, long = d.side === "LONG", open = d.status === "OPEN";
-  if (!c.length) return `<p class="reasons">No candles for ${escapeHtml(d.symbol)} yet - the chart fills in once IBKR sends prices.</p>`;
+const TRADE_CHART_H = 420;             // tall, to use the panel's height
+
+/* What goes on the trade's candles, shared by the drawing (tradeChartHTML) and the mouse wiring
+   (attachTradeChart) so both work in the same frame. */
+function tradeChartParts(d) {
+  const c = d.candles, lv = d.levels, long = d.side === "LONG";
   const clock = c.length > 1 && Date.parse(c[1].t) - Date.parse(c[0].t) < 864e5;   // 5-minute candles, not daily
   const when = clock ? etTime : etWhen;
   const moved = lv.initial_stop != null && lv.stop != null && Math.abs(lv.stop - lv.initial_stop) > 0.01;
@@ -191,10 +209,19 @@ export function tradeChartHTML(d) {
   });
   const entry = d.marks.find(m => m.kind === "entry");
   const vlines = entry ? [{ t: entry.t, cls: "vl-entry", title: `entered ${when(entry.t)} ET` }] : [];
+  return { c, lines, marks, vlines, clock, when };
+}
+
+/** The trade on its candles: the entry, stop and target lines (the first stop lighter once the stop has
+    moved), where the bot got in, took part off and got out, the best point it saw, a line at the entry time
+    so what led to the trade stands apart from what came after, and the ways it can still end. */
+export function tradeChartHTML(d) {
+  if (!d.candles.length) return `<p class="reasons">No candles for ${escapeHtml(d.symbol)} yet - the chart fills in once IBKR sends prices.</p>`;
+  const { c, lines, marks, vlines, clock, when } = tradeChartParts(d), open = d.status === "OPEN";
   const moves = (d.stop_moves || []).map(m =>
     `${m.t ? `${when(m.t)} ET → ` : "→ "}${num(m.price)}${m.r != null ? ` at ${m.r >= 0 ? "+" : ""}${num(m.r, 1)}R` : ""}`);
   return `<div class="muted small">${escapeHtml(d.bars)}${S.state.data && S.state.data.delayed ? " · IBKR prices are delayed" : ""}</div>
-    ${candlesSVG(c, { lines, vlines, marks, height: 420, clock })}
+    ${candlesSVG(c, { lines, vlines, marks, height: TRADE_CHART_H, clock })}
     <ul class="chart-key small">
       <li><i class="mk-entry"></i>the entry</li><li><i class="mk-part"></i>part taken off</li>
       <li><i class="mk-win"></i><i class="mk-loss"></i>the exit</li><li><i class="mk-best"></i>the best point</li>
@@ -202,4 +229,165 @@ export function tradeChartHTML(d) {
     </ul>
     ${moves.length ? `<p class="muted small">Stop moved: ${escapeHtml(moves.join(" · "))}</p>` : ""}
     ${d.routes.length ? `<h4>${open ? "Ways the trade can end" : "The ways it could have ended"}</h4>${routesHTML(d.routes)}` : ""}`;
+}
+
+/** Wire the trade's chart for the mouse once tradeChartHTML's markup is in `box` (attachChartInteraction). A
+    measure outlives the minute's redraw: its two candle times are kept on the box, which the redraw keeps,
+    and it is drawn again while both candles are still on the chart. */
+export function attachTradeChart(box, d) {
+  const svg = box.querySelector("svg.play-chart");
+  if (!svg || !d.candles.length) return;
+  const { c, lines, marks, clock } = tradeChartParts(d);
+  const lv = d.levels, first = lv.initial_stop ?? lv.stop;
+  let kept = null;
+  try { kept = JSON.parse(box.dataset.measure || "null"); } catch (e) { kept = null; }
+  attachChartInteraction(svg, {
+    candles: c, clock, scale: chartFrame(c, { lines, marks, height: TRADE_CHART_H }),
+    trade: { side: d.side, quantity: Math.abs(d.quantity || 0), entry: lv.entry,
+      risk: lv.entry != null && first != null ? Math.abs(lv.entry - first) : 0 },
+    measure: kept,
+    onMeasure: m => { if (m) box.dataset.measure = JSON.stringify(m); else delete box.dataset.measure; },
+  });
+}
+
+/* ---- the chart under the mouse ---- */
+const SVG_NS = "http://www.w3.org/2000/svg";
+const svgEl = (tag, cls, parent) => {
+  const n = document.createElementNS(SVG_NS, tag);
+  if (cls) n.setAttribute("class", cls);
+  parent.appendChild(n);
+  return n;
+};
+const setAttrs = (n, a) => { for (const k of Object.keys(a)) n.setAttribute(k, a[k]); };
+const priceText = v => num(v, Math.abs(v) < 1 ? 4 : 2);          // pennies, or hundredths of one under a dollar
+const plus = (v, d = 2) => `${v >= 0 ? "+" : ""}${num(v, d)}`;
+const plusUsd = v => `${v < 0 ? "-" : "+"}${usd(Math.abs(v))}`;
+let wired = null;      // the listeners of the chart wired last: one chart at a time is (the record's), and they go when the next is wired
+
+/* A box of text the chart floats over itself: `lines` are [text, class] pairs, the rect grows to the longest
+   line, and `place(w, h)` says where the box goes once its size is known. The text is set as text, never
+   parsed as markup. */
+function fillBox(g, lines, place) {
+  g.textContent = "";
+  const rect = svgEl("rect", "box", g), PAD = 5, LH = 13;
+  const texts = lines.map(([s, cls]) => { const t = svgEl("text", cls || "", g); t.textContent = s; return t; });
+  const w = Math.max(...texts.map(t => t.getBBox().width)) + PAD * 2, h = LH * texts.length + PAD * 2 - 3;
+  const { x, y } = place(w, h);
+  setAttrs(rect, { x, y, width: w, height: h, rx: 3 });
+  texts.forEach((t, i) => setAttrs(t, { x: x + PAD, y: y + PAD + 9 + LH * i }));
+}
+
+/** The chart under the mouse. A crosshair follows it over the plot: the price at the cursor read off the y
+    scale (so the stop line reads the stop), the candle whose span the cursor is in with its time under the
+    plot, and beside the cursor that candle's open, high, low and close and how far its close is from the
+    entry, in R and in money for this position (a short gains below the entry). A drag from one candle to
+    another shades the span green or red for what the move made or lost this position and reads it out; the
+    measure stays until a click, another drag or a redraw, and Escape or leaving the chart lets go of a drag
+    under way. A touch reads as a hover. `model`: the candles, `clock` (5-minute candles, not daily), the
+    `scale` (chartFrame's), the `trade` (side, quantity, entry, risk a share), a `measure` to draw again (two
+    candle times) and `onMeasure(times | null)`, told when one is kept or cleared. Everything is listened for
+    here - the content-security policy allows no inline handlers - and nothing drawn takes the mouse, so the
+    marks' tooltips still show through. */
+export function attachChartInteraction(svg, model) {
+  const { candles: c, scale, trade } = model;
+  const { W, H, top, bottom, left, right, step, x, priceAt, indexAt } = scale;
+  const when = timeLabel(c, model.clock), sign = trade.side === "SHORT" ? -1 : 1;
+  if (wired) wired.abort();
+  wired = new AbortController();
+  const signal = wired.signal;
+  // the span a drag shades and its reading, then the crosshair over it
+  const root = svgEl("g", "xhair", svg), span = svgEl("g", "span", root), cross = svgEl("g", "cross", root);
+  const shade = svgEl("rect", "measure", span), spanBox = svgEl("g", "", span);
+  const hLine = svgEl("line", "", cross), vLine = svgEl("line", "", cross);
+  const priceBox = svgEl("g", "", cross), timeBox = svgEl("g", "", cross), candleBox = svgEl("g", "", cross);
+  const within = (v, a, b) => Math.min(Math.max(v, a), b);
+  const inPlot = p => p.px >= left && p.px <= W - right && p.py >= top && p.py <= H - bottom;
+  const has = t => c.some(k => k.t === t);
+  let drag = null, measure = null;     // the drag under way {from, to, moved} (candle indexes); the measure kept (two candle times)
+
+  // where the mouse is in the chart's own units, whatever size the SVG is drawn at
+  const toView = e => {
+    const m = svg.getScreenCTM();
+    if (!m) return null;
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX; pt.y = e.clientY;
+    const p = pt.matrixTransform(m.inverse());
+    return { px: p.x, py: p.y };
+  };
+  const showCross = show => { cross.setAttribute("visibility", show ? "visible" : "hidden"); svg.classList.toggle("in-plot", show); };
+
+  function drawCross(p) {
+    const i = indexAt(p.px), k = c[i], cx = x(i);
+    setAttrs(hLine, { x1: left, x2: W - right, y1: p.py, y2: p.py });
+    setAttrs(vLine, { x1: cx, x2: cx, y1: top, y2: H - bottom });
+    fillBox(priceBox, [[priceText(priceAt(p.py))]], (w, h) => ({ x: W - right + 2, y: within(p.py - h / 2, 0, H - h) }));
+    fillBox(timeBox, [[when(k.t)]], (w, h) => ({ x: within(cx - w / 2, left, W - right - w), y: H - h }));
+    const lines = [[`O ${priceText(k.o)}  H ${priceText(k.h)}  L ${priceText(k.l)}  C ${priceText(k.c)}`]];
+    if (trade.entry != null) {
+      const away = sign * (k.c - trade.entry);
+      lines.push([`${trade.risk ? `${plus(away / trade.risk)}R from the entry · ` : ""}${plusUsd(away * trade.quantity)} this position`,
+        away >= 0 ? "pl-pos" : "pl-neg"]);
+    }
+    // beside the cursor, flipped to its other side where the plot's edge is near
+    fillBox(candleBox, lines, (w, h) => ({ x: p.px + 14 + w > W - right ? p.px - 14 - w : p.px + 14,
+      y: p.py + 14 + h > H - bottom ? p.py - 14 - h : p.py + 14 }));
+    showCross(true);
+  }
+
+  // `times`: the two candles' times in time order, or null for none; the change is the later close less the
+  // earlier, whichever way the mouse went
+  function drawMeasure(times) {
+    const a = times ? c.findIndex(k => k.t === times[0]) : -1, b = times ? c.findIndex(k => k.t === times[1]) : -1;
+    span.setAttribute("visibility", a >= 0 && b >= 0 ? "visible" : "hidden");
+    if (a < 0 || b < 0) return;
+    const chg = c[b].c - c[a].c, gain = sign * chg >= 0;
+    setAttrs(shade, { x: x(a) - step / 2, y: top, width: x(b) - x(a) + step, height: H - top - bottom, class: `measure ${gain ? "gain" : "loss"}` });
+    fillBox(spanBox, [
+      [`${when(c[a].t)} → ${when(c[b].t)}`],
+      [`${priceText(c[a].c)} → ${priceText(c[b].c)}  ${plus(chg)} (${c[a].c ? pct(chg / c[a].c * 100) : "–"})`],
+      [`this position: ${plusUsd(sign * chg * trade.quantity)}`, gain ? "pl-pos" : "pl-neg"],
+    ], (w, h) => ({ x: within((x(a) + x(b)) / 2 - w / 2, left, W - right - w), y: top + 4 }));
+  }
+  const setMeasure = m => { measure = m; drawMeasure(m); if (model.onMeasure) model.onMeasure(m); };
+  const letGo = () => { if (!drag) return; drag = null; drawMeasure(measure); };     // a drag dropped: the kept measure is back
+  const spanOf = d => [c[Math.min(d.from, d.to)].t, c[Math.max(d.from, d.to)].t];
+
+  const move = e => {
+    const p = toView(e);
+    if (!p) return;
+    if (drag) {                        // past the plot's edges a drag still reaches the first or the last candle
+      drag.to = indexAt(p.px);
+      drag.moved = drag.moved || drag.to !== drag.from;
+      drawMeasure(spanOf(drag));
+    }
+    if (inPlot(p)) drawCross(p); else showCross(false);
+  };
+  svg.addEventListener("mousemove", move, { signal });
+  svg.addEventListener("mouseleave", () => { showCross(false); letGo(); }, { signal });
+  svg.addEventListener("mousedown", e => {
+    const p = e.button === 0 ? toView(e) : null;
+    if (!p || !inPlot(p)) return;
+    e.preventDefault();                // no text selection while the mouse is dragged across the labels
+    drag = { from: indexAt(p.px), to: indexAt(p.px), moved: false };
+  }, { signal });
+  svg.addEventListener("mouseup", () => {
+    if (!drag) return;
+    const d = drag;
+    drag = null;
+    setMeasure(d.moved ? spanOf(d) : null);      // a drag keeps its span; a click clears whatever was kept
+  }, { signal });
+  // Escape lets go of a drag under way, and only that: it stops here, so the drawer's own Escape (ui.js) doesn't
+  // close the record mid-drag
+  document.addEventListener("keydown", e => {
+    if (e.key !== "Escape" || !drag) return;
+    e.stopPropagation();
+    letGo();
+  }, { capture: true, signal });
+  // a finger reads the chart as the mouse hovering does; no measure by touch
+  const touch = e => { if (e.touches[0]) move(e.touches[0]); };
+  svg.addEventListener("touchstart", touch, { passive: true, signal });
+  svg.addEventListener("touchmove", touch, { passive: true, signal });
+  showCross(false);
+  const kept = model.measure;
+  setMeasure(Array.isArray(kept) && kept.length === 2 && kept.every(has) ? kept : null);
 }

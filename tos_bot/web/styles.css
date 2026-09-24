@@ -483,6 +483,16 @@ button.link:hover{text-decoration:underline; filter:none}
 .play-chart .mk-best, .chart-key .mk-best{fill:var(--fg); background:var(--fg)}
 .play-chart .vl-entry, .chart-key .vl-entry{stroke:var(--accent); background:var(--accent)}
 .play-chart .lv-initial{opacity:.5; stroke-width:.7}
+/* the chart under the mouse (chart.js attachChartInteraction): the crosshair with its readings and the span a
+   drag measures; none of it takes the mouse, so the marks' tooltips show through */
+.play-chart.in-plot{cursor:crosshair}
+.play-chart .xhair{pointer-events:none}
+.play-chart .xhair line{stroke:var(--muted); stroke-dasharray:3 3; stroke-width:1}
+.play-chart .xhair .box{fill:var(--bg2); stroke:var(--line); stroke-width:1}
+.play-chart .xhair text{font-size:11px; fill:var(--fg); stroke:none}
+.play-chart .xhair text.pl-pos{fill:var(--long)} .play-chart .xhair text.pl-neg{fill:var(--short)}
+.play-chart .measure.gain{fill:var(--long); opacity:.15}
+.play-chart .measure.loss{fill:var(--short); opacity:.15}
 .chart-key{list-style:none; padding:0; margin:4px 0 10px; display:flex; flex-wrap:wrap; gap:4px 16px; color:var(--muted)}
 .chart-key i{display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:middle}
 @media (max-width:900px){ .sheet-main.with-side{grid-template-columns:1fr} .sheet-side{flex-direction:row; overflow-x:auto; border-right:none}

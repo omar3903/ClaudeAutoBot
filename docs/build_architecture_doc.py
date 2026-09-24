@@ -1299,7 +1299,8 @@ def build() -> str:
         ("topbar.js, ui.js, tooltips.js", "the header pills (connection, market session, regime, equity), the drawer "
          "and tabs, hover help"),
         ("plays.js, chart.js, sheet.js", "the board of plays, the detail panel with the candle chart and exit routes; "
-         "chart.js also draws the trade record's chart (GET /api/trades/{id}/chart: candles, levels, marks, standing)"),
+         "chart.js also draws the trade record's chart (GET /api/trades/{id}/chart: candles, levels, marks, standing) "
+         "with a crosshair and a drag that measures a move for the position"),
         ("autopilot.js", "Autopilot on/off, dry run, types, the confidence / R:R / loss-stop sliders"),
         ("filters.js, strategies.js, settings.js", "the filter bar (sides, timeframes, sectors), the strategy "
          "catalogue with weights in plain words, the scan schedule"),

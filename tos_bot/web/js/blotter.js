@@ -11,7 +11,7 @@ import { loadWatchlist } from "./watchlist.js";
 import { loadOrders } from "./orders.js";
 import { loadPairs } from "./pairs.js";
 import { watchPrice } from "./price.js";
-import { tradeChartHTML } from "./chart.js";
+import { attachTradeChart, tradeChartHTML } from "./chart.js";
 
 const LOADERS = {
   open: loadOpen, orders: () => loadOrders(true), history: loadHistory, stats: loadStats, watchlist: loadWatchlist,
@@ -430,9 +430,11 @@ async function loadRecordChart(id) {
     try { d = await api(`/api/trades/${encodeURIComponent(id)}/chart`); } catch (e) { d = { ok: false, reason: `No chart - ${e.message}.` }; }
     if (!showing()) return;
     recordChart = d.ok ? d : null;
-    $("#drawer-body .rec-chart").innerHTML = d.ok
+    const box = $("#drawer-body .rec-chart");
+    box.innerHTML = d.ok
       ? `<h4>${escapeHtml(d.symbol)} · ${d.side === "SHORT" ? "short" : "long"} · where it stands</h4>${standingHTML(d)}${tradeChartHTML(d)}`
       : `<p class="reasons">${escapeHtml(d.reason || "No chart for this trade.")}</p>`;
+    if (d.ok) attachTradeChart(box, d);          // the crosshair and the drag measure, once the SVG is in the page
   }
   chartTimer = setTimeout(() => loadRecordChart(id), CHART_EVERY_MS);
 }
