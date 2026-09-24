@@ -7,7 +7,9 @@ background loops:
     scan loop      the daily full scan before the open, the intraday cycles over
                    the hot list and sector buffers, and fast hot-list cycles while
                    Autopilot is day-trading (see scanner/schedule.py)
-    sync loop      every few seconds: fills, automatic exits, quit progress
+    sync loop      every few seconds: fills, automatic exits, quit progress - and in
+                   regular hours the exits again within a second of a streamed
+                   tick on a stock held
     snapshot loop  every 10-30 s: account, broker-vs-database check, broadcast
 
 Whatever the user changes on the dashboard applies straight away, is
@@ -28,7 +30,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 from .. import secrets_store
 from ..brokers import get_broker
@@ -97,6 +99,15 @@ ORDERS_MAX_AGE_S = 8.0
 SESSION_WORDS = {clock.Session.PRE: "pre-market", clock.Session.REGULAR: "regular",
                  clock.Session.POST: "after-hours", clock.Session.CLOSED: "closed"}
 
+
+def tick_exit_wait(now: float, last_exit: float, deadline: float, gap: float) -> Tuple[float, bool]:
+    """Once a streamed tick wakes the sync loop: how long it waits, then whether an exits-only pass follows. That
+    comes ``gap`` after the last exit pass at the soonest, and not at all when the full pass is due by then - the
+    full pass reads every price afresh anyway, and keeps its turn (``deadline``)."""
+    ready = max(now, last_exit + gap)
+    if ready >= deadline:
+        return max(0.0, deadline - now), False
+    return ready - now, True
 
 
 class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayStateOps):
@@ -225,6 +236,12 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._snapshot_wake = threading.Event()
         # set to have the stream loop point the streams at what changed now - a new position, a new board
         self._stream_wake = threading.Event()
+        # a streamed tick on a stock the exits manage: the stocks, and the sync loop's wake (_on_stream_ticks)
+        self._exit_wake = threading.Event()
+        self._ticked: set = set()
+        self._ticked_lock = threading.Lock()
+        self._tick_exits_on = False                 # regular hours - each full pass of the sync loop sets it
+        self.md.streams.add_listener(self._on_stream_ticks)
         self._reconciled_at = float("-inf")         # the loop's last position check (see _reconcile_if_due)
         self._armed = False
 
@@ -297,6 +314,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._scan_wake.set()
         self._snapshot_wake.set()
         self._stream_wake.set()
+        self._exit_wake.set()
         self._day_changed(now=True)
         self.connections.close_all()
         log.info("engine stopped")
@@ -733,23 +751,69 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._scan_wake.wait(5.0)
             self._scan_wake.clear()
 
+    #: the order sync and a full pass of the exits come this often
+    SYNC_S = 4.0
+    #: in regular hours a streamed tick on a stock held runs its exits this long after their last pass at the soonest
+    EXIT_TICK_GAP_S = 1.0
+
     def _sync_loop(self) -> None:
         steps = ((self._sync_orders, "order sync"), (self._run_exits, "automatic exits"),
                  (self._check_quit_progress, "quit progress check"))
         while not self._stop.is_set():
+            # ticks drive the exits in regular hours only; after-hours prints are read by the full pass, as before
+            self._tick_exits_on = clock.current_session() is clock.Session.REGULAR
+            self._exit_wake.clear()
+            self._take_ticked()                     # the full pass reads every price afresh
             for step, what in steps:
                 try:
                     step()
                 except Exception:  # noqa: BLE001
                     log.exception("%s failed", what)
-            self._stop.wait(4.0)
+            self._exits_on_ticks(time.monotonic())
+
+    def _exits_on_ticks(self, last_exit: float) -> None:
+        """Until the next full pass is due, run the exits on the stocks held whose streamed price moved -
+        EXIT_TICK_GAP_S apart at the most. Here on the sync thread, so an exit pass never runs beside another
+        or beside the order sync."""
+        deadline = last_exit + self.SYNC_S
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or self._stop.is_set() or not self._exit_wake.wait(left) or self._stop.is_set():
+                return                              # the full pass is due, or the engine is stopping
+            self._exit_wake.clear()
+            wait, tick_pass = tick_exit_wait(time.monotonic(), last_exit, deadline, self.EXIT_TICK_GAP_S)
+            if (wait > 0 and self._stop.wait(wait)) or not tick_pass:
+                return
+            only = self._take_ticked()
+            if only:
+                try:
+                    self._run_exits(only=only)
+                except Exception:  # noqa: BLE001
+                    log.exception("automatic exits on ticks failed")
+                last_exit = time.monotonic()
+
+    def _on_stream_ticks(self, symbols: FrozenSet[str]) -> None:
+        """StreamManager's word that ``symbols`` ticked - on the IB loop thread, so it only notes the stocks the
+        exits manage and wakes the sync loop."""
+        em = self.exit_manager
+        hit = em.watched.intersection(symbols) if em is not None and self._tick_exits_on else frozenset()
+        if hit:
+            with self._ticked_lock:
+                self._ticked |= hit
+            self._exit_wake.set()
+
+    def _take_ticked(self) -> FrozenSet[str]:
+        with self._ticked_lock:
+            hit, self._ticked = frozenset(self._ticked), set()
+        return hit
 
     def _sync_orders(self) -> None:
         if self.executor:
             self.executor.sync_open_orders()
 
-    def _run_exits(self) -> None:
-        if self.exit_manager and self.exit_manager.run_once():
+    def _run_exits(self, only: Optional[FrozenSet[str]] = None) -> None:
+        """A full pass of the exits, or with ``only`` a tick pass on just those stocks (ExitManager.run_once)."""
+        if self.exit_manager and self.exit_manager.run_once(only):
             self._refresh_account()
             self._publish("account.snapshot", state=self.snapshot())
 

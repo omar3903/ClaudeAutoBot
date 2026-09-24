@@ -813,6 +813,11 @@ The stop only ever ratchets in your favour and never through the last price. R
 is measured against the **original** stop. Each open position has an **Auto
 exit** toggle in the blotter if you want to hand-manage it.
 
+In regular hours a streamed tick on a stock held (see **Real-time streams**)
+runs its stop and target checks, and moves its stop, within about a second. The
+note on the record and the message about a moved stop wait for the next full
+pass a few seconds later, and so do the time exits.
+
 Every strategy also declares how long its trade *should* take. The blotter shows
 an **Age / Expected** bar per position (green → amber **aging** → red **⏰
 overdue**). For a swing trade this is informational. **A day trade that reaches

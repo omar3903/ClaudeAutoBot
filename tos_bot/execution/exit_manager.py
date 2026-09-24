@@ -20,6 +20,11 @@ A trade whose close order is still working is left alone. An exit that can't
 be sent, or that the broker rejects or cancels, is sent again - waiting a
 little longer after each try (``RETRY_DELAYS_S``).
 
+Between full passes, a streamed tick on a stock held runs a tick pass on just that
+stock (``run_once(only=...)``, engine._sync_loop): steps 1 and 5 on the fresh price.
+It moves the stop on the record at once, but keeps the excursions in memory and
+leaves the note and the message about the move to the next full pass.
+
 Entries always need your click; exits never do.
 """
 
@@ -29,7 +34,7 @@ import datetime as dt
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, FrozenSet, List, Optional, Tuple
 
 from ..core.eventbus import BUS
 from ..util import clock
@@ -87,10 +92,22 @@ class ExitManager:
         self._overdue_seen: set = set()     # trade ids we've already flagged as overdue
         self._not_held: set = set()         # trade ids whose position the broker doesn't show
         self._prices: Dict[str, Optional[float]] = {}   # this pass's quotes
+        #: the stocks the last full pass managed - a streamed tick on one of them wakes a tick pass (engine)
+        self.watched: FrozenSet[str] = frozenset()
+        # what tick passes leave for the next full pass: the low and high they saw, and a stop move not yet told
+        self._extreme: Dict[str, Tuple[float, float]] = {}   # trade id -> (low, high)
+        self._unannounced: Dict[str, float] = {}            # trade id -> the stop a tick pass moved it to
 
     # ------------------------------------------------------------------ #
-    def run_once(self) -> List[Dict[str, Any]]:
+    def run_once(self, only: Optional[Collection[str]] = None) -> List[Dict[str, Any]]:
+        """A full pass over the open trades, or with ``only`` a tick pass over the trades in just those stocks,
+        whose streamed price just moved."""
+        full = only is None
         if not bool(getattr(self.cfg, "enabled", True)):
+            if full:
+                self.watched = frozenset()
+            return []
+        if not full and not only:
             return []
         try:
             open_trades = self.repo.open_trades()
@@ -103,12 +120,18 @@ class ExitManager:
         in_flight = self.executor.pending_exit_trade_ids()
         mine = [t for t in open_trades if t["id"] not in in_flight and not t.get("pair_id")   # the pair desk's
                 and not (self.venue and (t.get("broker") or self.venue) != self.venue)]
+        if full:
+            self.watched = frozenset(t["symbol"] for t in mine)
+        else:
+            # a trade the broker doesn't hold waits for the engine's broker check - trying its exit every
+            # second would ask the broker for its orders and account each time, for nothing
+            mine = [t for t in mine if t["symbol"] in only and t["id"] not in self._not_held]
         self._prices = self._fetch_prices({t["symbol"] for t in mine})
         acted: List[Dict[str, Any]] = []
         try:
             for t in mine:
                 try:
-                    r = self._manage(t)
+                    r = self._manage(t, full)
                     if r:
                         acted.append(r)
                 except Exception:  # noqa: BLE001
@@ -192,14 +215,16 @@ class ExitManager:
 
     def _forget_all_but(self, open_ids: set) -> None:
         """Drop what's remembered about trades that are no longer open."""
-        for book in (self._tries, self._last_failure):
+        for book in (self._tries, self._last_failure, self._extreme, self._unannounced):
             for tid in [k for k in book if k not in open_ids]:
                 del book[tid]
         self._not_held &= open_ids
         self._overdue_seen &= open_ids
 
     # ------------------------------------------------------------------ #
-    def _manage(self, t: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _manage(self, t: Dict[str, Any], full: bool = True) -> Optional[Dict[str, Any]]:
+        """One trade's exits and stop. ``full`` False: a tick pass - the stop and target checks and the stop's
+        move on the record only (see the module docstring)."""
         sym, side = t["symbol"], t["side"]
         entry = float(t["entry_price"] or 0.0)
         if entry <= 0:
@@ -216,13 +241,21 @@ class ExitManager:
         r_now = ((px - entry) * sign / risk_ps) if risk_ps else 0.0
 
         # --- excursions + high-water mark ------------------------------ #
+        # a tick pass keeps the low and high it saw in memory; the next full pass folds them in and writes the
+        # record, only when something changed - not a database write per position every second
         fav = max(0.0, (px - entry) * sign)
         adv = max(0.0, (entry - px) * sign)
-        mfe = max(float(t.get("mfe") or 0.0), fav)
-        mae = max(float(t.get("mae") or 0.0), adv)
+        low, high = self._extreme.pop(t["id"], (px, px))
+        low, high = min(low, px), max(high, px)
+        best, worst = (high, low) if side == "LONG" else (low, high)
+        mfe = max(float(t.get("mfe") or 0.0), fav, (best - entry) * sign)
+        mae = max(float(t.get("mae") or 0.0), adv, (entry - worst) * sign)
         hwm = t.get("hwm_price") or entry
-        hwm = max(hwm, px) if side == "LONG" else min(hwm, px)
-        self.repo.update_trade_risk(t["id"], hwm_price=hwm, mae=mae, mfe=mfe)
+        hwm = max(hwm, best) if side == "LONG" else min(hwm, best)
+        if not full:
+            self._extreme[t["id"]] = (low, high)
+        elif any(_changed(new, t.get(k)) for new, k in ((hwm, "hwm_price"), (mae, "mae"), (mfe, "mfe"))):
+            self.repo.update_trade_risk(t["id"], hwm_price=hwm, mae=mae, mfe=mfe)
 
         managed = bool(t.get("managed_exit", True))
         overdue = t.get("time_status") == "overdue"
@@ -231,7 +264,7 @@ class ExitManager:
                       and bool(getattr(self.cfg, "intraday_time_stop", False)) and not stop_locked(side, work_stop, entry))
 
         # --- 0. expected-exit overwatch ------------------------------------ #
-        if (overdue and not t.get("overdue_notified")
+        if (full and overdue and not t.get("overdue_notified")
                 and t["id"] not in self._overdue_seen):
             self._overdue_seen.add(t["id"])
             self.repo.note_overdue(t["id"])
@@ -261,18 +294,19 @@ class ExitManager:
                 return self._close(t["id"], "target", seen=px)
 
         # --- 2. time / session exits ------------------------------- #
-        if timing_out:
+        # (full passes only: a tick pass is about the price, and a time-stop goes out after the overdue note)
+        if full and timing_out:
             # Aziz: a day trade that hasn't moved in its time is wrong - its setup's window has passed, and
             # it only holds a slot and capital a fresh setup could use. One that is working (its stop at
             # break-even or better) keeps its trail until the flatten
             return self._close(t["id"], "time-stop", seen=px)
         flat_min = float(getattr(self.cfg, "flatten_intraday_before_close_min", 10) or 0)
-        if managed and t.get("timeframe") == "INTRADAY" and flat_min > 0:
+        if full and managed and t.get("timeframe") == "INTRADAY" and flat_min > 0:
             if clock.minutes_to_close() <= flat_min:
                 return self._close(t["id"], "eod-flatten", seen=px)
 
         max_hold = int(getattr(self.cfg, "max_swing_hold_days", 0) or 0)
-        if managed and max_hold > 0 and t.get("timeframe") == "SWING" and t.get("entry_time"):
+        if full and managed and max_hold > 0 and t.get("timeframe") == "SWING" and t.get("entry_time"):
             try:
                 et = dt.datetime.fromisoformat(t["entry_time"])
                 age_days = (dt.datetime.utcnow() - et.replace(tzinfo=None)).days
@@ -308,16 +342,37 @@ class ExitManager:
         else:
             new_stop = max(new_stop, px + 0.01)
 
-        if abs(new_stop - float(work_stop or init_stop)) > 0.01:
+        was = float(work_stop or init_stop)
+        told = self._unannounced.pop(t["id"], None) if full else None
+        if abs(new_stop - was) > 0.01:
+            if not full:
+                # the exit check reads the record, so the stop moves there now; its note and message wait for
+                # the next full pass - a trending stock would add one every second
+                self.repo.update_trade_risk(t["id"], stop_price=round(new_stop, 4))
+                self._unannounced[t["id"]] = round(new_stop, 4)
+                return None
             self.repo.update_trade_risk(
                 t["id"], stop_price=round(new_stop, 4),
                 note_append=f"stop->{new_stop:.2f} @ {r_now:.1f}R",
             )
-            # what the stop now keeps if it's hit is not where the trade stands: a +1.4R trade whose
-            # stop goes to break-even locks about +0.3R. Send both (r stays, the same as r_now, for
-            # older readers)
-            kept_r = (round(new_stop, 4) - entry) * sign / risk_ps
-            self.bus.publish("exit.stop_moved", trade_id=t["id"], symbol=sym,
-                             new_stop=round(new_stop, 4), locked_r=round(kept_r, 2),
-                             r_now=round(r_now, 2), r=round(r_now, 2))
+        elif told is not None and abs(told - was) <= 0.01:
+            # a move a tick pass made, still on the record, is told now. A stop something else set since (the
+            # break-even after a part came off at the first target) isn't the exit manager's move to tell
+            new_stop = told
+            self.repo.update_trade_risk(t["id"], note_append=f"stop->{new_stop:.2f} @ {r_now:.1f}R")
+        else:
+            return None
+        # what the stop now keeps if it's hit is not where the trade stands: a +1.4R trade whose
+        # stop goes to break-even locks about +0.3R. Send both (r stays, the same as r_now, for
+        # older readers)
+        kept_r = (round(new_stop, 4) - entry) * sign / risk_ps
+        self.bus.publish("exit.stop_moved", trade_id=t["id"], symbol=sym,
+                         new_stop=round(new_stop, 4), locked_r=round(kept_r, 2),
+                         r_now=round(r_now, 2), r=round(r_now, 2))
         return None
+
+
+def _changed(new: float, old: Any) -> bool:
+    """Whether a value differs from the record's - which keeps six decimals, so a float the same to within
+    that reads as unchanged."""
+    return old is None or abs(float(new) - float(old)) > 1e-6

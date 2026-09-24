@@ -1679,6 +1679,76 @@ def test_new_plays_and_an_approval_wake_the_stream_loop_and_stopping_ends_it(eng
     assert not loop.is_alive()
 
 
+def _streaming_position(engine, symbol="T01"):
+    """A position here whose stock streams, next to a play's stock (T03) that streams too."""
+    gateway = fakes.StreamingGateway(fakes.SYMBOLS)
+    gateway.connect()
+    engine.md.attach(gateway)
+    tid = _open(engine, symbol)
+    assert engine.md.streams.sync([symbol], ["T03"], 5) == [symbol, "T03"]
+    return gateway, tid
+
+
+def test_a_tick_wakes_the_exits_only_for_a_stock_held_and_only_in_regular_hours(engine):
+    gateway, _ = _streaming_position(engine)
+    engine.exit_manager.watched = frozenset({"T01"})                  # what the last full pass managed
+    engine._tick_exits_on = True
+    gateway.tick("T03", 50.0)                                           # a play's stock: not the exits' business
+    assert not engine._exit_wake.is_set() and engine._take_ticked() == frozenset()
+    gateway.tick("T01", 101.0)
+    assert engine._exit_wake.is_set() and engine._take_ticked() == frozenset({"T01"})
+    engine._exit_wake.clear()
+    engine._tick_exits_on = False                                       # outside regular hours
+    gateway.tick("T01", 101.5)
+    assert not engine._exit_wake.is_set() and engine._take_ticked() == frozenset()
+
+
+def test_a_tick_pass_comes_a_second_after_the_last_exits_at_the_soonest_and_asks_for_no_snapshot(engine):
+    from tos_bot.engine.engine import tick_exit_wait
+
+    wait, go = tick_exit_wait(now=10.3, last_exit=10.0, deadline=14.0, gap=1.0)
+    assert go and abs(wait - 0.7) < 1e-9                                # 0.3 s after the last pass: 0.7 s more
+    assert tick_exit_wait(now=11.5, last_exit=10.0, deadline=14.0, gap=1.0) == (0.0, True)
+    wait, go = tick_exit_wait(now=13.2, last_exit=13.0, deadline=14.0, gap=1.0)
+    assert not go and abs(wait - 0.8) < 1e-9                            # the full pass is due first: wait for it
+
+    gateway, tid = _streaming_position(engine)
+    gateway.tick("T01", 107.0)                                          # +1.4R: the stop goes to break-even and a bit
+    engine._run_exits(only=frozenset({"T01"}))
+    t = engine.repo.get_trade(tid)
+    assert t["stop_price"] == 101.55 and "stop->" not in (t["notes"] or "")
+    assert gateway.snapshots == 0                                       # priced off the stream
+
+
+def test_the_sync_loop_runs_the_exits_on_a_tick_between_its_full_passes_and_stops_promptly(engine, monkeypatch):
+    from tos_bot.engine import engine as module
+
+    passes, session = [], {"now": clock.Session.REGULAR}
+    monkeypatch.setattr(engine, "_sync_orders", lambda: None)
+    monkeypatch.setattr(engine, "_check_quit_progress", lambda: None)
+    monkeypatch.setattr(engine, "_run_exits", lambda only=None: passes.append((only, time.monotonic())))
+    monkeypatch.setattr(module.clock, "current_session", lambda ts=None: session["now"])
+    monkeypatch.setattr(engine, "SYNC_S", 0.6)
+    monkeypatch.setattr(engine, "EXIT_TICK_GAP_S", 0.2)
+    engine.exit_manager.watched = frozenset({"T01"})
+    loop = threading.Thread(target=engine._sync_loop, daemon=True)
+    loop.start()
+    assert _until(lambda: len(passes) == 1) and engine._tick_exits_on   # a full pass, in regular hours
+    engine._on_stream_ticks(frozenset({"T01", "T03"}))
+    assert _until(lambda: len(passes) == 2)
+    (full, t0), (only, t1) = passes
+    assert full is None and only == frozenset({"T01"}) and t1 - t0 >= 0.2 - 0.02
+    assert _until(lambda: len(passes) == 3)
+    assert passes[2][0] is None and passes[2][1] - t0 >= 0.6 - 0.02      # the full pass keeps its turn
+    session["now"] = clock.Session.POST
+    monkeypatch.setattr(engine, "SYNC_S", 30.0)
+    assert _until(lambda: len(passes) == 4) and not engine._tick_exits_on
+    engine._on_stream_ticks(frozenset({"T01"}))                         # after hours the full pass reads it
+    engine.stop()
+    loop.join(2.0)                                                      # not the 30 s to the next full pass
+    assert not loop.is_alive() and [only for only, _ in passes[3:]] == [None]
+
+
 # ---------------------------------------------------------------- open positions on the dashboard
 def test_each_open_position_says_what_rests_at_the_broker_to_close_it(engine):
     """The Open positions tab's protection chip reads the orders the executor placed and follows
