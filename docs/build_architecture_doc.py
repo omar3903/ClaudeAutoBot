@@ -1298,12 +1298,13 @@ def build() -> str:
     A(table(["Module", "Panel / job"], [
         ("topbar.js, ui.js, tooltips.js", "the header pills (connection, market session, regime, equity), the drawer "
          "and tabs, hover help"),
-        ("plays.js, chart.js, sheet.js", "the board of plays, the detail panel with the candle chart and exit routes"),
+        ("plays.js, chart.js, sheet.js", "the board of plays, the detail panel with the candle chart and exit routes; "
+         "chart.js also draws the trade record's chart (GET /api/trades/{id}/chart: candles, levels, marks, standing)"),
         ("autopilot.js", "Autopilot on/off, dry run, types, the confidence / R:R / loss-stop sliders"),
         ("filters.js, strategies.js, settings.js", "the filter bar (sides, timeframes, sectors), the strategy "
          "catalogue with weights in plain words, the scan schedule"),
-        ("blotter.js, orders.js, notes.js", "open and closed trades, untracked shares, working orders, "
-         "Autopilot notes"),
+        ("blotter.js, orders.js, notes.js", "open and closed trades (each record a panel with its chart, live while "
+         "it's open), untracked shares, working orders, Autopilot notes"),
         ("scan.js, watchlist.js", "the scan status bar and the hot list / buffers / decisions"),
         ("reports.js, journal.js, movers.js", "the Reports page: reviews, movers, strategy tables"),
         ("signals.js, pairs.js, connections.js, quit.js", "the Signals page, the pairs desk, the Connections "

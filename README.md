@@ -59,8 +59,10 @@ more books of setups, **Grimes, *The Art and Science of Technical Analysis*** an
   simulator and shuts down; live asks whether to exit everything first or
   cancel. Until the last position is out, nothing else can change.
 - **Trade records** — click a position (or a closed trade) for everything stored
-  about it. An open-trade record whose position no longer exists at the broker
-  is deleted automatically.
+  about it, with a chart of the trade: the candles from the session before the
+  entry, where the bot got in and out, the stop and the target, and how it
+  stands, kept live while it's open. An open-trade record whose position no
+  longer exists at the broker is deleted automatically.
 - **Trading capital** — tell the bot to use only part of the account.
 - **A report on every session** — after the close: the market's biggest movers,
   why each one moved (earnings, filings, analyst actions, news, its sector) and
@@ -515,7 +517,15 @@ the market at any time, including while quitting.
 Click an open position or a closed trade for its **record**: status, entry and
 exit, stop moves, what the broker holds right now, why it was taken (the play's
 explanation), every fill and every order sent to the broker — with an **Exit**
-button while it's open.
+button while it's open. The record opens as a panel across the window, and a
+chart of the trade fills the rest of it (`GET /api/trades/{id}/chart`): 5-minute
+candles from the session before the entry (daily candles once it has been held
+longer than ten sessions), the entry, stop and target lines with the first stop
+lighter once the stop has moved, the entry, the parts taken off, the exit and the
+best point marked on the candles, and a strip saying where it stands — open R,
+unrealized, best and worst, held, what the stop and the target would make of it
+(a closed trade's R, P/L and exit reason). The strip follows the streamed price
+and the chart is fetched again every minute while the panel shows the trade.
 
 An open-trade record whose position no longer exists where it was opened —
 closed in the broker's own app, or by an exit that filled while the app was down

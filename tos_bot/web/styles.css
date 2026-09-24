@@ -275,6 +275,8 @@ button.flash-bad{color:var(--short); border-color:var(--short); transition:color
 .drawer{position:fixed; inset:0; background:var(--overlay); display:flex; justify-content:flex-end; z-index:9997}
 .drawer-inner{width:460px; max-width:92vw; background:var(--bg2); height:100%; overflow-y:auto; padding:16px; border-left:1px solid var(--line)}
 .drawer-inner.wide{width:600px}
+/* the trade record's panel: the whole window but a margin, so its chart gets the room */
+.drawer-inner.panel{width:calc(100vw - 48px); max-width:none}
 .drawer-head{display:flex; justify-content:space-between; align-items:center; margin-bottom:12px}
 .shutdown{position:fixed; inset:0; z-index:10002; background:var(--bg); display:flex; align-items:center; justify-content:center; text-align:center; padding:24px}
 .shutdown .card{max-width:460px}
@@ -476,10 +478,28 @@ button.link:hover{text-decoration:underline; filter:none}
 .play-chart .mk-win, .chart-key .mk-win{fill:var(--long); background:var(--long)}
 .play-chart .mk-loss, .chart-key .mk-loss{fill:var(--short); background:var(--short)}
 .play-chart .mk-play, .chart-key .mk-play{fill:var(--warn); background:var(--warn)}
+/* a trade record's chart: the parts taken off, the best point, the entry time, and the first stop once the stop has moved */
+.play-chart .mk-part, .chart-key .mk-part{fill:var(--accent2); background:var(--accent2)}
+.play-chart .mk-best, .chart-key .mk-best{fill:var(--fg); background:var(--fg)}
+.play-chart .vl-entry, .chart-key .vl-entry{stroke:var(--accent); background:var(--accent)}
+.play-chart .lv-initial{opacity:.5; stroke-width:.7}
 .chart-key{list-style:none; padding:0; margin:4px 0 10px; display:flex; flex-wrap:wrap; gap:4px 16px; color:var(--muted)}
 .chart-key i{display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:middle}
 @media (max-width:900px){ .sheet-main.with-side{grid-template-columns:1fr} .sheet-side{flex-direction:row; overflow-x:auto; border-right:none}
   .mover-story{grid-template-columns:1fr} }
+
+/* ---- trade record panel: the chart on the left with where the trade stands over it, the record's details beside it ---- */
+.rec-panel{display:flex; gap:22px; align-items:flex-start}
+.rec-chart{flex:1; min-width:0}
+.rec-chart > h4:first-child{margin:0 0 4px; font-size:14px}
+.rec-side{width:360px; flex:none}
+.standing{display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 10px}
+.standing-live{display:contents}
+.standing div{background:var(--bg3); border:1px solid var(--line); border-radius:8px; padding:6px 12px; min-width:104px}
+.standing label{display:block; font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted)}
+.standing b{display:block; font-size:14px; font-variant-numeric:tabular-nums}
+/* a narrow window stacks the two: the chart column stretched to the panel, its candles scrolling inside it */
+@media (max-width:900px){ .drawer-inner.panel{width:100vw} .rec-panel{flex-direction:column; align-items:stretch} .rec-side{width:auto} }
 
 /* ---- pairs ---- */
 .pairs{padding:10px 12px}
