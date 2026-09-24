@@ -86,6 +86,7 @@ class FakeIB:
         self.pendingTickersEvent, self.errorEvent, self.disconnectedEvent = _FakeEvent(), _FakeEvent(), _FakeEvent()
         self.subscribed, self.cancelled, self.stray_cancels, self.qualified, self.con_ids = [], [], [], [], {}
         self.last_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        self.clock = None                          # a wall clock to stamp packets by instead (see ticks_arrived)
         # snapshots: the ticks one sends, and the error IBKR refuses one with instead (0: none)
         self.snapshot = dict(bid=100.0, ask=100.1, last=float("nan"), close=99.9, volume=1234.0)
         self.refuse_snapshots = 0
@@ -157,9 +158,11 @@ class FakeIB:
 
     def ticks_arrived(self, *tickers):
         """A packet's ticks landing, as ib_async's wrapper.tcpDataProcessed hands them on: each Ticker that got one
-        is stamped with the packet's time, then pendingTickersEvent. The fake's packet times always move on - on a
-        coarse clock two packets could otherwise share one."""
-        self.last_time = max(dt.datetime.now(dt.timezone.utc), self.last_time + dt.timedelta(microseconds=1))
+        is stamped with the packet's time - a new datetime for each packet, as ib_async's datetime.now() gives -
+        then pendingTickersEvent. The fake's packet times always move on, unless a test sets ``clock`` to stamp
+        them as a coarse or reset wall clock would."""
+        self.last_time = (self.clock() if self.clock else
+                          max(dt.datetime.now(dt.timezone.utc), self.last_time + dt.timedelta(microseconds=1)))
         for tk in tickers:
             tk.time = self.last_time
         self.pendingTickersEvent.emit(set(tickers))
@@ -918,6 +921,22 @@ def test_a_refused_snapshot_never_passes_off_an_earlier_snapshots_prices(broker)
     ib.refuse_snapshots = 0
     again = broker.get_quote("AAA")
     assert (again.last, again.source) == (101.05, "snapshot")
+
+
+@pytest.mark.parametrize("step_s", [0, -2])
+def test_a_snapshot_is_read_though_the_wall_clock_stamped_it_no_later_than_the_last_ticks(broker, step_s):
+    # ib_async stamps a packet with datetime.now(): on a coarse clock an answer that comes back at once shares the
+    # last packet's time, and a clock set back gives it an earlier one - it answered all the same
+    ib = broker._session.ib
+    broker.set_streams(["AAA"], 1)
+    at = _tick(broker, "AAA", **FULL).time
+    ib.clock = lambda: at + dt.timedelta(seconds=step_s)                         # a new datetime each packet
+    ib.snapshot = dict(bid=14.0, ask=14.02, last=14.01)
+    q = broker.get_quote("AAA")
+    assert (q.bid, q.ask, q.last, q.source) == (14.0, 14.02, 14.01, "snapshot")
+    ib.refuse_snapshots = 101
+    with pytest.raises(RuntimeError, match="no price"):
+        broker.get_quote("AAA")                                                   # nothing came: still no price
 
 
 def test_a_refused_snapshot_is_priced_as_a_failed_one_from_the_quote_kept_or_the_latest_candle(broker, tmp_path):
