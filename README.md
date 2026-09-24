@@ -819,7 +819,8 @@ exit** toggle in the blotter if you want to hand-manage it.
 In regular hours a streamed tick on a stock held (see **Real-time streams**)
 runs its stop and target checks, and moves its stop, within about a second. The
 note on the record and the message about a moved stop wait for the next full
-pass a few seconds later, and so do the time exits.
+pass a few seconds later (or the exit, if one goes out first), and so do the time
+exits.
 
 Every strategy also declares how long its trade *should* take. The blotter shows
 an **Age / Expected** bar per position (green → amber **aging** → red **⏰

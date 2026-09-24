@@ -22,9 +22,9 @@ little longer after each try (``RETRY_DELAYS_S``).
 
 Between full passes, a streamed tick on a stock held runs a tick pass on just that
 stock (``run_once(only=...)``, engine._sync_loop): steps 1 and 5 on the fresh price.
-It moves the stop on the record at once, but keeps the excursions in memory - written
-before an exit it sends, else by the next full pass - and leaves the note and the
-message about the move to the next full pass.
+It moves the stop on the record at once, but keeps the excursions in memory and leaves
+the note and the message about the move to the next full pass - or to the exit, if one
+goes out first: they're written just before it.
 
 Entries always need your click; exits never do.
 """
@@ -97,7 +97,7 @@ class ExitManager:
         self.watched: FrozenSet[str] = frozenset()
         # what tick passes leave for the next full pass: the low and high they saw, and a stop move not yet told
         self._extreme: Dict[str, Tuple[float, float]] = {}   # trade id -> (low, high)
-        self._unannounced: Dict[str, float] = {}            # trade id -> the stop a tick pass moved it to
+        self._unannounced: Dict[str, Tuple[float, float]] = {}   # trade id -> (the stop a tick pass moved it to, R then)
 
     # ------------------------------------------------------------------ #
     def run_once(self, only: Optional[Collection[str]] = None) -> List[Dict[str, Any]]:
@@ -255,19 +255,42 @@ class ExitManager:
         hwm = t.get("hwm_price") or entry
         hwm = max(hwm, best) if side == "LONG" else min(hwm, best)
 
-        def write_excursions() -> None:
+        def excursions() -> Dict[str, float]:
             if any(_changed(new, t.get(k)) for new, k in ((hwm, "hwm_price"), (mae, "mae"), (mfe, "mfe"))):
-                self.repo.update_trade_risk(t["id"], hwm_price=hwm, mae=mae, mfe=mfe)
+                return dict(hwm_price=hwm, mae=mae, mfe=mfe)
+            return {}
+
+        def tell(new_stop: float, r: float, **write: Any) -> None:
+            """The note on the record and the message for a stop the exit manager moved; ``r``: where the
+            trade stood when it moved."""
+            self.repo.update_trade_risk(t["id"], note_append=f"stop->{new_stop:.2f} @ {r:.1f}R", **write)
+            # what the stop now keeps if it's hit is not where the trade stands: a +1.4R trade whose
+            # stop goes to break-even locks about +0.3R. Send both (r stays, the same as r_now, for
+            # older readers)
+            kept_r = (round(new_stop, 4) - entry) * sign / risk_ps
+            self.bus.publish("exit.stop_moved", trade_id=t["id"], symbol=sym,
+                             new_stop=round(new_stop, 4), locked_r=round(kept_r, 2),
+                             r_now=round(r, 2), r=round(r, 2))
 
         def close(reason: str, **kw: Any) -> Optional[Dict[str, Any]]:
-            if not full:
-                # a trade whose exit goes out gets no next full pass - it's left alone while the exit works,
-                # then closed - so the record gets what the tick passes saw first, as a full pass writes it
-                write_excursions()
+            # a trade whose exit goes out gets no next full pass - it's left alone while the exit works,
+            # then closed - so the record gets what the tick passes saw first, as a full pass writes it: the
+            # excursions, and a stop move not yet told (still the record's: see step 3), in one write
+            try:
+                write = {} if full else excursions()
+                told = self._unannounced.pop(t["id"], None)
+                if told is not None and risk_ps > 0 and work_stop and abs(told[0] - float(work_stop)) <= 0.01:
+                    tell(*told, **write)
+                elif write:
+                    self.repo.update_trade_risk(t["id"], **write)
+            except Exception:  # noqa: BLE001 - the exit goes out all the same
+                log.exception("exit manager: could not write %s before its exit", t["id"])
             return self._close(t["id"], reason, seen=px, **kw)
 
         if full:
-            write_excursions()
+            write = excursions()
+            if write:
+                self.repo.update_trade_risk(t["id"], **write)
         else:
             self._extreme[t["id"]] = (low, high)
 
@@ -313,11 +336,11 @@ class ExitManager:
             # Aziz: a day trade that hasn't moved in its time is wrong - its setup's window has passed, and
             # it only holds a slot and capital a fresh setup could use. One that is working (its stop at
             # break-even or better) keeps its trail until the flatten
-            return self._close(t["id"], "time-stop", seen=px)
+            return close("time-stop")
         flat_min = float(getattr(self.cfg, "flatten_intraday_before_close_min", 10) or 0)
         if full and managed and t.get("timeframe") == "INTRADAY" and flat_min > 0:
             if clock.minutes_to_close() <= flat_min:
-                return self._close(t["id"], "eod-flatten", seen=px)
+                return close("eod-flatten")
 
         max_hold = int(getattr(self.cfg, "max_swing_hold_days", 0) or 0)
         if full and managed and max_hold > 0 and t.get("timeframe") == "SWING" and t.get("entry_time"):
@@ -325,7 +348,7 @@ class ExitManager:
                 et = dt.datetime.fromisoformat(t["entry_time"])
                 age_days = (dt.datetime.utcnow() - et.replace(tzinfo=None)).days
                 if age_days >= max_hold:
-                    return self._close(t["id"], "time-stop", seen=px)
+                    return close("time-stop")
             except Exception:  # noqa: BLE001
                 pass
 
@@ -361,28 +384,15 @@ class ExitManager:
         if abs(new_stop - was) > 0.01:
             if not full:
                 # the exit check reads the record, so the stop moves there now; its note and message wait for
-                # the next full pass - a trending stock would add one every second
+                # the next full pass, or the exit if one goes first - a trending stock would add one every second
                 self.repo.update_trade_risk(t["id"], stop_price=round(new_stop, 4))
-                self._unannounced[t["id"]] = round(new_stop, 4)
+                self._unannounced[t["id"]] = (round(new_stop, 4), r_now)
                 return None
-            self.repo.update_trade_risk(
-                t["id"], stop_price=round(new_stop, 4),
-                note_append=f"stop->{new_stop:.2f} @ {r_now:.1f}R",
-            )
-        elif told is not None and abs(told - was) <= 0.01:
+            tell(new_stop, r_now, stop_price=round(new_stop, 4))
+        elif told is not None and abs(told[0] - was) <= 0.01:
             # a move a tick pass made, still on the record, is told now. A stop something else set since (the
             # break-even after a part came off at the first target) isn't the exit manager's move to tell
-            new_stop = told
-            self.repo.update_trade_risk(t["id"], note_append=f"stop->{new_stop:.2f} @ {r_now:.1f}R")
-        else:
-            return None
-        # what the stop now keeps if it's hit is not where the trade stands: a +1.4R trade whose
-        # stop goes to break-even locks about +0.3R. Send both (r stays, the same as r_now, for
-        # older readers)
-        kept_r = (round(new_stop, 4) - entry) * sign / risk_ps
-        self.bus.publish("exit.stop_moved", trade_id=t["id"], symbol=sym,
-                         new_stop=round(new_stop, 4), locked_r=round(kept_r, 2),
-                         r_now=round(r_now, 2), r=round(r_now, 2))
+            tell(*told)
         return None
 
 

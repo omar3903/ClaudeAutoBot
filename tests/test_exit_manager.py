@@ -355,6 +355,40 @@ def test_an_exit_a_tick_pass_sends_writes_the_excursions_first_as_a_full_pass_wo
         assert {k: round(repo._t["t1"][k], 6) for k in want} == want, reason
 
 
+def test_a_stop_a_tick_moved_is_told_before_the_exit_that_closes_the_trade_first():
+    # the next full pass never sees the trade again, so the move's note and message go out with the exit - once,
+    # and saying where the trade stood when the stop moved, not where it is when the exit goes
+    for last in ("tick", "full"):
+        prices = {"AAA": 100.0}
+        em, repo, ex, events, _ = _ticking([_trade()], prices)
+        em.run_once()
+        for px in (103.5, 104.0):                                        # +1.75R then +2R: the trail keeps half
+            prices["AAA"] = px
+            em.run_once(only={"AAA"})
+        assert repo._t["t1"]["stop_price"] == 102.0 and events == []
+        prices["AAA"] = 101.0                                            # through the moved stop
+        em.run_once(only={"AAA"}) if last == "tick" else em.run_once()
+        em.run_once()
+        assert ex.closed == [("t1", "trailing-stop")], last
+        assert [kw["note_append"] for _, kw in repo.writes if "note_append" in kw] == ["stop->102.00 @ 2.0R"], last
+        assert [topic for topic, _ in events] == ["exit.stop_moved", "exit.triggered"], last
+        assert events[0][1]["new_stop"] == 102.0 and events[0][1]["locked_r"] == 1.0 and events[0][1]["r_now"] == 2.0
+        assert repo._t["t1"]["mfe"] == 4.0 and repo._t["t1"]["hwm_price"] == 104.0
+
+
+def test_a_stop_note_that_cant_be_written_doesnt_hold_up_the_exit():
+    prices = {"AAA": 104.0}
+    em, repo, ex, events, _ = _ticking([_trade()], prices)
+    em.run_once(only={"AAA"})                                            # the stop moves to 102, not yet told
+
+    def down(tid, **kw):
+        raise RuntimeError("database is locked")
+    repo.update_trade_risk = down
+    prices["AAA"] = 101.0
+    em.run_once(only={"AAA"})
+    assert ex.closed == [("t1", "trailing-stop")]
+
+
 def test_a_stop_hit_on_a_tick_sends_one_exit_and_the_ticks_right_after_send_none(monkeypatch):
     from tos_bot.execution import exit_manager as module
 
