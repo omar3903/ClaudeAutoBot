@@ -1749,6 +1749,34 @@ def test_the_sync_loop_runs_the_exits_on_a_tick_between_its_full_passes_and_stop
     assert not loop.is_alive() and [only for only, _ in passes[3:]] == [None]
 
 
+def test_the_streamed_prices_that_moved_go_to_the_dashboard_at_most_once_a_second(engine, monkeypatch):
+    from tos_bot.engine.engine import SESSION_WORDS
+
+    gateway, _ = _streaming_position(engine)
+    sent = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **payload: sent.append((topic, payload, time.monotonic())))
+    monkeypatch.setattr(engine, "PRICE_PUSH_S", 0.5)
+    loop = threading.Thread(target=engine._price_push_loop, daemon=True)
+    loop.start()
+    time.sleep(0.1)
+    assert sent == []                                                   # nothing streamed: nothing sent
+    q = gateway.tick("T01", 101.0)
+    assert _until(lambda: len(sent) == 1)
+    topic, payload, t0 = sent[0]
+    assert topic == "prices.tick" and payload == {"prices": {"T01": {
+        "price": 101.0, "at": q.ts.isoformat(), "session": SESSION_WORDS[clock.current_session(q.ts)]}}}
+    gateway.tick("T01", 101.5)
+    gateway.tick("T03", 50.0)
+    gateway.tick("T01", 102.0)
+    assert _until(lambda: len(sent) == 2)
+    prices, t1 = sent[1][1]["prices"], sent[1][2]
+    assert t1 - t0 >= 0.5 - 0.02                                        # one message a second at the most...
+    assert {s: p["price"] for s, p in prices.items()} == {"T01": 102.0, "T03": 50.0}   # ...with each stock's latest
+    engine.stop()
+    loop.join(2.0)
+    assert not loop.is_alive() and len(sent) == 2
+
+
 # ---------------------------------------------------------------- open positions on the dashboard
 def test_each_open_position_says_what_rests_at_the_broker_to_close_it(engine):
     """The Open positions tab's protection chip reads the orders the executor placed and follows

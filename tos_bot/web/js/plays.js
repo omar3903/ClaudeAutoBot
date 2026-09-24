@@ -1,5 +1,5 @@
 /* The plays table, and the detail panel: why, the numbers, and the order. */
-import { $, $$, api, escapeHtml, fmtClock, num, pct, pretty, post, sectorTag, sideBadge, tfLabel, usd } from "./util.js";
+import { $, $$, api, escapeHtml, fmtClock, isNewer, num, pct, pretty, post, sectorTag, sideBadge, tfLabel, usd } from "./util.js";
 import { S, on } from "./state.js";
 import { openModal, toast } from "./ui.js";
 import { hideTip, showTipAt } from "./tooltips.js";
@@ -52,6 +52,7 @@ function emptyText() {
    only the rows whose signature changed and moves rows only when the order did, so a hover, the selected row
    and a click in flight survive a push that didn't touch them. */
 const shown = new Map();
+const sigOf = ({ cls, html }) => `${cls}|${html}`;
 
 export function renderPlays() {
   const rows = visiblePlays(), offered = S.plays.filter(p => !dismissed(p)).length;
@@ -63,13 +64,13 @@ export function renderPlays() {
   const body = $("#plays-body"), ids = new Set(rows.map(p => p.id));
   for (const [id, r] of shown) if (!ids.has(id)) { r.tr.remove(); shown.delete(id); }
   rows.forEach((p, i) => {
-    const { cls, html } = playRow(p), sig = `${cls}|${html}`;
+    const row = playRow(p), sig = sigOf(row);
     let r = shown.get(p.id);
     if (!r || r.sig !== sig) {
       const tr = document.createElement("tr");
       tr.dataset.id = p.id;
-      tr.className = cls;
-      tr.innerHTML = html;
+      tr.className = row.cls;
+      tr.innerHTML = row.html;
       if (r) r.tr.replaceWith(tr);
       shown.set(p.id, r = { tr, sig });
     }
@@ -77,6 +78,24 @@ export function renderPlays() {
     if (body.children[i] !== r.tr) body.insertBefore(r.tr, body.children[i] || null);
   });
   followSelected();
+}
+
+/* A streamed price (events.js): each play of those stocks takes it where it's newer than the price the play
+   holds, and with `draw` its Price cell alone is drawn again - the row stays the same element, so a hover, the
+   selected row and a click in flight survive - and the row's signature follows, so the next push doesn't draw
+   it again for the price. A row that was due a redraw anyway keeps its old signature, and gets it. */
+export function tickPlays(prices, draw) {
+  for (const p of S.plays) {
+    const t = prices[p.symbol];
+    if (!t || !isNewer(t.at, p.last_at)) continue;
+    const r = draw ? shown.get(p.id) : null, current = !!r && r.sig === sigOf(playRow(p));
+    p.last_price = t.price;
+    p.last_at = t.at;
+    const cell = r && $('td[data-live="price"]', r.tr);
+    if (!cell) continue;
+    cell.outerHTML = priceCell(p);
+    if (current) r.sig = sigOf(playRow(p));
+  }
 }
 
 /** A play whose score the insider or news signals moved: click for its stock on the Signals page. */
@@ -96,12 +115,12 @@ const pastEntryWords = r => `${Math.abs(r).toFixed(2)}R ${r >= 0 ? "past" : "sho
 /* The latest price the app holds for the stock, and how far it has run from the entry in R - an entry is
    refused a quarter of an R past it (execution.max_chase_r). The time it's from is in the tooltip. */
 function priceCell(p) {
-  if (p.last_price == null) return `<td class="num muted" title="No price yet - Refresh fetches one">–</td>`;
+  if (p.last_price == null) return `<td class="num muted" data-live="price" title="No price yet - Refresh fetches one">–</td>`;
   const r = pastEntry(p, p.last_price);
   const at = p.last_at ? new Date(p.last_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
   const tip = `${at ? `As of ${at}` : ""}${(S.state.data || {}).delayed ? " (delayed data)" : ""}${r == null ? "" : `. ${pastEntryWords(r)}`}`;
   const cls = r == null ? "" : r > 0.25 ? "warn-text" : "muted";
-  return `<td class="num" title="${escapeHtml(tip)}">${num(p.last_price)}${r == null ? "" : ` <span class="small ${cls}">${r >= 0 ? "+" : ""}${r.toFixed(1)}R</span>`}</td>`;
+  return `<td class="num" data-live="price" title="${escapeHtml(tip)}">${num(p.last_price)}${r == null ? "" : ` <span class="small ${cls}">${r >= 0 ? "+" : ""}${r.toFixed(1)}R</span>`}</td>`;
 }
 
 /* What Autopilot makes of a play, in one line: the first of its checks the play fails (the gate's own

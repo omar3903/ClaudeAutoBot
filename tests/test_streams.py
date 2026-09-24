@@ -150,6 +150,46 @@ def test_the_latest_price_takes_a_streamed_quote_when_its_the_newest(tmp_path):
     assert md.last_seen("AAA")[:2] == (9.5, later)
 
 
+def test_the_dashboard_is_sent_each_streamed_price_that_moved_once_the_latest_of_several(tmp_path):
+    gateway, md = _streaming(tmp_path)
+    md.streams.sync(["AAA", "BBB"], [], 5)
+    assert md.streams.take_moves() == {}                   # nothing ticked
+    gateway.tick("AAA", 10.0)
+    a = gateway.tick("AAA", 10.25)                         # two ticks before the push: the later one goes
+    b = gateway.tick("BBB", 20.0)
+    assert md.streams.take_moves() == {"AAA": (10.25, a.ts), "BBB": (20.0, b.ts)}
+    assert md.streams.take_moves() == {}                   # sent once
+    gateway.tick("AAA", 10.25, bid=10.2, ask=10.3)          # the bid and ask moved, the price shown didn't
+    assert md.streams.take_moves() == {}
+    c = gateway.tick("AAA", 10.3)
+    assert md.streams.take_moves() == {"AAA": (10.3, c.ts)}
+
+
+def test_no_price_is_sent_once_it_cant_stream_and_a_new_connection_or_stream_sends_afresh(tmp_path):
+    gateway, md = _streaming(tmp_path)
+    md.streams.sync(["AAA"], [], 5)
+    gateway.tick("AAA", 10.0)
+    gateway.delayed = True                                 # the data went delayed before the push
+    assert md.streams.take_moves() == {}
+    gateway.delayed = False
+    gateway.tick("AAA", 10.0)
+    gateway.close()                                        # ...or the connection dropped
+    assert md.streams.take_moves() == {}
+
+    gateway.connect()
+    md.streams.sync(["AAA"], [], 5)
+    gateway.tick("AAA", 10.0)
+    assert list(md.streams.take_moves()) == ["AAA"]
+    md.attach(gateway)                                     # a new connection: its first price is sent
+    md.streams.sync(["AAA"], [], 5)
+    gateway.tick("AAA", 10.0)
+    assert list(md.streams.take_moves()) == ["AAA"]
+    md.streams.sync(["BBB"], [], 1)                        # AAA stops streaming - a snapshot may be shown meanwhile
+    md.streams.sync(["AAA"], [], 1)
+    gateway.tick("AAA", 10.0)
+    assert list(md.streams.take_moves()) == ["AAA"]
+
+
 # ---------------------------------------------------------------- the setting
 def test_the_line_budget_stays_within_what_ibkr_allows():
     assert ExecutionCfg().stream_lines == 60

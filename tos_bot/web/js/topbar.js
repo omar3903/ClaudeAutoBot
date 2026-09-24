@@ -192,7 +192,13 @@ function renderBalances(s) {
   pnl.textContent = foreign ? money(today, "USD") : usd(today);
   pnl.title = foreign ? "Trades are in US dollars" : "";
   pnl.style.color = today > 0 ? "var(--long)" : today < 0 ? "var(--short)" : "var(--fg)";
-  // the positions held now, each at its latest price against its average cost - in US dollars, like the trades
+  renderOpenPL(s);
+}
+
+/* The header's Unrealized: the positions held now, each at its latest price against its average cost - in US
+   dollars, like the trades. Drawn with the balances, and again by each streamed price (events.js). */
+export function renderOpenPL(s = S.state) {
+  const foreign = (((s.account || {}).base || {}).currency || "USD") !== "USD";
   const held = s.positions || [], open = held.reduce((sum, p) => sum + (p.unrealized_pl || 0), 0);
   const upl = $("#a-pnl-open");
   upl.textContent = held.length ? (foreign ? money(open, "USD") : usd(open)) : "–";

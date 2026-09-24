@@ -1,13 +1,13 @@
 /* The live feed: engine events over the WebSocket, applied to the dashboard. */
-import { $, count, fmtClock, num, pct, plural, pretty, usd } from "./util.js";
-import { S, emit, refreshState, setState } from "./state.js";
+import { $, count, fmtClock, isNewer, num, pct, plural, pretty, usd } from "./util.js";
+import { S, emit, on, refreshState, setState } from "./state.js";
 import { closeModal, drawerOpen, toast } from "./ui.js";
-import { noteDisarmed, renderCapital } from "./topbar.js";
+import { noteDisarmed, renderCapital, renderOpenPL } from "./topbar.js";
 import { openQuitDialog, renderLock, showShutdown } from "./quit.js";
 import { onDailyLoss, renderAutopilot } from "./autopilot.js";
 import { onScanEvent } from "./scan.js";
-import { mergePlay, selectPlay } from "./plays.js";
-import { loadHistory, loadOpen, loadStats, openRecord, recordGone, tabVisible } from "./blotter.js";
+import { mergePlay, renderPlays, selectPlay, tickPlays } from "./plays.js";
+import { loadHistory, loadOpen, loadStats, openRecord, recordGone, tabVisible, tickOpen } from "./blotter.js";
 import { renderWatchlist } from "./watchlist.js";
 import { indexStrategies, onReplayEvent } from "./strategies.js";
 import { loadOrders, ordersChanged } from "./orders.js";
@@ -15,6 +15,7 @@ import { addNotes } from "./notes.js";
 import { reportsUpdated } from "./reports.js";
 import { signalsUpdated } from "./signals.js";
 import { loadPairs, showPairs } from "./pairs.js";
+import { priceTicks } from "./price.js";
 
 export function connect() {
   if (S.stopped) return;
@@ -88,12 +89,59 @@ function loadNewScripts(build) {
   location.reload();
 }
 
+/* Streamed prices (prices.tick): at most one message a second while IBKR streams, with each stock whose price
+   moved. They go into what the tab holds - the positions' marks and unrealized, the plays' prices - and straight
+   into the cells that show them, in place: the header's Unrealized, the open positions' Mark, Unrealized and
+   R now, the plays' Price and the panels' market price. A snapshot or a board push can carry an older price
+   than a tick already shown, so the latest ticks are kept and applied again after one where they're newer.
+   Hidden, the tab keeps the numbers and draws them once it's shown. */
+let lastTicks = {};                  // symbol -> its latest {price, at, session}
+
+function onPrices(prices) {
+  Object.assign(lastTicks, prices);
+  const held = markPositions(prices, true), draw = !document.hidden;
+  tickPlays(prices, draw);
+  if (!draw) return;
+  if (held.length) { renderOpenPL(); tickOpen(held); }
+  priceTicks(prices);
+}
+
+/* The positions held in `prices`' stocks at their newer price, and their unrealized worked out as the server's
+   views.positions does. A tick just pushed also replaces the broker's own mark (a position with no price time);
+   applied again after a snapshot, it leaves that mark - the app had no price of its own fresh enough. Returns
+   the stocks it changed. */
+function markPositions(prices, pushed) {
+  const changed = [];
+  (S.state.positions || []).forEach(pos => {
+    const t = prices[pos.symbol];
+    if (!t || !(pos.price_at ? isNewer(t.at, pos.price_at) : pushed)) return;
+    pos.market_price = t.price;
+    pos.price_at = t.at;
+    pos.unrealized_pl = Math.round((t.price - pos.avg_price) * pos.qty * 100) / 100;
+    changed.push(pos.symbol);
+  });
+  return changed;
+}
+
+export function initTicks() {
+  // every snapshot, the 15 s refresh's too, keeps a tick newer than its marks
+  on("state", () => { if (markPositions(lastTicks, false).length && !document.hidden) renderOpenPL(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    renderOpenPL();
+    tickOpen(Object.keys(lastTicks));
+    renderPlays();                   // the rows whose price changed while hidden
+    priceTicks(lastTicks);
+  });
+}
+
 function handle(topic, p) {
   if (topic === "hello") loadNewScripts(p.web_build);
   switch (topic) {
     case "hello":
     case "account.snapshot":
     case "engine.started":
+      if (topic === "hello") lastTicks = {};    // a new link: the app's own snapshot is the word from here
       setState(p.state || p);
       if (tabVisible("open")) loadOpen();
       if (topic === "hello") {                   // after a reconnect, the tab showing may be out of date
@@ -104,7 +152,11 @@ function handle(topic, p) {
       break;
     case "plays.updated":
       S.plays = p.plays || [];
+      tickPlays(lastTicks, false);               // a tick newer than the board's price stays
       emit("plays");
+      break;
+    case "prices.tick":
+      onPrices(p.prices || {});
       break;
     case "plays.changes":
       addNotes(p.notes);

@@ -1051,7 +1051,9 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
   (the exit manager's, Refresh's or an open panel's), otherwise the broker's mark, which IBKR updates only
   every few minutes. Prices fetched to be shown include pre-market and after-hours trades and are kept apart:
   the exits and the entry checks read regular-hours prices only. `GET /api/price/{symbol}` gives one stock's
-  latest price with its time and session, asking IBKR at most every 15 s per stock.
+  latest price with its time and session, asking IBKR at most every 15 s per stock. While a stock streams
+  (see **Real-time streams**) its Price, Mark, Unrealized, R now, the header's Unrealized and its Market price
+  in any panel follow each move in place, at most once a second (`prices.tick`).
 * **Market price** (every panel about a stock) — a play's detail panel (with how far it is past the entry in
   R until the play is sent) and its chart, the stock on the Signals page, an open trade's record, an exit's
   confirmation ("Last trade"), a mover's chart (the price now) and a pair's chart (both legs) show the latest

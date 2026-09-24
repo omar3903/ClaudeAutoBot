@@ -65,6 +65,8 @@ export const pretty = key => (key || "").replace(/_/g, " ");
 export const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 export const parseDate = s => new Date(/[zZ]|[+-]\d\d:\d\d$/.test(s) ? s : s + "Z");     // the database stores UTC
+/** Whether a price from `at` is later than one from `than` - or there's none to compare it with. */
+export const isNewer = (at, than) => !than || parseDate(at) > parseDate(than);
 export function fmtTime(s) {
   if (!s) return "–";
   const d = parseDate(s);

@@ -11,6 +11,9 @@ background loops:
                    regular hours the exits again within a second of a streamed
                    tick on a stock held
     snapshot loop  every 10-30 s: account, broker-vs-database check, broadcast
+    stream loop    points IBKR's real-time streams at the positions, then the plays
+    price push     the streamed prices that moved, to the dashboard at most once a
+                   second (prices.tick)
 
 Whatever the user changes on the dashboard applies straight away, is
 remembered in data/runtime.json (runtime.py) and is broadcast to every tab.
@@ -242,6 +245,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._ticked_lock = threading.Lock()
         self._tick_exits_on = False                 # regular hours - each full pass of the sync loop sets it
         self.md.streams.add_listener(self._on_stream_ticks)
+        # a streamed tick has the price push send the dashboard what moved (_price_push_loop)
+        self._price_wake = threading.Event()
+        self.md.streams.add_listener(lambda symbols: self._price_wake.set())
         self._reconciled_at = float("-inf")         # the loop's last position check (see _reconcile_if_due)
         self._armed = False
 
@@ -304,7 +310,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             ("scan-loop", self._scan_loop), ("sync-loop", self._sync_loop), ("snapshot-loop", self._snapshot_loop),
             ("orders-loop", self._orders_loop), ("signals-loop", self._signals_loop),
             ("journal-loop", self._journal_loop), ("pairs-loop", self._pairs_loop),
-            ("stream-loop", self._stream_loop))]
+            ("stream-loop", self._stream_loop), ("price-push", self._price_push_loop))]
         for t in self._threads:
             t.start()
         self._publish("engine.started", state=self.snapshot())
@@ -315,6 +321,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._snapshot_wake.set()
         self._stream_wake.set()
         self._exit_wake.set()
+        self._price_wake.set()
         self._day_changed(now=True)
         self.connections.close_all()
         log.info("engine stopped")
@@ -892,6 +899,34 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         except Exception:  # noqa: BLE001 - ranked() reads the board without its lock, and a scan may change it then
             plays = []                        # the positions still stream; the plays wait for the next pass
         return list(dict.fromkeys(held)), list(dict.fromkeys(plays))
+
+    #: the dashboard is sent the streamed prices that moved at most this often
+    PRICE_PUSH_S = 1.0
+
+    def _price_push_loop(self) -> None:
+        """Sends the dashboard the streamed prices that moved (prices.tick), woken by a tick: one message with
+        each stock's latest, then PRICE_PUSH_S before the next - so a busy tape costs one message a second,
+        and nothing streaming costs none. Only shown: the exits and the entry checks read their own prices."""
+        while not self._stop.is_set():
+            self._price_wake.wait()
+            self._price_wake.clear()
+            if self._stop.is_set():
+                return
+            try:
+                self._push_prices()
+            except Exception:  # noqa: BLE001
+                log.debug("price push failed", exc_info=True)
+            self._stop.wait(self.PRICE_PUSH_S)
+
+    def _push_prices(self) -> int:
+        """One prices.tick with the streamed prices the dashboard hasn't been sent, in /api/price's words: the
+        price, when it's from and the session it traded in. Returns how many went."""
+        moved = self.md.streams.take_moves()
+        if moved:
+            self._publish("prices.tick", prices={
+                symbol: {"price": price, "at": at.isoformat(), "session": SESSION_WORDS[clock.current_session(at)]}
+                for symbol, (price, at) in moved.items()})
+        return len(moved)
 
     # ------------------------------------------------------------------ #
     #  Scans                                                             #
