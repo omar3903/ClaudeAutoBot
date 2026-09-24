@@ -700,9 +700,15 @@ class IbkrBroker(BrokerAdapter):
         contract = self._contract(symbol)
 
         async def _quote(ib):
+            # a refused snapshot still hands back the stock's one Ticker, with what its stream or an earlier snapshot
+            # left on it. ib_async stamps a Ticker's time only when ticks reach it: no newer, nothing came for this one
+            before = getattr(ib.ticker(contract), "time", None)
             tickers = await ib.reqTickersAsync(contract)
             if not tickers:
                 raise RuntimeError(f"IBKR returned no ticker for {symbol}")
+            when = getattr(tickers[0], "time", None)
+            if when is None or (before is not None and when <= before):
+                return None
             # read here, on the loop thread: a stream of the same stock shares the Ticker and writes to it there
             return _quote_from_ticker(symbol, tickers[0], "snapshot")
 

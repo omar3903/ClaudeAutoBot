@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from tos_bot.core.models import Quote
 from tos_bot.execution.exit_manager import ExitManager, stop_locked
 
@@ -320,18 +322,25 @@ def test_a_stop_something_else_set_after_a_tick_moved_it_isnt_told_as_the_exit_m
     assert events == [] and repo._t["t1"]["stop_price"] == 101.5
 
 
-def test_tick_passes_keep_the_excursions_in_memory_and_a_full_pass_writes_them_only_when_they_changed():
+@pytest.mark.parametrize("side,ticks,full_at", [
+    ("LONG", (100.7, 99.6, 100.4), 100.2),                               # a high, a low, then back
+    ("SHORT", (99.3, 100.4, 99.6), 99.8),                                # a short's way round: the low is its gain
+])
+def test_tick_passes_keep_the_excursions_in_memory_and_a_full_pass_writes_them_only_when_they_changed(side, ticks,
+                                                                                                    full_at):
     prices = {"AAA": 100.0}
-    em, repo, ex, events, _ = _ticking([_trade()], prices)
-    for px in (100.7, 99.6, 100.4):                                      # a high, a low, then back
+    trade = _trade() if side == "LONG" else _trade(side="SHORT", stop_price=102.0, initial_stop_price=102.0,
+                                                   target_price=90.0, initial_target_price=90.0)
+    em, repo, ex, events, _ = _ticking([trade], prices)
+    for px in ticks:
         prices["AAA"] = px
         em.run_once(only={"AAA"})
     assert repo.writes == []
-    prices["AAA"] = 100.2
+    prices["AAA"] = full_at
     em.run_once()
     [(_, wrote)] = repo.writes
-    assert wrote["hwm_price"] == 100.7 and abs(wrote["mfe"] - 0.7) < 1e-9 and abs(wrote["mae"] - 0.4) < 1e-9
-    prices["AAA"] = 100.7                                                # the same high again
+    assert wrote["hwm_price"] == ticks[0] and abs(wrote["mfe"] - 0.7) < 1e-9 and abs(wrote["mae"] - 0.4) < 1e-9
+    prices["AAA"] = ticks[0]                                             # the same best price again
     em.run_once()
     em.run_once(only={"AAA"})
     em.run_once()
