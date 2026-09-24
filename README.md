@@ -1509,7 +1509,7 @@ tos_bot/
     runtime.py               data/runtime.json
     views.py                 pieces of the dashboard snapshot
     market_regime.py         calm or turbulent, from SPY's daily returns (Hamilton ch. 22)
-    chart.py                 a play's candles and its exit routes
+    chart.py                 a play's or a trade's candles, marks and exit routes
   core/                    enums + framework-free dataclasses + event bus
   data/                    listings, symbols, daily bar store, market data, SEC EDGAR, fx, sectors
   indicators/ta.py         vectorised TA (no TA-Lib) incl. divergence, relative volume, beta

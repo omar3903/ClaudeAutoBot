@@ -46,7 +46,7 @@ from ..core.models import Account, Play
 from ..data.bars import DailyBarStore
 from ..data.fundamentals import FundamentalsProvider
 from ..data.listings import UsListings
-from ..data.market_data import MarketData, NoDataSource
+from ..data.market_data import INTRADAY_BAR, MarketData, NoDataSource
 from ..data.sec_edgar import SecEdgarFundamentals
 from ..data.symbols import SymbolMaster
 from ..execution.autopilot import AutoPilot
@@ -68,7 +68,8 @@ from ..pairs.desk import PairDesk
 from ..signals.book import BoostSettings, SignalBook
 from ..signals.service import SignalService
 from ..signals.store import SignalStore
-from .chart import chart_payload
+from .chart import (INTRADAY_MAX_SESSIONS, TRADE_CANDLES_TTL_S, candle_request, chart_payload,
+                    since_session_before, trade_chart_payload, trade_sessions)
 from .market_regime import MarketRegime
 from ..scanner.noise import LABELS as NOISE_LABELS
 from ..scanner import schedule
@@ -280,6 +281,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._orders_at = float("-inf")
         self._orders_checked: Optional[str] = None
         self._orders_lock = threading.Lock()
+        # a trade's own 5-minute candles for its record's chart, kept a minute (see trade_chart)
+        self._trade_bars: Dict[str, Tuple[float, Any]] = {}
 
         self._quit_lock = threading.Lock()
         self._fix_lock = threading.Lock()          # a share-count fix books at most once, however many tabs click
@@ -1254,6 +1257,59 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if frame is None or not len(frame):
             frame, intraday = self.md.daily_frame(p.symbol), False
         return chart_payload(p, frame, intraday, self.settings.config.exit_manager)
+
+    def trade_chart(self, trade_id: str) -> Dict[str, Any]:
+        """The chart behind a trade record - GET /api/trades/{id}/chart: the candles from the session
+        before its entry, its levels and marks, and how it stands (see engine/chart.py). The 5-minute
+        candles are the scans' cached ones while those cover the trade, else one request of its own kept
+        a minute; a trade past the intraday window, open or closed, shows the daily candles on hand."""
+        rec = self.repo.trade_record(trade_id)
+        if rec is None:
+            return {"ok": False, "reason": "That trade record is gone."}
+        t = rec["trade"]
+        sym, sessions = t["symbol"], trade_sessions(t, clock.session_date())
+        intraday = sessions <= INTRADAY_MAX_SESSIONS
+        if intraday and not self.md.attached:
+            return {"ok": False, "reason": "IB Gateway isn't connected, so there are no candles."}
+        frame = None
+        if intraday:
+            span = candle_request(sessions)
+            try:
+                frame = (self._trade_bars_for(trade_id, sym, span) if span
+                         else self.md.intraday([sym], self.scanner.con_ids([sym])).get(sym))
+            except Exception:  # noqa: BLE001
+                log.debug("chart candles for %s failed", sym, exc_info=True)
+            if frame is not None and len(frame):
+                frame = since_session_before(frame, t)
+        if frame is None or not len(frame):
+            frame, intraday = self.md.daily_frame(sym), False
+        mark = self._trade_mark(sym) if t["status"] == "OPEN" else None
+        return trade_chart_payload(rec, frame, intraday, self.settings.config.exit_manager, mark)
+
+    def _trade_bars_for(self, trade_id: str, symbol: str, span: str) -> Optional[Any]:
+        """A trade's own 5-minute candles over ``span`` (an IBKR duration) - a hold too long for the scans'
+        cached window - kept TRADE_CANDLES_TTL_S, so repeated clicks on its record don't each reach IBKR."""
+        now = time.monotonic()
+        hit = self._trade_bars.get(trade_id)
+        if hit and now - hit[0] < TRADE_CANDLES_TTL_S:
+            return hit[1]
+        frame = self.md.source.history_many({symbol: (INTRADAY_BAR, span)}, self.scanner.con_ids([symbol]),
+                                            rth=True).get(symbol)
+        self._trade_bars = {k: v for k, v in self._trade_bars.items() if now - v[0] < TRADE_CANDLES_TTL_S}
+        self._trade_bars[trade_id] = (now, frame)
+        return frame
+
+    def _trade_mark(self, symbol: str) -> Optional[Tuple[float, Optional[str]]]:
+        """The price the blotter shows a position at, and when it's from: the app's own when fresh
+        (_marks), else the broker's mark, else the newest price the app holds at all."""
+        mark = self._marks().get(symbol)
+        if mark:
+            return mark
+        pos = self._account.position(symbol) if self._account else None
+        if pos is not None and pos.market_price:
+            return (float(pos.market_price), None)
+        seen = self.md.last_seen(symbol)
+        return (round(seen[0], 4), seen[1].isoformat()) if seen else None
 
     # ------------------------------------------------------------------ #
     #  Account, arming, broker vs database                              #

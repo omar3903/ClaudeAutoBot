@@ -1318,8 +1318,9 @@ def build() -> str:
          "current_plays() (slim rows - what the table shows - unless full=1), play_row() (one play whole, for "
          "the row's hover; 404 once it has left the board), assess_play() (after watch_play(): the play opened "
          "streams ahead of the other plays), approve_play(), reject_play(), play_chart()"),
-        ("/api/trades, /api/trades/{id}/close | managed | record, /api/trades/close-all", "GET/POST",
-         "trade lists, close_position(), set_trade_managed(), trade_record(), close_all_positions()"),
+        ("/api/trades, /api/trades/{id}/close | managed | record | chart, /api/trades/close-all", "GET/POST",
+         "trade lists, close_position(), set_trade_managed(), trade_record(), trade_chart() (the record's "
+         "candles, marks and standing), close_all_positions()"),
         ("/api/positions/untracked/{symbol}/close", "POST", "close_untracked()"),
         ("/api/orders, /api/pnl, /api/account/refresh", "GET/POST", "active_orders(), pnl, refresh_account_now() "
          "(which also calls refresh_prices())"),
