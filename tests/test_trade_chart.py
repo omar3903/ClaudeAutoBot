@@ -10,15 +10,15 @@ import fakes
 from test_engine import _connect, engine, gateway, port  # noqa: F401  (the engine on a synthetic Gateway)
 from tos_bot.core.enums import Side, StrategyKind, Timeframe
 from tos_bot.core.models import Play
-from tos_bot.engine.chart import stop_moves
+from tos_bot.engine.chart import stop_moves, trade_standing
 from tos_bot.persistence.db import session_scope
 from tos_bot.persistence.models_orm import Trade
 from tos_bot.util import clock
 
 
-def _play(symbol="T01", side=Side.LONG, timeframe=Timeframe.INTRADAY):
+def _play(symbol="T01", side=Side.LONG, timeframe=Timeframe.INTRADAY, stop=95.0, target=110.0):
     return Play(symbol=symbol, side=side, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
-                timeframe=timeframe, entry=100.0, stop=95.0, targets=[110.0])
+                timeframe=timeframe, entry=100.0, stop=stop, targets=[target])
 
 
 def _open(engine, play, qty=5):
@@ -95,6 +95,27 @@ def test_a_closed_trade_carries_its_exit_mark_and_result(engine, port):
     standing = chart["standing"]
     assert standing["r_multiple"] == pytest.approx(0.8) and standing["realized_pl"] == 20.0
     assert standing["exit_reason"] == "target" and "price" not in standing
+
+
+def test_a_short_trade_stands_the_other_way_round():
+    # the same distances as the long's, so a sign slip would show this gain as a loss and the stop as a profit
+    t = {"side": "SHORT", "status": "OPEN", "entry_price": 100.0, "initial_stop_price": 105.0,
+         "stop_price": 105.0, "target_price": 90.0, "quantity": 5}
+    standing = trade_standing(t, (98.0, None))
+    assert (standing["price"], standing["open_r"], standing["unrealized_pl"]) == (98.0, 0.4, 10.0)
+    assert (standing["at_stop_pl"], standing["at_target_pl"]) == (-25.0, 50.0)
+    assert standing["open_r"] == -trade_standing({**t, "side": "LONG"}, (98.0, None))["open_r"]
+
+
+def test_a_closed_short_carries_its_loss_with_the_sign_of_a_short(engine, port):
+    _connect(engine, port)
+    tid = _open(engine, _play(side=Side.SHORT, stop=105.0, target=90.0))
+    engine.repo.close_trade(tid, 104.0, exit_reason="stop")            # covered higher: a loss for a short
+    chart = engine.trade_chart(tid)
+    assert chart["side"] == "SHORT" and chart["marks"][-1]["kind"] == "exit"
+    assert chart["marks"][-1]["r"] == pytest.approx(-0.8) and "-0.80R" in chart["marks"][-1]["title"]
+    standing = chart["standing"]
+    assert standing["r_multiple"] == pytest.approx(-0.8) and standing["realized_pl"] == -20.0
 
 
 def _stop_placed(engine, tid, stop, qty=4):
