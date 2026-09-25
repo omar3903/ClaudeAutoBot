@@ -26,11 +26,14 @@ export function openModal({ title, bodyHTML, okText = "Confirm", okClass = "dang
 }
 export function closeModal() { $("#modal").classList.add("hidden"); }
 
-export function openDrawer(kind, title, html, wide = true) {
+/** `size`: true for the wide drawer (the default), false for the narrow one, "panel" for the one a trade
+    record fills - the whole window but a margin, its chart taking what the details leave. */
+export function openDrawer(kind, title, html, size = true) {
   S.drawer = kind;
   $("#drawer-title").textContent = title;
   $("#drawer-body").innerHTML = html;
-  $("#drawer-inner").classList.toggle("wide", wide);
+  $("#drawer-inner").classList.toggle("wide", size === true);
+  $("#drawer-inner").classList.toggle("panel", size === "panel");
   $("#drawer").classList.remove("hidden");
 }
 export const drawerOpen = kind => S.drawer === kind && !$("#drawer").classList.contains("hidden");
