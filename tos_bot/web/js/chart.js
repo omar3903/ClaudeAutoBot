@@ -143,15 +143,18 @@ export function candlesSVG(c, { lines = [], vlines = [], marks = [], band = null
   const { W, H, top, bottom, left, right, step, bodyW, x, y } = chartFrame(c, { lines, marks, height });
   const starts = c.map(k => Date.parse(k.t)), span = starts.length > 1 ? starts[1] - starts[0] : 0;
   const day = ms => new Date(ms).toLocaleDateString("en-US", { timeZone: "America/New_York" });
-  const xAt = iso => {                 // the candle a moment falls in, or null outside the candles
+  const last = starts.length - 1;
+  const xAt = iso => {                 // the candle a moment falls in, or null before the candles
     const t = Date.parse(iso);
-    if (!isFinite(t) || t < starts[0] || t >= starts[starts.length - 1] + span) return null;
-    let i = starts.length - 1;
+    if (!isFinite(t) || t < starts[0]) return null;
+    let i = last;
     while (i > 0 && starts[i] > t) i--;
     // the candles are regular hours only, so a moment between two sessions has no candle of its own: after
     // the close it stays with that session's last, and once the day has turned it's the next session's
-    // first - a fill before the open sits at the open, not at the end of the session before
-    if (t >= starts[i] + span && day(t) !== day(starts[i])) i++;
+    // first - a fill before the open sits at the open, not at the end of the session before. A moment past
+    // the last candle stays with it: the daily candles end at the last session a scan stored, so a trade's
+    // exit or best point today comes after them, and an after-hours fill on the last session has no candle
+    if (i < last && t >= starts[i] + span && day(t) !== day(starts[i])) i++;
     return x(i);
   };
   const shade = band != null ? `<rect class="band" x="${x(band) - step / 2}" y="${top}" width="${step}" height="${H - top - bottom}"/>` : "";

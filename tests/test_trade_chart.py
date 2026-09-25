@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,7 +11,7 @@ import fakes
 from test_engine import _connect, engine, gateway, port  # noqa: F401  (the engine on a synthetic Gateway)
 from tos_bot.core.enums import Side, StrategyKind, Timeframe
 from tos_bot.core.models import Play
-from tos_bot.engine.chart import stop_moves, trade_standing
+from tos_bot.engine.chart import stop_moves, trade_chart_payload, trade_standing
 from tos_bot.persistence.db import session_scope
 from tos_bot.persistence.models_orm import Trade
 from tos_bot.util import clock
@@ -82,6 +83,24 @@ def test_a_trade_past_the_intraday_window_shows_daily_candles_without_asking_ibk
     closed = engine.trade_chart(tid)
     assert closed["bars"].startswith("daily") and closed["standing"]["held"] == "12 sessions"
     assert _candle_requests(gateway) == []
+
+
+def test_daily_candles_that_stop_short_of_today_say_which_session_they_run_to():
+    # the store the scans keep holds a session once a scan saw it finished, so a trade's exit today comes
+    # after its last daily candle: the caption says where the candles end (the chart draws the mark on the
+    # last candle), and says nothing once today's candle is there
+    today = clock.session_date()
+    before = clock.prev_trading_day(today)
+    at = dt.datetime.combine(today, dt.time(10, 0), tzinfo=clock.NY).astimezone(dt.timezone.utc).replace(tzinfo=None)
+    t = {"id": "trd_daily", "symbol": "T01", "side": "LONG", "timeframe": "SWING", "status": "CLOSED",
+         "quantity": 5, "entry_price": 100.0, "initial_stop_price": 95.0, "stop_price": 95.0, "target_price": 110.0}
+    rec = {"trade": t, "fills": [{"leg": "EXIT", "price": 104.0, "quantity": 5, "ts": at.isoformat()}]}
+    short = trade_chart_payload(rec, fakes.daily_bars("T01", through=before), False, SimpleNamespace())
+    assert short["bars"] == f"daily candles, the last six months, to {before:%b} {before.day}"
+    [exit_mark] = short["marks"]
+    assert dt.datetime.fromisoformat(exit_mark["t"]) > dt.datetime.fromisoformat(short["candles"][-1]["t"])
+    whole = trade_chart_payload(rec, fakes.daily_bars("T01", through=today), False, SimpleNamespace())
+    assert whole["bars"] == "daily candles, the last six months"
 
 
 def test_a_closed_trade_carries_its_exit_mark_and_result(engine, port):

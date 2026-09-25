@@ -9,9 +9,10 @@ gain once the trade is ``breakeven_at_r`` in profit, trails the price past
 
 A trade's chart spans from the session before its entry to today, in 5-minute
 candles while that fits IBKR's window (the scans' cached five sessions first,
-the trade's own request up to ten), daily candles beyond. The marks come from
-its fills, the stop moves from the exit manager's notes, and the standing from
-the price the blotter shows it at.
+the trade's own request up to ten), daily candles beyond - as far as the scans
+have stored them, which can stop at the session before today's. The marks come
+from its fills, the stop moves from the exit manager's notes, and the standing
+from the price the blotter shows it at.
 """
 
 from __future__ import annotations
@@ -161,6 +162,28 @@ def since_session_before(frame: pd.DataFrame, t: Dict[str, Any]) -> pd.DataFrame
     return frame[index.date >= first]
 
 
+def last_session(frame: Optional[pd.DataFrame]) -> Optional[dt.date]:
+    """The session of the newest candle (its New York date), or None without candles."""
+    if frame is None or not len(frame):
+        return None
+    at = frame.index[-1]
+    at = at.tz_convert(clock.NY) if at.tzinfo is not None else at.tz_localize("UTC").tz_convert(clock.NY)
+    return at.date()
+
+
+def bars_words(frame: Optional[pd.DataFrame], intraday: bool) -> str:
+    """What the trade's candles are. The daily candles are the store the scans keep, which holds a session
+    once a scan has seen it finished - so when they stop short of today's session the caption says which
+    session they run to, since the trade's exit or best point today comes after its last candle (the chart
+    puts such a mark on the last candle: web/js/chart.js, candlesSVG)."""
+    if intraday:
+        return "5-minute candles since the session before the entry"
+    last = last_session(frame)
+    if last is None or last >= clock.session_date():
+        return "daily candles, the last six months"
+    return f"daily candles, the last six months, to {last:%b} {last.day}"
+
+
 def _risk_per_share(t: Dict[str, Any]) -> float:
     """The risk the trade was opened with: entry to the original stop, R's basis (as the exit manager measures it)."""
     stop = t.get("initial_stop_price") or t.get("stop_price")
@@ -267,8 +290,7 @@ def trade_chart_payload(rec: Dict[str, Any], frame: Optional[pd.DataFrame], intr
     return {"ok": True, "trade_id": t["id"], "symbol": t["symbol"], "side": t.get("side"),
             "timeframe": t.get("timeframe"), "strategy": t.get("strategy"), "status": t.get("status"),
             "quantity": t.get("quantity"),
-            "bars": ("5-minute candles since the session before the entry" if intraday
-                     else "daily candles, the last six months"),
+            "bars": bars_words(frame, intraday),
             "candles": candles(frame, len(frame) if intraday and frame is not None else DAILY_BARS),
             "levels": {"entry": t.get("entry_price"), "initial_stop": t.get("initial_stop_price"),
                        "stop": t.get("stop_price") or t.get("initial_stop_price"),
