@@ -322,6 +322,17 @@ class Repository:
             t.exit_price = exit_price
             t.exit_time = now
             t.exit_reason = exit_reason
+            # the fill is the last price the trade saw, and the passes that mark the excursions (the exit manager)
+            # never see it: a stop that fills through the worst point marked so far would leave the MAE short of the
+            # trade's own loss, a target that fills past the best point its MFE and high-water mark short
+            entry = float(t.entry_price)
+            gain, loss = (exit_price - entry) * sign, (entry - exit_price) * sign
+            if gain > float(t.mfe or 0.0) + 1e-6:
+                t.mfe, t.mfe_at = gain, now
+            if loss > float(t.mae or 0.0) + 1e-6:
+                t.mae = loss
+            if t.hwm_price is None or (exit_price - float(t.hwm_price)) * sign > 1e-6:
+                t.hwm_price = exit_price
             if submitted_at is not None and (t.broker or SIMULATOR) != SIMULATOR:
                 t.exit_submitted_at = _naive(submitted_at)
                 t.exit_latency_s = _took(submitted_at, now)

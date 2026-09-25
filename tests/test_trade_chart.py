@@ -116,6 +116,15 @@ def test_a_closed_trade_carries_its_exit_mark_and_result(engine, port):
     assert standing["exit_reason"] == "target" and "price" not in standing
 
 
+def test_a_best_point_before_the_exit_keeps_its_own_mark(engine, port):
+    _connect(engine, port)
+    tid = _open(engine, _play())
+    engine.repo.update_trade_risk(tid, mfe=4.0, hwm_price=104.0)          # it reached 104 and came back
+    engine.repo.close_trade(tid, 102.0, exit_reason="trailing-stop")
+    chart = engine.trade_chart(tid)
+    assert [(m["kind"], m["price"]) for m in chart["marks"]] == [("entry", 100.0), ("exit", 102.0), ("best", 104.0)]
+
+
 def test_a_short_trade_stands_the_other_way_round():
     # the same distances as the long's, so a sign slip would show this gain as a loss and the stop as a profit
     t = {"side": "SHORT", "status": "OPEN", "entry_price": 100.0, "initial_stop_price": 105.0,

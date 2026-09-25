@@ -197,7 +197,8 @@ def _in_r(t: Dict[str, Any], key: str) -> Optional[float]:
 
 def trade_marks(t: Dict[str, Any], fills: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Where the bot got in and out, from the fills: the entry, the parts taken off, the exit that closed
-    the trade (with its R) - and the best point the trade reached, when the exit manager saw one."""
+    the trade (with its R) - and the best point the trade reached, when the exit manager saw one and the trade
+    didn't close there (the exit mark already stands on it)."""
     marks: List[Dict[str, Any]] = []
     exits = [f for f in fills if f.get("leg") == "EXIT"]
     last_exit = exits[-1] if exits and t.get("status") == "CLOSED" else None
@@ -215,7 +216,11 @@ def trade_marks(t: Dict[str, Any], fills: Sequence[Dict[str, Any]]) -> List[Dict
             marks.append({"t": _stamp(f.get("ts")), "price": round(price, 4), "kind": "part",
                           "title": f"Took {qty:g} off @ {price:.2f}"})
     best, best_at = t.get("hwm_price"), _stamp(t.get("mfe_at"))
-    if best is not None and best_at:
+    # the close folds its own fill into the best point (repository.close_trade): a trade that closed at its best
+    # would get a second mark on top of its exit
+    at_exit = (last_exit is not None and best is not None and t.get("exit_price") is not None
+               and abs(float(best) - float(t["exit_price"])) < 5e-5)
+    if best is not None and best_at and not at_exit:
         mfe_r = _in_r(t, "mfe")
         marks.append({"t": best_at, "price": round(float(best), 4), "kind": "best",
                       "title": f"Best point {float(best):.2f}" + (f" ({mfe_r:+.1f}R)" if mfe_r is not None else "")})
