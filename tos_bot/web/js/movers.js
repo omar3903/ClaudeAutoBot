@@ -2,7 +2,7 @@
    and losers, why each one moved, what the bot made of it, and a chart of each with the bot's trades,
    the setups it offered and the news on the session's candles. */
 import { $, $$, api, escapeHtml, num, shorten, usd } from "./util.js";
-import { chartModal } from "./chart.js";
+import { candlesSVG, chartModal } from "./chart.js";
 import { watchPrice } from "./price.js";
 import { stratLabel } from "./strategies.js";
 import { inR, pctOf, tone } from "./journal.js";
@@ -180,52 +180,4 @@ function moverChartHTML(d) {
       <li><i class="mk-play"></i>setups offered</li><li><i class="vl-news"></i>news during the session</li><li><i class="lv-prev"></i>the previous close</li>
     </ul>
     ${daily ? `<h4>Daily candles, the session shaded</h4>${daily}` : ""}`;
-}
-
-/** Candles as an SVG, with optional price lines, time lines, markers and one shaded candle. */
-function candlesSVG(c, { lines = [], vlines = [], marks = [], band = null, height = 320, clock = false }) {
-  const W = 860, H = height, top = 12, bottom = 22, left = 8, right = 96;
-  const plotW = W - left - right;
-  const values = [...c.flatMap(k => [k.h, k.l]), ...lines.map(l => l.v), ...marks.map(m => m.v)].filter(v => v != null && isFinite(v));
-  let lo = Math.min(...values), hi = Math.max(...values);
-  const pad = (hi - lo) * 0.06 || hi * 0.01;
-  lo -= pad; hi += pad;
-  const y = v => top + (hi - v) / (hi - lo) * (H - top - bottom);
-  const step = plotW / c.length, bodyW = Math.max(1, step * 0.65);
-  const x = i => left + i * step + step / 2;
-  const starts = c.map(k => Date.parse(k.t)), span = starts.length > 1 ? starts[1] - starts[0] : 0;
-  const xAt = iso => {                 // the candle a moment falls in, or null outside the candles
-    const t = Date.parse(iso);
-    if (!isFinite(t) || t < starts[0] || t >= starts[starts.length - 1] + span) return null;
-    let i = starts.length - 1;
-    while (i > 0 && starts[i] > t) i--;
-    return x(i);
-  };
-  const shade = band != null ? `<rect class="band" x="${x(band) - step / 2}" y="${top}" width="${step}" height="${H - top - bottom}"/>` : "";
-  const bars = c.map((k, i) => {
-    const cls = k.c >= k.o ? "up" : "down", t = y(Math.max(k.o, k.c)), bt = y(Math.min(k.o, k.c));
-    return `<line class="wick ${cls}" x1="${x(i)}" x2="${x(i)}" y1="${y(k.h)}" y2="${y(k.l)}"/>`
-      + `<rect class="body ${cls}" x="${x(i) - bodyW / 2}" y="${t}" width="${bodyW}" height="${Math.max(1, bt - t)}"/>`;
-  }).join("");
-  const priceLines = lines.map(l => `<line class="lvl ${l.cls}" x1="${left}" x2="${W - right}" y1="${y(l.v)}" y2="${y(l.v)}"/>`
-    + `<text class="lbl ${l.cls}" x="${W - right + 4}" y="${y(l.v) + 4}">${escapeHtml(l.text)}</text>`).join("");
-  const timeLines = vlines.map(v => {
-    const at = xAt(v.t);
-    return at == null ? "" : `<line class="vline ${v.cls}" x1="${at}" x2="${at}" y1="${top}" y2="${H - bottom}"><title>${escapeHtml(v.title)}</title></line>`;
-  }).join("");
-  const markers = marks.map(m => {
-    const at = xAt(m.t);
-    if (at == null || m.v == null) return "";
-    const py = y(m.v), s = 6;
-    const shape = m.shape === "dot" ? `<circle cx="${at}" cy="${py}" r="4"/>`
-      : m.shape === "up" ? `<path d="M ${at} ${py - s} L ${at + s} ${py + s} L ${at - s} ${py + s} z"/>`
-        : `<path d="M ${at} ${py + s} L ${at + s} ${py - s} L ${at - s} ${py - s} z"/>`;
-    return `<g class="mark ${m.cls}">${shape}<title>${escapeHtml(m.title)}</title></g>`;
-  }).join("");
-  const label = t => new Date(t).toLocaleString(undefined, clock
-    ? { hour: "numeric", minute: "2-digit", timeZone: "America/New_York" } : { month: "short", day: "numeric" });
-  const ticks = [...new Set([0, Math.floor(c.length / 2), c.length - 1])].map(i =>
-    `<text class="tick" x="${x(i)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === c.length - 1 ? "end" : "middle"}">${escapeHtml(label(c[i].t))}</text>`).join("");
-  return `<div class="chart-wrap"><svg class="play-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">
-    ${shade}${bars}${priceLines}${timeLines}${markers}${ticks}</svg></div>`;
 }

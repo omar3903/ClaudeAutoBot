@@ -1,7 +1,7 @@
 /* The bottom panel: open positions, active orders (see orders.js), trade history,
-   P/L summary, the watchlist, and the trade-record drawer. */
+   P/L summary, the watchlist, and the trade-record panel with its chart. */
 import {
-  $, $$, SECTOR_SHORT, VENUE_SHORT, api, escapeHtml, fmtTime, markStale, num, parseDate, pct, plural, positionList, post,
+  $, $$, SECTOR_SHORT, VENUE_SHORT, api, escapeHtml, fmtTime, isNewer, markStale, num, parseDate, pct, plural, positionList, post,
   sectorTag, sideBadge, tfLabel, usd, fmtDay, fmtClock, fmtWhen,
 } from "./util.js";
 import { S, on, refreshState, serverNow } from "./state.js";
@@ -11,6 +11,7 @@ import { loadWatchlist } from "./watchlist.js";
 import { loadOrders } from "./orders.js";
 import { loadPairs } from "./pairs.js";
 import { watchPrice } from "./price.js";
+import { attachTradeChart, tradeChartHTML } from "./chart.js";
 
 const LOADERS = {
   open: loadOpen, orders: () => loadOrders(true), history: loadHistory, stats: loadStats, watchlist: loadWatchlist,
@@ -206,7 +207,8 @@ function rCell(t, pos, parked) {
 
 /* A streamed price (events.js): the live cells of the open positions in `symbols` drawn again from the marks the
    tab holds now - the rows stay the same elements, so a click on one isn't lost, and the rest waits for the next
-   load. A position on another platform shows no mark, so it's left alone. */
+   load. A position on another platform shows no mark, so it's left alone. The record panel's standing strip,
+   when it shows one of those positions, follows the same way (tickRecord). */
 export function tickOpen(symbols) {
   const want = new Set(symbols), el = $("#tab-open");
   openTrades.forEach(t => {
@@ -218,6 +220,7 @@ export function tickOpen(symbols) {
       if (td) td.outerHTML = html;
     });
   });
+  tickRecord(want);
 }
 
 function openRow(t, here) {
@@ -383,20 +386,98 @@ function byTypeHTML(bt) {
 }
 
 /* ---------- trade record (open or closed) ---------- */
+// the chart as the panel last drew it (its symbol, levels, shares and standing) - a streamed price redraws the
+// strip's live cells from it (tickRecord); and the fetch that is due next, with a count so an older fetch still
+// in flight when the record is opened again neither draws over the newer one nor keeps its own timer going
+let recordChart = null, chartTimer = null, chartRun = 0;
+const CHART_EVERY_MS = 60000;
+
+/* The record opens as a panel across the window: the trade's chart on the left, with where it stands over it
+   (GET /api/trades/{id}/chart, chart.js), and the record's details beside it. The two are fetched together and
+   each draws as it arrives; a record drawn again (a part came off, the trade closed) keeps the panel. */
 export async function openRecord(id) {
   if (!id) return;
-  if (!drawerOpen("record")) openDrawer("record", "Trade record", `<p class="muted">Loading…</p>`);
+  if (!drawerOpen("record") || S.recordId !== id) {
+    if (!drawerOpen("record")) openDrawer("record", "Trade record", "", "panel");
+    $("#drawer-body").innerHTML = `<div class="rec-panel"><div class="rec-chart"><p class="muted">Loading the chart…</p></div>
+      <div class="rec-side"><p class="muted">Loading…</p></div></div>`;
+    recordChart = null;
+  }
   S.recordId = id;
+  loadRecordChart(id);
   let rec;
   try {
     const res = await fetch(`/api/trades/${encodeURIComponent(id)}/record`);
     rec = await res.json();
     if (!res.ok) throw new Error(rec.detail || "Trade record not found.");
   } catch (e) {
-    if (S.recordId === id) $("#drawer-body").innerHTML = `<p class="reasons">${escapeHtml(e.message || "Couldn't load the record.")}</p>`;
+    if (S.recordId === id) $("#drawer-body .rec-side").innerHTML = `<p class="reasons">${escapeHtml(e.message || "Couldn't load the record.")}</p>`;
     return;
   }
   if (drawerOpen("record") && S.recordId === id) renderRecord(rec);
+}
+
+/* The chart column: fetched with the record and again every minute while the panel shows this trade - the
+   candles grow, the stop moves, a part comes off. Skipped while the tab is hidden or the app is away, as the
+   panels' prices are; over once the panel closes or shows another trade. */
+async function loadRecordChart(id) {
+  const run = ++chartRun;
+  clearTimeout(chartTimer);
+  const showing = () => drawerOpen("record") && S.recordId === id && run === chartRun;
+  if (!showing()) return;
+  if (!document.hidden && !document.body.classList.contains("offline")) {
+    let d;
+    try { d = await api(`/api/trades/${encodeURIComponent(id)}/chart`); } catch (e) { d = { ok: false, reason: `No chart - ${e.message}.` }; }
+    if (!showing()) return;
+    recordChart = d.ok ? d : null;
+    const box = $("#drawer-body .rec-chart");
+    box.innerHTML = d.ok
+      ? `<h4>${escapeHtml(d.symbol)} · ${d.side === "SHORT" ? "short" : "long"} · where it stands</h4>${standingHTML(d)}${tradeChartHTML(d)}`
+      : `<p class="reasons">${escapeHtml(d.reason || "No chart for this trade.")}</p>`;
+    if (d.ok) attachTradeChart(box, d);          // the crosshair and the drag measure, once the SVG is in the page
+  }
+  chartTimer = setTimeout(() => loadRecordChart(id), CHART_EVERY_MS);
+}
+
+/* Where the trade stands, in a strip over its chart. Open: at the price the position is marked at - the chart's
+   own, or the tab's when a streamed price has moved it on since - in R and in money, its best and worst so far,
+   how long it's been held, and what the stop and the target would make of it. Closed: its result. */
+const standingCell = (label, value, cls = "", term = "") =>
+  `<div><label${term ? ` data-term="${term}"` : ""}>${label}</label><b class="${cls}">${value}</b></div>`;
+const standingTone = v => v == null ? "" : v >= 0 ? "pl-pos" : "pl-neg";
+const standingR = (v, d = 2) => v == null ? "–" : `${v >= 0 ? "+" : ""}${num(v, d)}R`;
+
+function standingHTML(d) {
+  const s = d.standing || {};
+  const extremes = standingCell("Best / worst", `${s.mfe_r != null ? standingR(s.mfe_r, 1) : "–"} / ${s.mae_r != null ? `-${num(s.mae_r, 1)}R` : "–"}`, "", "best_worst");
+  const held = standingCell("Held", escapeHtml(s.held || "–"), "", "held");
+  if (d.status !== "OPEN") {
+    return `<div class="standing">${standingCell("Result", standingR(s.r_multiple), standingTone(s.r_multiple), "r_now")}
+      ${standingCell("P/L", usd(s.realized_pl), standingTone(s.realized_pl))}${standingCell("Exit", escapeHtml(s.exit_reason || "–"))}${held}${extremes}</div>`;
+  }
+  const pos = livePosition(d), newer = pos.market_price != null && (s.price == null || isNewer(pos.price_at, s.price_at));
+  return `<div class="standing"><span class="standing-live">${liveCells(d, newer ? pos.market_price : s.price, newer ? pos.price_at : s.price_at)}</span>
+    ${extremes}${held}${standingCell("At the stop", usd(s.at_stop_pl), standingTone(s.at_stop_pl), "at_stop")}
+    ${standingCell("At the target", usd(s.at_target_pl), standingTone(s.at_target_pl), "at_target")}</div>`;
+}
+
+/* The strip's cells a price redraws: the price and when it's from, and the trade's open R and unrealized at it,
+   worked out as the rows' cells are (rNow, uplCell) from the levels and the shares the chart carries. */
+function liveCells(d, price, at) {
+  const lv = d.levels, sign = d.side === "SHORT" ? -1 : 1, first = lv.initial_stop ?? lv.stop;
+  const risk = first != null ? Math.abs(lv.entry - first) : 0;
+  const r = price != null && risk ? sign * (price - lv.entry) / risk : null;
+  const upl = price != null ? sign * (price - lv.entry) * Math.abs(d.quantity || 0) : null;
+  return standingCell("Price", price == null ? "–" : `${num(price)}${at ? ` <span class="muted small">${escapeHtml(fmtWhen(at))}</span>` : ""}`, "", "mark")
+    + standingCell("Open R", standingR(r), standingTone(r), "r_now") + standingCell("Unrealized", usd(upl), standingTone(upl), "unrealized");
+}
+
+/* A streamed price for the trade on show (tickOpen): the strip's Price, Open R and Unrealized drawn again at the
+   position's mark, as the row's cells are. */
+function tickRecord(want) {
+  if (!recordChart || recordChart.status !== "OPEN" || !want.has(recordChart.symbol) || !drawerOpen("record")) return;
+  const live = $("#drawer-body .standing-live"), pos = livePosition(recordChart);
+  if (live && pos.market_price != null) live.innerHTML = liveCells(recordChart, pos.market_price, pos.price_at);
 }
 
 function orderSummary(req) {
@@ -414,7 +495,7 @@ function renderRecord(rec) {
   const atBroker = bp ? `${num(bp.quantity, 0)} @ ${num(bp.market_price)} · <span class="${bp.unrealized_pl >= 0 ? "pl-pos" : "pl-neg"}">${usd(bp.unrealized_pl)}</span>`
     : rec.on_current_venue ? "not reported yet" : `held on ${escapeHtml(rec.venue_label)} — switch to it to manage`;
   $("#drawer-title").textContent = `${t.symbol} · ${open ? "open" : "closed"} trade`;
-  $("#drawer-body").innerHTML = `
+  $("#drawer-body .rec-side").innerHTML = `
     <div class="sub">${sideBadge(t.side)} ${t.timeframe ? tfLabel(t.timeframe) + " ·" : ""} ${stratLabel(t.strategy)} · ${escapeHtml(rec.venue_label)} ${sectorTag(t.sector)}</div>
     <div class="kv">
       <span>Status</span><span>${open ? "OPEN" : `CLOSED${t.exit_reason ? ` (${escapeHtml(t.exit_reason)})` : ""}`}</span>

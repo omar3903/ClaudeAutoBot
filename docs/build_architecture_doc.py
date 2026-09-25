@@ -1298,12 +1298,14 @@ def build() -> str:
     A(table(["Module", "Panel / job"], [
         ("topbar.js, ui.js, tooltips.js", "the header pills (connection, market session, regime, equity), the drawer "
          "and tabs, hover help"),
-        ("plays.js, chart.js, sheet.js", "the board of plays, the detail panel with the candle chart and exit routes"),
+        ("plays.js, chart.js, sheet.js", "the board of plays, the detail panel with the candle chart and exit routes; "
+         "chart.js also draws the trade record's chart (GET /api/trades/{id}/chart: candles, levels, marks, standing) "
+         "with a crosshair and a drag that measures a move for the position"),
         ("autopilot.js", "Autopilot on/off, dry run, types, the confidence / R:R / loss-stop sliders"),
         ("filters.js, strategies.js, settings.js", "the filter bar (sides, timeframes, sectors), the strategy "
          "catalogue with weights in plain words, the scan schedule"),
-        ("blotter.js, orders.js, notes.js", "open and closed trades, untracked shares, working orders, "
-         "Autopilot notes"),
+        ("blotter.js, orders.js, notes.js", "open and closed trades (each record a panel with its chart, live while "
+         "it's open), untracked shares, working orders, Autopilot notes"),
         ("scan.js, watchlist.js", "the scan status bar and the hot list / buffers / decisions"),
         ("reports.js, journal.js, movers.js", "the Reports page: reviews, movers, strategy tables"),
         ("signals.js, pairs.js, connections.js, quit.js", "the Signals page, the pairs desk, the Connections "
@@ -1318,8 +1320,9 @@ def build() -> str:
          "current_plays() (slim rows - what the table shows - unless full=1), play_row() (one play whole, for "
          "the row's hover; 404 once it has left the board), assess_play() (after watch_play(): the play opened "
          "streams ahead of the other plays), approve_play(), reject_play(), play_chart()"),
-        ("/api/trades, /api/trades/{id}/close | managed | record, /api/trades/close-all", "GET/POST",
-         "trade lists, close_position(), set_trade_managed(), trade_record(), close_all_positions()"),
+        ("/api/trades, /api/trades/{id}/close | managed | record | chart, /api/trades/close-all", "GET/POST",
+         "trade lists, close_position(), set_trade_managed(), trade_record(), trade_chart() (the record's "
+         "candles, marks and standing), close_all_positions()"),
         ("/api/positions/untracked/{symbol}/close", "POST", "close_untracked()"),
         ("/api/orders, /api/pnl, /api/account/refresh", "GET/POST", "active_orders(), pnl, refresh_account_now() "
          "(which also calls refresh_prices())"),

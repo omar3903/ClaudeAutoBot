@@ -193,6 +193,10 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
             raise HTTPException(404, "trade record not found (it may have been removed)")
         return rec
 
+    @app.get("/api/trades/{trade_id}/chart")
+    def trade_chart(trade_id: str):
+        return eng().trade_chart(trade_id)
+
     @app.post("/api/trades/{trade_id}/close")
     def close_trade(trade_id: str):
         return _result(eng().close_position(trade_id, reason="manual"))
