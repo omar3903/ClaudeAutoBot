@@ -10,8 +10,8 @@ gain once the trade is ``breakeven_at_r`` in profit, trails the price past
 A trade's chart spans from the session before its entry to today, in 5-minute
 candles while that fits IBKR's window (the scans' cached five sessions first,
 the trade's own request up to ten), daily candles beyond. The marks come from
-its fills, the stop moves from the orders sent for it (or its notes), and the
-standing from the price the blotter shows it at.
+its fills, the stop moves from the exit manager's notes, and the standing from
+the price the blotter shows it at.
 """
 
 from __future__ import annotations
@@ -199,31 +199,14 @@ def trade_marks(t: Dict[str, Any], fills: Sequence[Dict[str, Any]]) -> List[Dict
     return marks
 
 
-def stop_moves(t: Dict[str, Any], orders: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Every time the stop moved: from the stop orders sent to the broker (each move is placed afresh, so
-    they carry the time), with where the trade stood then from the exit manager's notes - or from the
-    notes alone, without a time, where no broker holds the stop (the simulator)."""
-    notes = [(float(price), float(r)) for price, r in _STOP_NOTE.findall(t.get("notes") or "")]
-    last = t.get("initial_stop_price") or t.get("stop_price")
-    moves: List[Dict[str, Any]] = []
-    for o in orders:
-        req = o.get("request") or {}
-        if not o.get("ok") or req.get("is_entry") or req.get("type") != "STOP" or req.get("stop") is None:
-            continue
-        price = float(req["stop"])
-        if last is not None and abs(price - float(last)) <= 0.01:
-            continue                        # the first placement, or the same stop placed again after a restart
-        moves.append({"t": _stamp(o.get("ts")), "price": round(price, 4), "r": None})
-        last = price
-    if not moves:
-        return [{"t": None, "price": round(price, 4), "r": r} for price, r in notes]
-    for m in moves:
-        for i, (price, r) in enumerate(notes):
-            if abs(price - m["price"]) <= 0.01:
-                m["r"] = r
-                notes.pop(i)
-                break
-    return moves
+def stop_moves(t: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every time the stop moved, from the exit manager's notes: the new stop and where the trade stood then.
+    None carries a time (``t``): the notes don't, and neither do the orders sent for the trade - a stop
+    resting at the broker is moved by modifying it, which leaves no order row, and a stop order placed
+    afresh is the same stop placed again (after a restart, a lost order, a refused pair), so its time is
+    the placement's, not a move's."""
+    return [{"t": None, "price": round(float(price), 4), "r": float(r)}
+            for price, r in _STOP_NOTE.findall(t.get("notes") or "")]
 
 
 def trade_routes(t: Dict[str, Any], cfg: Any) -> List[Dict[str, Any]]:
@@ -291,6 +274,6 @@ def trade_chart_payload(rec: Dict[str, Any], frame: Optional[pd.DataFrame], intr
                        "stop": t.get("stop_price") or t.get("initial_stop_price"),
                        "targets": [x for x in (t.get("target_price"), t.get("target2_price")) if x]},
             "marks": trade_marks(t, rec.get("fills") or []),
-            "stop_moves": stop_moves(t, rec.get("orders") or []),
+            "stop_moves": stop_moves(t),
             "routes": trade_routes(t, cfg),
             "standing": trade_standing(t, mark)}

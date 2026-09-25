@@ -97,28 +97,46 @@ def test_a_closed_trade_carries_its_exit_mark_and_result(engine, port):
     assert standing["exit_reason"] == "target" and "price" not in standing
 
 
+def _stop_placed(engine, tid, stop, qty=4):
+    """A protective stop order sent to the broker, as the stop keeper audits one."""
+    engine.repo.record_order_audit("PLACE", {"symbol": "T01", "side": "SHORT", "qty": qty, "type": "STOP",
+                                             "stop": stop, "is_entry": False}, {}, True, "ibkr",
+                                   trade_id=tid, message="protective stop")
+
+
 def test_the_marks_show_the_parts_taken_off_the_best_point_and_every_stop_move(engine, port):
     _connect(engine, port)
     tid = _open(engine, _play(), qty=6)
     engine.repo.update_trade_risk(tid, mfe=3.0, hwm_price=103.0)          # the exit manager saw +0.6R
     engine.repo.reduce_trade(tid, 2, 103.0)                                # the scale-out
+    _stop_placed(engine, tid, 95.0)                                        # the stop at the broker
+    # the exit manager moved it by modifying the resting order, which leaves no order row - only its note
     engine.repo.update_trade_risk(tid, stop_price=101.0, note_append="stop->101.00 @ 1.4R")
-    for stop in (95.0, 95.0, 101.0):                   # placed, placed again after a restart, moved
-        engine.repo.record_order_audit("PLACE", {"symbol": "T01", "side": "SHORT", "qty": 4, "type": "STOP",
-                                                 "stop": stop, "is_entry": False}, {}, True, "ibkr",
-                                       trade_id=tid, message="protective stop")
+    _stop_placed(engine, tid, 101.0)                                       # lost later, and placed again
     chart = engine.trade_chart(tid)
     assert [(m["kind"], m["price"]) for m in chart["marks"]] == [("entry", 100.0), ("part", 103.0), ("best", 103.0)]
     assert "+0.6R" in chart["marks"][-1]["title"]
-    [move] = chart["stop_moves"]
-    assert (move["price"], move["r"]) == (101.0, 1.4) and move["t"]
+    # the move is the note's; the placement again is not it, so it lends the move no time
+    assert chart["stop_moves"] == [{"t": None, "price": 101.0, "r": 1.4}]
     assert (chart["levels"]["initial_stop"], chart["levels"]["stop"], chart["quantity"]) == (95.0, 101.0, 4.0)
     assert chart["standing"]["mfe_r"] == 0.6
 
 
-def test_without_broker_orders_the_stop_moves_come_from_the_notes_without_times():
+def test_a_stop_placed_again_after_two_moves_hides_neither_move(engine, port):
+    _connect(engine, port)
+    tid = _open(engine, _play())
+    _stop_placed(engine, tid, 95.0)
+    engine.repo.update_trade_risk(tid, stop_price=100.1, note_append="stop->100.10 @ 1.3R")
+    engine.repo.update_trade_risk(tid, stop_price=101.5, note_append="stop->101.50 @ 1.9R")
+    _stop_placed(engine, tid, 101.5)                                       # placed again where the stop now stands
+    assert engine.trade_chart(tid)["stop_moves"] == [{"t": None, "price": 100.1, "r": 1.3},
+                                                     {"t": None, "price": 101.5, "r": 1.9}]
+
+
+def test_the_stop_moves_come_from_the_notes_without_times():
     t = {"initial_stop_price": 95.0, "stop_price": 101.5, "notes": "stop->100.10 @ 1.3R | stop->101.50 @ 1.9R"}
-    assert stop_moves(t, []) == [{"t": None, "price": 100.1, "r": 1.3}, {"t": None, "price": 101.5, "r": 1.9}]
+    assert stop_moves(t) == [{"t": None, "price": 100.1, "r": 1.3}, {"t": None, "price": 101.5, "r": 1.9}]
+    assert stop_moves({"stop_price": 95.0, "notes": ""}) == []
 
 
 def test_without_the_gateway_there_are_no_candles(engine):
