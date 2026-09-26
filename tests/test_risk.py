@@ -37,6 +37,20 @@ def test_sizing_fixed_fractional():
     assert r.notional == 1000.0              # 10% of equity, under the 35% cap
 
 
+def test_the_size_factor_scales_the_risk_and_the_caps_still_hold():
+    assert size_play(_play(100, 90), _acct(10000), RISK_CFG, size_factor=2.5).qty == 25   # $250 of risk
+    none = size_play(_play(100, 90), _acct(10000), RISK_CFG, size_factor=0.0)
+    assert none.qty == 0 and "position size factor 0x" in none.caps_hit
+    usual = size_play(_play(100, 90), _acct(10000), RISK_CFG)
+    assert usual.qty == 10 and not any("size factor" in c for c in usual.caps_hit)          # 1 is the usual size
+    # 5x a $100 budget is $500, past the 4% open-risk ceiling with $300 of it used: the ceiling still holds
+    big = size_play(_play(100, 90), _acct(10000), RISK_CFG, open_risk_used=300.0, size_factor=5.0)
+    assert big.qty == 10 and "portfolio open-risk ceiling" in big.caps_hit
+    # and the notional cap: 5x on a tight stop stops at 35% of equity
+    tight = size_play(_play(100, 99.9), _acct(10000), RISK_CFG, size_factor=5.0)
+    assert tight.qty * 100 <= 10000 * 0.35 + 1 and "max position % of equity" in tight.caps_hit
+
+
 def test_sizing_capped_by_notional():
     p = _play(100, 99.9)                     # tiny risk -> huge qty by risk alone
     r = size_play(p, _acct(10000), RISK_CFG)

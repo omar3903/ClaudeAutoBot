@@ -93,6 +93,33 @@ async function saveSplit() {
   toast(r.note, "good");
 }
 
+/* ---------- the position size factor: every new position's size times this, 0-5 ---------- */
+let sizeDragging = false;
+
+function renderSize() {
+  const c = S.state.capital;
+  if (!c || c.size_factor == null || sizeDragging) return;
+  $("#size-range").value = c.size_factor;
+  labelSize(c.size_factor);
+}
+
+function labelSize(factor) {
+  $("#size-label").textContent = `${Number(factor).toFixed(1)}x`;
+  $("#size-label").classList.toggle("warn-text", Number(factor) !== 1);
+  $("#size-range").title = Number(factor) > 0
+    ? `New positions are ${Number(factor).toFixed(1)} times the usual size; the caps on open risk, per stock, liquidity and buying power still hold`
+    : "New positions are sized at nothing: no entries until the factor is above 0";
+}
+
+async function saveSize() {
+  sizeDragging = false;
+  const r = await post("/api/capital/size_factor", { factor: parseFloat($("#size-range").value) });
+  if (!r.ok) { toast("Size factor not changed: " + (r.reason || ""), "bad"); renderSize(); return; }
+  S.state.capital = r.capital;
+  emit("capital", r.capital);
+  toast(r.note, "good");
+}
+
 function renderSectorsButton() {
   const sel = (S.state.filters || {}).sectors || [];
   const b = $("#btn-sectors");
@@ -145,6 +172,10 @@ export function initFilters() {
   on("capital", renderSplit);
   $("#split-range").oninput = e => { splitDragging = true; labelSplit(parseFloat(e.target.value)); };
   $("#split-range").onchange = saveSplit;
+  on("state", renderSize);
+  on("capital", renderSize);
+  $("#size-range").oninput = e => { sizeDragging = true; labelSize(parseFloat(e.target.value)); };
+  $("#size-range").onchange = saveSize;
   Object.keys(BOXES).forEach(id => { $("#" + id).onchange = e => changeFilter(e.target); });
   $("#btn-sectors").onclick = pickSectors;
   for (const [id, [key, byDefault]] of Object.entries(VIEW_OPTIONS)) {

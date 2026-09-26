@@ -414,6 +414,32 @@ def test_a_replay_a_restart_interrupted_is_resumed_once_and_an_older_one_is_drop
     assert len(started) == 1 and not checkpoint.path.exists()                # deleted, nothing started
 
 
+# ---------------------------------------------------------------- the position size factor
+def test_the_size_factor_resizes_the_plays_is_remembered_and_refuses_what_is_out_of_range(engine, port):
+    _connect(engine, port)
+    assert engine.size_factor == 1.0 and engine.capital_state()["size_factor"] == 1.0
+    p = _play()                                                                 # entry 100, stop 95
+    engine.board.replace([p])
+    engine._size_plays([p])
+    usual = p.suggested_qty
+    out = engine.set_size_factor(2)
+    assert out["ok"] and out["capital"]["size_factor"] == 2.0 and "2 times the usual size" in out["note"]
+    assert p.suggested_qty > usual                                              # the board is sized again at once
+    assert engine.runtime.read()["sizing"] == {"factor": 2.0}                   # remembered
+    for bad in (-0.1, 5.5, "lots", None, float("nan")):
+        assert not engine.set_size_factor(bad)["ok"] and engine.size_factor == 2.0
+    zero = engine.set_size_factor(0)
+    assert zero["ok"] and "sized at nothing" in zero["note"] and p.suggested_qty == 0
+    assert any("size factor is 0" in r for r in engine.assess_play(p.id)["reasons"])
+
+
+def test_the_size_factor_on_disk_is_read_back_and_a_bad_one_is_the_usual_size():
+    from tos_bot.engine.runtime import load_size_factor
+    assert load_size_factor({"factor": 3.5}) == 3.5
+    assert load_size_factor(None) == 1.0 and load_size_factor({"factor": 9}) == 1.0
+    assert load_size_factor({"factor": True}) == 1.0 and load_size_factor({"factor": "2"}) == 1.0
+
+
 # ---------------------------------------------------------------- the split, and changes made while it runs
 def test_entries_still_working_count_in_their_kinds_share_of_the_capital(engine, port):
     _connect(engine, port)

@@ -115,6 +115,20 @@ def parse_day_pct(value: Any) -> float:
     return pct
 
 
+#: the position size factor's range: 0 sizes every position at nothing, 5 at five times the usual
+SIZE_FACTOR_MAX = 5.0
+
+
+def parse_size_factor(value: Any) -> float:
+    try:
+        factor = round(float(value), 2)
+    except (TypeError, ValueError):
+        raise ValueError("Enter the position size factor as a number, like 1.5.") from None
+    if not math.isfinite(factor) or not 0.0 <= factor <= SIZE_FACTOR_MAX:
+        raise ValueError(f"The position size factor has to be between 0 and {SIZE_FACTOR_MAX:g}.")
+    return factor
+
+
 def parse_amount(amount: Any) -> float:
     try:
         value = round(float(amount), 2)
