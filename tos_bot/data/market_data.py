@@ -127,6 +127,13 @@ class MarketData:
         return self._source is not None
 
     @property
+    def connected(self) -> bool:
+        """A source is attached and its connection is up. While IBKR reconnects by itself after a Gateway
+        restart or a drop, the source stays attached with nothing to ask it."""
+        src = self._source
+        return src is not None and bool(getattr(src, "is_connected", True))
+
+    @property
     def source_name(self) -> str:
         return self._source.name if self._source is not None else "none"
 

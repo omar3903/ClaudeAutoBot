@@ -186,7 +186,8 @@ def test_a_5_minute_close_queues_the_check_2_s_on_and_it_stands_in_for_the_fast_
     assert {p.symbol: p.confirmations for p in engine.board.plays.values()} == {s: n + 1 for s, n in before.items()}
 
 
-@pytest.mark.parametrize("off", ["close_check", "stream_watch", "delayed", "quit", "16:00", "09:30"])
+@pytest.mark.parametrize("off", ["close_check", "stream_watch", "delayed", "gateway down", "quit", "16:00",
+                                 "09:30"])
 def test_nothing_is_queued_while_the_check_is_off_or_cant_run(engine, gateway, now, monkeypatch, off):
     _bars_until(gateway, monkeypatch, _at(10, 5))
     engine.md.intraday(["T01"])
@@ -197,6 +198,8 @@ def test_nothing_is_queued_while_the_check_is_off_or_cant_run(engine, gateway, n
         monkeypatch.setattr(engine.settings.config.execution, "stream_watch", 0)
     elif off == "delayed":
         gateway.delayed = True
+    elif off == "gateway down":
+        gateway.connected = False                  # IBKR reconnecting by itself: the source stays attached
     elif off == "quit":
         engine.quit_state = {"by": "operator"}
     now["t"] = boundary + dt.timedelta(seconds=0.3)
@@ -208,6 +211,47 @@ def test_nothing_is_queued_while_the_check_is_off_or_cant_run(engine, gateway, n
         engine._on_minute(_at(10, 7).timestamp())
     assert engine._close_due is None and engine._movers_due == {} and not engine._scan_wake.is_set()
     assert engine._due_scan() == answer and len(gateway.requests) == asked
+
+
+def test_a_check_that_fails_before_it_starts_is_dropped_and_the_scan_loop_doesnt_spin_on_it(engine, gateway, now,
+                                                                                            monkeypatch):
+    def broken():
+        raise RuntimeError("the database is locked")
+
+    monkeypatch.setattr(engine, "strategy_odds", broken)          # the lead-in fails, before the check itself
+    engine._close_due = (_at(10, 5), time.monotonic())
+    engine._movers_due, engine._mover_why = {"T01": _at(10, 4)}, {"T01": "a move"}
+    engine._last_cycle_at = engine._last_plays_at = time.monotonic()
+    asked = len(gateway.requests)
+    engine._run_scan("close")
+    # nothing left due: the scan loop waits its 5 s and the other scans get their turn - not 'close' again at once
+    assert engine._close_due is None and engine._movers_due == {} and engine._mover_why == {}
+    assert engine._next_scan_wait() == 5.0 and engine._due_scan() is None and _asked(gateway, asked) == []
+
+
+def test_an_early_mover_waits_for_the_close_queued_behind_it_until_ibkr_has_finished_the_bar(engine, gateway, now,
+                                                                                               monkeypatch):
+    limits = _bars_until(gateway, monkeypatch, _at(10, 5))
+    engine.md.intraday(WATCH)
+    engine._last_cycle_at = engine._last_plays_at = time.monotonic()
+    # T01 moved in the 10:08 minute, but the scan thread was busy until just after 10:10, when the close was queued
+    engine._movers_due, engine._mover_why = {"T01": _at(10, 9)}, {"T01": "1-minute candle 1.4 ATRs"}
+    engine._close_due = (_at(10, 10), time.monotonic() + 1.5)
+    now["t"] = _at(10, 10, 0.75)
+    assert engine._due_scan() is None and 0 < engine._next_scan_wait() <= 1.5
+    asked = len(gateway.requests)
+    engine._run_scan("close")                                    # even if it runs, nothing is asked before the grace
+    assert _asked(gateway, asked) == [] and engine._close_due is not None and "T01" in engine._movers_due
+
+    # due: one check over the whole tier, T01 among it, on the finished bars
+    limits["at"], now["t"] = _at(10, 10), _at(10, 10, 2.3)
+    engine._close_due = (_at(10, 10), time.monotonic())
+    got = _spy_run_close(engine, monkeypatch)
+    assert engine._due_scan() == "close"
+    engine._run_scan("close")
+    assert sorted(r[0] for r in _asked(gateway, asked)) == sorted(WATCH) and engine._movers_due == {}
+    [result] = got
+    assert result.symbols == WATCH and engine._close_due is None
 
 
 # ---------------------------------------------------------------- early movers

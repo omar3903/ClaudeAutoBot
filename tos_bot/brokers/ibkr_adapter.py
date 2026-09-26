@@ -755,8 +755,8 @@ class IbkrBroker(BrokerAdapter):
         with self._stream_lock:
             self._unstreamable = {s: t for s, t in self._unstreamable.items() if t > now}
             n = min(int(limit), self.STREAM_LINES_MAX, self._stream_cap)
-            self._stream_protect = max(0, min(int(protect), n))
             wanted = [s for s in dict.fromkeys(symbols) if s and s not in self._unstreamable][:n]
+        held = set(list(dict.fromkeys(symbols))[:max(0, int(protect))])
         # a stream needs a qualified contract (ib_async keys its Tickers by the contract id): look up the
         # missing ones here, off the loop, most wanted first
         todo = [s for s in wanted if not _qualified(self._contracts.get(s))][:self.STREAM_ADDS_PER_CALL]
@@ -778,8 +778,12 @@ class IbkrBroker(BrokerAdapter):
                     elif answered:
                         self._unstreamable[s] = now + self.UNSTREAMABLE_S
         order = [s for s in wanted if _qualified(self._contracts.get(s))]
+        # the positions head the order; how many is set on the loop with the order itself - set sooner (before the
+        # contract lookups above), a 101 meanwhile would read fewer positions against the order held till then,
+        # and a position that is still held but no longer first could lose its stream
+        protected = sum(1 for s in order if s in held)
         try:
-            return self._session.call(lambda ib: self._sync_streams(ib, order), timeout=10)
+            return self._session.call(lambda ib: self._sync_streams(ib, order, protected), timeout=10)
         except Exception as e:  # noqa: BLE001
             log.debug("IBKR streams not updated: %s", e)
             with self._stream_lock:
@@ -796,14 +800,16 @@ class IbkrBroker(BrokerAdapter):
             return None
         return got[0], max(0.0, time.monotonic() - got[1])
 
-    def _sync_streams(self, ib, order: List[str]) -> List[str]:
-        """Make the streams held match ``order``. Runs on the loop thread - the one that changes them, and the
-        one _on_error runs on, so a refusal can't land between the check below and a request."""
+    def _sync_streams(self, ib, order: List[str], protect: int = 0) -> List[str]:
+        """Make the streams held match ``order``, whose first ``protect`` (the positions) error 101 never takes.
+        Runs on the loop thread - the one that changes them, and the one _on_error runs on, so a refusal can't
+        land between the check below and a request."""
         if not (self.can_stream and ib.isConnected()):
             self._drop_streams(ib, cancel=True)
             return []
         with self._stream_lock:
             self._stream_order = list(order)
+            self._stream_protect = max(0, min(int(protect), len(order)))
             keep = set(order)
             gone = [s for s in self._streams if s not in keep]
             new = [s for s in order if s not in self._streams]

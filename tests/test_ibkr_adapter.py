@@ -1152,6 +1152,29 @@ def test_error_101_cuts_the_watch_tier_first_and_never_the_positions(broker, mon
     assert broker._stream_protect == 0 and broker._stream_cap == broker.STREAM_LINES_MAX
 
 
+def test_error_101_while_a_resync_looks_up_contracts_never_cuts_a_position_still_held(broker, monkeypatch):
+    ib, symbols = broker._session.ib, [f"T{i:02d}" for i in range(1, 26)]
+    broker.set_streams(symbols, 25, protect=3)
+    broker.set_streams(symbols, 25, protect=3)
+    broker._on_error(broker._streams["T25"].req_id, 101, "Max number of tickers has been reached", None)
+    for _ in range(3):                                   # down to the three positions
+        broker._on_error(ib.client._reqIdSeq, 101, "Max number of tickers has been reached", None)
+    assert list(broker._streams) == symbols[:3] and broker._stream_cap == 3
+    # T01's position closes: the next resync leads with T02 and T03 and first looks up a new name's contract -
+    # and the lines are refused again meanwhile, before the streams have followed the new order
+    qualify = ib.qualifyContractsAsync
+
+    async def refused_meanwhile(*contracts):
+        broker._on_error(ib.client._reqIdSeq, 101, "Max number of tickers has been reached", None)
+        return await qualify(*contracts)
+
+    monkeypatch.setattr(ib, "qualifyContractsAsync", refused_meanwhile)
+    cancelled = len(ib.cancelled)
+    assert broker.set_streams(["T02", "T03", "T30"], 25, protect=2) == ["T02", "T03", "T30"]
+    assert ib.cancelled[cancelled:] == ["T01"]              # the closed one's stream ended; T03's never did
+    assert broker._stream_cap == 3 and broker._stream_protect == 2
+
+
 def test_a_stock_refused_a_stream_is_quoted_by_snapshot_and_only_a_burst_turns_the_data_delayed(broker):
     ib = broker._session.ib
     symbols = [f"T{i:02d}" for i in range(1, 8)]

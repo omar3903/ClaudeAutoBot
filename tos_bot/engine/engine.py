@@ -1054,9 +1054,11 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _close_checks_on(self, at: dt.datetime) -> bool:
         """Whether the candle-close and early-mover checks run at ``at``: switched on (scanner.close_check, and a
-        watch tier to check), connected on real-time data that flows, in regular hours and not while quitting."""
+        watch tier to check), connected on real-time data that flows, in regular hours and not while quitting.
+        Connected means the Gateway is up, not only attached: while IBKR reconnects by itself the source stays
+        attached, and a check queued then would only fail at the scan thread every 5 minutes."""
         cfg = self.settings.config
-        return bool(cfg.scanner.close_check and int(cfg.execution.stream_watch or 0) > 0 and self.md.attached
+        return bool(cfg.scanner.close_check and int(cfg.execution.stream_watch or 0) > 0 and self.md.connected
                     and not self.md.delayed and not self.md.refused and not self.quit_state
                     and clock.is_market_open(at))
 
@@ -1221,7 +1223,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return None
         with self._close_lock:
             close_due, movers = self._close_due, bool(self._movers_due)
-        if movers or (close_due is not None and mono >= close_due[1]):
+        # the early movers wait for a 5-minute close queued behind them: it covers them, and run now it would read
+        # IBKR's bars before CLOSE_GRACE_S has let IBKR finish them
+        if (close_due is not None and mono >= close_due[1]) or (close_due is None and movers):
             return "close"
         # a candle-close check starts within seconds: it stands in for the fast cycle, and the quick re-check
         # waits for it rather than hold it up
@@ -1268,6 +1272,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if not light:
             self._scan_running = {"kind": kind, "started_at": clock.now_ny().isoformat()}
             self._publish("scan.started", kind=kind)
+        # the candle-close check takes what the candle loop queued before anything can fail: a failure in the
+        # lead-in below that left it queued would find it due again at once - the scan loop would spin on it,
+        # logging, with every cycle starved behind it
+        queued = self._take_close_queue() if kind == "close" else None
         try:
             if not light:
                 self._refresh_account()
@@ -1284,7 +1292,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             elif kind == "wide":
                 result = self.scanner.run_wide(self.scan_settings.wide_stocks, self.scan_settings.movers)
             elif kind == "close":
-                result = self._close_check()
+                result = self._close_check(queued)
                 if result is None:
                     return                                 # nothing left to check
             elif quick:
@@ -1373,17 +1381,27 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._thin_live_names(result)
         self._note_changes(changes)
 
-    def _close_check(self) -> Optional[ScanResult]:
-        """The check the candle loop queued (_on_minute), on the scan thread: at a 5-minute close the whole watch
-        tier, else the early movers still in it, on IBKR's newest 5-minute bars (Scanner.run_close). A check
-        that couldn't start within CLOSE_STALE_S of its close is dropped, and no stock is asked twice within
-        CLOSE_ASK_GAP_S. None when nothing is left to check."""
+    def _take_close_queue(self) -> Tuple[Optional[dt.datetime], Dict[str, dt.datetime], Dict[str, str]]:
+        """Take what the candle loop queued (_on_minute): the 5-minute close once it is due, and the early movers
+        with why. A close not due yet stays queued, and the movers with it - it covers them, and IBKR is still
+        finishing its bar (CLOSE_GRACE_S); the scan loop wakes for it when it is due."""
         with self._close_lock:
-            due, self._close_due = self._close_due, None
-            movers, self._movers_due = self._movers_due, {}
-            why, self._mover_why = self._mover_why, {}
+            due = self._close_due
+            if due is not None and time.monotonic() < due[1]:
+                return None, {}, {}
+            movers, why = self._movers_due, self._mover_why
+            self._close_due, self._movers_due, self._mover_why = None, {}, {}
+        return (due[0] if due is not None else None), movers, why
+
+    def _close_check(self, queued: Optional[Tuple[Optional[dt.datetime], Dict[str, dt.datetime],
+                                                  Dict[str, str]]] = None) -> Optional[ScanResult]:
+        """The check the candle loop queued (_on_minute), on the scan thread - ``queued`` as _take_close_queue
+        took it (taken here when not given): at a 5-minute close the whole watch tier, else the early movers still
+        in it, on IBKR's newest 5-minute bars (Scanner.run_close). A check that couldn't start within
+        CLOSE_STALE_S of its close is dropped, and no stock is asked twice within CLOSE_ASK_GAP_S. None when
+        nothing is left to check."""
+        boundary, movers, why = queued if queued is not None else self._take_close_queue()
         now = clock.now_ny()
-        boundary = due[0] if due is not None else None
         if boundary is not None and (now - boundary).total_seconds() > self.CLOSE_STALE_S:
             log.debug("the %s ET candle-close check is dropped: it couldn't start until %.0f s after the close",
                       boundary.strftime("%H:%M"), (now - boundary).total_seconds())
