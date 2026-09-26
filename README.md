@@ -307,8 +307,12 @@ data pill shows `data: IBKR (delayed)`; hover it for the detail.
 holds IBKR streams for the stocks that matter most: the open positions and
 working entries first, then the plays still on offer - the ones you opened in
 the detail panel in the last 5 minutes, then the ones Autopilot would take, then
-the best of the rest (a play keeps its stream at least a minute) - up to
-`execution.stream_lines` (60 of the account's ~100 market-data lines; 0 = none).
+the best of the rest (a play keeps its stream at least a minute) - then the
+watch tier: the day's hot list, the kept buffer names and the buffer names the
+next cycle looks at, up to `execution.stream_watch` (50; 0 = none) - all within
+`execution.stream_lines` (80 of the account's ~100 market-data lines; 0 = none).
+If IBKR says every line is in use (error 101), the watch names give theirs back
+first, then the plays - never the positions.
 A stock whose stream ticked in the last 2 seconds is priced off it; a quieter
 one, or one past the budget, gets a one-off snapshot as before - an entry never
 waits for a stream. Delayed data never streams.

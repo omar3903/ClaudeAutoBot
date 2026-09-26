@@ -555,8 +555,8 @@ def fig_threads(journal_s, pairs_s) -> str:
                          "when due (+ the movers report)"),
         ("pairs-loop", f"every {pairs_s:.0f} s: refresh the pair list after a new session, watch z-scores, "
                        "manage open pairs"),
-        ("stream-loop", "every 5 s, and on a new board or order: IBKR streams on the positions, then the plays, "
-                        "within execution.stream_lines"),
+        ("stream-loop", "every 5 s, and on a new board or order: IBKR streams on the positions, the plays, then "
+                        "the watch tier, within execution.stream_lines"),
         ("price-push", "woken by a streamed tick: the prices that moved, to the dashboard as prices.tick, "
                        "at most once a second"),
     ]
@@ -1432,12 +1432,14 @@ def build() -> str:
         ("engine/engine.py", "refresh_prices(), _marks()", "Refresh prices the board and the positions; a position's "
          "mark is the app's own price when fetched in the last APP_MARK_S (120 s), else the broker's"),
         ("data/streams.py", "StreamManager.sync(), fresh(), prefer(), take_moves()", "the line budget: IBKR streams "
-         "for at most execution.stream_lines stocks (60; 0 = none) - the positions and working entries, then the plays "
-         "the operator opened in the last 5 minutes, the plays Autopilot would take and the best of the rest; "
-         "quote() serves a stream that ticked in the last 2 s, else a snapshot as before"),
+         "for at most execution.stream_lines stocks (80; 0 = none) - the positions and working entries, then the plays "
+         "the operator opened in the last 5 minutes, the plays Autopilot would take and the best of the rest, then "
+         "the watch tier (Scanner.watch_symbols(): the hot list, kept and next buffer names, up to "
+         "execution.stream_watch, 50); quote() serves a stream that ticked in the last 2 s, else a snapshot as before"),
         ("brokers/ibkr_adapter.py", "IbkrBroker.set_streams(), streamed_quote(), _on_tickers()", "the streams on the "
          "IB loop thread: only on proven real-time data, a stock's quote kept once its bid, ask and last have all "
-         "come; a refusal of lines (101) lowers the budget, a stock IBKR won't stream is dropped"),
+         "come; a refusal of lines (101) lowers the budget from the tail (the watch tier, then the plays - never the "
+         "positions), a stock IBKR won't stream is dropped"),
         ("engine/engine.py", "_stream_loop(), _price_push_loop(), watch_play()", "points the streams at what matters "
          "every 5 s, or at once on a new board, an order or a play opened on the dashboard; sends the streamed "
          "prices that moved as prices.tick, at most once a second"),

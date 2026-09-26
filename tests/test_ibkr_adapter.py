@@ -1039,6 +1039,29 @@ def test_error_101_gives_lines_back_from_the_end_once_per_burst(broker):
     assert broker._stream_cap == 4 and sorted(broker._streams) == symbols[:4]
 
 
+def test_error_101_cuts_the_watch_tier_first_and_never_the_positions(broker, monkeypatch):
+    ib, symbols = broker._session.ib, [f"T{i:02d}" for i in range(1, 26)]
+    broker.set_streams(symbols, 25, protect=3)                                        # three positions first
+    broker.set_streams(symbols, 25, protect=3)
+    broker._on_error(broker._streams["T25"].req_id, 101, "Max number of tickers has been reached", None)
+    caps = [broker._stream_cap]
+    while True:                                   # every request sent after a cut is refused again: news each time
+        broker._on_error(ib.client._reqIdSeq, 101, "Max number of tickers has been reached", None)
+        if broker._stream_cap == caps[-1]:
+            break
+        caps.append(broker._stream_cap)
+    assert caps == [14, 4, 3] and list(broker._streams) == symbols[:3]              # the tail went, the positions stay
+    assert broker.set_streams(symbols, 25, protect=3) == symbols[:3]
+
+    # a new connection has every line again, and nothing held yet to keep
+    monkeypatch.setattr(broker, "_start_reconnect", lambda: None)
+    ib.disconnect()
+    broker._on_disconnect()
+    ib.wrapper.reset()
+    broker._do_connect()
+    assert broker._stream_protect == 0 and broker._stream_cap == broker.STREAM_LINES_MAX
+
+
 def test_a_stock_refused_a_stream_is_quoted_by_snapshot_and_only_a_burst_turns_the_data_delayed(broker):
     ib = broker._session.ib
     symbols = [f"T{i:02d}" for i in range(1, 8)]

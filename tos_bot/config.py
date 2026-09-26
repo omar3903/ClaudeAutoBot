@@ -177,16 +177,26 @@ class ExecutionCfg(_Model):
                                           # than this share of the distance to the stop - the reward:risk the play was
                                           # judged on is gone; within it a limit entry is priced off the live quote so
                                           # it fills now (0 = off)
-    stream_lines: int = 60                # on proven real-time data, hold IBKR streams for this many stocks - the
-                                          # positions first, then the best plays - and price them off a stream that
-                                          # ticked in the last 2 s instead of a snapshot each time. Of the account's
-                                          # ~100 market-data lines, the rest stay free for snapshots (0-90; 0 = off)
+    stream_lines: int = 80                # on proven real-time data, hold IBKR streams for this many stocks - the
+                                          # positions and working entries first, then the best plays, then the watch
+                                          # tier - and price them off a stream that ticked in the last 2 s instead of
+                                          # a snapshot each time. Of the account's ~100 market-data lines, ~20 stay
+                                          # free for snapshots (0-90; 0 = off)
+    stream_watch: int = 50                # the watch tier: the day's hot list, the kept buffer names and the buffer
+                                          # names the cycles sample next, streamed after the plays within
+                                          # stream_lines, and checked at each candle close (0-80; 0 = off, as before)
 
     @field_validator("stream_lines", mode="after")
     @classmethod
     def _within_the_lines(cls, value: int) -> int:
         """IBKR refuses streams past the account's lines, and the snapshots need some of them too."""
         return max(0, min(90, value))
+
+    @field_validator("stream_watch", mode="after")
+    @classmethod
+    def _within_the_watch(cls, value: int) -> int:
+        """The watch tier streams inside stream_lines, behind the positions and the plays."""
+        return max(0, min(80, value))
 
 
 class ExitManagerCfg(_Model):

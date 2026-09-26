@@ -204,6 +204,7 @@ class StreamingGateway(FakeGateway):
         self.on_tick: Optional[Callable[[frozenset], None]] = None
         self.streams: List[str] = []                        # streaming now, in the order asked
         self.stream_calls: List[Tuple[List[str], int]] = []   # every set_streams: (symbols, limit)
+        self.protect = 0                                    # the last set_streams' protect: streams 101 never takes
         self.refuse: set = set()                            # stocks IBKR won't stream
         self.snapshots = 0
         self._latest: Dict[str, Tuple[Quote, float]] = {}
@@ -212,8 +213,9 @@ class StreamingGateway(FakeGateway):
     def can_stream(self) -> bool:
         return self.connected and not self.delayed
 
-    def set_streams(self, symbols: Sequence[str], limit: int) -> List[str]:
+    def set_streams(self, symbols: Sequence[str], limit: int, protect: int = 0) -> List[str]:
         self.stream_calls.append((list(symbols), limit))
+        self.protect = protect
         if not self.connected:
             return []                                       # the streams went with the connection
         if not self.can_stream or limit <= 0:

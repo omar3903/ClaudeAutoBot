@@ -1800,6 +1800,36 @@ def test_the_plays_autopilot_would_take_stream_ahead_of_the_rest_while_on_offer(
     assert engine._resync_streams() == ["T03", "T04"]
 
 
+def test_the_watch_tier_streams_after_the_positions_and_plays(engine, monkeypatch):
+    from tos_bot.scanner.watchlist import Candidate, DayWatchlist
+
+    day = dt.date(2026, 9, 24)
+    monkeypatch.setattr(clock, "now_ny", lambda: dt.datetime.combine(day, dt.time(10, 0), clock.NY))
+    gateway = fakes.StreamingGateway(fakes.SYMBOLS)
+    gateway.connect()
+    engine.md.attach(gateway)
+    _open(engine, "T01")                                                        # a trade on this venue
+    best, next_ = _play("T02"), _play("T03")
+    best.score, next_.score = 0.9, 0.5
+    engine.board.replace([best, next_], None)
+    engine.scanner.watchlist = DayWatchlist(
+        session=day, bars_through=day - dt.timedelta(days=1), built_at="", universe=40, liquid=40,
+        hot=[Candidate("T04", "Technology", 1.0, heat=3.0), Candidate("T03", "Technology", 1.0, heat=2.0),
+             Candidate("T05", "Energy", 1.0, heat=1.0)],
+        queues={}, kept={"Energy": [Candidate("T06", "Energy", 1.0, heat=0.5)]})
+    execution = engine.settings.config.execution
+    monkeypatch.setattr(execution, "stream_lines", 6)
+    monkeypatch.setattr(execution, "stream_watch", 3)
+    # the position, the plays, then the tier's first three - T03 once, as a play; T06 is past stream_watch
+    assert engine._resync_streams() == ["T01", "T02", "T03", "T04", "T05"]
+    assert gateway.stream_calls[-1] == (["T01", "T02", "T03", "T04", "T05"], 6) and gateway.protect == 1
+
+    monkeypatch.setattr(execution, "stream_watch", 0)
+    monkeypatch.setattr(engine.scanner, "watch_symbols", lambda *a, **k: pytest.fail("no watch tier when it's off"))
+    assert engine._resync_streams() == ["T01", "T02", "T03"]
+    assert gateway.stream_calls[-1] == (["T01", "T02", "T03"], 6)            # as before the watch tier
+
+
 def _streaming_position(engine, symbol="T01"):
     """A position here whose stock streams, next to a play's stock (T03) that streams too."""
     gateway = fakes.StreamingGateway(fakes.SYMBOLS)

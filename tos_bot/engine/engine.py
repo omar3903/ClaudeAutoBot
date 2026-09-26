@@ -11,7 +11,8 @@ background loops:
                    regular hours the exits again within a second of a streamed
                    tick on a stock held
     snapshot loop  every 10-30 s: account, broker-vs-database check, broadcast
-    stream loop    points IBKR's real-time streams at the positions, then the plays
+    stream loop    points IBKR's real-time streams at the positions, then the plays,
+                   then the watch tier (the day's hot list and buffer names)
     price push     the streamed prices that moved, to the dashboard at most once a
                    second (prices.tick)
 
@@ -892,11 +893,19 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _resync_streams(self) -> List[str]:
         """Stream the stocks held, then the plays on offer - the ones the operator opened and the ones
-        Autopilot would take first - within execution.stream_lines (0 = none, and every price is a snapshot
-        as before). Returns the symbols streaming now."""
-        lines = int(self.settings.config.execution.stream_lines or 0)
+        Autopilot would take first - then the watch tier (the day's hot list, kept and next buffer names, up to
+        execution.stream_watch; 0 = none), all within execution.stream_lines (0 = none, and every price is a
+        snapshot as before). Returns the symbols streaming now."""
+        execution = self.settings.config.execution
+        lines = int(execution.stream_lines or 0)
         held, plays = self._stream_wanted() if lines > 0 else ([], [])
-        return self.md.streams.sync(held, plays, lines, candidates=self._ap_candidates)
+        n = int(execution.stream_watch or 0)
+        try:
+            watch = self.scanner.watch_symbols(n) if lines > 0 and n > 0 else []
+        except Exception:  # noqa: BLE001 - the positions and plays still stream; the tier waits for the next pass
+            log.debug("the watch tier couldn't be read", exc_info=True)
+            watch = []
+        return self.md.streams.sync(held, plays, lines, candidates=self._ap_candidates, watch=watch)
 
     def _stream_wanted(self) -> Tuple[List[str], List[str]]:
         """The stocks to stream, most needed first: those held - this venue's open trades, the entries still

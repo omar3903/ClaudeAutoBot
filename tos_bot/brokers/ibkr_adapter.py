@@ -268,6 +268,8 @@ class IbkrBroker(BrokerAdapter):
         #: the priority order last asked for, and how many streams may be held (lowered by error 101)
         self._stream_order: List[str] = []
         self._stream_cap = self.STREAM_LINES_MAX
+        #: how many at the head of that order error 101 never takes: the positions and working entries
+        self._stream_protect = 0
         #: request ids below this were sent before the last cut for error 101: their 101s are that same burst
         self._cut_below = -1
         self._unstreamable: Dict[str, float] = {}        # symbol -> when it may be tried again (time.monotonic)
@@ -309,7 +311,7 @@ class IbkrBroker(BrokerAdapter):
         # new connection has all its lines, and a stock refused on the last one may be covered now
         self._live_verified = False
         with self._stream_lock:
-            self._stream_cap, self._cut_below = self.STREAM_LINES_MAX, -1
+            self._stream_cap, self._cut_below, self._stream_protect = self.STREAM_LINES_MAX, -1, 0
             self._unstreamable.clear()
             self._refusals.clear()
             self._ended_reqs.clear()                  # request ids start again with the connection
@@ -726,11 +728,12 @@ class IbkrBroker(BrokerAdapter):
         and not before the connect probe is through."""
         return self.is_connected and self._data_type == 1 and not self._data_is_delayed and self._live_verified
 
-    def set_streams(self, symbols: Sequence[str], limit: int) -> List[str]:
+    def set_streams(self, symbols: Sequence[str], limit: int, protect: int = 0) -> List[str]:
         """Hold real-time streams for the first ``limit`` of ``symbols`` (in priority order) that can stream -
-        never more than STREAM_LINES_MAX, or than error 101 has left room for - and end the others. Returns the
-        symbols streaming now; asking for the same again sends nothing. It waits on the loop, so never call it
-        from the loop thread."""
+        never more than STREAM_LINES_MAX, or than error 101 has left room for - and end the others; the first
+        ``protect`` of them (the positions) are never given back for error 101. Returns the symbols streaming
+        now; asking for the same again sends nothing. It waits on the loop, so never call it from the loop
+        thread."""
         if not self.is_connected:
             return []                                 # the streams already went with the connection
         if not self.can_stream or limit <= 0:
@@ -746,6 +749,7 @@ class IbkrBroker(BrokerAdapter):
         with self._stream_lock:
             self._unstreamable = {s: t for s, t in self._unstreamable.items() if t > now}
             n = min(int(limit), self.STREAM_LINES_MAX, self._stream_cap)
+            self._stream_protect = max(0, min(int(protect), n))
             wanted = [s for s in dict.fromkeys(symbols) if s and s not in self._unstreamable][:n]
         # a stream needs a qualified contract (ib_async keys its Tickers by the contract id): look up the
         # missing ones here, off the loop, most wanted first
@@ -925,15 +929,17 @@ class IbkrBroker(BrokerAdapter):
 
     def _lines_full(self, req_id: int, symbol: Optional[str]) -> None:
         """Error 101: every market-data line the account has is in use. Give STREAM_BACKOFF of the held streams
-        back from the end of the priority order - plays go, positions stay - and hold no more than that until
-        the next connection. The rest of a burst of 101s - requests sent before the cut - cuts nothing more."""
+        back from the end of the priority order - the watch tier goes first, then the plays; the positions (the
+        first ``protect`` set_streams was told of) never - and hold no more than that until the next connection.
+        The rest of a burst of 101s - requests sent before the cut - cuts nothing more."""
         ib = self._ib
         if symbol is not None:
             self._end_stream(ib, symbol, cancel=False)    # refused: IBKR holds no line for it
         with self._stream_lock:
             if req_id < self._cut_below:
                 return
-            self._stream_cap = max(0, min(self._stream_cap, len(self._streams) - self.STREAM_BACKOFF))
+            self._stream_cap = max(min(self._stream_protect, len(self._streams)),
+                                   min(self._stream_cap, len(self._streams) - self.STREAM_BACKOFF))
             keep = set([s for s in self._stream_order if s in self._streams][:self._stream_cap])
             tail = [s for s in self._streams if s not in keep]
             cap = self._stream_cap

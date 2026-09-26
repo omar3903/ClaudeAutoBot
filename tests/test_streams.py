@@ -103,6 +103,23 @@ def test_the_plays_opened_on_the_dashboard_go_first_then_the_ones_autopilot_woul
     assert md.streams.preferred() == ["T08", "T10", "T09", "T07"]
 
 
+def test_the_watch_tier_streams_after_the_plays_within_the_lines(tmp_path):
+    gateway, md = _streaming(tmp_path, fakes.SYMBOLS)
+    # T03 is a play already: it streams once, as a play; the tier fills the lines left, in the order given
+    assert md.streams.sync(["T01"], ["T02", "T03"], 5, watch=["T03", "T04", "", "T05", "T06"]) == [
+        "T01", "T02", "T03", "T04", "T05"]
+    assert gateway.stream_calls[-1] == (["T01", "T02", "T03", "T04", "T05", "T06"], 5)
+    assert gateway.protect == 1                                             # 101 never takes the position's line
+    # a watch name has no minute's hold: the tier re-ranked, T04 gives its line up at once
+    assert md.streams.sync(["T01"], ["T02", "T03"], 5, watch=["T06", "T05", "T04"]) == [
+        "T01", "T02", "T03", "T06", "T05"]
+    # no watch tier: the same call as without one
+    md.streams.sync(["T01", "T07"], ["T02", "T03"], 5)
+    without = gateway.stream_calls[-1]
+    md.streams.sync(["T01", "T07"], ["T02", "T03"], 5, watch=())
+    assert gateway.stream_calls[-1] == without == (["T01", "T07", "T02", "T03"], 5) and gateway.protect == 2
+
+
 def test_a_dropped_connection_prices_as_before_and_the_streams_are_asked_for_again(tmp_path):
     gateway, md = _streaming(tmp_path)
     md.streams.sync(["AAA"], [], 5)
@@ -213,6 +230,8 @@ def test_no_price_is_sent_once_it_cant_stream_and_a_new_connection_or_stream_sen
 
 # ---------------------------------------------------------------- the setting
 def test_the_line_budget_stays_within_what_ibkr_allows():
-    assert ExecutionCfg().stream_lines == 60
+    assert ExecutionCfg().stream_lines == 80 and ExecutionCfg().stream_watch == 50
     assert ExecutionCfg(stream_lines=500).stream_lines == 90
     assert ExecutionCfg(stream_lines=-3).stream_lines == 0
+    assert ExecutionCfg(stream_watch=500).stream_watch == 80
+    assert ExecutionCfg(stream_watch=-3).stream_watch == 0

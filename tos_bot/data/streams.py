@@ -1,4 +1,5 @@
-"""Real-time streams of the prices that matter most: the stocks held first, then the best plays on offer.
+"""Real-time streams of the prices that matter most: the stocks held first, then the best plays on offer, then
+the watch tier (the day's hot list and the buffer names behind it).
 
 The price source holds the streams itself (IbkrBroker.set_streams, on its own loop); this points them at the
 right stocks within the line budget, and tells MarketData.quote when a streamed quote is fresh enough to serve
@@ -51,12 +52,15 @@ class StreamManager:
 
     # ---- which stocks stream ---------------------------------------------- #
     def sync(self, held: Sequence[str], plays: Sequence[str], lines: int,
-             candidates: Sequence[str] = ()) -> List[str]:
+             candidates: Sequence[str] = (), watch: Sequence[str] = ()) -> List[str]:
         """One resync: stream ``held`` (the positions and working entries) first, then ``plays`` (best first),
-        ``lines`` at most - 0 streams nothing. Of the plays, the ones the operator opened lately (prefer) go
-        first, then ``candidates`` (the plays Autopilot would take), then the rest - where a play streaming for
-        less than PLAY_MIN_HOLD_S keeps its line ahead of the others while it's still on offer. Returns the
-        symbols streaming now. It waits on the source, so never call it from the IB loop."""
+        then ``watch`` (the watch tier, in the order given), ``lines`` at most - 0 streams nothing. Of the plays,
+        the ones the operator opened lately (prefer) go first, then ``candidates`` (the plays Autopilot would
+        take), then the rest - where a play streaming for less than PLAY_MIN_HOLD_S keeps its line ahead of the
+        others while it's still on offer. The watch names get no such hold: the tier changes at the cycles' pace,
+        not the ticks'. The source is told how many of the order are held, so a refusal of lines (101) never
+        takes those. Returns the symbols streaming now. It waits on the source, so never call it from the IB
+        loop."""
         src = self._source()
         if src is None or not hasattr(src, "set_streams"):
             self.reset()
@@ -80,7 +84,9 @@ class StreamManager:
             young = [s for s in rest if now - self._since.get(s, float("-inf")) < self.PLAY_MIN_HOLD_S]
         kept = set(young)
         order = first + ahead + young + [s for s in rest if s not in kept]
-        streaming = list(src.set_streams(order, lines))
+        placed = set(order)
+        order += [s for s in dict.fromkeys(watch) if s and s not in placed]
+        streaming = list(src.set_streams(order, lines, protect=len(first)))
         with self._lock:
             if self._src is src:
                 self._since = {s: self._since.get(s, now) for s in streaming}

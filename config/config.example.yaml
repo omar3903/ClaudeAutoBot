@@ -119,8 +119,10 @@ execution:
   limit_offset_bps: 5                  # cross the spread by this when marketable-limit
   time_in_force: "DAY"
   bracket_orders: true                # attach stop + target as an OCO child (regular hours)
-  stream_lines: 60                    # real-time streams for the positions, then the best plays; the rest of
-                                      # IBKR's ~100 market-data lines stay free for snapshots (0-90; 0 = off)
+  stream_lines: 80                    # real-time streams for the positions, then the best plays, then the watch
+                                      # tier; ~20 of IBKR's ~100 market-data lines stay free for snapshots (0-90; 0 = off)
+  stream_watch: 50                    # the watch tier: the day's hot list, kept and next buffer names, streamed
+                                      # after the plays within stream_lines, checked at each candle close (0-80; 0 = off)
 
 exit_manager:
   # Automatic exit strategy - runs every few seconds, no manual input.

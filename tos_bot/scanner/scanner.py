@@ -50,7 +50,7 @@ from .filters import TradeFilters
 from .heat import (DailyMetrics, daily_metrics, intraday_metrics, liquid, premarket_metrics, rank_by_daily_heat,
                    rank_gappers)
 from .schedule import ScanSettings
-from .watchlist import Decision, DayWatchlist
+from .watchlist import Candidate, Decision, DayWatchlist
 
 log = logging.getLogger(__name__)
 
@@ -137,6 +137,33 @@ class Scanner:
     def watchlist_state(self) -> Optional[Dict[str, Any]]:
         with self._watchlist_lock:
             return self.watchlist.state() if self.watchlist else None
+
+    def watch_symbols(self, n: int, now: Optional[dt.datetime] = None) -> List[str]:
+        """The watch tier: the day's ``n`` most relevant stocks, streamed after the plays - the hot list, then the
+        kept buffer names (both by their latest heat, the daily heat until a cycle has seen them), then the buffer
+        names the next cycle samples (by daily heat), each stock once and only in the sectors the filters allow.
+        Nothing outside the pre-market and the regular session, or from a watchlist left from another day. A pure
+        read - no request, no disk, no change to the watchlist: the stream thread asks every few seconds."""
+        if n <= 0:
+            return []
+        now = (now or clock.now_ny()).astimezone(clock.NY)
+        if clock.current_session(now) not in (clock.Session.PRE, clock.Session.REGULAR):
+            return []
+        per_sector, sectors = self.settings.config.scanner.buffer_picks_per_sector, self.filters.sectors
+
+        def heat(c: Candidate) -> float:
+            return c.heat if c.heat is not None else c.daily_heat
+
+        with self._watchlist_lock:
+            wl = self.watchlist
+            if wl is None or wl.session != now.date():
+                return []
+            hot = sorted(wl.hot, key=heat, reverse=True)
+            kept = sorted((c for cs in wl.kept.values() for c in cs), key=heat, reverse=True)
+            picks = sorted((c for cs in wl.next_picks(per_sector, sectors).values() for c in cs),
+                           key=lambda c: c.daily_heat, reverse=True)
+            symbols = [c.symbol for c in (*hot, *kept, *picks)]
+        return [s for s in dict.fromkeys(symbols) if s and sector_allowed(self.symbols.sector(s), sectors)][:n]
 
     # ---- the full scan ----------------------------------------------------- #
     def run_full(self, scan: ScanSettings, now: Optional[dt.datetime] = None) -> ScanResult:
