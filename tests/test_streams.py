@@ -13,6 +13,7 @@ from tos_bot.config import ExecutionCfg
 from tos_bot.data.bars import DailyBarStore
 from tos_bot.data.market_data import MarketData, NoDataSource, quote_from_price
 from tos_bot.data.streams import StreamManager
+from tos_bot.util import clock
 
 
 def _streaming(tmp_path, symbols=("AAA", "BBB"), **kwargs):
@@ -170,6 +171,28 @@ def test_ticks_reach_every_listener_even_when_one_fails(tmp_path):
     assert heard == [frozenset({"AAA"})] and md.streams._moved == {"AAA"}
     md.attach(gateway)                                   # a new connection starts clean
     assert md.streams._moved == set()
+
+
+def test_the_streamed_ticks_build_live_candles_and_a_stock_no_longer_streamed_is_forgotten(tmp_path):
+    gateway, md = _streaming(tmp_path, fakes.SYMBOLS)
+    md.streams.sync(["T01"], ["T02"], 5)
+    at = dt.datetime(2026, 9, 24, 10, 0, 20, tzinfo=clock.NY)
+    assert clock.is_trading_day(at.date())
+
+    def ago(sec: float) -> float:                        # the age that stamps a tick ``sec`` after ``at``
+        return time.time() - (at.timestamp() + sec)
+
+    gateway.tick("T01", 10.0, age_s=ago(0), volume=1000)
+    gateway.tick("T01", 10.4, age_s=ago(10), volume=1500)
+    gateway.tick("T01", 10.4, age_s=ago(15), volume=1500, bid=10.3, ask=10.5)    # only the book moved
+    gateway.tick("T02", 20.0, age_s=ago(5), volume=300)
+    c = md.candles.forming("T01")
+    assert (c.close, c.high, c.volume, c.at) == (10.4, 10.4, 500.0, at.replace(second=0))
+    assert md.candles.forming("T02").close == 20.0
+    md.streams.sync(["T01"], [], 5)                      # T02's play went: its stream ends, and its candles
+    assert md.candles.symbols() == ["T01"] and md.candles.forming("T02") is None
+    md.detach()
+    assert md.candles.symbols() == []
 
 
 # ---------------------------------------------------------------- the latest price, for the dashboard

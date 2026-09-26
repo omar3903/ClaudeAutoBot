@@ -20,7 +20,8 @@ from ..core.models import Quote
 
 log = logging.getLogger(__name__)
 
-#: told the symbols whose streamed price just changed - on the IB loop thread, so it may only set flags
+#: told the symbols whose streamed price just changed - on the IB loop thread, so it may only set flags. The same
+#: ticks feed the live candles first (MarketData.candles, O(1) a stock)
 Listener = Callable[[FrozenSet[str]], None]
 
 
@@ -46,6 +47,7 @@ class StreamManager:
         self._pushed: Dict[str, float] = {}            # symbol -> the price the dashboard was last sent (take_moves)
         self._preferred: Dict[str, float] = {}         # symbol -> when the operator last opened a play on it
         self._listeners: List[Listener] = []
+        self._feed_failed = False                      # a tick the candles couldn't take is logged once
 
     def _source(self) -> Any:
         return self._md._source
@@ -92,6 +94,9 @@ class StreamManager:
                 self._since = {s: self._since.get(s, now) for s in streaming}
                 # a stock that stops streaming is sent afresh when it starts again: a snapshot may be shown meanwhile
                 self._pushed = {s: px for s, px in self._pushed.items() if s in self._since}
+        candles = self._candles()
+        if candles is not None:
+            candles.keep(streaming)                 # a stream that ended takes its candles along
         return streaming
 
     def prefer(self, symbol: str) -> None:
@@ -122,6 +127,13 @@ class StreamManager:
             self._since.clear()
             self._moved.clear()
             self._pushed.clear()
+        candles = self._candles()
+        if candles is not None:
+            candles.clear()
+
+    def _candles(self) -> Any:
+        """The live candles the ticks feed (MarketData.candles) - None for an md without them."""
+        return getattr(self._md, "candles", None)
 
     def _unbind(self) -> None:
         """Stop hearing from the source held till now (under _lock)."""
@@ -180,12 +192,34 @@ class StreamManager:
             self._listeners.append(fn)
 
     def _on_ticks(self, symbols: FrozenSet[str]) -> None:
-        """The source's word that ``symbols`` ticked, on its loop thread: noted, then passed on."""
+        """The source's word that ``symbols`` ticked, on its loop thread: noted, fed to the live candles, then
+        passed on."""
         with self._lock:
             self._moved |= symbols
             listeners = list(self._listeners)
+            src = self._src
+        self._feed(src, symbols)
         for fn in listeners:
             try:
                 fn(symbols)
             except Exception:  # noqa: BLE001
                 log.debug("a stream listener failed", exc_info=True)
+
+    def _feed(self, src: Any, symbols: FrozenSet[str]) -> None:
+        """Each ticked stock's streamed quote to the live candles - on the IB loop, with no lock of ours held:
+        the candles take their own, briefly, and do O(1) work a stock."""
+        candles = self._candles()
+        if candles is None:
+            return
+        try:
+            for symbol in symbols:
+                got = self._read(src, symbol)
+                if got:
+                    q = got[0]
+                    ts = q.ts if q.ts.tzinfo else q.ts.replace(tzinfo=dt.timezone.utc)
+                    candles.add(symbol, float(q.last or 0), float(q.volume or 0), ts.timestamp())
+        except Exception:  # noqa: BLE001 - the listeners still hear of the tick
+            if not self._feed_failed:
+                self._feed_failed = True
+                log.debug("a streamed tick couldn't go into the live candles (later failures are not logged)",
+                          exc_info=True)

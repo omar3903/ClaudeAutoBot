@@ -185,7 +185,7 @@ def fig_components() -> str:
 
     # engine
     s.rect(20, 185, 680, 300, "#fbfbf6", "#333", rx=6)
-    s.text(360, 203, "TradingEngine  (tos_bot/engine/engine.py + mixins)  -  one object, 9 background threads",
+    s.text(360, 203, "TradingEngine  (tos_bot/engine/engine.py + mixins)  -  one object, 10 background threads",
            11, "middle", "bold")
     s.text(360, 217, "ResearchOps · JournalOps · PairsOps · CapitalOps · QuitOps  (mixins)      "
                      "EventBus (core/eventbus.py) carries every change to the dashboard", 8.5, "middle", fill="#444")
@@ -532,8 +532,8 @@ def fig_sequence() -> str:
 #  Figure 5 - threads and loops
 # ----------------------------------------------------------------------------------------------
 def fig_threads(journal_s, pairs_s) -> str:
-    s = Svg(720, 530)
-    s.rect(15, 15, 690, 500, "#fbfbfb", "#333", rx=6)
+    s = Svg(720, 560)
+    s.rect(15, 15, 690, 530, "#fbfbfb", "#333", rx=6)
     s.text(360, 33, "One process:  python run.py  ->  uvicorn (asyncio main thread)  ->  create_app()  ->  "
                     "TradingEngine.start()", 10.5, "middle", "bold")
     main = s.box(30, 48, 320, 60, "Main thread - uvicorn / asyncio",
@@ -559,6 +559,7 @@ def fig_threads(journal_s, pairs_s) -> str:
                         "the watch tier, within execution.stream_lines"),
         ("price-push", "woken by a streamed tick: the prices that moved, to the dashboard as prices.tick, "
                        "at most once a second"),
+        ("candle-loop", "every minute + 0.25 s: close the live candles built from the streamed ticks"),
     ]
     y = 125
     s.text(30, y - 4, "Engine daemon threads (engine.start())", 9.5, weight="bold")

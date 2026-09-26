@@ -1830,6 +1830,33 @@ def test_the_watch_tier_streams_after_the_positions_and_plays(engine, monkeypatc
     assert gateway.stream_calls[-1] == (["T01", "T02", "T03"], 6)            # as before the watch tier
 
 
+def test_the_candle_loop_closes_each_minute_just_after_it_ends_and_stops_promptly(engine, monkeypatch):
+    from tos_bot.engine import engine as module
+
+    ten = dt.datetime(2026, 9, 24, 10, 0, tzinfo=clock.NY).timestamp()
+    engine.md.candles.add("T01", 10.0, 1000, ten + 5)
+    engine.md.candles.add("T01", 10.2, 1200, ten + 40)
+    got = engine._on_minute(ten + 60)
+    assert list(got) == ["T01"] and (got["T01"].close, got["T01"].volume) == (10.2, 200.0)
+    assert engine.md.candles.latest("T01") is got["T01"] and engine.md.candles.forming("T01") is None
+
+    rolled, now = [], {"t": ten + 119.9}                                       # a tenth of a second before 10:02
+
+    def roll(minute):
+        rolled.append((minute, now["t"]))
+        now["t"] = ten + 120.3                                                  # the next minute is a minute away
+        return {}
+
+    monkeypatch.setattr(engine, "_on_minute", roll)
+    monkeypatch.setattr(module.time, "time", lambda: now["t"])
+    loop = threading.Thread(target=engine._candle_loop, daemon=True)
+    loop.start()
+    assert _until(lambda: rolled) and rolled[0] == (ten + 120, ten + 119.9)    # 10:02's roll, once 10:01 is over
+    engine.stop()
+    loop.join(2.0)                                                              # not the minute to the next roll
+    assert not loop.is_alive() and len(rolled) == 1
+
+
 def _streaming_position(engine, symbol="T01"):
     """A position here whose stock streams, next to a play's stock (T03) that streams too."""
     gateway = fakes.StreamingGateway(fakes.SYMBOLS)

@@ -315,7 +315,10 @@ If IBKR says every line is in use (error 101), the watch names give theirs back
 first, then the plays - never the positions.
 A stock whose stream ticked in the last 2 seconds is priced off it; a quieter
 one, or one past the budget, gets a one-off snapshot as before - an entry never
-waits for a stream. Delayed data never streams.
+waits for a stream. Delayed data never streams. Each streamed stock also gets
+live 1- and 5-minute candles built from its ticks and closed on the clock, for
+speed and show only: the setups, confirmations and the replay still run on
+IBKR's own 5-minute candles.
 
 > The app manages exits itself (it doesn't attach a native OCO bracket at IBKR,
 > so two exit managers never fight over one position). That means **no stop is

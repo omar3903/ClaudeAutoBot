@@ -15,6 +15,8 @@ background loops:
                    then the watch tier (the day's hot list and buffer names)
     price push     the streamed prices that moved, to the dashboard at most once a
                    second (prices.tick)
+    candle loop    a moment after each minute: closes the live 1- and 5-minute
+                   candles built from the streamed ticks (data/candles.py)
 
 Whatever the user changes on the dashboard applies straight away, is
 remembered in data/runtime.json (runtime.py) and is broadcast to every tab.
@@ -45,6 +47,7 @@ from ..core.enums import PlayStatus, Side, Timeframe
 from ..core.eventbus import BUS
 from ..core.models import Account, Play
 from ..data.bars import DailyBarStore
+from ..data.candles import Candle
 from ..data.fundamentals import FundamentalsProvider
 from ..data.listings import UsListings
 from ..data.market_data import INTRADAY_BAR, MarketData, NoDataSource
@@ -319,7 +322,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             ("scan-loop", self._scan_loop), ("sync-loop", self._sync_loop), ("snapshot-loop", self._snapshot_loop),
             ("orders-loop", self._orders_loop), ("signals-loop", self._signals_loop),
             ("journal-loop", self._journal_loop), ("pairs-loop", self._pairs_loop),
-            ("stream-loop", self._stream_loop), ("price-push", self._price_push_loop))]
+            ("stream-loop", self._stream_loop), ("price-push", self._price_push_loop),
+            ("candle-loop", self._candle_loop))]
         for t in self._threads:
             t.start()
         self._publish("engine.started", state=self.snapshot())
@@ -946,6 +950,28 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 symbol: {"price": price, "at": at.isoformat(), "session": SESSION_WORDS[clock.current_session(at)]}
                 for symbol, (price, at) in moved.items()})
         return len(moved)
+
+    #: the live candles close this long after each minute, so a tick stamped just before it is in first
+    CANDLE_ROLL_DELAY_S = 0.25
+
+    def _candle_loop(self) -> None:
+        """Closes the live candles (data/candles.py) on the clock, a moment after each minute - so a quiet stock's
+        candle closes on time too, not at its next tick. It never asks IBKR for anything, and never touches the
+        scanner, the board or Autopilot."""
+        while not self._stop.is_set():
+            now = time.time()
+            minute = (now // 60 + 1) * 60
+            if self._stop.wait(minute - now + self.CANDLE_ROLL_DELAY_S):
+                return
+            try:
+                self._on_minute(minute)
+            except Exception:  # noqa: BLE001
+                log.exception("live candles: the minute roll failed")
+
+    def _on_minute(self, minute: float) -> Dict[str, Candle]:
+        """The minute ending at ``minute`` (epoch seconds) is over: close its live candles, and the 5-minute ones
+        on a :00/:05... boundary. Returns {symbol: the 1-minute candle just closed}."""
+        return self.md.candles.roll(minute)
 
     # ------------------------------------------------------------------ #
     #  Scans                                                             #

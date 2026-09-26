@@ -232,11 +232,12 @@ class StreamingGateway(FakeGateway):
         return None if hit is None else (hit[0], max(0.0, time.monotonic() - hit[1]))
 
     def tick(self, symbol: str, price: float, age_s: float = 0.0,
-             bid: Optional[float] = None, ask: Optional[float] = None) -> Quote:
-        """A streamed trade at ``price`` for a stock that is streaming, as if it came ``age_s`` seconds ago."""
+             bid: Optional[float] = None, ask: Optional[float] = None, volume: float = 0.0) -> Quote:
+        """A streamed trade at ``price`` for a stock that is streaming, as if it came ``age_s`` seconds ago.
+        ``volume``: the day's cumulative volume so far, as the Ticker holds it."""
         assert symbol in self.streams, f"{symbol} isn't streaming - set_streams first"
         q = Quote(symbol=symbol, bid=round(price - 0.01, 2) if bid is None else bid,
-                  ask=round(price + 0.01, 2) if ask is None else ask, last=price,
+                  ask=round(price + 0.01, 2) if ask is None else ask, last=price, volume=volume,
                   ts=dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=age_s), source="stream")
         self._latest[symbol] = (q, time.monotonic() - age_s)
         if self.on_tick is not None:

@@ -19,6 +19,7 @@ import pandas as pd
 
 from ..core.models import Quote
 from .bars import DailyBarStore
+from .candles import LiveCandles
 from .streams import StreamManager
 
 log = logging.getLogger(__name__)
@@ -88,6 +89,8 @@ class MarketData:
         self._pruned_at = 0.0
         #: the morning scan and the movers report can want the same download; the second then finds it done
         self._daily_lock = threading.Lock()
+        #: 1- and 5-minute candles built from the streamed ticks, for speed and show - never for proof (candles.py)
+        self.candles = LiveCandles()
         #: the real-time streams the source holds, when it can (streams.py) - quote() serves a fresh one
         self.streams = StreamManager(self)
 
@@ -104,6 +107,7 @@ class MarketData:
             self._quotes.clear()
             self._shown.clear()
             self._shown_asked.clear()
+        self.candles.clear()
         self.streams.reset()
 
     @property
