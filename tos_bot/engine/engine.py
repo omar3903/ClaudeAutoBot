@@ -90,7 +90,8 @@ from .capital_ops import CapitalOps
 from .quit_ops import QuitOps
 from .connections import Connections
 from .reconcile import PositionCheck
-from .runtime import RuntimeFile, load_capital, load_day_trade_pct, load_filters, load_strategy_overrides
+from .runtime import (RuntimeFile, load_capital, load_day_trade_pct, load_filters, load_size_factor,
+                      load_strategy_overrides)
 
 from .support import _ACTED_ON, duration
 log = logging.getLogger(__name__)
@@ -159,6 +160,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self.capital = load_capital(saved.get("capital"))
         #: the part of the trading capital day trades may hold; swing trades get the rest (engine/capital.py)
         self.day_trade_pct = load_day_trade_pct(saved.get("capital_split"), cfg.account.day_trade_pct)
+        #: every position is the usual size times this, 0-5 (the slider over the plays; CapitalOps.set_size_factor)
+        self.size_factor = load_size_factor(saved.get("sizing"))
         sc = cfg.scanner
         self.scan_settings = ScanSettings.load(saved.get("scan"), ScanSettings(
             premarket_time=sc.premarket_time, gapper_time=sc.gapper_time, cycle_minutes=sc.cycle_minutes,
@@ -337,7 +340,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             payload: Dict[str, Any] = {
                 "mode": self.mode, "paper_platform": self.paper_platform, "filters": self.filters.as_dict(),
                 "strategies": self.strategy_overrides, "capital": self.capital,
-                "capital_split": {"day_pct": self.day_trade_pct}, "scan": self.scan_settings.as_dict(),
+                "capital_split": {"day_pct": self.day_trade_pct}, "sizing": {"factor": self.size_factor},
+                "scan": self.scan_settings.as_dict(),
                 "autopilot": self.autopilot.to_runtime(),
             }
             if self.quit_state:
@@ -1818,7 +1822,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         # sized against the trading capital; the PDT rule and the floor see the real account
         sizing = size_play(p, self.sizing_account(p.timeframe) or acc, cfg.risk,
                            symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0),
-                           risk_pct=self._play_risk_pct(p), risk_why=self.strategy_risk_why(p.strategy))
+                           risk_pct=self._play_risk_pct(p), risk_why=self.strategy_risk_why(p.strategy),
+                           size_factor=self.size_factor)
         decision = self.pdt.assess(acc, p)
         session = clock.current_session()
         plan = plan_order(p, session, cfg.execution)
@@ -1839,7 +1844,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if not acc.usd_per_base:
             reasons.append(f"no {acc.base_currency}->USD exchange rate yet, so the trade can't be sized")
         elif p.suggested_qty <= 0:
-            reasons.append(f"{p.symbol} already takes up the {cfg.risk.max_symbol_pct_of_equity:.0f}% of equity "
+            reasons.append("the position size factor is 0, so new positions are sized at nothing"
+                           if self.size_factor <= 0
+                           else f"{p.symbol} already takes up the {cfg.risk.max_symbol_pct_of_equity:.0f}% of equity "
                            "allowed in one stock" if "max exposure per stock" in sizing.caps_hit
                            else self._too_thin_reason(p, cfg.risk) if liquidity_cap(p, cfg.risk) == 0
                            else self._no_room_reason(p) if "trading capital" in sizing.caps_hit

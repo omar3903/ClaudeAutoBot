@@ -54,6 +54,7 @@ class CapitalOps:
         state = capital.state(self._account, self._venue, venue_label(self._venue), self.capital.get(self._venue),
                               sum(held.values()), self.effective_day_pct(), held)
         state["split"].update(on=self._both_kinds(), set_pct=self.day_trade_pct)
+        state["size_factor"] = self.size_factor
         return state
 
     def _both_kinds(self) -> bool:
@@ -86,6 +87,27 @@ class CapitalOps:
             note += " It applies while Intraday and Swing are both switched on."
         note += self._over_share_note(state)
         return {"ok": True, "capital": state, "note": note}
+
+    def set_size_factor(self, factor: Any) -> Dict[str, Any]:
+        """Every position's size times this, 0-5: 1 is the usual size, 0 sizes every new position at nothing.
+        It scales the risk each trade takes; the caps (open risk, per stock, liquidity, buying power) still hold."""
+        locked = self._locked()
+        if locked:
+            return {"ok": False, "reason": locked}
+        try:
+            value = capital.parse_size_factor(factor)
+        except ValueError as e:
+            return {"ok": False, "reason": str(e)}
+        self.size_factor = value
+        self._save_runtime()
+        log.info("position size factor set to %g", value)
+        self._settings_changed()
+        state = self.capital_state()
+        self._publish("capital.updated", capital=state)
+        note = (f"New positions are now {value:g} times the usual size" if value > 0 else
+                "New positions are now sized at nothing - no entries until the factor is above 0")
+        return {"ok": True, "capital": state,
+                "note": note + ". The caps on open risk, per stock, liquidity and buying power still hold."}
 
     def _over_share_note(self, state: Optional[Dict[str, Any]]) -> str:
         """Said once, when a change leaves a kind of trade holding more than its share."""
@@ -143,4 +165,4 @@ class CapitalOps:
         for p in plays:
             size_play(p, accounts[capital.kind_of(p.timeframe)], self.settings.config.risk,
                       symbol_notional=exposure.get(p.symbol, 0.0), risk_pct=self._play_risk_pct(p),
-                      risk_why=self.strategy_risk_why(p.strategy))
+                      risk_why=self.strategy_risk_why(p.strategy), size_factor=self.size_factor)

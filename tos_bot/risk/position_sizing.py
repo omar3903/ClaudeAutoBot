@@ -30,12 +30,14 @@ class SizingResult:
 
 def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
               symbol_notional: float = 0.0, risk_pct: Optional[float] = None,
-              risk_why: Optional[str] = None) -> SizingResult:
+              risk_why: Optional[str] = None, size_factor: float = 1.0) -> SizingResult:
     """``symbol_notional``: dollars already in this stock - shares held at the
     broker and entry orders still working. ``risk_pct``: the strategy's half-Kelly
     risk per trade (see quant/sizing.py), which can only lower the configured one.
     ``risk_why``: what set that risk, when it isn't the record's half-Kelly - the
-    practice size of a strategy the replay hasn't proven - as caps_hit names it."""
+    practice size of a strategy the replay hasn't proven - as caps_hit names it. ``size_factor``: the
+    operator's position size factor (0-5), which scales the risk budget before any cap below - so the
+    open-risk ceiling, the per-stock and liquidity caps and buying power still hold at 5x."""
     entry = play.entry
     stop = play.stop
     rps = abs(entry - stop)
@@ -53,6 +55,9 @@ def size_play(play: Play, account: Account, cfg, open_risk_used: float = 0.0,
     if factor < 1.0:
         pct *= factor
         caps.append("Mid-day: a smaller size (Aziz)")
+    if size_factor != 1.0:
+        pct *= max(0.0, float(size_factor))
+        caps.append(f"position size factor {float(size_factor):g}x")
     risk_budget = equity * pct / 100.0
 
     # respect the portfolio-wide open-risk ceiling

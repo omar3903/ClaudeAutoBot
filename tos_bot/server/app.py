@@ -251,6 +251,10 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     def set_capital_split(body: dict):
         return _result(eng().set_capital_split((body or {}).get("day_pct")))
 
+    @app.post("/api/capital/size_factor")
+    def set_size_factor(body: dict):
+        return _result(eng().set_size_factor((body or {}).get("factor")))
+
     # ---- quitting (same machine only) ----------------------------------- #
     @app.get("/api/quit", dependencies=LOCAL_ONLY)
     def quit_preview():

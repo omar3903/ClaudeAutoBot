@@ -73,6 +73,14 @@ def load_day_trade_pct(saved: Any, default: float) -> float:
     return float(value) if ok else float(default)
 
 
+def load_size_factor(saved: Any, default: float = 1.0) -> float:
+    """The position size factor, 0-5: every position is the usual size times this (engine/capital.py)."""
+    value = saved.get("factor") if isinstance(saved, dict) else None
+    ok = (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+          and 0 <= value <= 5)
+    return float(value) if ok else float(default)
+
+
 def load_capital(saved: Any) -> Dict[str, float]:
     """Trading capital per venue - positive, finite amounts only."""
     return {str(venue): float(amount)
