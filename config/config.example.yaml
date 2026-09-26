@@ -142,6 +142,7 @@ autopilot:
   enabled: false                     # master switch
   allow_live: false                  # HARD gate - Autopilot NEVER routes a real order unless true
   trade_types: ["INTRADAY"]          # what it may auto-take: INTRADAY, SWING and/or PAIRS
+  strategies: []                      # only these setups, by key (e.g. ["abcd_pattern"]); empty = every setup
   min_confidence: 0.5                # day trades: only the weakest are kept out - the replay found higher stated
                                      # confidence went with worse trades, so it is no filter for quality
   min_swing_confidence: 0.5          # swing trades: their setups state flat 0.55-0.58 confidences and the

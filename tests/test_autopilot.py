@@ -488,6 +488,28 @@ def test_counting_confirmations_on_candles_is_a_setting_that_is_remembered():
     assert AutoPilot(FakeEngine(), _cfg(confirm_on_new_candle=False), bus=SILENT).confirm_on_new_candle is False
 
 
+def test_autopilot_takes_only_the_setups_named_and_remembers_them():
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(), bus=SILENT)
+    assert ap.strategies == [] and ap.status()["strategies"] == []             # none named: every setup
+    ap.configure(strategies=["abcd_pattern", "abcd_pattern", " "])
+    assert ap.strategies == ["abcd_pattern"]
+    other = mkplay()                                                             # an opening range breakout
+    assert "setups Autopilot takes" in ap._play_check(*ap._facts(other))
+    named = mkplay("BBB")
+    named.strategy = "abcd_pattern"
+    _run(ap, other, named)
+    assert eng.approved_ids() == [named.id]
+    again = AutoPilot(FakeEngine(), _cfg(), bus=SILENT)
+    again.load_runtime(ap.to_runtime())
+    assert again.strategies == ["abcd_pattern"]
+    again.load_runtime({"strategies": "abcd_pattern"})                           # not a list: left as it was
+    assert again.strategies == ["abcd_pattern"]
+    ap.configure(strategies=[])
+    assert ap.strategies == [] and ap._play_check(*ap._facts(other)) is None
+    assert AutoPilot(FakeEngine(), _cfg(strategies=["abcd_pattern"]), bus=SILENT).strategies == ["abcd_pattern"]
+
+
 def test_autopilot_only_trades_strategies_the_replay_has_proven():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(require_proven=True, min_replay_trades=30, min_replay_expectancy_r=0.05), bus=SILENT)
