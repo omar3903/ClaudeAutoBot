@@ -11,7 +11,9 @@ Cycle (every few minutes in the regular session):
     5-minute candles for the hot list, the kept buffer names and the next
     buffer picks -> day-trade and swing setups -> intraday heat -> buffer decisions
 
-A fast cycle (while Autopilot day-trades) rescans only the hot list.
+A fast cycle (while Autopilot day-trades) rescans only the hot list. The
+candle-close check (run_close) reads the watch tier's newest 5-minute candles
+seconds after each close, in place of the fast cycle due then.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import dataclasses
 import datetime as dt
 import logging
 import math
+import statistics
 import threading
 import time
 import uuid
@@ -36,7 +39,7 @@ from ..core.eventbus import BUS
 from ..core.models import Account, Play
 from ..data.fundamentals import Financials, FundamentalsProvider
 from ..data.listings import UsListings
-from ..data.market_data import MarketData, NoDataSource
+from ..data.market_data import CLOSE_DURATION, MarketData, NoDataSource
 from ..data.sectors import sector_allowed
 from ..data.symbols import SymbolMaster
 from ..indicators import ta
@@ -129,6 +132,8 @@ class Scanner:
         #: what the gap check saw per stock today (heat.GapperMetrics.as_dict): the gap, the pre-market
         #: high and low the setups use as levels
         self.premarket: Dict[str, Dict[str, Any]] = {}
+        #: the session the live candles were last compared with IBKR's bars in (_compare_candles)
+        self._candles_compared: Optional[dt.date] = None
 
     def set_strategies(self, strategies: Sequence[Strategy]) -> None:
         """Swap the active setups. A scan already running keeps the set it started with."""
@@ -474,12 +479,44 @@ class Scanner:
         daily = self.md.daily(wanted) if wanted else {}
         result.symbols = [s for s in wanted if s in intraday and s in daily]
         result.universe_size, result.scanned = len(wanted), len(result.symbols)
+        self._evaluate_intraday(result, result.symbols, intraday, daily, filters, strategies)
+        for p in result.plays:
+            p.scan_run_id = None               # a quick re-check isn't recorded as a scan
+        return self._finish(result, filters, quiet=True)
+
+    def run_close(self, symbols: Sequence[str], since: dt.datetime) -> ScanResult:
+        """The candle-close check: the setups on ``symbols`` - the watch tier, or the stocks moving early - on
+        IBKR's 5-minute bars, seconds after the candle that closed at ``since``. The last hour of bars is fetched
+        for each stock, past the 60 s cache (a stock with nothing cached gets its full history once), and a stock
+        is looked at only once the bar starting at ``since`` is printing: the setups read the bar before the
+        newest as the last closed one. A stock whose new bar isn't in yet is left out, so it keeps its plays -
+        the next check or the fast cycle gets it. No watchlist decision; the plays are recorded like a cycle's."""
+        filters, strategies = self.filters, list(self.strategies)
+        result = ScanResult("close")
+        wanted = list(dict.fromkeys(symbols))
+        with self._timed(result, "intraday_candles"):
+            intraday = self.md.refresh_intraday(wanted, self.con_ids(wanted), duration=CLOSE_DURATION) if wanted else {}
+        daily = self.md.daily(wanted) if wanted else {}
+        printing = pd.Timestamp(since)
+        result.symbols = [s for s in wanted if s in daily and (f := intraday.get(s)) is not None and len(f)
+                          and f.index[-1] >= printing]
+        result.universe_size, result.scanned = len(wanted), len(result.symbols)
+        self._evaluate_intraday(result, result.symbols, intraday, daily, filters, strategies)
+        self._compare_candles({s: intraday[s] for s in result.symbols}, since)
+        return self._finish(result, filters, quiet=True)
+
+    def _evaluate_intraday(self, result: ScanResult, symbols: Sequence[str], intraday: Mapping[str, pd.DataFrame],
+                           daily: Mapping[str, pd.DataFrame], filters: TradeFilters,
+                           strategies: Sequence[Strategy]) -> None:
+        """The setups the filters allow on each of ``symbols``' newest candles, into ``result`` - the quick
+        re-check's pass and the candle-close check's. Day setups only while the market is open; the swing setups
+        come along, so the board doesn't drop the swing plays on those stocks."""
         market_open = clock.is_market_open()
         active = [s for s in strategies if s.kind is StrategyKind.TECHNICAL and s.timeframe.value in filters.timeframes
                   and (s.timeframe is Timeframe.SWING or market_open)]
-        benchmark = self._benchmark(True) if result.symbols else None
+        benchmark = self._benchmark(True) if symbols else None
         with self._timed(result, "setups"):
-            for symbol in result.symbols:
+            for symbol in symbols:
                 activity = intraday_metrics(symbol, intraday[symbol], daily[symbol])
                 result.plays += evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
                                          equity=self._equity, params=self._params, activity=activity,
@@ -487,9 +524,33 @@ class Scanner:
                                          evidence_weights=self.evidence_weights,
                                          records=self.strategy_records, benchmark=benchmark,
                                          premarket=self.premarket.get(symbol))
-        for p in result.plays:
-            p.scan_run_id = None               # a quick re-check isn't recorded as a scan
-        return self._finish(result, filters, quiet=True)
+
+    #: stocks a comparison of the live candles with IBKR's bars wants before it says anything
+    COMPARE_MIN_STOCKS = 5
+
+    def _compare_candles(self, frames: Mapping[str, pd.DataFrame], since: dt.datetime) -> None:
+        """Once a session: the live 5-minute candles that closed at ``since`` against IBKR's bars for the same
+        5 minutes, logged. The volume ratio settles whether the stream counts shares or lots of 100
+        (data/candles.py); nothing acts on it. A stock counts only when its live candle is whole."""
+        since = since.astimezone(clock.NY)
+        if self._candles_compared == since.date():
+            return
+        start = since - dt.timedelta(minutes=5)
+        bar_at, ratios, gaps = pd.Timestamp(start), [], []
+        for symbol, frame in frames.items():
+            live = self.md.candles.latest(symbol, 5)
+            if live is None or live.start != start.timestamp() or live.partial or bar_at not in frame.index:
+                continue
+            volume, close = float(frame.at[bar_at, "volume"]), float(frame.at[bar_at, "close"])
+            if volume > 0 and close > 0:
+                ratios.append(live.volume / volume)
+                gaps.append(abs(live.close - close) / close * 100.0)
+        if len(ratios) < self.COMPARE_MIN_STOCKS:
+            return                                       # too few to say: the next check tries again
+        self._candles_compared = since.date()
+        log.info("live candles vs IBKR 5-minute bars at %s: median volume ratio %.3g (about 1 = the stream counts "
+                 "shares, about 0.01 = lots of 100), median close difference %.2f%%", since.strftime("%H:%M"),
+                 statistics.median(ratios), statistics.median(gaps))
 
     # ---- shared ------------------------------------------------------------- #
     def _benchmark(self, intraday: bool) -> Optional[pd.Series]:

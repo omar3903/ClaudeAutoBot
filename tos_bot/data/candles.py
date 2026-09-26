@@ -11,7 +11,8 @@ Units: ib_async 2.1.0 passes IBKR's size fields through unchanged (wrapper.tickS
 version 178, and IBKR sends US-stock sizes to API v10+ clients in shares - unless IB Gateway's "Send market data
 in lots for US stocks for dual-mode API clients" box is ticked, when they come in lots of 100 (the legacy
 tick-type table still says "multiplier 100"). Nothing here depends on the unit: a candle's volume is only ever
-compared with the stream's own.
+compared with the stream's own (the candle-close check logs its ratio to IBKR's bar volume once a session, which
+settles the unit).
 
 The IB loop feeds every tick to add() (O(1), its own short lock); the engine's candle loop calls roll() a moment
 after each minute, so a candle closes on the clock even when its stock goes quiet.
@@ -186,6 +187,23 @@ class LiveCandles:
             ref = max(self._rolled, st.forming.start if st.forming else 0.0, st.ones[-1].start if st.ones else 0.0)
             start = ref // 300 * 300
             return self._five(st, start, start + 300, with_forming=True)
+
+    def day_stats(self, symbol: str, before: float) -> Optional[Tuple[float, float, float, int]]:
+        """Over ``symbol``'s whole closed 1-minute candles today that started before ``before`` (epoch seconds):
+        (the highest high, the lowest low, the mean volume, how many). None when there are none. A partial
+        candle is left out - its volume is only part of a minute's."""
+        with self._lock:
+            st = self._stocks.get(symbol)
+            if st is None:
+                return None
+            high, low, volume, n = float("-inf"), float("inf"), 0.0, 0
+            for c in st.ones:                        # a new day clears them: every one is today's
+                if c.start >= before:
+                    break
+                if c.partial:
+                    continue
+                high, low, volume, n = max(high, c.high), min(low, c.low), volume + c.volume, n + 1
+        return (high, low, volume / n, n) if n else None
 
     def symbols(self) -> List[str]:
         """The stocks with candles or a tick held."""

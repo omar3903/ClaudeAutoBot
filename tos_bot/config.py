@@ -119,6 +119,12 @@ class ScannerCfg(_Model):
     cycle_minutes: int = 5                # intraday rescan of the hot list + buffer (3-5)
     fast_cycle_seconds: int = 60          # hot list only, while Autopilot is day-trading
     plays_refresh_seconds: int = 15       # re-check the stocks with plays on the board (0 = off)
+    close_check: bool = True              # at each 5-minute candle close in regular hours, +2 s, check the watch
+                                          # tier's setups on IBKR's just-closed bars at once - it stands in for the
+                                          # fast cycle due then; false = off, the fast cycle as before
+    mover_atr: float = 1.0                # a watch stock whose streamed 1-minute candle spans at least this many of
+                                          # its 5-minute ATRs, or makes a new high/low of the day on 3x its average
+                                          # minute volume, is checked at once, at most once per 5 minutes (0-5; 0 = off)
     hot_list_size: int = 20
     sector_queue_size: int = 25           # buffer candidates lined up per sector
     wide_minutes: int = 30                # the wide scan - every liquid stock's 5-minute candles - this often
@@ -139,6 +145,12 @@ class ScannerCfg(_Model):
     max_universe: int = 0                 # 0 = every listing (smoke tests cap it)
     sectors: list = Field(default_factory=list)
     prefilter: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("mover_atr", mode="after")
+    @classmethod
+    def _within_the_atrs(cls, value: float) -> float:
+        """Past 5 ATRs a minute's candle almost never qualifies; below 0 is off."""
+        return max(0.0, min(5.0, value))
 
 
 class ValuationCfg(_Model):
