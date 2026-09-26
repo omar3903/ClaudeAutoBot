@@ -159,6 +159,10 @@ function configure() {
       <p class="muted small">The <b>Intraday</b> / <b>Swing</b> boxes above the plays say what is scanned and shown; these say what
         Autopilot may take of it. Untick day trades here to keep day plays on the board for the review without trading them.
         Taking now: <b>${(ap.trade_types || []).map(typeName).join(", ") || "none"}</b>.</p>
+      <label title="Tick the setups Autopilot may take; none ticked = every setup. The others stay on the board for you to click - the Strategies panel is where a setup is switched off everywhere.">Only these setups <span class="muted">(none ticked = every setup)</span></label>
+      <div class="ap-noise">${Object.values(S.strategies || {}).filter(s => s.kind !== "FUNDAMENTAL")
+        .sort((a, b) => String(a.title || a.key).localeCompare(String(b.title || b.key))).map(s =>
+        `<label><input type="checkbox" class="ap-strat-check" value="${escapeHtml(s.key)}" ${(ap.strategies || []).includes(s.key) ? "checked" : ""}> ${escapeHtml(s.title || pretty(s.key))}</label>`).join("")}</div>
       ${(() => { const sp = splitSlots(); return sp.text ? `<p class="muted small">Positions follow the day / swing split of the trading capital (the slider above the plays): <b>${escapeHtml(sp.text)}</b> of ${ap.max_auto_positions ?? 0}, and the day's entries the same way.</p>${sp.warnings.map(w => `<p class="small warn-text">⚠ ${escapeHtml(w)}</p>`).join("")}` : ""; })()}
       <label>Minimum confidence, day trades <b id="ap-conf-v">${ap.min_confidence ?? 0.5}</b></label>
       <input type="range" id="ap-conf" min="0.4" max="0.9" step="0.01" value="${ap.min_confidence ?? 0.5}">
@@ -217,6 +221,7 @@ function configure() {
       const int = sel => parseInt($(sel).value, 10);
       await postAutopilot({
         trade_types: types.length ? types : ["INTRADAY"],
+        strategies: $$(".ap-strat-check").filter(c => c.checked).map(c => c.value),
         min_confidence: parseFloat($("#ap-conf").value),
         min_swing_confidence: parseFloat($("#ap-sconf").value),
         min_reward_risk: parseFloat($("#ap-rr").value),

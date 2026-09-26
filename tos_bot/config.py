@@ -214,6 +214,8 @@ class AutopilotCfg(_Model):
     enabled: bool = False
     allow_live: bool = False              # HARD gate: never auto-route real orders unless true
     trade_types: list = Field(default_factory=lambda: ["INTRADAY"])
+    strategies: list = Field(default_factory=list)   # the setups Autopilot may take, by key - empty = every setup.
+                                          # Unlike the Strategies panel's switch, the others stay on the board to click
     min_confidence: float = 0.5           # day trades: the setup's own conviction. The replay found higher stated
                                           # confidence went with worse trades, so the gate only keeps out the weakest
     min_swing_confidence: float = 0.5     # swing setups state flat, modest confidences (0.55-0.58); their real

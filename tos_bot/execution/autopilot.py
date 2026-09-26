@@ -66,6 +66,13 @@ def _loser_scope(value: Any) -> str:
     return value if value in LOSER_SCOPES else "day"
 
 
+def _setup_list(value: Any) -> List[str]:
+    """The setups Autopilot may take, by strategy key, each once; not a list = none named (every setup)."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return list(dict.fromkeys(s for s in (str(v).strip() for v in value) if s))
+
+
 class AutoPilot:
     def __init__(self, engine: Any, cfg: Any, *, bus: Any = BUS,
                  persist: Optional[Callable[[], None]] = None) -> None:
@@ -77,6 +84,7 @@ class AutoPilot:
         # runtime state (the UI can override the config values below)
         self.enabled: bool = bool(cfg.enabled)
         self.trade_types: List[str] = [t.upper() for t in (cfg.trade_types or ["INTRADAY"])]
+        self.strategies: List[str] = _setup_list(getattr(cfg, "strategies", None))   # empty = every setup
         self.min_confidence: float = float(cfg.min_confidence)
         self.min_swing_confidence: float = float(getattr(cfg, "min_swing_confidence", 0.5))
         self.min_reward_risk: float = float(cfg.min_reward_risk)
@@ -138,6 +146,7 @@ class AutoPilot:
         return {
             "enabled": self.enabled,
             "trade_types": self.trade_types,
+            "strategies": list(self.strategies),
             "min_confidence": self.min_confidence,
             "min_swing_confidence": self.min_swing_confidence,
             "min_reward_risk": self.min_reward_risk,
@@ -176,6 +185,8 @@ class AutoPilot:
         tt = d.get("trade_types")
         if isinstance(tt, list) and tt:
             self.trade_types = [str(x).upper() for x in tt if str(x).upper() in TRADE_TYPES] or self.trade_types
+        if isinstance(d.get("strategies"), list):
+            self.strategies = _setup_list(d["strategies"])
         for k in ("min_confidence", "min_swing_confidence", "min_reward_risk", "max_gross_exposure_pct",
                   "max_daily_loss_pct", "max_giveback_pct"):
             if isinstance(d.get(k), (int, float)):
@@ -228,6 +239,8 @@ class AutoPilot:
             clean = [str(x).upper() for x in tt if str(x).upper() in TRADE_TYPES]
             if clean:
                 self.trade_types = clean
+        if isinstance(kw.get("strategies"), list):
+            self.strategies = _setup_list(kw["strategies"])
         if isinstance(kw.get("min_confidence"), (int, float)):
             self.min_confidence = max(0.0, min(1.0, float(kw["min_confidence"])))
         if isinstance(kw.get("min_swing_confidence"), (int, float)):
@@ -402,6 +415,7 @@ class AutoPilot:
             "dry_run": self.dry_run,
             "trade_types": self.effective_trade_types(),
             "own_trade_types": list(self.trade_types),
+            "strategies": list(self.strategies),
             "min_confidence": round(self.min_confidence, 2),
             "min_swing_confidence": round(self.min_swing_confidence, 2),
             "min_reward_risk": round(self.min_reward_risk, 2),
@@ -904,6 +918,8 @@ class AutoPilot:
             return "not a fresh proposed play"
         if tf not in self.play_types():
             return f"{'day' if tf == 'INTRADAY' else tf.lower()} trades are switched off - in the Intraday / Swing filters or in Autopilot's own boxes"
+        if self.strategies and strategy not in self.strategies:
+            return f"not one of the setups Autopilot takes ({', '.join(self.strategies)}) - Autopilot settings"
         floor = self.confidence_floor(tf)
         if confidence < floor:
             return f"confidence {confidence:.2f} < {floor:.2f}{'' if tf == 'INTRADAY' else ' (the swing floor)'}"
