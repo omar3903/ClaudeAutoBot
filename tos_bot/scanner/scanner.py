@@ -50,8 +50,8 @@ from ..signals.book import SignalBook
 from .evaluator import evaluate, with_today
 from .noise import NoiseSettings
 from .filters import TradeFilters
-from .heat import (DailyMetrics, daily_metrics, intraday_metrics, liquid, premarket_metrics, rank_by_daily_heat,
-                   rank_gappers)
+from .heat import (DailyMetrics, IntradayMetrics, daily_metrics, intraday_metrics, liquid, premarket_metrics,
+                   rank_by_daily_heat, rank_gappers)
 from .schedule import ScanSettings
 from .watchlist import Candidate, Decision, DayWatchlist
 
@@ -134,6 +134,11 @@ class Scanner:
         self.premarket: Dict[str, Dict[str, Any]] = {}
         #: the session the live candles were last compared with IBKR's bars in (_compare_candles)
         self._candles_compared: Optional[dt.date] = None
+        #: the stocks topping IBKR's live market scans that hold watch-tier slots (the engine's live scan sets them),
+        #: and each stock the candle-close check read today: (its intraday heat, today's dollar volume so far). Both
+        #: under _watchlist_lock
+        self.live_names: List[str] = []
+        self.live_stats: Dict[str, Tuple[float, float]] = {}
 
     def set_strategies(self, strategies: Sequence[Strategy]) -> None:
         """Swap the active setups. A scan already running keeps the set it started with."""
@@ -143,12 +148,19 @@ class Scanner:
         with self._watchlist_lock:
             return self.watchlist.state() if self.watchlist else None
 
+    def set_live_names(self, names: Sequence[str]) -> None:
+        """The stocks from IBKR's live market scans that take watch-tier slots, best first (none: [])."""
+        with self._watchlist_lock:
+            self.live_names = list(names)
+
     def watch_symbols(self, n: int, now: Optional[dt.datetime] = None) -> List[str]:
         """The watch tier: the day's ``n`` most relevant stocks, streamed after the plays - the hot list, then the
-        kept buffer names (both by their latest heat, the daily heat until a cycle has seen them), then the buffer
-        names the next cycle samples (by daily heat), each stock once and only in the sectors the filters allow.
-        Nothing outside the pre-market and the regular session, or from a watchlist left from another day. A pure
-        read - no request, no disk, no change to the watchlist: the stream thread asks every few seconds."""
+        names from IBKR's live scans (by the heat the candle-close check last saw, the ones it hasn't read yet after
+        them in scan order), then the kept buffer names (these and the hot list by their latest heat, the daily
+        heat until a cycle has seen them), then the buffer names the next cycle samples (by daily heat), each stock
+        once and only in the sectors the filters allow. Nothing outside the pre-market and the regular session, or
+        from a watchlist left from another day. A pure read - no request, no disk, no change to the watchlist: the
+        stream thread asks every few seconds."""
         if n <= 0:
             return []
         now = (now or clock.now_ny()).astimezone(clock.NY)
@@ -164,10 +176,12 @@ class Scanner:
             if wl is None or wl.session != now.date():
                 return []
             hot = sorted(wl.hot, key=heat, reverse=True)
+            live = sorted(self.live_names, key=lambda s: (0, -self.live_stats[s][0]) if s in self.live_stats
+                          else (1, 0.0))
             kept = sorted((c for cs in wl.kept.values() for c in cs), key=heat, reverse=True)
             picks = sorted((c for cs in wl.next_picks(per_sector, sectors).values() for c in cs),
                            key=lambda c: c.daily_heat, reverse=True)
-            symbols = [c.symbol for c in (*hot, *kept, *picks)]
+            symbols = [c.symbol for c in hot] + live + [c.symbol for c in (*kept, *picks)]
         return [s for s in dict.fromkeys(symbols) if s and sector_allowed(self.symbols.sector(s), sectors)][:n]
 
     # ---- the full scan ----------------------------------------------------- #
@@ -209,6 +223,7 @@ class Scanner:
             self.watchlist = watchlist
             watchlist.save(self.watchlist_dir)
             self.premarket = {}
+            self.live_stats = {}
         result.hot = watchlist.hot_symbols()
 
         swing_on = "SWING" in filters.timeframes
@@ -490,7 +505,8 @@ class Scanner:
         for each stock, past the 60 s cache (a stock with nothing cached gets its full history once), and a stock
         is looked at only once the bar starting at ``since`` is printing: the setups read the bar before the
         newest as the last closed one. A stock whose new bar isn't in yet is left out, so it keeps its plays -
-        the next check or the fast cycle gets it. No watchlist decision; the plays are recorded like a cycle's."""
+        the next check or the fast cycle gets it. No watchlist decision; the plays are recorded like a cycle's.
+        Each stock read leaves its intraday heat and today's dollar volume in live_stats."""
         filters, strategies = self.filters, list(self.strategies)
         result = ScanResult("close")
         wanted = list(dict.fromkeys(symbols))
@@ -501,29 +517,41 @@ class Scanner:
         result.symbols = [s for s in wanted if s in daily and (f := intraday.get(s)) is not None and len(f)
                           and f.index[-1] >= printing]
         result.universe_size, result.scanned = len(wanted), len(result.symbols)
-        self._evaluate_intraday(result, result.symbols, intraday, daily, filters, strategies)
+        activity = self._evaluate_intraday(result, result.symbols, intraday, daily, filters, strategies)
+        stats: Dict[str, Tuple[float, float]] = {}
+        for symbol in result.symbols:
+            frame = intraday[symbol]
+            sessions = frame.index.date
+            today = frame[sessions == sessions[-1]]
+            m = activity.get(symbol)
+            stats[symbol] = (m.heat if m is not None else 0.0, float((today["close"] * today["volume"]).sum()))
+        with self._watchlist_lock:
+            self.live_stats.update(stats)
         self._compare_candles({s: intraday[s] for s in result.symbols}, since)
         return self._finish(result, filters, quiet=True)
 
     def _evaluate_intraday(self, result: ScanResult, symbols: Sequence[str], intraday: Mapping[str, pd.DataFrame],
                            daily: Mapping[str, pd.DataFrame], filters: TradeFilters,
-                           strategies: Sequence[Strategy]) -> None:
+                           strategies: Sequence[Strategy]) -> Dict[str, Optional[IntradayMetrics]]:
         """The setups the filters allow on each of ``symbols``' newest candles, into ``result`` - the quick
         re-check's pass and the candle-close check's. Day setups only while the market is open; the swing setups
-        come along, so the board doesn't drop the swing plays on those stocks."""
+        come along, so the board doesn't drop the swing plays on those stocks. Returns each stock's intraday
+        metrics (None when its candles are too few)."""
         market_open = clock.is_market_open()
         active = [s for s in strategies if s.kind is StrategyKind.TECHNICAL and s.timeframe.value in filters.timeframes
                   and (s.timeframe is Timeframe.SWING or market_open)]
         benchmark = self._benchmark(True) if symbols else None
+        seen: Dict[str, Optional[IntradayMetrics]] = {}
         with self._timed(result, "setups"):
             for symbol in symbols:
-                activity = intraday_metrics(symbol, intraday[symbol], daily[symbol])
+                activity = seen[symbol] = intraday_metrics(symbol, intraday[symbol], daily[symbol])
                 result.plays += evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
                                          equity=self._equity, params=self._params, activity=activity,
                                          noise=self._noise, signals=self.signals, market=self.market,
                                          evidence_weights=self.evidence_weights,
                                          records=self.strategy_records, benchmark=benchmark,
                                          premarket=self.premarket.get(symbol))
+        return seen
 
     #: stocks a comparison of the live candles with IBKR's bars wants before it says anything
     COMPARE_MIN_STOCKS = 5

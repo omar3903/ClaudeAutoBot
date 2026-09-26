@@ -43,6 +43,7 @@ _MARKET_DATA_TYPES = {"live": 1, "frozen": 2, "delayed": 3, "delayed-frozen": 4}
 _DELAYED_ERRS = {10167, 10168, 10197, 10089, 354}
 COMPETING_SESSION = 10197
 _COMPETING_WORDS = "different ip address"          # error 162: historical data refused for the same reason
+_SCAN_CANCELLED = "scanner subscription cancelled"  # error 162 again: IBKR's echo of a market scan's cancel
 #: what the dashboard says about delayed or refused data
 COMPETING_REASON = ("IBKR sends no market data to this login while your live account is logged in somewhere else "
                     "(IBKR Mobile, Client Portal, TWS or the web trader) - with market data shared to the paper "
@@ -72,10 +73,13 @@ _STREAM_RESET_FIELDS = ("bid", "ask", "last", "close", "bidSize", "askSize", "la
 
 class _QuietDataErrors(logging.Filter):
     """ib_async logs every "not subscribed" reply as an ERROR. _on_error handles
-    those and explains them once, so keep them out of the console."""
+    those and explains them once, so keep them out of the console - and the
+    echo of every market scan's cancel (market_scan), which is no error at all."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
+        if msg.startswith("Error 162,") and _SCAN_CANCELLED in msg.lower():
+            return False
         return not any(msg.startswith(f"Error {code},") for code in _DELAYED_ERRS | _PARTIAL_DATA_ERRS)
 
 
@@ -549,6 +553,8 @@ class IbkrBroker(BrokerAdapter):
             return
         if errorCode in _INFO_ERRS:
             return
+        if errorCode == 162 and _SCAN_CANCELLED in str(errorString).lower():
+            return                                   # a market scan's cancel confirmed - every scan sends one
         if self._stream_error(reqId, errorCode, errorString):
             return
         if errorCode in _DELAYED_ERRS:
@@ -1060,6 +1066,39 @@ class IbkrBroker(BrokerAdapter):
 
         budget = timeout * (len(symbols) / self.DETAILS_CONCURRENCY + 1) + 30
         return {s: d for s, d, answered in self._session.run_coro(run, timeout=budget) if answered}
+
+    def market_scan(self, code: str, rows: int = 50, above_price: float = 3.0, below_price: float = 600.0,
+                    timeout: float = 8.0) -> List[str]:
+        """The US stocks topping one of IBKR's live market scans (``code``: TOP_PERC_GAIN, TOP_PERC_LOSE,
+        HOT_BY_VOLUME...) between ``above_price`` and ``below_price``, in rank order - one answer, then the
+        subscription is cancelled, answered or not: IBKR allows 10 open at once, and ib_async's
+        reqScannerDataAsync would leave one open on a timeout. No market-data line is used. Empty when not
+        connected or when the scan fails."""
+        if not self.is_connected:
+            return []
+        from ib_async import ScannerSubscription
+
+        wanted = ScannerSubscription(instrument="STK", locationCode="STK.US.MAJOR", scanCode=code,
+                                     numberOfRows=rows, abovePrice=above_price, belowPrice=below_price)
+
+        async def run(ib):
+            data = ib.reqScannerSubscription(wanted)
+            try:
+                try:
+                    await asyncio.wait_for(ib.wrapper.startReq(data.reqId, container=data), timeout)
+                except Exception:  # noqa: BLE001 - a timeout or a refusal: whatever rows came are read below
+                    pass
+            finally:
+                ib.cancelScannerSubscription(data)
+            ranked = sorted(data, key=lambda row: row.rank)
+            return [row.contractDetails.contract.symbol for row in ranked
+                    if getattr(row.contractDetails.contract, "secType", "") == "STK"]
+
+        try:
+            return list(dict.fromkeys(self._session.run_coro(run, timeout=timeout + 2)))
+        except Exception as e:  # noqa: BLE001
+            log.debug("IBKR's %s scan failed: %s", code, e)
+            return []
 
     # ---- orders ------------------------------------------------------------ #
     def _guard_orders(self) -> None:

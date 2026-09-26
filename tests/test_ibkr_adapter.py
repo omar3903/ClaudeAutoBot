@@ -3,8 +3,9 @@
 Covers the translation layer: interval -> barSize, order action (an order's
 side is its direction, exits included), order states and IBKR's rejection
 reasons, account parsing, quote NaN fallback, the delayed-data downgrade,
-bar-frame shaping, connection state, and real-time streams (the lines held,
-when a stream's quote can be trusted, and IBKR's refusals). The real Gateway path is not tested
+bar-frame shaping, connection state, real-time streams (the lines held,
+when a stream's quote can be trusted, and IBKR's refusals) and the live market
+scans (always cancelled). The real Gateway path is not tested
 here (it needs a running IB Gateway). Where the app's threads overlap, the real
 session's loop runs around the fake (ThreadedSession).
 """
@@ -44,9 +45,12 @@ class FakeTicker:
 
 
 class FakeWrapper:
-    """ib_async's bookkeeping of market-data requests: a Ticker per contract, and its request ids by kind."""
+    """ib_async's bookkeeping of market-data requests: a Ticker per contract, and its request ids by kind - and of
+    one-off requests (startReq), which the fake answers with ``scan_rows`` on the loop's next turn, or never when
+    that is None."""
 
     def __init__(self):
+        self.scan_rows = []
         self.reset()
 
     def reset(self):                                   # what ib_async does when the socket closes
@@ -60,6 +64,30 @@ class FakeWrapper:
 
     def endTicker(self, tk, kind):
         return self.ticker2ReqId[kind].pop(tk, 0)
+
+    def startReq(self, key, contract=None, container=None):
+        future = asyncio.get_running_loop().create_future()
+        rows = self.scan_rows
+
+        def answer():
+            if not future.done():
+                container.extend(rows)
+                future.set_result(container)
+
+        if rows is not None:
+            asyncio.get_running_loop().call_soon(answer)
+        return future
+
+
+class _ScanDataList(list):
+    """Like ib_async's ScanDataList: the rows of one scanner subscription, and its request id."""
+
+    reqId = 0
+
+
+def _scan_row(rank, symbol, sec_type="STK"):
+    return SimpleNamespace(rank=rank, contractDetails=SimpleNamespace(contract=SimpleNamespace(symbol=symbol,
+                                                                                               secType=sec_type)))
 
 
 class _FakeEvent:
@@ -85,6 +113,7 @@ class FakeIB:
         self.wrapper, self.client = FakeWrapper(), SimpleNamespace(_reqIdSeq=100)
         self.pendingTickersEvent, self.errorEvent, self.disconnectedEvent = _FakeEvent(), _FakeEvent(), _FakeEvent()
         self.subscribed, self.cancelled, self.stray_cancels, self.qualified, self.con_ids = [], [], [], [], {}
+        self.scans, self.scan_cancels = [], []     # market scans: each subscription asked for, each one cancelled
         self.last_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
         self.clock = None                          # a wall clock to stamp packets by instead (see ticks_arrived)
         # snapshots: the ticks one sends, and the error IBKR refuses one with instead (0: none)
@@ -181,6 +210,15 @@ class FakeIB:
             self.ticks_arrived(tk)
         self.wrapper.endTicker(tk, "snapshot")
         return [tk]
+
+    def reqScannerSubscription(self, subscription):
+        data, self.client._reqIdSeq = _ScanDataList(), self.client._reqIdSeq + 1
+        data.reqId = self.client._reqIdSeq - 1
+        self.scans.append(subscription)
+        return data
+
+    def cancelScannerSubscription(self, data):
+        self.scan_cancels.append(data.reqId)
 
     async def reqContractDetailsAsync(self, contract):
         if contract.symbol == "NOPE":
@@ -672,6 +710,58 @@ def test_each_fill_carries_the_tag_of_the_order_it_filled(broker):
     broker._session.ib.reqExecutionsAsync = executions
     [fill] = broker.get_fills("AAPL")
     assert (fill.tag, fill.quantity, fill.price, fill.side) == ("exit:trd_1", 40.0, 12.5, Side.SHORT)
+
+
+# --------------------------------------------------------------------------- #
+#  IBKR's live market scans
+# --------------------------------------------------------------------------- #
+def test_a_market_scan_gives_its_stocks_in_rank_order_and_is_cancelled_once_answered(broker):
+    ib = broker._session.ib
+    ib.wrapper.scan_rows = [_scan_row(1, "BBB"), _scan_row(0, "AAA"), _scan_row(2, "CCC", "WAR"),
+                            _scan_row(3, "DDD"), _scan_row(4, "AAA")]
+    assert broker.market_scan("TOP_PERC_GAIN") == ["AAA", "BBB", "DDD"]          # stocks only, each once
+    [sub] = ib.scans
+    assert (sub.instrument, sub.locationCode, sub.scanCode, sub.numberOfRows, sub.abovePrice, sub.belowPrice) == (
+        "STK", "STK.US.MAJOR", "TOP_PERC_GAIN", 50, 3.0, 600.0)
+    assert ib.scan_cancels == [ib.client._reqIdSeq - 1]                           # no scan stays open
+    assert ib.subscribed == []                                                    # and no market-data line is used
+
+
+def test_a_market_scan_that_never_answers_is_cancelled_all_the_same(broker):
+    ib = broker._session.ib
+    ib.wrapper.scan_rows = None
+    assert broker.market_scan("HOT_BY_VOLUME", timeout=0.05) == []
+    assert [s.scanCode for s in ib.scans] == ["HOT_BY_VOLUME"] and ib.scan_cancels == [ib.client._reqIdSeq - 1]
+
+
+def test_a_market_scan_asks_nothing_when_not_connected_and_a_failure_is_no_names(broker):
+    ib = broker._session.ib
+
+    def refused(subscription):
+        raise ConnectionError("Not connected")
+
+    ib.reqScannerSubscription = refused
+    assert broker.market_scan("TOP_PERC_LOSE") == [] and ib.scan_cancels == []
+    del ib.reqScannerSubscription
+    ib.disconnect()
+    assert broker.market_scan("TOP_PERC_LOSE") == [] and ib.scans == []
+
+
+def test_the_echo_of_a_scans_cancel_is_no_error(broker):
+    import logging
+
+    broker._on_error(101, 162, "API scanner subscription cancelled: 101", None)
+    assert broker._last_error == ""
+    quiet = mod._QuietDataErrors()
+    echo = logging.LogRecord("ib_async.wrapper", logging.ERROR, __file__, 1,
+                             "Error 162, reqId 101: API scanner subscription cancelled: 101", None, None)
+    assert not quiet.filter(echo)
+    # a 162 about candles is still noted
+    other = "Historical Market Data Service error message:HMDS query returned no data"
+    broker._on_error(7, 162, other, None)
+    assert broker._last_error == f"162: {other}"
+    assert quiet.filter(logging.LogRecord("ib_async.wrapper", logging.ERROR, __file__, 1,
+                                          f"Error 162, reqId 7: {other}", None, None))
 
 
 

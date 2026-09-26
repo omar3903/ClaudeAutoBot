@@ -185,7 +185,7 @@ def fig_components() -> str:
 
     # engine
     s.rect(20, 185, 680, 300, "#fbfbf6", "#333", rx=6)
-    s.text(360, 203, "TradingEngine  (tos_bot/engine/engine.py + mixins)  -  one object, 10 background threads",
+    s.text(360, 203, "TradingEngine  (tos_bot/engine/engine.py + mixins)  -  one object, 11 background threads",
            11, "middle", "bold")
     s.text(360, 217, "ResearchOps · JournalOps · PairsOps · CapitalOps · QuitOps  (mixins)      "
                      "EventBus (core/eventbus.py) carries every change to the dashboard", 8.5, "middle", fill="#444")
@@ -532,8 +532,8 @@ def fig_sequence() -> str:
 #  Figure 5 - threads and loops
 # ----------------------------------------------------------------------------------------------
 def fig_threads(journal_s, pairs_s) -> str:
-    s = Svg(720, 560)
-    s.rect(15, 15, 690, 530, "#fbfbfb", "#333", rx=6)
+    s = Svg(720, 590)
+    s.rect(15, 15, 690, 560, "#fbfbfb", "#333", rx=6)
     s.text(360, 33, "One process:  python run.py  ->  uvicorn (asyncio main thread)  ->  create_app()  ->  "
                     "TradingEngine.start()", 10.5, "middle", "bold")
     main = s.box(30, 48, 320, 60, "Main thread - uvicorn / asyncio",
@@ -560,6 +560,8 @@ def fig_threads(journal_s, pairs_s) -> str:
         ("price-push", "woken by a streamed tick: the prices that moved, to the dashboard as prices.tick, "
                        "at most once a second"),
         ("candle-loop", "every minute + 0.25 s: close the live candles built from the streamed ticks"),
+        ("live-scan", "every 60 s in regular hours: IBKR's % gainers / % losers / hot-by-volume scans "
+                      "-> the watch tier"),
     ]
     y = 125
     s.text(30, y - 4, "Engine daemon threads (engine.start())", 9.5, weight="bold")
@@ -964,7 +966,7 @@ def build() -> str:
     A('<h2>3. The runtime: process, threads and loops</h2>')
     A('<p><code>python run.py</code> builds the FastAPI app, which constructs one <code>TradingEngine</code> '
       'and calls <code>start()</code>. Start binds the broker chosen by the routing (<code>brokers/venues.py</code>: '
-      'IBKR paper, IBKR live, or the simulator on IBKR prices), reads the account once, and launches the nine '
+      'IBKR paper, IBKR live, or the simulator on IBKR prices), reads the account once, and launches the eleven '
       'daemon threads below. Every thread sleeps on the same <code>threading.Event</code>, or on a wake event '
       'that <code>stop()</code> sets as well, so <code>stop()</code> ends them together. Ctrl+C goes through the '
       'quit rules: in paper it closes positions and exits; in live with positions open it asks in the dashboard '
@@ -1435,8 +1437,9 @@ def build() -> str:
         ("data/streams.py", "StreamManager.sync(), fresh(), prefer(), take_moves()", "the line budget: IBKR streams "
          "for at most execution.stream_lines stocks (80; 0 = none) - the positions and working entries, then the plays "
          "the operator opened in the last 5 minutes, the plays Autopilot would take and the best of the rest, then "
-         "the watch tier (Scanner.watch_symbols(): the hot list, kept and next buffer names, up to "
-         "execution.stream_watch, 50); quote() serves a stream that ticked in the last 2 s, else a snapshot as before"),
+         "the watch tier (Scanner.watch_symbols(): the hot list, IBKR's live-scan movers, kept and next buffer "
+         "names, up to execution.stream_watch, 50); quote() serves a stream that ticked in the last 2 s, else a "
+         "snapshot as before"),
         ("brokers/ibkr_adapter.py", "IbkrBroker.set_streams(), streamed_quote(), _on_tickers()", "the streams on the "
          "IB loop thread: only on proven real-time data, a stock's quote kept once its bid, ask and last have all "
          "come; a refusal of lines (101) lowers the budget from the tail (the watch tier, then the plays - never the "
@@ -1444,6 +1447,9 @@ def build() -> str:
         ("engine/engine.py", "_stream_loop(), _price_push_loop(), watch_play()", "points the streams at what matters "
          "every 5 s, or at once on a new board, an order or a play opened on the dashboard; sends the streamed "
          "prices that moved as prices.tick, at most once a second"),
+        ("engine/engine.py", "_live_scan_once(), _thin_live_names()", "every minute in regular hours IBKR's three "
+         "live scans (IbkrBroker.market_scan: one open at a time, always cancelled) put up to scanner.live_scan (10) "
+         "movers the morning's ranking missed into the watch tier; one thin on today's dollar volume is left out"),
         ("execution/executor.py", "expire_entries(), _on_unfilled(), on_entry_unfilled", "calls off a day entry "
          "unfilled after 10 minutes and any entry part-filled 30 s ago (the rest cancelled, the part booked); an "
          "entry that bought nothing is saved CANCELED/ERROR with why (_note -> repo.settle_play) and Autopilot is "

@@ -13,7 +13,7 @@ import datetime as dt
 import logging
 import threading
 import time
-from typing import Callable, Dict, Iterable, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 import pandas as pd
 
@@ -215,6 +215,19 @@ class MarketData:
 
     def daily_frame(self, symbol: str) -> Optional[pd.DataFrame]:
         return self.bars.frame(symbol)
+
+    # ---- the broker's live market scans ---------------------------------- #
+    def market_scan(self, code: str) -> List[str]:
+        """The stocks topping the source's live market scan ``code`` (IbkrBroker.market_scan), in rank order.
+        Empty when the source has no scans or the scan fails - the caller carries on without it."""
+        scan = getattr(self._source, "market_scan", None)
+        if scan is None:
+            return []
+        try:
+            return list(scan(code))
+        except Exception as e:  # noqa: BLE001
+            log.debug("the %s market scan failed: %s", code, e)
+            return []
 
     # ---- intraday candles and quotes ------------------------------------- #
     def intraday(self, symbols: Sequence[str],

@@ -28,6 +28,8 @@ SYMBOLS = [f"T{i:02d}" for i in range(40)]
 #: pre-market gaps the fake Gateway shows, symbol -> %; a gapping stock trades heavy pre-market volume
 GAPS: Dict[str, float] = {}
 GAP_VOLUME = 1e5
+#: what IBKR's live market scans show, scan code -> symbols in rank order (tests set and clear it)
+SCANS: Dict[str, List[str]] = {}
 
 _SESSIONS = 300
 _BARS_PER_SESSION = 78                    # 09:30-16:00 in 5-minute bars
@@ -141,6 +143,7 @@ class FakeGateway:
         self.kw: Dict[str, object] = {}                     # how the app asked for the connection
         self.requests: List[Tuple[str, str, str]] = []      # (symbol, bar size, duration)
         self.fills: list = []                               # what get_fills reports
+        self.scan_calls: List[str] = []                     # every market scan asked for, by its code
 
     def knows(self, symbol: str) -> bool:
         return not self.symbols or symbol in self.symbols
@@ -187,6 +190,10 @@ class FakeGateway:
 
     def contract_details_many(self, symbols: Sequence[str]) -> Dict[str, Optional[dict]]:
         return {s: contract_details(s) if self.knows(s) else None for s in symbols}
+
+    def market_scan(self, code: str, **kw) -> List[str]:
+        self.scan_calls.append(code)
+        return [s for s in SCANS.get(code, []) if self.knows(s)]
 
     def list_orders(self, status: Optional[str] = None) -> list:
         return []

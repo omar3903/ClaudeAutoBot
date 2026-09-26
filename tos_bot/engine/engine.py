@@ -21,6 +21,9 @@ background loops:
                    candles built from the streamed ticks (data/candles.py), and
                    queues the candle-close check or the early movers for the scan
                    loop
+    live scan      every minute in regular hours: IBKR's % gainers, % losers and
+                   hot-by-volume scans put the movers the morning's ranking missed
+                   into the watch tier
 
 Whatever the user changes on the dashboard applies straight away, is
 remembered in data/runtime.json (runtime.py) and is broadcast to every tab.
@@ -34,6 +37,7 @@ record is deleted only when a connected broker confirms the position is gone
 
 
 import datetime as dt
+import itertools
 import logging
 import threading
 import time
@@ -56,6 +60,7 @@ from ..data.fundamentals import FundamentalsProvider
 from ..data.listings import UsListings
 from ..data.market_data import INTRADAY_BAR, MarketData, NoDataSource
 from ..data.sec_edgar import SecEdgarFundamentals
+from ..data.sectors import sector_allowed
 from ..data.symbols import SymbolMaster
 from ..execution.autopilot import AutoPilot
 from ..execution.executor import Executor
@@ -296,6 +301,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         # scan thread only: when each stock was last asked for its bars by a check, and the last check's context
         self._close_asked: Dict[str, float] = {}
         self._close_ran: Optional[Dict[str, Any]] = None
+        # IBKR's live scans (_live_scan_once): the names a close check found too thin on today's volume, left out
+        # for the rest of the session, and the session that is
+        self._live_thin: set = set()
+        self._live_session: Optional[dt.date] = None
 
         # the orders working at the broker, for the dashboard (see active_orders)
         self._orders: List[Dict[str, Any]] = []
@@ -338,7 +347,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             ("orders-loop", self._orders_loop), ("signals-loop", self._signals_loop),
             ("journal-loop", self._journal_loop), ("pairs-loop", self._pairs_loop),
             ("stream-loop", self._stream_loop), ("price-push", self._price_push_loop),
-            ("candle-loop", self._candle_loop))]
+            ("candle-loop", self._candle_loop), ("live-scan", self._live_scan_loop))]
         for t in self._threads:
             t.start()
         self._publish("engine.started", state=self.snapshot())
@@ -1094,6 +1103,100 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 found.append((span, symbol, ", ".join(why)))
         return {symbol: why for _, symbol, why in sorted(found, key=lambda f: -f[0])}
 
+    #: IBKR's live market scans run this often in regular hours, one after another on the live-scan thread
+    LIVE_SCAN_S = 60.0
+    #: ...these three: the biggest % gainers, the biggest % losers and the stocks hottest by volume
+    LIVE_SCAN_CODES = ("TOP_PERC_GAIN", "TOP_PERC_LOSE", "HOT_BY_VOLUME")
+    #: names the scans bring that the app has never seen are looked up at most this many a round
+    LIVE_LOOKUPS = 20
+
+    def _live_scan_loop(self) -> None:
+        """Runs IBKR's live market scans every LIVE_SCAN_S (_live_scan_once). A thread of its own: each scan waits
+        a couple of seconds on the Gateway, and must never hold up a scan, the streams or the exits."""
+        if self._stop.wait(30.0):                    # the connection and the day's watchlist come first
+            return
+        while not self._stop.is_set():
+            try:
+                self._live_scan_once()
+            except Exception:  # noqa: BLE001
+                log.exception("live scan failed")
+            self._stop.wait(self.LIVE_SCAN_S)
+
+    def _live_scan_once(self, now: Optional[dt.datetime] = None) -> List[str]:
+        """One round of IBKR's live scans (LIVE_SCAN_CODES, one after another): their names interleaved by rank -
+        each scan's first, then each one's second... - that SymbolMaster calls ordinary tradable shares, in a sector
+        the filters allow, with daily candles (the morning's download covers every tradable listing), not on the
+        hot list already and not found too thin today (_thin_live_names). The first scanner.live_scan of them take
+        watch-tier slots right after the hot list (Scanner.set_live_names), so a stock too quiet for the morning's
+        ranking is streamed and checked once it moves. Names never seen before are looked up first, LIVE_LOOKUPS a
+        round, and kept in symbols.json. Only in regular hours on real-time data, with today's watchlist and the
+        watch tier on, and not while quitting - otherwise nothing is asked and the names held are let go. Returns
+        the names held now."""
+        cfg = self.settings.config
+        now = (now or clock.now_ny()).astimezone(clock.NY)
+        n, wl = int(cfg.scanner.live_scan or 0), self.scanner.watchlist
+        if not (n > 0 and int(cfg.execution.stream_watch or 0) > 0 and self.md.attached and not self.md.delayed
+                and not self.md.refused and not self.quit_state and clock.is_market_open(now)
+                and wl is not None and wl.session == now.date()):
+            if self.scanner.live_names:
+                self.scanner.set_live_names([])
+                self._stream_wake.set()
+            return []
+        if self._live_session != now.date():
+            self._live_session, self._live_thin = now.date(), set()     # a new session's volume is judged afresh
+        scans = []
+        for code in self.LIVE_SCAN_CODES:
+            if self._stop.is_set():
+                return list(self.scanner.live_names)
+            scans.append(self.md.market_scan(code))
+        if not any(scans):
+            # in regular hours IBKR always has movers: nothing at all is the scans failing, and dropping the names
+            # held would only end their streams until the next round brings them back
+            return list(self.scanner.live_names)
+        found = list(dict.fromkeys(s for rank in itertools.zip_longest(*scans) for s in rank if s))
+        master = self.scanner.symbols
+        unknown = master.unknown(found)[:self.LIVE_LOOKUPS]
+        if unknown:
+            try:
+                master.record(self.md.source.contract_details_many(unknown))
+            except Exception as e:  # noqa: BLE001 - the names already known still count; the rest wait a round
+                log.debug("live scan: contract details unavailable: %s", e)
+        hot, thin, sectors = set(wl.hot_symbols()), set(self._live_thin), self.scanner.filters.sectors
+        names: List[str] = []
+        for symbol in master.tradable(found):
+            if len(names) >= n:
+                break
+            if (symbol not in hot and symbol not in thin and sector_allowed(master.sector(symbol), sectors)
+                    and self.md.daily_frame(symbol) is not None):
+                names.append(symbol)
+        before = list(self.scanner.live_names)
+        if names != before:
+            self.scanner.set_live_names(names)
+            moved = [f"+{s}" for s in names if s not in before] + [f"-{s}" for s in before if s not in names]
+            if moved:
+                log.info("live scan: %s", " ".join(moved))
+            self._stream_wake.set()                  # the streams follow the watch tier
+        return names
+
+    def _thin_live_names(self, result: ScanResult) -> List[str]:
+        """After a candle-close check: the live-scan names it read whose dollar volume today is short of the
+        morning's liquidity floor (scanner.prefilter's min_dollar_volume, 5,000,000 when unset) pro rata for the
+        time of day - max(30, minutes since the open) of 390 - are left out from the live scan's next round, for
+        the rest of the session: judged on today's volume, as the morning's ranking judges 20 sessions'. Sizing's
+        cap on the median daily volume (risk.max_adv_pct) still limits any order on them. Returns those names."""
+        live = set(self.scanner.live_names)
+        if not live:
+            return []
+        least = self.settings.config.scanner.prefilter.get("min_dollar_volume")
+        floor = float(5_000_000 if least is None else least) * max(30.0, clock.minutes_since_open()) / 390.0
+        stats = self.scanner.live_stats
+        thin = [s for s in result.symbols if s in live and s in stats and stats[s][1] < floor]
+        if thin:
+            self._live_thin.update(thin)
+            log.debug("live scan: %s too thin today (under $%.0f so far) - left out from the next round",
+                      ", ".join(thin), floor)
+        return thin
+
     # ------------------------------------------------------------------ #
     #  Scans                                                             #
     # ------------------------------------------------------------------ #
@@ -1267,6 +1370,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._publish_plays()                              # after the pass: each play carries Autopilot's verdict on it
         if kind == "close":
             self._log_close_check(result, changes)
+            self._thin_live_names(result)
         self._note_changes(changes)
 
     def _close_check(self) -> Optional[ScanResult]:

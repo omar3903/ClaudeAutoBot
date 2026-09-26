@@ -134,6 +134,10 @@ class ScannerCfg(_Model):
                                           # after each wide scan (0-20; 0 = off) - Aziz's stocks in play
     yesterday_movers: int = 10            # the last session's biggest movers hold slots from the full scan, in
                                           # case they move for a second day (0-20; 0 = off)
+    live_scan: int = 10                   # watch-tier slots, right after the hot list, for the stocks topping IBKR's
+                                          # live scans - % gainers, % losers, hot by volume; US stocks and ADRs at
+                                          # $3-600 - so a stock too quiet for the morning's ranking that explodes
+                                          # intraday is streamed and checked (0-20; 0 = off)
     movers_min_rvol: float = 1.5          # a mover counts only on at least this much relative volume
     buffer_picks_per_sector: int = 2      # new buffer names scanned per sector per cycle
     kept_per_sector: int = 2              # buffer names kept waiting for a hot-list slot
@@ -151,6 +155,12 @@ class ScannerCfg(_Model):
     def _within_the_atrs(cls, value: float) -> float:
         """Past 5 ATRs a minute's candle almost never qualifies; below 0 is off."""
         return max(0.0, min(5.0, value))
+
+    @field_validator("live_scan", mode="after")
+    @classmethod
+    def _within_the_live_slots(cls, value: int) -> int:
+        """The live-scan names take watch-tier slots, which the hot list and the buffers need too."""
+        return max(0, min(20, value))
 
 
 class ValuationCfg(_Model):

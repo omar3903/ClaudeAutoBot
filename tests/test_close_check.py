@@ -1,5 +1,6 @@
 """The candle-close check seconds after each 5-minute close and the early-mover check between closes: what the
-candle loop queues, when the scan loop runs it, what it asks IBKR for, and the switches that leave it all off."""
+candle loop queues, when the scan loop runs it, what it asks IBKR for, and the switches that leave it all off - and
+IBKR's live scans, whose movers join the watch tier the checks read."""
 
 from __future__ import annotations
 
@@ -337,3 +338,97 @@ def test_once_a_session_the_live_candles_are_compared_with_ibkrs_bars(engine, ga
     assert len(lines) == 1 and lines[0].startswith("live candles vs IBKR 5-minute bars at 10:05")
     assert float(re.search(r"median volume ratio ([\d.]+)", lines[0]).group(1)) == pytest.approx(1.0)
     assert "median close difference 0.00%" in lines[0]
+
+
+# ---------------------------------------------------------------- IBKR's live scans
+#: what IBKR's three live scans show: T01 is on the hot list already, T23 is no stock IBKR has, T24 is in a sector the
+#: filters leave out and T25 has no daily candles; the rest are names the app has never seen
+LIVE = {"TOP_PERC_GAIN": ["T20", "T01", "T21", "T22"], "TOP_PERC_LOSE": ["T23", "T24", "T20"],
+        "HOT_BY_VOLUME": ["T25", "T26", "T27"]}
+
+
+@pytest.fixture
+def live(engine, monkeypatch):
+    """The engine with IBKR's live scans showing LIVE, 3 live-scan slots and every sector but Utilities (T24's)."""
+    from tos_bot.data.sectors import SECTORS
+    from tos_bot.scanner.filters import TradeFilters
+
+    monkeypatch.setattr(fakes, "SCANS", {code: list(names) for code, names in LIVE.items()})
+    monkeypatch.setattr(engine.settings.config.scanner, "live_scan", 3)
+    engine.scanner.filters = TradeFilters(sectors=tuple(s for s in SECTORS if s != "Utilities"))
+    engine.scanner.symbols.record({**{s: fakes.contract_details(s) for s in WATCH}, "T23": None})
+    engine.md.update_daily(["T20", "T21", "T22", "T24", "T26", "T27"], clock.prev_trading_day(DAY))
+    return engine
+
+
+def test_the_live_scans_put_the_first_passing_names_right_after_the_hot_list(live, gateway, monkeypatch, caplog):
+    live._stream_wake.clear()
+    with caplog.at_level(logging.INFO, logger="tos_bot.engine.engine"):
+        assert live._live_scan_once() == ["T20", "T26", "T21"]        # interleaved by rank, the first 3 that pass
+    assert gateway.scan_calls == ["TOP_PERC_GAIN", "TOP_PERC_LOSE", "HOT_BY_VOLUME"]
+    assert live.scanner.live_names == ["T20", "T26", "T21"] and live._stream_wake.is_set()
+    assert "live scan: +T20 +T26 +T21" in caplog.text
+    master = live.scanner.symbols
+    assert master.get("T22").found and master.get("T24").sector == "Utilities"      # looked up and kept
+    assert not master.get("T23").found
+    assert live.scanner.watch_symbols(50) == WATCH + ["T20", "T26", "T21"]
+    # once the close check has read them, the hottest first; one it hasn't read yet after them
+    live.scanner.live_stats = {"T21": (0.9, 1e8), "T26": (0.2, 1e8)}
+    assert live.scanner.watch_symbols(50) == WATCH + ["T21", "T26", "T20"]
+    assert live.scanner.watch_symbols(8) == WATCH + ["T21", "T26"]
+
+    # the same names next round: nothing said, the streams left alone
+    live._stream_wake.clear()
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="tos_bot.engine.engine"):
+        assert live._live_scan_once() == ["T20", "T26", "T21"]
+    assert len(gateway.scan_calls) == 6 and not live._stream_wake.is_set() and "live scan" not in caplog.text
+    # every scan empty is the scans failing: the names held stay
+    monkeypatch.setattr(fakes, "SCANS", {})
+    assert live._live_scan_once() == ["T20", "T26", "T21"] and len(gateway.scan_calls) == 9
+
+
+def test_the_live_scan_slots_default_to_10_within_0_to_20():
+    from tos_bot.config import ScannerCfg
+
+    assert ScannerCfg().live_scan == 10
+    assert ScannerCfg(live_scan=50).live_scan == 20 and ScannerCfg(live_scan=-1).live_scan == 0
+
+
+@pytest.mark.parametrize("off", ["live_scan", "stream_watch", "delayed", "closed", "quit", "yesterday"])
+def test_no_live_scan_is_asked_for_while_it_is_off_or_cant_run(live, gateway, now, monkeypatch, off):
+    live.scanner.set_live_names(["T20"])
+    if off == "live_scan":
+        monkeypatch.setattr(live.settings.config.scanner, "live_scan", 0)
+    elif off == "stream_watch":
+        monkeypatch.setattr(live.settings.config.execution, "stream_watch", 0)
+    elif off == "delayed":
+        gateway.delayed = True
+    elif off == "closed":
+        now["t"] = _at(16, 5)
+    elif off == "quit":
+        live.quit_state = {"by": "operator"}
+    elif off == "yesterday":
+        live.scanner.watchlist.session = clock.prev_trading_day(DAY)
+    assert live._live_scan_once() == [] and gateway.scan_calls == []
+    assert live.scanner.live_names == []                              # the names held are let go
+
+
+def test_a_live_name_thin_on_todays_volume_is_left_out_from_the_next_round(live, gateway, now, monkeypatch):
+    _bars_until(gateway, monkeypatch, _at(10, 5))
+    live._live_scan_once()
+    live._close_due = (_at(10, 5), time.monotonic())
+    live._run_scan("close")                                           # the live names are in the watch tier it reads
+    dollars = {s: live.scanner.live_stats[s][1] for s in ("T20", "T26", "T21")}
+    assert live._live_thin == set() and all(v > 0 for v in dollars.values())     # liquid enough at 5M a day
+
+    # a day's floor that, pro rata for 35 minutes of the session, falls between the thinnest and the rest
+    low, *rest = sorted(dollars.values())
+    per_day = (low + rest[0]) / 2 * 390 / max(30.0, clock.minutes_since_open(now["t"]))
+    monkeypatch.setattr(live.settings.config.scanner, "prefilter", {"min_dollar_volume": per_day})
+    _later(live, 300)
+    live._close_due = (_at(10, 5), time.monotonic())
+    live._run_scan("close")
+    thin = min(dollars, key=dollars.get)
+    assert live._live_thin == {thin}
+    assert live._live_scan_once() == [s for s in ("T20", "T26", "T21") if s != thin] + ["T27"]
