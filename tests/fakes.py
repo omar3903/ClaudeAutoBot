@@ -28,6 +28,8 @@ SYMBOLS = [f"T{i:02d}" for i in range(40)]
 #: pre-market gaps the fake Gateway shows, symbol -> %; a gapping stock trades heavy pre-market volume
 GAPS: Dict[str, float] = {}
 GAP_VOLUME = 1e5
+#: what IBKR's live market scans show, scan code -> symbols in rank order (tests set and clear it)
+SCANS: Dict[str, List[str]] = {}
 
 _SESSIONS = 300
 _BARS_PER_SESSION = 78                    # 09:30-16:00 in 5-minute bars
@@ -141,6 +143,7 @@ class FakeGateway:
         self.kw: Dict[str, object] = {}                     # how the app asked for the connection
         self.requests: List[Tuple[str, str, str]] = []      # (symbol, bar size, duration)
         self.fills: list = []                               # what get_fills reports
+        self.scan_calls: List[str] = []                     # every market scan asked for, by its code
 
     def knows(self, symbol: str) -> bool:
         return not self.symbols or symbol in self.symbols
@@ -188,6 +191,10 @@ class FakeGateway:
     def contract_details_many(self, symbols: Sequence[str]) -> Dict[str, Optional[dict]]:
         return {s: contract_details(s) if self.knows(s) else None for s in symbols}
 
+    def market_scan(self, code: str, **kw) -> List[str]:
+        self.scan_calls.append(code)
+        return [s for s in SCANS.get(code, []) if self.knows(s)]
+
     def list_orders(self, status: Optional[str] = None) -> list:
         return []
 
@@ -204,6 +211,7 @@ class StreamingGateway(FakeGateway):
         self.on_tick: Optional[Callable[[frozenset], None]] = None
         self.streams: List[str] = []                        # streaming now, in the order asked
         self.stream_calls: List[Tuple[List[str], int]] = []   # every set_streams: (symbols, limit)
+        self.protect = 0                                    # the last set_streams' protect: streams 101 never takes
         self.refuse: set = set()                            # stocks IBKR won't stream
         self.snapshots = 0
         self._latest: Dict[str, Tuple[Quote, float]] = {}
@@ -212,8 +220,9 @@ class StreamingGateway(FakeGateway):
     def can_stream(self) -> bool:
         return self.connected and not self.delayed
 
-    def set_streams(self, symbols: Sequence[str], limit: int) -> List[str]:
+    def set_streams(self, symbols: Sequence[str], limit: int, protect: int = 0) -> List[str]:
         self.stream_calls.append((list(symbols), limit))
+        self.protect = protect
         if not self.connected:
             return []                                       # the streams went with the connection
         if not self.can_stream or limit <= 0:
@@ -230,11 +239,12 @@ class StreamingGateway(FakeGateway):
         return None if hit is None else (hit[0], max(0.0, time.monotonic() - hit[1]))
 
     def tick(self, symbol: str, price: float, age_s: float = 0.0,
-             bid: Optional[float] = None, ask: Optional[float] = None) -> Quote:
-        """A streamed trade at ``price`` for a stock that is streaming, as if it came ``age_s`` seconds ago."""
+             bid: Optional[float] = None, ask: Optional[float] = None, volume: float = 0.0) -> Quote:
+        """A streamed trade at ``price`` for a stock that is streaming, as if it came ``age_s`` seconds ago.
+        ``volume``: the day's cumulative volume so far, as the Ticker holds it."""
         assert symbol in self.streams, f"{symbol} isn't streaming - set_streams first"
         q = Quote(symbol=symbol, bid=round(price - 0.01, 2) if bid is None else bid,
-                  ask=round(price + 0.01, 2) if ask is None else ask, last=price,
+                  ask=round(price + 0.01, 2) if ask is None else ask, last=price, volume=volume,
                   ts=dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=age_s), source="stream")
         self._latest[symbol] = (q, time.monotonic() - age_s)
         if self.on_tick is not None:

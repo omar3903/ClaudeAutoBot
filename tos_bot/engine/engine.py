@@ -5,15 +5,25 @@ the scanner, order execution and the automatic exits, and runs three
 background loops:
 
     scan loop      the daily full scan before the open, the intraday cycles over
-                   the hot list and sector buffers, and fast hot-list cycles while
-                   Autopilot is day-trading (see scanner/schedule.py)
+                   the hot list and sector buffers, fast hot-list cycles while
+                   Autopilot is day-trading (see scanner/schedule.py), and the
+                   candle-close check on the watch tier seconds after each
+                   5-minute close
     sync loop      every few seconds: fills, automatic exits, quit progress - and in
                    regular hours the exits again within a second of a streamed
                    tick on a stock held
     snapshot loop  every 10-30 s: account, broker-vs-database check, broadcast
-    stream loop    points IBKR's real-time streams at the positions, then the plays
+    stream loop    points IBKR's real-time streams at the positions, then the plays,
+                   then the watch tier (the day's hot list and buffer names)
     price push     the streamed prices that moved, to the dashboard at most once a
                    second (prices.tick)
+    candle loop    a moment after each minute: closes the live 1- and 5-minute
+                   candles built from the streamed ticks (data/candles.py), and
+                   queues the candle-close check or the early movers for the scan
+                   loop
+    live scan      every minute in regular hours: IBKR's % gainers, % losers and
+                   hot-by-volume scans put the movers the morning's ranking missed
+                   into the watch tier
 
 Whatever the user changes on the dashboard applies straight away, is
 remembered in data/runtime.json (runtime.py) and is broadcast to every tab.
@@ -27,13 +37,14 @@ record is deleted only when a connected broker confirms the position is gone
 
 
 import datetime as dt
+import itertools
 import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from .. import secrets_store
 from ..brokers import get_broker
@@ -44,16 +55,19 @@ from ..core.enums import PlayStatus, Side, Timeframe
 from ..core.eventbus import BUS
 from ..core.models import Account, Play
 from ..data.bars import DailyBarStore
+from ..data.candles import Candle
 from ..data.fundamentals import FundamentalsProvider
 from ..data.listings import UsListings
 from ..data.market_data import INTRADAY_BAR, MarketData, NoDataSource
 from ..data.sec_edgar import SecEdgarFundamentals
+from ..data.sectors import sector_allowed
 from ..data.symbols import SymbolMaster
 from ..execution.autopilot import AutoPilot
 from ..execution.executor import Executor
 from ..execution.exit_manager import ExitManager, scale_out_plan
 from ..execution.order_builder import plan_order
 from ..execution.protective_stops import TAG as STOP_TAG, TARGET_TAG, stop_exit_reason
+from ..indicators import ta
 from ..persistence.db import init_db
 from ..persistence.repository import Repository
 from ..risk.pdt_guard import PdtGuard
@@ -74,7 +88,7 @@ from .market_regime import MarketRegime
 from ..scanner.noise import LABELS as NOISE_LABELS
 from ..scanner import schedule
 from ..scanner.filters import TradeFilters
-from ..scanner.scanner import Scanner
+from ..scanner.scanner import Scanner, ScanResult
 from ..scanner.schedule import ScanSettings
 from ..strategies.registry import REGISTRY, build_strategies, strategy_catalog
 from ..util import clock
@@ -277,6 +291,20 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._last_wide_at = time.monotonic()
         self._noted: Dict[tuple, float] = {}          # Autopilot notes already shown, and when
         self._scan_retry_at = 0.0
+        # the candle-close and early-mover checks the candle loop queues for the scan loop (_on_minute). The lock
+        # guards the queue only - it is never held across a request, the scanner, the board or Autopilot
+        self._close_lock = threading.Lock()
+        self._close_due: Optional[Tuple[dt.datetime, float]] = None   # the 5-minute close, and the monotonic time due
+        self._movers_due: Dict[str, dt.datetime] = {}      # early movers to check: the minute each was found in
+        self._mover_why: Dict[str, str] = {}               # ...and why, for the check's log line
+        self._mover_at: Dict[str, float] = {}              # when each stock was last queued as a mover (epoch)
+        # scan thread only: when each stock was last asked for its bars by a check, and the last check's context
+        self._close_asked: Dict[str, float] = {}
+        self._close_ran: Optional[Dict[str, Any]] = None
+        # IBKR's live scans (_live_scan_once): the names a close check found too thin on today's volume, left out
+        # for the rest of the session, and the session that is
+        self._live_thin: set = set()
+        self._live_session: Optional[dt.date] = None
 
         # the orders working at the broker, for the dashboard (see active_orders)
         self._orders: List[Dict[str, Any]] = []
@@ -318,7 +346,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             ("scan-loop", self._scan_loop), ("sync-loop", self._sync_loop), ("snapshot-loop", self._snapshot_loop),
             ("orders-loop", self._orders_loop), ("signals-loop", self._signals_loop),
             ("journal-loop", self._journal_loop), ("pairs-loop", self._pairs_loop),
-            ("stream-loop", self._stream_loop), ("price-push", self._price_push_loop))]
+            ("stream-loop", self._stream_loop), ("price-push", self._price_push_loop),
+            ("candle-loop", self._candle_loop), ("live-scan", self._live_scan_loop))]
         for t in self._threads:
             t.start()
         self._publish("engine.started", state=self.snapshot())
@@ -756,6 +785,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         while not self._stop.is_set():
             # every other loop guards its body; this one must too - if it stops, no scan runs and Autopilot
             # never takes another entry, with nothing on the dashboard to say so
+            kind = None
             try:
                 kind = self._due_scan()
                 if kind:
@@ -764,8 +794,18 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self._resume_replay()
             except Exception:  # noqa: BLE001
                 log.exception("scan loop pass failed")
-            self._scan_wake.wait(5.0)
+            # a candle-close check due sooner cuts the wait short; one that came due while a scan ran follows it
+            # at once - but a pass that ran nothing (quitting, backing off) never spins on it
+            wait = self._next_scan_wait()
+            self._scan_wake.wait(wait if wait > 0 or kind else 5.0)
             self._scan_wake.clear()
+
+    def _next_scan_wait(self) -> float:
+        """How long the scan loop waits before its next pass: 5 s, or until a candle-close check is due if that
+        is sooner - so the check starts CLOSE_GRACE_S after the close without the candle thread sleeping."""
+        with self._close_lock:
+            due = self._close_due
+        return 5.0 if due is None else max(0.0, min(5.0, due[1] - time.monotonic()))
 
     #: the order sync and a full pass of the exits come this often
     SYNC_S = 4.0
@@ -892,11 +932,19 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _resync_streams(self) -> List[str]:
         """Stream the stocks held, then the plays on offer - the ones the operator opened and the ones
-        Autopilot would take first - within execution.stream_lines (0 = none, and every price is a snapshot
-        as before). Returns the symbols streaming now."""
-        lines = int(self.settings.config.execution.stream_lines or 0)
+        Autopilot would take first - then the watch tier (the day's hot list, kept and next buffer names, up to
+        execution.stream_watch; 0 = none), all within execution.stream_lines (0 = none, and every price is a
+        snapshot as before). Returns the symbols streaming now."""
+        execution = self.settings.config.execution
+        lines = int(execution.stream_lines or 0)
         held, plays = self._stream_wanted() if lines > 0 else ([], [])
-        return self.md.streams.sync(held, plays, lines, candidates=self._ap_candidates)
+        n = int(execution.stream_watch or 0)
+        try:
+            watch = self.scanner.watch_symbols(n) if lines > 0 and n > 0 else []
+        except Exception:  # noqa: BLE001 - the positions and plays still stream; the tier waits for the next pass
+            log.debug("the watch tier couldn't be read", exc_info=True)
+            watch = []
+        return self.md.streams.sync(held, plays, lines, candidates=self._ap_candidates, watch=watch)
 
     def _stream_wanted(self) -> Tuple[List[str], List[str]]:
         """The stocks to stream, most needed first: those held - this venue's open trades, the entries still
@@ -938,11 +986,224 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 for symbol, (price, at) in moved.items()})
         return len(moved)
 
+    #: the live candles close this long after each minute, so a tick stamped just before it is in first
+    CANDLE_ROLL_DELAY_S = 0.25
+
+    def _candle_loop(self) -> None:
+        """Closes the live candles (data/candles.py) on the clock, a moment after each minute - so a quiet stock's
+        candle closes on time too, not at its next tick. It never asks IBKR for anything, and never touches the
+        scanner, the board or Autopilot."""
+        while not self._stop.is_set():
+            now = time.time()
+            minute = (now // 60 + 1) * 60
+            if self._stop.wait(minute - now + self.CANDLE_ROLL_DELAY_S):
+                return
+            try:
+                self._on_minute(minute)
+            except Exception:  # noqa: BLE001
+                log.exception("live candles: the minute roll failed")
+
+    #: the candle-close check starts this long after a 5-minute close, so IBKR has finished the bar
+    CLOSE_GRACE_S = 2.0
+    #: a check that can't start within this long of its close is dropped - a long scan held the thread; the fast
+    #: cycle and the next close cover it
+    CLOSE_STALE_S = 60.0
+    #: no stock is asked for its bars by two checks within this long: IBKR refuses identical requests within 15 s
+    CLOSE_ASK_GAP_S = 15.0
+    #: a stock is queued as an early mover at most this often
+    MOVER_EVERY_S = 300.0
+    #: a new high or low of the day counts as a move on this many times the stream's mean minute volume...
+    MOVER_VOLUME_X = 3.0
+    #: ...once the stream holds this many whole minutes of the stock today
+    MOVER_MIN_CANDLES = 5
+
+    def _on_minute(self, minute: float) -> Dict[str, Candle]:
+        """The minute ending at ``minute`` (epoch seconds) is over: close its live candles, and the 5-minute ones
+        on a :00/:05... boundary. Then, in regular hours on real-time data, queue the candle-close check at a
+        5-minute close (due CLOSE_GRACE_S later, over the whole watch tier) or, between closes, the watch stocks
+        whose minute was a move (_find_movers), and wake the scan loop. Here on the candle thread it only reads
+        and queues: the scan thread fetches the bars, runs the setups and lets Autopilot enter. Returns {symbol:
+        the 1-minute candle just closed}."""
+        closed = self.md.candles.roll(minute)
+        at = dt.datetime.fromtimestamp(minute, clock.NY)
+        if not self._close_checks_on(at):
+            return closed
+        cfg = self.settings.config
+        watch = self.scanner.watch_symbols(int(cfg.execution.stream_watch), at)
+        if not watch:
+            return closed
+        # the 09:30 close has only pre-market behind it, and 16:00 none after it
+        boundary = at.minute % 5 == 0 and self._in_session(at, 5)
+        movers: Dict[str, str] = {}
+        if not boundary and cfg.scanner.mover_atr > 0 and self._in_session(at, 1):
+            movers = self._find_movers(closed, watch, at)
+        queued = boundary
+        with self._close_lock:
+            if boundary:
+                self._close_due = (at, time.monotonic() + self.CLOSE_GRACE_S)
+            if movers:
+                self._mover_at = {s: t for s, t in self._mover_at.items() if minute - t < self.MOVER_EVERY_S}
+            for symbol, why in movers.items():
+                if symbol in self._mover_at:
+                    continue                             # checked as a mover in the last 5 minutes
+                self._movers_due[symbol], self._mover_why[symbol], self._mover_at[symbol] = at, why, minute
+                queued = True
+        if queued:
+            self._scan_wake.set()
+        return closed
+
+    def _close_checks_on(self, at: dt.datetime) -> bool:
+        """Whether the candle-close and early-mover checks run at ``at``: switched on (scanner.close_check, and a
+        watch tier to check), connected on real-time data that flows, in regular hours and not while quitting.
+        Connected means the Gateway is up, not only attached: while IBKR reconnects by itself the source stays
+        attached, and a check queued then would only fail at the scan thread every 5 minutes."""
+        cfg = self.settings.config
+        return bool(cfg.scanner.close_check and int(cfg.execution.stream_watch or 0) > 0 and self.md.connected
+                    and not self.md.delayed and not self.md.refused and not self.quit_state
+                    and clock.is_market_open(at))
+
+    @staticmethod
+    def _in_session(at: dt.datetime, minutes: int) -> bool:
+        """Whether the candle of ``minutes`` that ended at ``at`` lies in the regular session."""
+        return clock.is_market_open(at - dt.timedelta(minutes=minutes)) and clock.is_market_open(at)
+
+    def _find_movers(self, closed: Mapping[str, Candle], watch: Sequence[str], at: dt.datetime) -> Dict[str, str]:
+        """The watch stocks whose whole 1-minute candle that just closed was a move: (a) its true range spans at
+        least scanner.mover_atr of the stock's 5-minute ATRs (IBKR's bars, as cached - no request), or (b) it made
+        a new high or low of the day on at least MOVER_VOLUME_X times the stream's mean minute volume today.
+        Biggest range first, each with a few words on why. A candle spanning a whole 5-minute ATR is far outside
+        a stock's usual minute, and (b) compares the stream with itself, so whether the stream counts shares or
+        lots can't skew either. On the candle thread: it only reads."""
+        k, midnight = float(self.settings.config.scanner.mover_atr), at.replace(hour=0, minute=0)
+        found: List[Tuple[float, str, str]] = []
+        for symbol in watch:
+            c = closed.get(symbol)
+            if c is None or c.partial:
+                continue
+            frame = self.md.cached_intraday(symbol)
+            if frame is None or len(frame) < 15:
+                continue
+            atr5 = float(ta.atr(frame.tail(30), 14).iloc[-1])
+            if not atr5 > 0:
+                continue
+            last = self.md.candles.closed(symbol, 1, n=2)
+            prev = last[0].close if len(last) == 2 and last[1] is c else None
+            high, low = (c.high, c.low) if prev is None else (max(c.high, prev), min(c.low, prev))
+            span = (high - low) / atr5
+            why = [f"1-minute candle {span:.1f} ATRs"] if span >= k else []
+            stats = self.md.candles.day_stats(symbol, c.start)
+            if (stats is not None and stats[3] >= self.MOVER_MIN_CANDLES and stats[2] > 0
+                    and c.volume >= self.MOVER_VOLUME_X * stats[2]):
+                # the day's range so far: the stream's whole minutes, and IBKR's bars that had ended by then
+                bars = frame[(frame.index >= midnight)
+                             & (frame.index <= c.at - dt.timedelta(minutes=5))]
+                day_high = max(stats[0], float(bars["high"].max()) if len(bars) else stats[0])
+                day_low = min(stats[1], float(bars["low"].min()) if len(bars) else stats[1])
+                if c.high > day_high or c.low < day_low:
+                    why.append(f"new {'high' if c.high > day_high else 'low'} on {c.volume / stats[2]:.1f}x volume")
+            if why:
+                found.append((span, symbol, ", ".join(why)))
+        return {symbol: why for _, symbol, why in sorted(found, key=lambda f: -f[0])}
+
+    #: IBKR's live market scans run this often in regular hours, one after another on the live-scan thread
+    LIVE_SCAN_S = 60.0
+    #: ...these three: the biggest % gainers, the biggest % losers and the stocks hottest by volume
+    LIVE_SCAN_CODES = ("TOP_PERC_GAIN", "TOP_PERC_LOSE", "HOT_BY_VOLUME")
+    #: names the scans bring that the app has never seen are looked up at most this many a round
+    LIVE_LOOKUPS = 20
+
+    def _live_scan_loop(self) -> None:
+        """Runs IBKR's live market scans every LIVE_SCAN_S (_live_scan_once). A thread of its own: each scan waits
+        a couple of seconds on the Gateway, and must never hold up a scan, the streams or the exits."""
+        if self._stop.wait(30.0):                    # the connection and the day's watchlist come first
+            return
+        while not self._stop.is_set():
+            try:
+                self._live_scan_once()
+            except Exception:  # noqa: BLE001
+                log.exception("live scan failed")
+            self._stop.wait(self.LIVE_SCAN_S)
+
+    def _live_scan_once(self, now: Optional[dt.datetime] = None) -> List[str]:
+        """One round of IBKR's live scans (LIVE_SCAN_CODES, one after another): their names interleaved by rank -
+        each scan's first, then each one's second... - that SymbolMaster calls ordinary tradable shares, in a sector
+        the filters allow, with daily candles (the morning's download covers every tradable listing), not on the
+        hot list already and not found too thin today (_thin_live_names). The first scanner.live_scan of them take
+        watch-tier slots right after the hot list (Scanner.set_live_names), so a stock too quiet for the morning's
+        ranking is streamed and checked once it moves. Names never seen before are looked up first, LIVE_LOOKUPS a
+        round, and kept in symbols.json. Only in regular hours on real-time data, with today's watchlist and the
+        watch tier on, and not while quitting - otherwise nothing is asked and the names held are let go. Returns
+        the names held now."""
+        cfg = self.settings.config
+        now = (now or clock.now_ny()).astimezone(clock.NY)
+        n, wl = int(cfg.scanner.live_scan or 0), self.scanner.watchlist
+        if not (n > 0 and int(cfg.execution.stream_watch or 0) > 0 and self.md.attached and not self.md.delayed
+                and not self.md.refused and not self.quit_state and clock.is_market_open(now)
+                and wl is not None and wl.session == now.date()):
+            if self.scanner.live_names:
+                self.scanner.set_live_names([])
+                self._stream_wake.set()
+            return []
+        if self._live_session != now.date():
+            self._live_session, self._live_thin = now.date(), set()     # a new session's volume is judged afresh
+        scans = []
+        for code in self.LIVE_SCAN_CODES:
+            if self._stop.is_set():
+                return list(self.scanner.live_names)
+            scans.append(self.md.market_scan(code))
+        if not any(scans):
+            # in regular hours IBKR always has movers: nothing at all is the scans failing, and dropping the names
+            # held would only end their streams until the next round brings them back
+            return list(self.scanner.live_names)
+        found = list(dict.fromkeys(s for rank in itertools.zip_longest(*scans) for s in rank if s))
+        master = self.scanner.symbols
+        unknown = master.unknown(found)[:self.LIVE_LOOKUPS]
+        if unknown:
+            try:
+                master.record(self.md.source.contract_details_many(unknown))
+            except Exception as e:  # noqa: BLE001 - the names already known still count; the rest wait a round
+                log.debug("live scan: contract details unavailable: %s", e)
+        hot, thin, sectors = set(wl.hot_symbols()), set(self._live_thin), self.scanner.filters.sectors
+        names: List[str] = []
+        for symbol in master.tradable(found):
+            if len(names) >= n:
+                break
+            if (symbol not in hot and symbol not in thin and sector_allowed(master.sector(symbol), sectors)
+                    and self.md.daily_frame(symbol) is not None):
+                names.append(symbol)
+        before = list(self.scanner.live_names)
+        if names != before:
+            self.scanner.set_live_names(names)
+            moved = [f"+{s}" for s in names if s not in before] + [f"-{s}" for s in before if s not in names]
+            if moved:
+                log.info("live scan: %s", " ".join(moved))
+            self._stream_wake.set()                  # the streams follow the watch tier
+        return names
+
+    def _thin_live_names(self, result: ScanResult) -> List[str]:
+        """After a candle-close check: the live-scan names it read whose dollar volume today is short of the
+        morning's liquidity floor (scanner.prefilter's min_dollar_volume, 5,000,000 when unset) pro rata for the
+        time of day - max(30, minutes since the open) of 390 - are left out from the live scan's next round, for
+        the rest of the session: judged on today's volume, as the morning's ranking judges 20 sessions'. Sizing's
+        cap on the median daily volume (risk.max_adv_pct) still limits any order on them. Returns those names."""
+        live = set(self.scanner.live_names)
+        if not live:
+            return []
+        least = self.settings.config.scanner.prefilter.get("min_dollar_volume")
+        floor = float(5_000_000 if least is None else least) * max(30.0, clock.minutes_since_open()) / 390.0
+        stats = self.scanner.live_stats
+        thin = [s for s in result.symbols if s in live and s in stats and stats[s][1] < floor]
+        if thin:
+            self._live_thin.update(thin)
+            log.debug("live scan: %s too thin today (under $%.0f so far) - left out from the next round",
+                      ", ".join(thin), floor)
+        return thin
+
     # ------------------------------------------------------------------ #
     #  Scans                                                             #
     # ------------------------------------------------------------------ #
     def _due_scan(self) -> Optional[str]:
-        """full | cycle | fast | None - see scanner/schedule.py."""
+        """full | gappers | close | cycle | wide | fast | plays | None - see scanner/schedule.py."""
         if self.quit_state:
             return None
         with self._scan_lock:
@@ -960,14 +1221,24 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return "gappers"
         if wl is None or not clock.is_market_open(now):
             return None
+        with self._close_lock:
+            close_due, movers = self._close_due, bool(self._movers_due)
+        # the early movers wait for a 5-minute close queued behind them: it covers them, and run now it would read
+        # IBKR's bars before CLOSE_GRACE_S has let IBKR finish them
+        if (close_due is not None and mono >= close_due[1]) or (close_due is None and movers):
+            return "close"
+        # a candle-close check starts within seconds: it stands in for the fast cycle, and the quick re-check
+        # waits for it rather than hold it up
+        waiting = close_due is not None
         if mono - self._last_cycle_at >= self.scan_settings.cycle_minutes * 60:
             return "cycle"
         if self.scan_settings.wide_on and mono - self._last_wide_at >= self.scan_settings.wide_minutes * 60:
             return "wide"
-        if self._autopilot_day_active() and mono - self._last_fast_at >= self.settings.config.scanner.fast_cycle_seconds:
+        if (not waiting and self._autopilot_day_active()
+                and mono - self._last_fast_at >= self.settings.config.scanner.fast_cycle_seconds):
             return "fast"
         refresh = self.settings.config.scanner.plays_refresh_seconds
-        if refresh and mono - self._last_plays_at >= refresh and self._board_symbols():
+        if not waiting and refresh and mono - self._last_plays_at >= refresh and self._board_symbols():
             return "plays"
         return None
 
@@ -996,14 +1267,20 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _run_scan(self, kind: str) -> None:
         quick = kind == "plays"                         # the quick re-check of the plays on the board
-        if not quick:
+        # ...and the candle-close check are light: seconds matter, so no lead-in, and a failure is only logged
+        light = quick or kind == "close"
+        if not light:
             self._scan_running = {"kind": kind, "started_at": clock.now_ny().isoformat()}
             self._publish("scan.started", kind=kind)
+        # the candle-close check takes what the candle loop queued before anything can fail: a failure in the
+        # lead-in below that left it queued would find it due again at once - the scan loop would spin on it,
+        # logging, with every cycle starved behind it
+        queued = self._take_close_queue() if kind == "close" else None
         try:
-            if not quick:
+            if not light:
                 self._refresh_account()
             self.scanner.account = self.sizing_account()
-            if not quick:
+            if not light:
                 self._refresh_regime()
             self.scanner.market = self.regime.context()
             self.scanner.evidence_weights = self.evidence_weights()
@@ -1014,6 +1291,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 result = self.scanner.run_gappers()
             elif kind == "wide":
                 result = self.scanner.run_wide(self.scan_settings.wide_stocks, self.scan_settings.movers)
+            elif kind == "close":
+                result = self._close_check(queued)
+                if result is None:
+                    return                                 # nothing left to check
             elif quick:
                 result = self.scanner.run_plays(self._board_symbols())
             else:
@@ -1021,6 +1302,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         except NoDataSource as e:
             if quick:
                 self._last_plays_at = time.monotonic()
+            elif kind == "close":
+                log.warning("the candle-close check failed: %s", e)
             else:
                 self._scan_failed(kind, str(e))
             return
@@ -1028,17 +1311,24 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             if quick:
                 log.debug("quick re-check of the plays failed", exc_info=True)
                 self._last_plays_at = time.monotonic()
+            elif kind == "close":                        # no back-off: the fast cycle and the next close go on
+                log.warning("the candle-close check failed: %s", e)
             else:
                 log.exception("%s scan failed", kind)
                 self._scan_failed(kind, f"The {kind} scan failed: {e}")
             return
         finally:
-            if not quick:
+            if not light:
                 self._scan_running = None
 
         mono = time.monotonic()
         if quick:
             self._last_plays_at = mono
+        elif kind == "close":
+            # a check at a 5-minute close stood in for the fast cycle: the next one comes fast_cycle_seconds on.
+            # An early-mover check covered a few stocks only, so it moves no timer
+            if self._close_ran is not None and self._close_ran["boundary"] is not None:
+                self._last_fast_at = mono
         else:
             self._scan_retry_at = 0.0
             if kind == "full":
@@ -1078,7 +1368,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                                       plays=held)
             except Exception:  # noqa: BLE001
                 log.exception("could not save the scan")
-        if not quick:
+        if not light:                                      # the light checks make no watchlist decision
             self._publish("watchlist.updated", **self.watchlist_state())
         if not self.quit_state:
             try:
@@ -1086,7 +1376,73 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             except Exception:  # noqa: BLE001
                 log.exception("autopilot pass failed")
         self._publish_plays()                              # after the pass: each play carries Autopilot's verdict on it
+        if kind == "close":
+            self._log_close_check(result, changes)
+            self._thin_live_names(result)
         self._note_changes(changes)
+
+    def _take_close_queue(self) -> Tuple[Optional[dt.datetime], Dict[str, dt.datetime], Dict[str, str]]:
+        """Take what the candle loop queued (_on_minute): the 5-minute close once it is due, and the early movers
+        with why. A close not due yet stays queued, and the movers with it - it covers them, and IBKR is still
+        finishing its bar (CLOSE_GRACE_S); the scan loop wakes for it when it is due."""
+        with self._close_lock:
+            due = self._close_due
+            if due is not None and time.monotonic() < due[1]:
+                return None, {}, {}
+            movers, why = self._movers_due, self._mover_why
+            self._close_due, self._movers_due, self._mover_why = None, {}, {}
+        return (due[0] if due is not None else None), movers, why
+
+    def _close_check(self, queued: Optional[Tuple[Optional[dt.datetime], Dict[str, dt.datetime],
+                                                  Dict[str, str]]] = None) -> Optional[ScanResult]:
+        """The check the candle loop queued (_on_minute), on the scan thread - ``queued`` as _take_close_queue
+        took it (taken here when not given): at a 5-minute close the whole watch tier, else the early movers still
+        in it, on IBKR's newest 5-minute bars (Scanner.run_close). A check that couldn't start within
+        CLOSE_STALE_S of its close is dropped, and no stock is asked twice within CLOSE_ASK_GAP_S. None when
+        nothing is left to check."""
+        boundary, movers, why = queued if queued is not None else self._take_close_queue()
+        now = clock.now_ny()
+        if boundary is not None and (now - boundary).total_seconds() > self.CLOSE_STALE_S:
+            log.debug("the %s ET candle-close check is dropped: it couldn't start until %.0f s after the close",
+                      boundary.strftime("%H:%M"), (now - boundary).total_seconds())
+            boundary = None
+        movers = {s: m for s, m in movers.items() if (now - m).total_seconds() <= self.CLOSE_STALE_S}
+        watch = self.scanner.watch_symbols(int(self.settings.config.execution.stream_watch or 0))
+        if boundary is not None:
+            symbols, since = watch, boundary
+        else:
+            tier = set(watch)
+            symbols = [s for s in movers if s in tier]
+            since = now.replace(minute=now.minute - now.minute % 5, second=0, microsecond=0)
+        mono = time.monotonic()
+        self._close_asked = {s: t for s, t in self._close_asked.items() if mono - t < 60.0}    # long past IBKR's 15 s
+        symbols = [s for s in symbols if mono - self._close_asked.get(s, float("-inf")) >= self.CLOSE_ASK_GAP_S]
+        if not symbols:
+            return None
+        self._close_asked.update(dict.fromkeys(symbols, mono))
+        self._close_ran = {"boundary": boundary, "asked": len(symbols),
+                           "minute": max((movers[s] for s in symbols if s in movers), default=since),
+                           "why": {s: why[s] for s in symbols if s in why}}
+        return self.scanner.run_close(symbols, since)
+
+    def _log_close_check(self, result: ScanResult, changes: List[Any]) -> None:
+        """The check's one INFO line: what it read and found, and how long after the close its plays were out."""
+        ran = self._close_ran or {}
+        now = clock.now_ny()
+        n, new = len(result.plays), sum(c.kind == "added" for c in changes)
+        plays = f"{n} play{'' if n == 1 else 's'}"
+        boundary = ran.get("boundary")
+        if boundary is not None:
+            log.info("close check %s ET: %d of %d stocks read, %s (%d new) - published %.1f s after the candle closed "
+                     "(candles %.1f s, setups %.1f s)", boundary.strftime("%H:%M"), len(result.symbols),
+                     ran.get("asked", 0), plays, new, (now - boundary).total_seconds(),
+                     result.timings.get("intraday_candles", 0.0), result.timings.get("setups", 0.0))
+            return
+        minute, asked = ran.get("minute") or now, int(ran.get("asked", 0))
+        why = "; ".join(f"{s}: {w}" for s, w in (ran.get("why") or {}).items())
+        log.info("early-mover check %s ET (%s): %d stock%s, %s - published %.1f s after the minute closed",
+                 minute.strftime("%H:%M"), why, asked, "" if asked == 1 else "s", plays,
+                 (now - minute).total_seconds())
 
     def _replay_after_full_scan(self) -> None:
         """The morning's full scan has just built today's watchlist - replay the strategies on it now

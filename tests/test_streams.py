@@ -13,6 +13,7 @@ from tos_bot.config import ExecutionCfg
 from tos_bot.data.bars import DailyBarStore
 from tos_bot.data.market_data import MarketData, NoDataSource, quote_from_price
 from tos_bot.data.streams import StreamManager
+from tos_bot.util import clock
 
 
 def _streaming(tmp_path, symbols=("AAA", "BBB"), **kwargs):
@@ -103,6 +104,23 @@ def test_the_plays_opened_on_the_dashboard_go_first_then_the_ones_autopilot_woul
     assert md.streams.preferred() == ["T08", "T10", "T09", "T07"]
 
 
+def test_the_watch_tier_streams_after_the_plays_within_the_lines(tmp_path):
+    gateway, md = _streaming(tmp_path, fakes.SYMBOLS)
+    # T03 is a play already: it streams once, as a play; the tier fills the lines left, in the order given
+    assert md.streams.sync(["T01"], ["T02", "T03"], 5, watch=["T03", "T04", "", "T05", "T06"]) == [
+        "T01", "T02", "T03", "T04", "T05"]
+    assert gateway.stream_calls[-1] == (["T01", "T02", "T03", "T04", "T05", "T06"], 5)
+    assert gateway.protect == 1                                             # 101 never takes the position's line
+    # a watch name has no minute's hold: the tier re-ranked, T04 gives its line up at once
+    assert md.streams.sync(["T01"], ["T02", "T03"], 5, watch=["T06", "T05", "T04"]) == [
+        "T01", "T02", "T03", "T06", "T05"]
+    # no watch tier: the same call as without one
+    md.streams.sync(["T01", "T07"], ["T02", "T03"], 5)
+    without = gateway.stream_calls[-1]
+    md.streams.sync(["T01", "T07"], ["T02", "T03"], 5, watch=())
+    assert gateway.stream_calls[-1] == without == (["T01", "T07", "T02", "T03"], 5) and gateway.protect == 2
+
+
 def test_a_dropped_connection_prices_as_before_and_the_streams_are_asked_for_again(tmp_path):
     gateway, md = _streaming(tmp_path)
     md.streams.sync(["AAA"], [], 5)
@@ -153,6 +171,28 @@ def test_ticks_reach_every_listener_even_when_one_fails(tmp_path):
     assert heard == [frozenset({"AAA"})] and md.streams._moved == {"AAA"}
     md.attach(gateway)                                   # a new connection starts clean
     assert md.streams._moved == set()
+
+
+def test_the_streamed_ticks_build_live_candles_and_a_stock_no_longer_streamed_is_forgotten(tmp_path):
+    gateway, md = _streaming(tmp_path, fakes.SYMBOLS)
+    md.streams.sync(["T01"], ["T02"], 5)
+    at = dt.datetime(2026, 9, 24, 10, 0, 20, tzinfo=clock.NY)
+    assert clock.is_trading_day(at.date())
+
+    def ago(sec: float) -> float:                        # the age that stamps a tick ``sec`` after ``at``
+        return time.time() - (at.timestamp() + sec)
+
+    gateway.tick("T01", 10.0, age_s=ago(0), volume=1000)
+    gateway.tick("T01", 10.4, age_s=ago(10), volume=1500)
+    gateway.tick("T01", 10.4, age_s=ago(15), volume=1500, bid=10.3, ask=10.5)    # only the book moved
+    gateway.tick("T02", 20.0, age_s=ago(5), volume=300)
+    c = md.candles.forming("T01")
+    assert (c.close, c.high, c.volume, c.at) == (10.4, 10.4, 500.0, at.replace(second=0))
+    assert md.candles.forming("T02").close == 20.0
+    md.streams.sync(["T01"], [], 5)                      # T02's play went: its stream ends, and its candles
+    assert md.candles.symbols() == ["T01"] and md.candles.forming("T02") is None
+    md.detach()
+    assert md.candles.symbols() == []
 
 
 # ---------------------------------------------------------------- the latest price, for the dashboard
@@ -213,6 +253,8 @@ def test_no_price_is_sent_once_it_cant_stream_and_a_new_connection_or_stream_sen
 
 # ---------------------------------------------------------------- the setting
 def test_the_line_budget_stays_within_what_ibkr_allows():
-    assert ExecutionCfg().stream_lines == 60
+    assert ExecutionCfg().stream_lines == 80 and ExecutionCfg().stream_watch == 50
     assert ExecutionCfg(stream_lines=500).stream_lines == 90
     assert ExecutionCfg(stream_lines=-3).stream_lines == 0
+    assert ExecutionCfg(stream_watch=500).stream_watch == 80
+    assert ExecutionCfg(stream_watch=-3).stream_watch == 0

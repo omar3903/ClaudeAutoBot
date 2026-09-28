@@ -47,11 +47,21 @@ scanner:
   wide_stocks: 0                       # the hottest N of the full scan's liquid stocks; 0 = all of them
   movers: 10                           # today's biggest movers on volume hold hot-list slots after each wide scan
   yesterday_movers: 10                 # ...and the last session's biggest movers, from the full scan (0 = off)
+  live_scan: 10                        # watch-tier slots, right after the hot list, for the stocks topping IBKR's
+                                       # live scans (% gainers, % losers, hot by volume; US stocks and ADRs at
+                                       # $3-600), so one too quiet for the morning's ranking that explodes intraday
+                                       # is streamed and checked (0-20; 0 = off)
   movers_min_rvol: 1.5                 # a mover counts only on at least this much relative volume
   buffer_picks_per_sector: 2           # new buffer names looked at per sector each cycle
   kept_per_sector: 2                   # promising buffer names kept waiting for a hot-list slot
   fast_cycle_seconds: 60               # hot list only, while Autopilot day-trades an open session
   plays_refresh_seconds: 15            # re-check the stocks with plays on the board this often (0 = off)
+  close_check: true                    # at each 5-minute candle close in regular hours, +2 s, check the watch
+                                       # tier's setups on IBKR's just-closed bars at once, in place of the fast
+                                       # cycle due then (false = off, the fast cycle as before)
+  mover_atr: 1.0                       # a watch stock whose streamed 1-minute candle spans this many 5-minute ATRs,
+                                       # or makes a new high/low of the day on 3x its average minute volume, is
+                                       # checked at once, at most once per 5 minutes (0-5; 0 = off)
   fundamentals_leaders: 8              # valuation setups (SEC EDGAR financials) on this many top names
   gapper_time: "09:15"                # ET, 08:00-09:25 - the pre-open gap check reads the hot list and buffer
                                        # names' pre-market candles once; the gappers join the hot list
@@ -119,8 +129,10 @@ execution:
   limit_offset_bps: 5                  # cross the spread by this when marketable-limit
   time_in_force: "DAY"
   bracket_orders: true                # attach stop + target as an OCO child (regular hours)
-  stream_lines: 60                    # real-time streams for the positions, then the best plays; the rest of
-                                      # IBKR's ~100 market-data lines stay free for snapshots (0-90; 0 = off)
+  stream_lines: 80                    # real-time streams for the positions, then the best plays, then the watch
+                                      # tier; ~20 of IBKR's ~100 market-data lines stay free for snapshots (0-90; 0 = off)
+  stream_watch: 50                    # the watch tier: the day's hot list, kept and next buffer names, streamed
+                                      # after the plays within stream_lines, checked at each candle close (0-80; 0 = off)
 
 exit_manager:
   # Automatic exit strategy - runs every few seconds, no manual input.

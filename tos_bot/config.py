@@ -119,6 +119,12 @@ class ScannerCfg(_Model):
     cycle_minutes: int = 5                # intraday rescan of the hot list + buffer (3-5)
     fast_cycle_seconds: int = 60          # hot list only, while Autopilot is day-trading
     plays_refresh_seconds: int = 15       # re-check the stocks with plays on the board (0 = off)
+    close_check: bool = True              # at each 5-minute candle close in regular hours, +2 s, check the watch
+                                          # tier's setups on IBKR's just-closed bars at once - it stands in for the
+                                          # fast cycle due then; false = off, the fast cycle as before
+    mover_atr: float = 1.0                # a watch stock whose streamed 1-minute candle spans at least this many of
+                                          # its 5-minute ATRs, or makes a new high/low of the day on 3x its average
+                                          # minute volume, is checked at once, at most once per 5 minutes (0-5; 0 = off)
     hot_list_size: int = 20
     sector_queue_size: int = 25           # buffer candidates lined up per sector
     wide_minutes: int = 30                # the wide scan - every liquid stock's 5-minute candles - this often
@@ -128,6 +134,10 @@ class ScannerCfg(_Model):
                                           # after each wide scan (0-20; 0 = off) - Aziz's stocks in play
     yesterday_movers: int = 10            # the last session's biggest movers hold slots from the full scan, in
                                           # case they move for a second day (0-20; 0 = off)
+    live_scan: int = 10                   # watch-tier slots, right after the hot list, for the stocks topping IBKR's
+                                          # live scans - % gainers, % losers, hot by volume; US stocks and ADRs at
+                                          # $3-600 - so a stock too quiet for the morning's ranking that explodes
+                                          # intraday is streamed and checked (0-20; 0 = off)
     movers_min_rvol: float = 1.5          # a mover counts only on at least this much relative volume
     buffer_picks_per_sector: int = 2      # new buffer names scanned per sector per cycle
     kept_per_sector: int = 2              # buffer names kept waiting for a hot-list slot
@@ -139,6 +149,18 @@ class ScannerCfg(_Model):
     max_universe: int = 0                 # 0 = every listing (smoke tests cap it)
     sectors: list = Field(default_factory=list)
     prefilter: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("mover_atr", mode="after")
+    @classmethod
+    def _within_the_atrs(cls, value: float) -> float:
+        """Past 5 ATRs a minute's candle almost never qualifies; below 0 is off."""
+        return max(0.0, min(5.0, value))
+
+    @field_validator("live_scan", mode="after")
+    @classmethod
+    def _within_the_live_slots(cls, value: int) -> int:
+        """The live-scan names take watch-tier slots, which the hot list and the buffers need too."""
+        return max(0, min(20, value))
 
 
 class ValuationCfg(_Model):
@@ -177,16 +199,26 @@ class ExecutionCfg(_Model):
                                           # than this share of the distance to the stop - the reward:risk the play was
                                           # judged on is gone; within it a limit entry is priced off the live quote so
                                           # it fills now (0 = off)
-    stream_lines: int = 60                # on proven real-time data, hold IBKR streams for this many stocks - the
-                                          # positions first, then the best plays - and price them off a stream that
-                                          # ticked in the last 2 s instead of a snapshot each time. Of the account's
-                                          # ~100 market-data lines, the rest stay free for snapshots (0-90; 0 = off)
+    stream_lines: int = 80                # on proven real-time data, hold IBKR streams for this many stocks - the
+                                          # positions and working entries first, then the best plays, then the watch
+                                          # tier - and price them off a stream that ticked in the last 2 s instead of
+                                          # a snapshot each time. Of the account's ~100 market-data lines, ~20 stay
+                                          # free for snapshots (0-90; 0 = off)
+    stream_watch: int = 50                # the watch tier: the day's hot list, the kept buffer names and the buffer
+                                          # names the cycles sample next, streamed after the plays within
+                                          # stream_lines, and checked at each candle close (0-80; 0 = off, as before)
 
     @field_validator("stream_lines", mode="after")
     @classmethod
     def _within_the_lines(cls, value: int) -> int:
         """IBKR refuses streams past the account's lines, and the snapshots need some of them too."""
         return max(0, min(90, value))
+
+    @field_validator("stream_watch", mode="after")
+    @classmethod
+    def _within_the_watch(cls, value: int) -> int:
+        """The watch tier streams inside stream_lines, behind the positions and the plays."""
+        return max(0, min(80, value))
 
 
 class ExitManagerCfg(_Model):

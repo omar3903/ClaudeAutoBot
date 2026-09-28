@@ -13,12 +13,13 @@ import datetime as dt
 import logging
 import threading
 import time
-from typing import Callable, Dict, Iterable, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 import pandas as pd
 
 from ..core.models import Quote
 from .bars import DailyBarStore
+from .candles import LiveCandles
 from .streams import StreamManager
 
 log = logging.getLogger(__name__)
@@ -27,6 +28,11 @@ INTRADAY_BAR = "5 mins"
 INTRADAY_DURATION = "5 D"            # today plus four sessions, for relative volume
 _INTRADAY_TTL_S = 60.0
 REFRESH_DURATION = "1800 S"           # the quick re-check fetches the last half hour only
+#: the candle-close check's 5-minute bars over the last hour - never identical to another path's request (the
+#: plays re-check's "1800 S", the cycles' "5 D", the price check's 1-minute "3600 S"; IBKR refuses identical
+#: history requests within 15 s), and an hour always overlaps a cached frame (entries are pruned 30-35 minutes
+#: after their fetch), so the merge leaves no hole
+CLOSE_DURATION = "3600 S"
 PREMARKET_DURATION = "1 D"            # the pre-open gap check: today's extended-hours candles
 SHOWN_DURATION = "3600 S"             # a price to show looks back an hour: long enough for a thin stock's last trade
 _QUOTE_TTL_S = 20.0
@@ -88,6 +94,8 @@ class MarketData:
         self._pruned_at = 0.0
         #: the morning scan and the movers report can want the same download; the second then finds it done
         self._daily_lock = threading.Lock()
+        #: 1- and 5-minute candles built from the streamed ticks, for speed and show - never for proof (candles.py)
+        self.candles = LiveCandles()
         #: the real-time streams the source holds, when it can (streams.py) - quote() serves a fresh one
         self.streams = StreamManager(self)
 
@@ -104,6 +112,7 @@ class MarketData:
             self._quotes.clear()
             self._shown.clear()
             self._shown_asked.clear()
+        self.candles.clear()
         self.streams.reset()
 
     @property
@@ -116,6 +125,13 @@ class MarketData:
     @property
     def attached(self) -> bool:
         return self._source is not None
+
+    @property
+    def connected(self) -> bool:
+        """A source is attached and its connection is up. While IBKR reconnects by itself after a Gateway
+        restart or a drop, the source stays attached with nothing to ask it."""
+        src = self._source
+        return src is not None and bool(getattr(src, "is_connected", True))
 
     @property
     def source_name(self) -> str:
@@ -207,6 +223,19 @@ class MarketData:
     def daily_frame(self, symbol: str) -> Optional[pd.DataFrame]:
         return self.bars.frame(symbol)
 
+    # ---- the broker's live market scans ---------------------------------- #
+    def market_scan(self, code: str) -> List[str]:
+        """The stocks topping the source's live market scan ``code`` (IbkrBroker.market_scan), in rank order.
+        Empty when the source has no scans or the scan fails - the caller carries on without it."""
+        scan = getattr(self._source, "market_scan", None)
+        if scan is None:
+            return []
+        try:
+            return list(scan(code))
+        except Exception as e:  # noqa: BLE001
+            log.debug("the %s market scan failed: %s", code, e)
+            return []
+
     # ---- intraday candles and quotes ------------------------------------- #
     def intraday(self, symbols: Sequence[str],
                  con_ids: Optional[Mapping[str, int]] = None) -> Dict[str, pd.DataFrame]:
@@ -239,18 +268,24 @@ class MarketData:
             self._shown = {s: hit for s, hit in self._shown.items() if now - hit[0] < _CACHE_KEEP_S}
             self._shown_asked = {s: at for s, at in self._shown_asked.items() if now - at < _CACHE_KEEP_S}
 
-    def refresh_intraday(self, symbols: Sequence[str],
-                         con_ids: Optional[Mapping[str, int]] = None) -> Dict[str, pd.DataFrame]:
+    def cached_intraday(self, symbol: str) -> Optional[pd.DataFrame]:
+        """``symbol``'s cached 5-minute candles, however old - no request. None when none are held."""
+        with self._lock:
+            hit = self._intraday.get(symbol)
+        return hit[1] if hit is not None else None
+
+    def refresh_intraday(self, symbols: Sequence[str], con_ids: Optional[Mapping[str, int]] = None,
+                         duration: str = REFRESH_DURATION) -> Dict[str, pd.DataFrame]:
         """Brings the cached 5-minute candles of ``symbols`` up to date by fetching only the
-        last half hour and merging it in - light enough to repeat every few seconds. A stock
-        without cached candles gets its full history first."""
+        recent ``duration`` (the last half hour unless told otherwise) and merging it in - light
+        enough to repeat every few seconds. A stock without cached candles gets its full history first."""
         wanted = list(dict.fromkeys(symbols))
         with self._lock:
             cached = {s: self._intraday[s][1] for s in wanted if s in self._intraday}
         out = self.intraday([s for s in wanted if s not in cached], con_ids) if len(cached) < len(wanted) else {}
         if cached:
             now = time.monotonic()
-            recent = self.source.history_many({s: (INTRADAY_BAR, REFRESH_DURATION) for s in cached}, con_ids)
+            recent = self.source.history_many({s: (INTRADAY_BAR, duration) for s in cached}, con_ids)
             with self._lock:
                 for s, frame in recent.items():
                     if frame is None or not len(frame) or s not in cached:

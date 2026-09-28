@@ -215,7 +215,9 @@ next buffer names.
 
 Also in `config.yaml`: `gapper_symbols` (400), `gapper_min_gap_pct` (2), `gapper_min_volume`
 (50,000), `buffer_picks_per_sector` (2), `kept_per_sector` (2),
-`fast_cycle_seconds` (60), `fundamentals_leaders` (8), the liquidity `prefilter`,
+`fast_cycle_seconds` (60), `close_check` (true) and `mover_atr` (1.0) (see
+**Candle-close check**), `live_scan` (10; see **Live scans**),
+`fundamentals_leaders` (8), the liquidity `prefilter`,
 and `max_universe` (0 = every listing; `SCANNER_MAX_UNIVERSE` caps it without
 editing the file).
 
@@ -307,11 +309,50 @@ data pill shows `data: IBKR (delayed)`; hover it for the detail.
 holds IBKR streams for the stocks that matter most: the open positions and
 working entries first, then the plays still on offer - the ones you opened in
 the detail panel in the last 5 minutes, then the ones Autopilot would take, then
-the best of the rest (a play keeps its stream at least a minute) - up to
-`execution.stream_lines` (60 of the account's ~100 market-data lines; 0 = none).
+the best of the rest (a play keeps its stream at least a minute) - then the
+watch tier: the day's hot list, the movers from IBKR's live scans (see **Live
+scans**), the kept buffer names and the buffer names the next cycle looks at,
+up to `execution.stream_watch` (50; 0 = none) - all within
+`execution.stream_lines` (80 of the account's ~100 market-data lines; 0 = none).
+If IBKR says every line is in use (error 101), the watch names give theirs back
+first, then the plays - never the positions.
 A stock whose stream ticked in the last 2 seconds is priced off it; a quieter
 one, or one past the budget, gets a one-off snapshot as before - an entry never
-waits for a stream. Delayed data never streams.
+waits for a stream. Delayed data never streams. Each streamed stock also gets
+live 1- and 5-minute candles built from its ticks and closed on the clock, for
+speed and show only: the setups, confirmations and the replay still run on
+IBKR's own 5-minute candles.
+
+**Candle-close check.** At every 5-minute close in regular hours (09:35 to
+15:55) the watch tier's setups are checked on IBKR's just-closed bars about 2
+seconds after the close - one request per stock for the last hour of bars - so
+a setup is typically published 5-8 seconds after its candle closes instead of
+up to a couple of minutes later. The check stands in for the fast cycle due
+then. Between closes, a watch stock whose streamed 1-minute candle spans at
+least `scanner.mover_atr` (1.0; 0 = off) of its 5-minute ATRs, or makes a new
+high or low of the day on 3x its average minute volume, gets an early-mover
+check at once (at most once per 5 minutes). An early-mover check can't add a
+candle confirmation - its 5-minute candle hasn't closed - so it catches
+price-level setups and refreshes the stock's plays. `scanner.close_check:
+false` turns both off (the fast cycle as before). The log says `close check
+10:05 ET: ... published 5.4 s after the candle closed` or `early-mover check
+10:07 ET (...)` for each one, and once a session `live candles vs IBKR
+5-minute bars` with the volume ratio that tells whether the stream counts
+shares or lots of 100.
+
+**Live scans.** Every minute in regular hours the app runs three of IBKR's
+live market scans - the biggest % gainers, the biggest % losers and the
+stocks hottest by volume (US stocks and ADRs at $3-600), one open at a time
+and each cancelled once it answers. The first `scanner.live_scan` (10; 0 =
+off) of their names that are ordinary shares in the sectors the filters
+allow, with daily candles and not on the hot list already, take watch-tier
+slots right after the hot list - so a stock that was quiet until today is
+streamed and checked at each close like the rest. Liquidity is judged on
+today's volume: after a candle-close check, a live name whose dollar volume
+so far is under the prefilter's `min_dollar_volume` pro rata for the time of
+day (at least 30 of the session's 390 minutes) is left out for the rest of
+the session, and sizing's `risk.max_adv_pct` cap still limits any order on
+these stocks. The log says `live scan: +A +B -C` when the names change.
 
 > The app manages exits itself (it doesn't attach a native OCO bracket at IBKR,
 > so two exit managers never fight over one position). That means **no stop is
@@ -959,7 +1000,8 @@ lists what is skipped now, and each trade keeps that list.
 **Faster loop while day-trading.** When Autopilot is armed with the **Intraday** filter on and
 the regular session is open, the hot list is rescanned every
 `scanner.fast_cycle_seconds` (60) between the regular cycles. The header button
-shows it (`Autopilot: day ⚡60s`).
+shows it (`Autopilot: day ⚡60s`). At each 5-minute close the candle-close check
+(see **Candle-close check**) takes the place of the fast cycle due then.
 
 ---
 

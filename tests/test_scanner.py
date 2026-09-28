@@ -158,6 +158,50 @@ def test_the_gap_check_adopts_the_gappers_into_the_hot_list(scanner, monkeypatch
     assert rank_gappers([quiet], 2.0, 50_000) == [] and rank_gappers([], 2.0, 50_000) == []
 
 
+def test_the_watch_tier_is_the_hot_list_then_kept_then_the_next_picks(scanner, monkeypatch):
+    from tos_bot.scanner.filters import TradeFilters
+    from tos_bot.scanner.watchlist import Candidate, DayWatchlist
+
+    day = dt.date(2026, 9, 24)
+    assert clock.is_trading_day(day)
+    at = lambda hhmm: dt.datetime.combine(day, dt.time.fromisoformat(hhmm), clock.NY)   # noqa: E731
+    monkeypatch.setattr(scanner.settings.config.scanner, "buffer_picks_per_sector", 2)
+    industry = {"T01": "Technology", "T02": "Energy", "T03": "Technology", "T04": "Technology", "T05": "Technology",
+                "T06": "Financial", "T07": "Technology", "T08": "Technology", "T09": "Technology", "T10": "Energy"}
+    scanner.symbols.record({s: {"con_id": i + 1, "industry": ind} for i, (s, ind) in enumerate(industry.items())})
+    wl = DayWatchlist(
+        session=day, bars_through=day - dt.timedelta(days=1), built_at="", universe=40, liquid=40,
+        # the latest intraday heat, or the daily heat until a cycle has seen the stock
+        hot=[Candidate("T01", "Technology", 1.0, heat=0.5), Candidate("T02", "Energy", 2.0),
+             Candidate("T03", "Technology", 0.5, heat=3.0)],
+        kept={"Technology": [Candidate("T04", "Technology", 5.0, heat=0.2),
+                             Candidate("T05", "Technology", 0.1, heat=0.9)],
+              "Financials": [Candidate("T06", "Financials", 0.3)]},
+        # two picks a sector - T09 waits for a later cycle; T02 is hot already
+        queues={"Technology": [Candidate("T07", "Technology", 0.4), Candidate("T08", "Technology", 0.6),
+                               Candidate("T09", "Technology", 9.0)],
+                "Energy": [Candidate("T10", "Energy", 0.8), Candidate("T02", "Energy", 0.7)]})
+    scanner.watchlist = wl
+    before, asked = wl.state(), len(scanner.md.source.requests)
+
+    tier = ["T03", "T02", "T01", "T05", "T06", "T04", "T10", "T08", "T07"]
+    assert scanner.watch_symbols(50, at("10:00")) == tier
+    assert scanner.watch_symbols(4, at("10:00")) == tier[:4]
+    assert scanner.watch_symbols(50, at("08:00")) == tier                      # the pre-market streams it too
+    # a read and nothing more: no request, no change, nothing saved
+    assert wl.state() == before and len(scanner.md.source.requests) == asked
+    assert not (scanner.watchlist_dir / f"watchlist_{day.isoformat()}.json").exists()
+
+    assert scanner.watch_symbols(0, at("10:00")) == []
+    assert scanner.watch_symbols(50, at("17:00")) == []                        # after hours
+    assert scanner.watch_symbols(50, dt.datetime.combine(day + dt.timedelta(days=1), dt.time(10), clock.NY)) == []
+    scanner.filters = TradeFilters(sectors=("Technology", "Energy"))           # Financials filtered out
+    assert scanner.watch_symbols(50, at("10:00")) == [s for s in tier if s != "T06"]
+    scanner.filters = TradeFilters()
+    wl.session = day - dt.timedelta(days=1)                                    # a watchlist left from yesterday
+    assert scanner.watch_symbols(50, at("10:00")) == []
+
+
 def test_todays_candle_is_built_from_the_intraday_bars():
     daily = fakes.daily_bars("AAA").iloc[:-1]
     intraday = fakes.intraday_bars("AAA")
