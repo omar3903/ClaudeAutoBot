@@ -10,8 +10,8 @@ import pytest
 
 pytest.importorskip("sklearn")
 
-from tos_bot.research import model as meta  # noqa: E402
-from tos_bot.research import validate  # noqa: E402
+from autotradebot.research import model as meta  # noqa: E402
+from autotradebot.research import validate  # noqa: E402
 
 UTC = dt.timezone.utc
 
@@ -90,7 +90,7 @@ def test_the_bet_grows_with_the_odds():
 
 def test_autopilot_listens_to_the_model_only_when_asked_and_only_while_it_is_usable():
     from test_autopilot import SILENT, FakeEngine, _cfg, _run, mkplay
-    from tos_bot.execution.autopilot import AutoPilot
+    from autotradebot.execution.autopilot import AutoPilot
 
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(model_mode="shadow", model_min_p=0.55), bus=SILENT)
@@ -111,7 +111,7 @@ def test_autopilot_listens_to_the_model_only_when_asked_and_only_while_it_is_usa
 
 
 def test_in_size_mode_the_risk_follows_the_odds(monkeypatch):
-    from tos_bot.engine.engine import TradingEngine
+    from autotradebot.engine.engine import TradingEngine
 
     fake = SimpleNamespace(strategy_risk_pct=lambda key: 0.8, autopilot=SimpleNamespace(model_mode="size"),
                            settings=SimpleNamespace(config=SimpleNamespace(risk=SimpleNamespace(max_risk_per_trade_pct=1.0))))

@@ -12,21 +12,21 @@ import pandas as pd
 import pytest
 
 from test_replay import EXACT, FLAT, QUIET, _daily, _LongAtBar, _session
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Account, Play
-from tos_bot.data.market_data import quote_from_price
-from tos_bot.engine.market_regime import MarketRegime
-from tos_bot.quant import readings
-from tos_bot.research.replay import (ReplaySettings, SimTrade, earnings_signals, held_out_from, learned_skips,
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Account, Play
+from autotradebot.data.market_data import quote_from_price
+from autotradebot.engine.market_regime import MarketRegime
+from autotradebot.quant import readings
+from autotradebot.research.replay import (ReplaySettings, SimTrade, earnings_signals, held_out_from, learned_skips,
                                      noise_report, replay_intraday, shadow_trade, strategy_records)
-from tos_bot.research.weights import evidence_multiplier
-from tos_bot.risk.position_sizing import size_play
-from tos_bot.scanner.evaluator import evaluate, with_today
-from tos_bot.scanner.noise import NoiseSettings, context_flags
-from tos_bot.signals.earnings import earnings_times
-from tos_bot.strategies import REGISTRY
-from tos_bot.strategies.base import Strategy, StrategyContext
-from tos_bot.util import clock
+from autotradebot.research.weights import evidence_multiplier
+from autotradebot.risk.position_sizing import size_play
+from autotradebot.scanner.evaluator import evaluate, with_today
+from autotradebot.scanner.noise import NoiseSettings, context_flags
+from autotradebot.signals.earnings import earnings_times
+from autotradebot.strategies import REGISTRY
+from autotradebot.strategies.base import Strategy, StrategyContext
+from autotradebot.util import clock
 
 NY = "America/New_York"
 DAY = dt.date(2026, 9, 10)
@@ -260,7 +260,7 @@ def test_post_earnings_drift_needs_an_earnings_filing_from_before_the_open():
 
 
 def test_the_new_setups_are_on_even_when_config_yaml_predates_them():
-    from tos_bot.strategies.registry import _effective
+    from autotradebot.strategies.registry import _effective
 
     assert _effective("gap_reversion", {}, {})["enabled"] and _effective("earnings_drift", {}, {})["enabled"]
     assert not _effective("vwap_reclaim", {}, {})["enabled"]

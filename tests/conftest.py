@@ -12,7 +12,7 @@ _RUN_DIR = tempfile.mkdtemp(prefix="atb-tests-")
 os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(_RUN_DIR, "tests.sqlite").replace("\\", "/")
 os.environ["ATB_ENV_PATH"] = os.path.join(_RUN_DIR, "tests.env")
 os.environ["ATB_DATA_DIR"] = os.path.join(_RUN_DIR, "data")
-os.environ["TOS_RUNTIME_PATH"] = os.path.join(_RUN_DIR, "runtime.json")
+os.environ["ATB_RUNTIME_PATH"] = os.path.join(_RUN_DIR, "runtime.json")
 os.environ["OPEN_BROWSER_ON_START"] = "0"
 os.environ["PAPER_PERSIST"] = "0"
 os.environ["SIGNALS_ENABLED"] = "0"            # no test reaches SEC, IBKR news or Finnhub
@@ -20,7 +20,7 @@ os.environ["SIGNALS_ENABLED"] = "0"            # no test reaches SEC, IBKR news 
 
 @pytest.fixture(scope="session", autouse=True)
 def _db():
-    from tos_bot.persistence.db import DB
+    from autotradebot.persistence.db import DB
     DB.init(url=os.environ["DATABASE_URL"])
     DB.create_all()
     yield
@@ -30,21 +30,21 @@ def _db():
 def _regular_session(monkeypatch):
     """The executor refuses exits while the exchange is closed; the tests run at any hour, so for them
     the session is open unless a test says otherwise."""
-    from tos_bot.execution.executor import Executor
-    from tos_bot.util import clock
+    from autotradebot.execution.executor import Executor
+    from autotradebot.util import clock
     monkeypatch.setattr(Executor, "_session_now", staticmethod(lambda: clock.Session.REGULAR))
 
 
 @pytest.fixture
 def repo():
-    from tos_bot.persistence.repository import Repository
+    from autotradebot.persistence.repository import Repository
     return Repository()
 
 
 @pytest.fixture
 def paper():
     from fakes import fixed_quote
-    from tos_bot.brokers.paper_adapter import PaperBroker
+    from autotradebot.brokers.paper_adapter import PaperBroker
     broker = PaperBroker(quote=fixed_quote(), starting_cash=5000.0)
     broker.connect()
     return broker

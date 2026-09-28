@@ -5,9 +5,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from test_order_follow_up import VENUE, _Broker, _executor, _Repo, _trade
-from tos_bot.brokers.base import BrokerError
-from tos_bot.core.enums import OrderType, Side, TimeInForce
-from tos_bot.core.models import Fill, OrderResult
+from autotradebot.brokers.base import BrokerError
+from autotradebot.core.enums import OrderType, Side, TimeInForce
+from autotradebot.core.models import Fill, OrderResult
 
 
 class _StopBroker(_Broker):
@@ -206,7 +206,7 @@ def test_a_stop_an_earlier_run_left_at_the_rounded_first_stop_is_booked_as_a_sto
 
 
 def test_a_stop_counts_as_moved_only_by_half_a_tick_or_more():
-    from tos_bot.execution.protective_stops import stop_exit_reason
+    from autotradebot.execution.protective_stops import stop_exit_reason
 
     assert stop_exit_reason(97.9968, 98.0) == "stop"                           # cents from a dollar up
     assert stop_exit_reason(97.9968, 98.01) == "trailing-stop"
@@ -328,8 +328,8 @@ def test_switching_venue_forgets_the_stops_without_touching_them():
 
 
 def test_an_exit_the_exchange_cannot_fill_never_touches_the_stop(monkeypatch):
-    from tos_bot.execution.executor import Executor
-    from tos_bot.util import clock
+    from autotradebot.execution.executor import Executor
+    from autotradebot.util import clock
 
     broker, _, ex, _ = _setup()
     ex.sync_open_orders()
@@ -342,8 +342,8 @@ def test_an_exit_the_exchange_cannot_fill_never_touches_the_stop(monkeypatch):
 
 
 def test_cancelling_the_working_orders_keeps_the_stops_that_protect_positions():
-    from tos_bot.core.enums import StrategyKind, Timeframe
-    from tos_bot.core.models import Account, Play
+    from autotradebot.core.enums import StrategyKind, Timeframe
+    from autotradebot.core.models import Account, Play
     from test_order_follow_up import PLAN
 
     stray = OrderResult(order_id="90", status="SUBMITTED", symbol="ZZZ", submitted_qty=4, side=Side.LONG, tag="")
@@ -394,8 +394,8 @@ def test_a_position_without_a_stop_at_the_broker_is_reported_and_reported_again(
 
 def test_the_shares_of_a_part_filled_entry_get_their_stop_once_the_stalled_rest_is_cancelled():
     from test_order_follow_up import PLAN
-    from tos_bot.core.enums import StrategyKind, Timeframe
-    from tos_bot.core.models import Account, Play
+    from autotradebot.core.enums import StrategyKind, Timeframe
+    from autotradebot.core.models import Account, Play
 
     broker, repo = _StopBroker({"AAA": 4}), _Repo([])
     ex = _executor(broker, repo)

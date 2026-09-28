@@ -10,15 +10,15 @@ import pytest
 
 import fakes
 from test_ibkr_adapter import FakeSession
-from tos_bot.brokers import ibkr_adapter as mod
-from tos_bot.brokers.base import AuthError
-from tos_bot.core.enums import PlayStatus, Side, StrategyKind, Timeframe
-from tos_bot.core.models import OrderResult, Play
-from tos_bot.data.bars import DailyBarStore
-from tos_bot.data.market_data import MarketData
-from tos_bot.execution.executor import Executor, _Pending
-from tos_bot.research import history as history_module
-from tos_bot.research.history import IntradayHistory
+from autotradebot.brokers import ibkr_adapter as mod
+from autotradebot.brokers.base import AuthError
+from autotradebot.core.enums import PlayStatus, Side, StrategyKind, Timeframe
+from autotradebot.core.models import OrderResult, Play
+from autotradebot.data.bars import DailyBarStore
+from autotradebot.data.market_data import MarketData
+from autotradebot.execution.executor import Executor, _Pending
+from autotradebot.research import history as history_module
+from autotradebot.research.history import IntradayHistory
 
 SILENT = SimpleNamespace(publish=lambda *a, **k: None)
 

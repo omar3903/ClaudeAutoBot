@@ -5,9 +5,9 @@ from __future__ import annotations
 import pandas as pd
 
 import fakes
-from tos_bot.core.enums import Side
-from tos_bot.strategies import REGISTRY, build_context
-from tos_bot.strategies.patterns import completed_daily, pivots
+from autotradebot.core.enums import Side
+from autotradebot.strategies import REGISTRY, build_context
+from autotradebot.strategies.patterns import completed_daily, pivots
 
 
 def _frame(closes, lows=None, highs=None, volume=None):

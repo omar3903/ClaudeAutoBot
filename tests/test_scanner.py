@@ -12,22 +12,22 @@ import pandas as pd
 import pytest
 
 import fakes
-from tos_bot.config import get_settings
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.data.bars import DailyBarStore
-from tos_bot.data.listings import UsListings, parse_directory
-from tos_bot.data.market_data import MarketData
-from tos_bot.data.sec_edgar import SecEdgarFundamentals, annual_series, financials_from_facts, sec_ticker
-from tos_bot.data.sectors import SECTORS, sector_from_ibkr
-from tos_bot.data.symbols import SymbolMaster
-from tos_bot.scanner import schedule
-from tos_bot.scanner.evaluator import evaluate, median_volume, with_today
-from tos_bot.scanner.heat import daily_metrics, intraday_metrics, liquid, rank_by_daily_heat
-from tos_bot.scanner.scanner import BENCHMARK, Scanner
-from tos_bot.scanner.schedule import ScanSettings
-from tos_bot.strategies.registry import build_strategies
-from tos_bot.util import clock
+from autotradebot.config import get_settings
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.data.bars import DailyBarStore
+from autotradebot.data.listings import UsListings, parse_directory
+from autotradebot.data.market_data import MarketData
+from autotradebot.data.sec_edgar import SecEdgarFundamentals, annual_series, financials_from_facts, sec_ticker
+from autotradebot.data.sectors import SECTORS, sector_from_ibkr
+from autotradebot.data.symbols import SymbolMaster
+from autotradebot.scanner import schedule
+from autotradebot.scanner.evaluator import evaluate, median_volume, with_today
+from autotradebot.scanner.heat import daily_metrics, intraday_metrics, liquid, rank_by_daily_heat
+from autotradebot.scanner.scanner import BENCHMARK, Scanner
+from autotradebot.scanner.schedule import ScanSettings
+from autotradebot.strategies.registry import build_strategies
+from autotradebot.util import clock
 
 
 @pytest.fixture
@@ -93,7 +93,7 @@ def test_the_wide_scan_looks_at_every_liquid_stock(scanner, monkeypatch):
 
 
 def test_yesterdays_movers_get_hot_list_slots_from_the_full_scan(scanner):
-    from tos_bot.scanner.heat import daily_metrics
+    from autotradebot.scanner.heat import daily_metrics
 
     scanner.settings.config.scanner.movers_min_rvol = 0.0
     result = scanner.run_full(ScanSettings(hot_list_size=6, sector_queue_size=10, yesterday_movers=3))
@@ -119,8 +119,8 @@ def test_todays_movers_get_hot_list_slots_from_the_wide_scan(scanner, monkeypatc
 
 
 def test_the_gap_check_adopts_the_gappers_into_the_hot_list(scanner, monkeypatch):
-    from tos_bot.analysis.levels import find_levels
-    from tos_bot.scanner.heat import GapperMetrics, rank_gappers
+    from autotradebot.analysis.levels import find_levels
+    from autotradebot.scanner.heat import GapperMetrics, rank_gappers
 
     scanner.run_full(ScanSettings(hot_list_size=6, sector_queue_size=10))
     wl = scanner.watchlist
@@ -159,8 +159,8 @@ def test_the_gap_check_adopts_the_gappers_into_the_hot_list(scanner, monkeypatch
 
 
 def test_the_watch_tier_is_the_hot_list_then_kept_then_the_next_picks(scanner, monkeypatch):
-    from tos_bot.scanner.filters import TradeFilters
-    from tos_bot.scanner.watchlist import Candidate, DayWatchlist
+    from autotradebot.scanner.filters import TradeFilters
+    from autotradebot.scanner.watchlist import Candidate, DayWatchlist
 
     day = dt.date(2026, 9, 24)
     assert clock.is_trading_day(day)

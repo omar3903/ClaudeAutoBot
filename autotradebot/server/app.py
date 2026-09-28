@@ -3,7 +3,7 @@
 Every request, and the live feed's WebSocket, must come from the dashboard on
 this computer, and the endpoints that touch secrets, exit every position, fix a
 share count or quit the app check it again, header included (see
-:mod:`tos_bot.server.security`). Every answer also forbids framing by another
+:mod:`autotradebot.server.security`). Every answer also forbids framing by another
 website and content sniffing, and lets the page run only the dashboard's own
 script files. Handlers that call into the engine are plain
 ``def``, so FastAPI runs them in its thread pool and a slow broker call never

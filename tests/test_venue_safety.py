@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from tos_bot.core.models import OrderResult, Quote
-from tos_bot.execution.executor import Executor
-from tos_bot.execution.exit_manager import ExitManager
+from autotradebot.core.models import OrderResult, Quote
+from autotradebot.execution.executor import Executor
+from autotradebot.execution.exit_manager import ExitManager
 
 SILENT = SimpleNamespace(publish=lambda *a, **k: None)
 CFG = SimpleNamespace(enabled=True, breakeven_at_r=0, breakeven_buffer_bps=0, trail_start_r=0,
@@ -75,8 +75,8 @@ def test_exit_manager_only_manages_trades_on_its_own_venue():
 
 
 # ---------------------------------------------------------------- only what's actually held
-from tos_bot.config import get_settings  # noqa: E402
-from tos_bot.core.models import Account, Position  # noqa: E402
+from autotradebot.config import get_settings  # noqa: E402
+from autotradebot.core.models import Account, Position  # noqa: E402
 
 
 class _ClosingRepo(_Repo):

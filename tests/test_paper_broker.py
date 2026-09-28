@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from fakes import fixed_quote
-from tos_bot.brokers.paper_adapter import PaperBroker
-from tos_bot.core.enums import OrderType, Side
-from tos_bot.core.models import OrderRequest
+from autotradebot.brokers.paper_adapter import PaperBroker
+from autotradebot.core.enums import OrderType, Side
+from autotradebot.core.models import OrderRequest
 
 
 def test_state_persists_across_restart(tmp_path):

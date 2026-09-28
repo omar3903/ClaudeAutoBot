@@ -23,9 +23,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import uvicorn  # noqa: E402
 
-from tos_bot.config import get_settings  # noqa: E402
-from tos_bot.util.keep_awake import keep_awake  # noqa: E402
-from tos_bot.util.logging_setup import setup_logging  # noqa: E402
+from autotradebot.config import get_settings  # noqa: E402
+from autotradebot.util.keep_awake import keep_awake  # noqa: E402
+from autotradebot.util.logging_setup import setup_logging  # noqa: E402
 
 
 class GuardedServer(uvicorn.Server):
@@ -105,11 +105,11 @@ def main() -> None:
     if s.config.app.keep_awake and keep_awake():          # this (main) thread lives as long as the app
         print("  Keeping this computer awake while the app runs (app.keep_awake in config.yaml).\n")
     if args.reload:
-        uvicorn.run("tos_bot.server.app:app", host=args.host, port=args.port,
+        uvicorn.run("autotradebot.server.app:app", host=args.host, port=args.port,
                     reload=True, log_level=log_level)
         return
 
-    from tos_bot.server.app import app
+    from autotradebot.server.app import app
 
     server = GuardedServer(uvicorn.Config(app, host=args.host, port=args.port,
                                           log_level=log_level), app)

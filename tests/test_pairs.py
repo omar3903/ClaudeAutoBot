@@ -8,11 +8,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tos_bot.pairs.backtest import replay_pairs, simulate, validate
-from tos_bot.pairs.finder import FinderSettings, aligned_closes, find_pairs, fit_pair
-from tos_bot.pairs.model import (KEY, LONG_SPREAD, SHORT_SPREAD, PairModel, PairRules, current_z, pair_pl,
+from autotradebot.pairs.backtest import replay_pairs, simulate, validate
+from autotradebot.pairs.finder import FinderSettings, aligned_closes, find_pairs, fit_pair
+from autotradebot.pairs.model import (KEY, LONG_SPREAD, SHORT_SPREAD, PairModel, PairRules, current_z, pair_pl,
                                  rolling_stats, signal, size_pair)
-from tos_bot.util import clock
+from autotradebot.util import clock
 
 NY = "America/New_York"
 LAST = dt.date(2026, 9, 11)
@@ -125,7 +125,7 @@ def test_a_watched_pair_shows_how_its_rules_did_on_the_latest_sessions():
 
 
 def test_the_replay_runs_the_pairs_as_one_job():
-    from tos_bot.research.runner import replay_job
+    from autotradebot.research.runner import replay_job
 
     inputs = {"groups": GROUPS, "rules": PairRules(), "finder": FinderSettings()}
     rows = replay_job(("pairs", inputs, industry(), 150))

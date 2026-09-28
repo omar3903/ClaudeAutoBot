@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tos_bot.core.models import Quote
-from tos_bot.execution.exit_manager import ExitManager, stop_locked
+from autotradebot.core.models import Quote
+from autotradebot.execution.exit_manager import ExitManager, stop_locked
 
 
 class FakeRepo:
@@ -138,7 +138,7 @@ def test_overdue_notifies_once_and_does_not_close():
     cfg = SimpleNamespace(enabled=True, breakeven_at_r=1.0, breakeven_buffer_bps=5,
                           trail_start_r=1.5, trail_lock_ratio=0.5,
                           flatten_intraday_before_close_min=10, max_swing_hold_days=0)
-    from tos_bot.core.models import Quote
+    from autotradebot.core.models import Quote
     em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=101, ask=101, last=101),
                      cfg=cfg, bus=SimpleNamespace(publish=lambda topic, **k: events.append(topic)))
     em.run_once()
@@ -399,8 +399,8 @@ def test_the_exit_fill_joins_the_excursions_when_it_is_the_worst_or_the_best_poi
     # the passes mark the excursions from the quotes between them and never see the fill itself: a stop that fills
     # through the worst point marked so far would leave the record's MAE short of the trade's own loss, a target that
     # fills past the best point its MFE and high-water mark short. The fill is the last price the trade saw
-    from tos_bot.core.enums import Side, StrategyKind, Timeframe
-    from tos_bot.core.models import Play
+    from autotradebot.core.enums import Side, StrategyKind, Timeframe
+    from autotradebot.core.models import Play
     cases = [  # (side, stop, target, what the passes marked, the fill, what the closed record keeps)
         ("LONG", 98.0, 104.0, dict(hwm_price=100.6, mae=0.8, mfe=0.6), 97.4, dict(hwm_price=100.6, mae=2.6, mfe=0.6)),
         ("LONG", 98.0, 104.0, dict(hwm_price=103.0, mae=0.8, mfe=3.0), 104.3, dict(hwm_price=104.3, mae=0.8, mfe=4.3)),
@@ -455,7 +455,7 @@ def test_a_stop_note_that_cant_be_written_doesnt_hold_up_the_exit():
 
 
 def test_a_stop_hit_on_a_tick_sends_one_exit_and_the_ticks_right_after_send_none(monkeypatch):
-    from tos_bot.execution import exit_manager as module
+    from autotradebot.execution import exit_manager as module
 
     class Working(FakeExecutor):                                        # the exit is sent and still working
         def __init__(self, repo):

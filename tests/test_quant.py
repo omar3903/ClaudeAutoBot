@@ -6,7 +6,7 @@ import math
 
 import numpy as np
 
-from tos_bot.quant import bands, cointegration, readings, regime, sizing, stationarity, volatility
+from autotradebot.quant import bands, cointegration, readings, regime, sizing, stationarity, volatility
 
 
 def _ar1(phi, n, seed, mean=0.0, sd=1.0):

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import datetime as dt
 
-from tos_bot.util import clock
-from tos_bot.util.clock import Session
+from autotradebot.util import clock
+from autotradebot.util.clock import Session
 
 NY = clock.NY
 

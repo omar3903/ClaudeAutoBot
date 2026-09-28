@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import datetime as dt
 
-from tos_bot.signals.finnhub import FinnhubNews, finnhub_symbol, parse_company_news
-from tos_bot.signals.sentiment import HeadlineSentiment, symbol_sentiment
+from autotradebot.signals.finnhub import FinnhubNews, finnhub_symbol, parse_company_news
+from autotradebot.signals.sentiment import HeadlineSentiment, symbol_sentiment
 
 UTC = dt.timezone.utc
 NOW = dt.datetime(2026, 9, 15, 12, tzinfo=UTC)

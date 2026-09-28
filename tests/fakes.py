@@ -15,13 +15,13 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from tos_bot.brokers import get_broker
-from tos_bot.core.models import Account, Quote
-from tos_bot.data.fundamentals import Financials, FundamentalsProvider
-from tos_bot.data.listings import Listing
-from tos_bot.data.market_data import quote_from_price
-from tos_bot.scanner import schedule
-from tos_bot.util import clock
+from autotradebot.brokers import get_broker
+from autotradebot.core.models import Account, Quote
+from autotradebot.data.fundamentals import Financials, FundamentalsProvider
+from autotradebot.data.listings import Listing
+from autotradebot.data.market_data import quote_from_price
+from autotradebot.scanner import schedule
+from autotradebot.util import clock
 
 NY = "America/New_York"
 SYMBOLS = [f"T{i:02d}" for i in range(40)]

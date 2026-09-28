@@ -7,8 +7,8 @@ import time
 from types import SimpleNamespace
 
 from test_engine import _connect, _open, engine, gateway, port  # noqa: F401 - pytest fixtures
-from tos_bot.engine import engine as engine_module
-from tos_bot.engine.reconcile import PositionCheck
+from autotradebot.engine import engine as engine_module
+from autotradebot.engine.reconcile import PositionCheck
 
 
 def test_the_dashboard_hears_when_the_gateway_drops_comes_back_or_stays_away(engine, port, gateway, monkeypatch):
@@ -75,7 +75,7 @@ def test_refresh_fetches_the_prices_too_and_says_how_many(engine, port, monkeypa
 
 
 def test_refresh_says_when_ibkr_doesnt_answer(engine, port, gateway, monkeypatch):
-    from tos_bot.brokers.base import BrokerError
+    from autotradebot.brokers.base import BrokerError
 
     _connect(engine, port)
     assert engine.refresh_account_now()["ok"]

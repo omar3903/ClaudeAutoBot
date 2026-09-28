@@ -7,9 +7,9 @@ import datetime as dt
 
 import numpy as np
 
-from tos_bot.research import validate
-from tos_bot.research.dataset import COLUMNS, load_csv, write_csv
-from tos_bot.research.features import FEATURE_SCHEMA
+from autotradebot.research import validate
+from autotradebot.research.dataset import COLUMNS, load_csv, write_csv
+from autotradebot.research.features import FEATURE_SCHEMA
 
 START = dt.datetime(2026, 1, 5, 15, 0, tzinfo=dt.timezone.utc)
 

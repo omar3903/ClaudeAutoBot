@@ -10,9 +10,9 @@ import sys
 
 import pytest
 
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.util import clock
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.util import clock
 
 SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "repair_play_log.py"
 
@@ -20,8 +20,8 @@ SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "repair_play_
 @pytest.fixture
 def db(tmp_path):
     """A database of its own - the script looks at every row."""
-    from tos_bot.persistence.db import DB
-    from tos_bot.persistence.repository import Repository
+    from autotradebot.persistence.db import DB
+    from autotradebot.persistence.repository import Repository
 
     DB.init(url=f"sqlite:///{(tmp_path / 'repair.sqlite').as_posix()}")
     DB.create_all()
@@ -42,8 +42,8 @@ def _sent(repo, symbol, sent_at=None, tif="DAY"):
     """A play Autopilot sent an entry for, saved the way the app saved it before - SUBMITTED."""
     from sqlalchemy import update
 
-    from tos_bot.persistence.db import session_scope
-    from tos_bot.persistence.models_orm import OrderAudit
+    from autotradebot.persistence.db import session_scope
+    from autotradebot.persistence.models_orm import OrderAudit
 
     p = Play(symbol=symbol, side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
              timeframe=Timeframe.INTRADAY, entry=100.0, stop=98.0, targets=[104.0])

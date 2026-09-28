@@ -10,7 +10,7 @@ app:
   keep_awake: true                    # keep Windows from sleeping while the app runs - it has to be awake to run 24/7
 
 account:
-  # Day-trading guard rails. See tos_bot/risk/pdt_guard.py
+  # Day-trading guard rails. See autotradebot/risk/pdt_guard.py
   min_start_equity: 2000.0              # LIVE only: refuse to arm below this. Ignored in paper mode.
   day_trade_pct: 75                   # of the trading capital, day trades may hold this % at once and swing
                                       # trades the rest - the dashboard's Trading capital dialog changes it
@@ -98,7 +98,7 @@ strategies:
     atr_channel_breakout:   { enabled: true,  weight: 0.9, params: { length: 20, mult: 1.5 } }
     divergence_reversal:    { enabled: true,  weight: 0.8, params: { lookback: 40, stop_atr: 1.5 } }
     week52_breakout:        { enabled: true,  weight: 0.9, params: { proximity_pct: 1.0 } }
-    # -- signal setups (tos_bot/signals): unusual insider buying from SEC Form 4 filings --
+    # -- signal setups (autotradebot/signals): unusual insider buying from SEC Form 4 filings --
     insider_buying:         { enabled: true,  weight: 1.0, params: { min_score: 0.55, max_days_since: 10, stop_atr: 2.0, target_r: 3.0 } }
     # -- statistical setups (Chan, Algorithmic Trading ch. 4 and 7); on even when this file doesn't list them --
     gap_reversion:          { enabled: true,  weight: 1.0, params: { sigma_days: 90, ma_days: 20, max_minutes: 30, min_gap_sigmas: 1.0 } }
@@ -226,7 +226,7 @@ replay:
   sessions_per_job: 10                # a day-trade job replays this many sessions of one stock (spreads the work)
 
 pairs:
-  # Pairs trading (tos_bot/pairs): two stocks from one industry whose log prices are cointegrated
+  # Pairs trading (autotradebot/pairs): two stocks from one industry whose log prices are cointegrated
   # (Vidyamurthy, Pairs Trading; Chan, Algorithmic Trading ch. 2-4). The spread is bought or sold past
   # its band and both legs are closed together at the mean, the stop, the time stop - or at once when
   # the pair has lost emergency_loss_r times its planned risk. Live pairs need a $25k margin account.

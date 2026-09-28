@@ -6,14 +6,14 @@ import datetime as dt
 
 import pytest
 
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.engine.board import PlayBoard
-from tos_bot.scanner import schedule
-from tos_bot.scanner.heat import DailyMetrics
-from tos_bot.scanner.schedule import ScanSettings
-from tos_bot.scanner.watchlist import DayWatchlist
-from tos_bot.util import clock
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.engine.board import PlayBoard
+from autotradebot.scanner import schedule
+from autotradebot.scanner.heat import DailyMetrics
+from autotradebot.scanner.schedule import ScanSettings
+from autotradebot.scanner.watchlist import DayWatchlist
+from autotradebot.util import clock
 
 MONDAY = dt.date(2026, 9, 14)
 
@@ -163,7 +163,7 @@ def test_settings_saved_under_the_old_limits_are_pulled_into_range():
 
 
 def test_the_replay_takes_the_full_scans_leaders_as_well_as_the_watchlist(watchlist):
-    from tos_bot.research.history import replay_symbols
+    from autotradebot.research.history import replay_symbols
 
     assert watchlist.leaders(3) == ["T0", "T1", "T2"] and len(watchlist.leaders(0)) == 16
     day = replay_symbols(watchlist)

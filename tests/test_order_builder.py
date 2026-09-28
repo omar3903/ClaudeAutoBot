@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.execution.order_builder import plan_order
-from tos_bot.util.clock import Session
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.execution.order_builder import plan_order
+from autotradebot.util.clock import Session
 
 CFG = SimpleNamespace(default_order_type="LIMIT", limit_offset_bps=5, time_in_force="DAY",
                       bracket_orders=True, allow_extended_hours=True)

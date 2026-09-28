@@ -1,5 +1,5 @@
 # An independent audit, in base R, of the statistics the app computes in Python
-# (tos_bot/research/significance.py): each setup's expectancy, Tharp's quality number, Aronson's
+# (autotradebot/research/significance.py): each setup's expectancy, Tharp's quality number, Aronson's
 # bootstrap p-value, and White's reality check across the setups. Two implementations that agree
 # are worth more than one that is trusted. Nothing here runs live - the app never waits on R.
 #

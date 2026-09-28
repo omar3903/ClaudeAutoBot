@@ -9,11 +9,11 @@ import time
 import pytest
 
 import fakes
-from tos_bot.config import ExecutionCfg
-from tos_bot.data.bars import DailyBarStore
-from tos_bot.data.market_data import MarketData, NoDataSource, quote_from_price
-from tos_bot.data.streams import StreamManager
-from tos_bot.util import clock
+from autotradebot.config import ExecutionCfg
+from autotradebot.data.bars import DailyBarStore
+from autotradebot.data.market_data import MarketData, NoDataSource, quote_from_price
+from autotradebot.data.streams import StreamManager
+from autotradebot.util import clock
 
 
 def _streaming(tmp_path, symbols=("AAA", "BBB"), **kwargs):

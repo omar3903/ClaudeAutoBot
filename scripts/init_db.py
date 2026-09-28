@@ -14,10 +14,10 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from tos_bot.config import get_settings
-from tos_bot.persistence.db import DB
-from tos_bot.persistence.models_orm import Base
-from tos_bot.util.logging_setup import setup_logging
+from autotradebot.config import get_settings
+from autotradebot.persistence.db import DB
+from autotradebot.persistence.models_orm import Base
+from autotradebot.util.logging_setup import setup_logging
 
 
 def main() -> None:

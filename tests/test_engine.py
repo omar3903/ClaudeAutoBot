@@ -17,17 +17,17 @@ import pytest
 
 import fakes
 from test_native_stop import _StopBroker
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Account, Fill, OrderResult, Play, Position
-from tos_bot.engine import TradingEngine
-from tos_bot.execution.executor import Executor
-from tos_bot.engine.research_ops import PRACTICE_LABEL
-from tos_bot.engine.reconcile import PositionCheck
-from tos_bot.engine.runtime import load_filters
-from tos_bot.risk.position_sizing import size_play
-from tos_bot.scanner.filters import TradeFilters
-from tos_bot.scanner.scanner import BENCHMARK
-from tos_bot.util import clock
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Account, Fill, OrderResult, Play, Position
+from autotradebot.engine import TradingEngine
+from autotradebot.execution.executor import Executor
+from autotradebot.engine.research_ops import PRACTICE_LABEL
+from autotradebot.engine.reconcile import PositionCheck
+from autotradebot.engine.runtime import load_filters
+from autotradebot.risk.position_sizing import size_play
+from autotradebot.scanner.filters import TradeFilters
+from autotradebot.scanner.scanner import BENCHMARK
+from autotradebot.util import clock
 
 
 @pytest.fixture
@@ -50,7 +50,7 @@ def _new_engine(tmp_path, gateway, port) -> TradingEngine:
 
 @pytest.fixture
 def engine(tmp_path, gateway, port):
-    from tos_bot.persistence.db import DB
+    from autotradebot.persistence.db import DB
 
     # a database of its own, so open trades left by other tests can't leak in
     DB.init(url=f"sqlite:///{(tmp_path / 'engine.sqlite').as_posix()}")
@@ -156,7 +156,7 @@ def test_switching_is_blocked_while_positions_are_open_here(engine, monkeypatch)
 
 
 def test_unknown_platforms_and_bad_settings_are_rejected(engine):
-    assert not engine.set_paper_platform("schwab")["ok"]
+    assert not engine.set_paper_platform("elsewhere")["ok"]
     r = engine.save_secrets({"IBKR_PAPER_PORT": "nope"})
     assert not r["ok"] and "whole number" in r["reason"]
 
@@ -434,7 +434,7 @@ def test_the_size_factor_resizes_the_plays_is_remembered_and_refuses_what_is_out
 
 
 def test_the_size_factor_on_disk_is_read_back_and_a_bad_one_is_the_usual_size():
-    from tos_bot.engine.runtime import load_size_factor
+    from autotradebot.engine.runtime import load_size_factor
     assert load_size_factor({"factor": 3.5}) == 3.5
     assert load_size_factor(None) == 1.0 and load_size_factor({"factor": 9}) == 1.0
     assert load_size_factor({"factor": True}) == 1.0 and load_size_factor({"factor": "2"}) == 1.0
@@ -832,7 +832,7 @@ def test_a_position_of_another_size_than_its_records_is_reported_and_left_alone(
 
 
 def test_an_account_that_cant_be_read_keeps_the_last_snapshot_and_touches_nothing(engine, monkeypatch):
-    from tos_bot.brokers.base import BrokerError
+    from autotradebot.brokers.base import BrokerError
 
     tid = _open(engine, "AAPL")
     engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
@@ -856,7 +856,7 @@ def test_an_account_that_cant_be_read_keeps_the_last_snapshot_and_touches_nothin
 def test_a_position_closed_outside_the_app_is_booked_from_the_brokers_fills(engine):
     import datetime as dt
 
-    from tos_bot.core.models import Fill
+    from autotradebot.core.models import Fill
 
     tid = _open(engine, "AAPL", qty=5)
     engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
@@ -879,7 +879,7 @@ def test_a_position_closed_outside_the_app_is_booked_from_the_brokers_fills(engi
 def test_an_exit_called_off_after_filling_in_part_is_booked_from_its_tagged_fills(engine):
     import datetime as dt
 
-    from tos_bot.core.models import Fill
+    from autotradebot.core.models import Fill
 
     tid = _open(engine, "AAPL", qty=10)                                     # entered at 100
     engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
@@ -907,7 +907,7 @@ def test_an_exit_called_off_after_filling_in_part_is_booked_from_its_tagged_fill
 def test_a_record_over_the_broker_for_a_reason_its_own_fills_dont_explain_is_left_alone(engine):
     import datetime as dt
 
-    from tos_bot.core.models import Fill
+    from autotradebot.core.models import Fill
 
     tid = _open(engine, "AAPL", qty=10)
     engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
@@ -1235,7 +1235,7 @@ def test_the_dashboard_lists_the_orders_working_at_the_broker(engine, monkeypatc
 def test_a_working_entrys_countdowns_are_sent_with_it_but_never_pushed_on_their_own(engine, monkeypatch):
     """The browser counts down from the times sent with the order. The part-fill cut is worked out again at
     each look; that alone isn't a change to push."""
-    from tos_bot.execution.executor import _Pending
+    from autotradebot.execution.executor import _Pending
 
     play = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
                 timeframe=Timeframe.INTRADAY, entry=100.0, stop=95.0, targets=[110.0])
@@ -1257,7 +1257,7 @@ def test_a_countdown_that_starts_after_its_order_was_sent_is_pushed(engine, monk
     """The orders loop can list a part-fill before the order sync notes its first fill, and an entry left
     working by an earlier run is listed before it is taken over. The cut, or the time-out, that follows
     changes nothing else about the order - it is still told to the browser, once."""
-    from tos_bot.execution.executor import _Pending
+    from autotradebot.execution.executor import _Pending
 
     play = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
                 timeframe=Timeframe.INTRADAY, entry=100.0, stop=95.0, targets=[110.0])
@@ -1285,7 +1285,7 @@ def test_a_countdown_that_starts_after_its_order_was_sent_is_pushed(engine, monk
 
 
 def test_the_session_review_keeps_each_trade_with_what_it_was_taken_on(engine):
-    from tos_bot.util import clock
+    from autotradebot.util import clock
 
     today = clock.now_ny().date()
     assert not engine.review_session(today)["ok"]                          # nothing offered or traded yet
@@ -1313,7 +1313,7 @@ def test_a_rebuild_without_ib_gateway_keeps_the_plays_not_taken_followed_before(
 
 
 def test_the_session_review_covers_positions_opened_and_still_open(engine, monkeypatch):
-    from tos_bot.core.models import Quote
+    from autotradebot.core.models import Quote
 
     today = clock.now_ny().date()
     monkeypatch.setattr(clock, "session_date", lambda *a, **k: today)       # on a weekend too, today is the session reviewed
@@ -1330,7 +1330,7 @@ def test_the_session_review_covers_positions_opened_and_still_open(engine, monke
 
 
 def test_an_entry_never_chases_the_price_past_the_play(engine, monkeypatch):
-    from tos_bot.core.models import Quote
+    from autotradebot.core.models import Quote
 
     p = _play("AAPL")                                                       # entry 100, stop 95: 1R is 5
     plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
@@ -1651,7 +1651,7 @@ def test_a_stocks_price_says_when_its_from_and_the_session_it_traded_in(engine, 
 
 
 def test_the_streams_go_to_the_positions_first_then_the_plays_still_on_offer(engine, monkeypatch):
-    from tos_bot.core.enums import PlayStatus
+    from autotradebot.core.enums import PlayStatus
 
     gateway = fakes.StreamingGateway(fakes.SYMBOLS)
     gateway.connect()
@@ -1721,7 +1721,7 @@ def test_an_entry_is_priced_off_a_fresh_stream_else_a_snapshot_and_the_log_says_
     assert engine.md.streams.sync(["T01"], [], 5) == ["T01"]
     gateway.tick("T01", 100.5, age_s=0.5)
     seen = {}
-    with caplog.at_level(logging.INFO, logger="tos_bot.engine.engine"):
+    with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
         assert engine._chase_check(p, plan, seen) is None
     assert plan["limit_price"] == 100.55 and gateway.snapshots == 0         # priced off the stream: no round trip
     assert seen["quote_source"] == "stream" and seen["live"] and 500 <= seen["quote_age_ms"] < 2000
@@ -1747,9 +1747,9 @@ def test_an_entry_is_priced_off_a_fresh_stream_else_a_snapshot_and_the_log_says_
 
 def test_the_play_opened_on_the_dashboard_streams_first_but_one_autopilot_assesses_doesnt(engine, monkeypatch):
     from fastapi.testclient import TestClient
-    from tos_bot.core.enums import PlayStatus
-    from tos_bot.server import security
-    from tos_bot.server.app import create_app
+    from autotradebot.core.enums import PlayStatus
+    from autotradebot.server import security
+    from autotradebot.server.app import create_app
 
     gateway = fakes.StreamingGateway(fakes.SYMBOLS)
     gateway.connect()
@@ -1778,7 +1778,7 @@ def test_the_play_opened_on_the_dashboard_streams_first_but_one_autopilot_assess
 
 
 def test_the_plays_autopilot_would_take_stream_ahead_of_the_rest_while_on_offer(engine, monkeypatch):
-    from tos_bot.core.enums import PlayStatus
+    from autotradebot.core.enums import PlayStatus
 
     gateway = fakes.StreamingGateway(fakes.SYMBOLS)
     gateway.connect()
@@ -1801,7 +1801,7 @@ def test_the_plays_autopilot_would_take_stream_ahead_of_the_rest_while_on_offer(
 
 
 def test_the_watch_tier_streams_after_the_positions_and_plays(engine, monkeypatch):
-    from tos_bot.scanner.watchlist import Candidate, DayWatchlist
+    from autotradebot.scanner.watchlist import Candidate, DayWatchlist
 
     day = dt.date(2026, 9, 24)
     monkeypatch.setattr(clock, "now_ny", lambda: dt.datetime.combine(day, dt.time(10, 0), clock.NY))
@@ -1831,7 +1831,7 @@ def test_the_watch_tier_streams_after_the_positions_and_plays(engine, monkeypatc
 
 
 def test_the_candle_loop_closes_each_minute_just_after_it_ends_and_stops_promptly(engine, monkeypatch):
-    from tos_bot.engine import engine as module
+    from autotradebot.engine import engine as module
 
     ten = dt.datetime(2026, 9, 24, 10, 0, tzinfo=clock.NY).timestamp()
     engine.md.candles.add("T01", 10.0, 1000, ten + 5)
@@ -1882,7 +1882,7 @@ def test_a_tick_wakes_the_exits_only_for_a_stock_held_and_only_in_regular_hours(
 
 
 def test_a_tick_pass_comes_a_second_after_the_last_exits_at_the_soonest_and_asks_for_no_snapshot(engine):
-    from tos_bot.engine.engine import tick_exit_wait
+    from autotradebot.engine.engine import tick_exit_wait
 
     wait, go = tick_exit_wait(now=10.3, last_exit=10.0, deadline=14.0, gap=1.0)
     assert go and abs(wait - 0.7) < 1e-9                                # 0.3 s after the last pass: 0.7 s more
@@ -1899,7 +1899,7 @@ def test_a_tick_pass_comes_a_second_after_the_last_exits_at_the_soonest_and_asks
 
 
 def test_the_sync_loop_runs_the_exits_on_a_tick_between_its_full_passes_and_stops_promptly(engine, monkeypatch):
-    from tos_bot.engine import engine as module
+    from autotradebot.engine import engine as module
 
     passes, session = [], {"now": clock.Session.REGULAR}
     monkeypatch.setattr(engine, "_sync_orders", lambda: None)
@@ -1928,7 +1928,7 @@ def test_the_sync_loop_runs_the_exits_on_a_tick_between_its_full_passes_and_stop
 
 
 def test_a_tick_pass_comes_a_second_after_the_last_tick_pass_too_not_just_the_last_full_pass(engine, monkeypatch):
-    from tos_bot.engine import engine as module
+    from autotradebot.engine import engine as module
 
     passes = []
     monkeypatch.setattr(engine, "_sync_orders", lambda: None)
@@ -1953,7 +1953,7 @@ def test_a_tick_pass_comes_a_second_after_the_last_tick_pass_too_not_just_the_la
 
 
 def test_the_streamed_prices_that_moved_go_to_the_dashboard_at_most_once_a_second(engine, monkeypatch):
-    from tos_bot.engine.engine import SESSION_WORDS
+    from autotradebot.engine.engine import SESSION_WORDS
 
     gateway, _ = _streaming_position(engine)
     sent = []
@@ -2025,7 +2025,7 @@ def test_autopilot_hears_of_the_entries_taken_over_after_a_restart_even_after_a_
 
 
 def test_what_became_of_a_sent_play_is_saved_without_losing_who_sent_it(engine):
-    from tos_bot.scanner.scanner import ScanResult
+    from autotradebot.scanner.scanner import ScanResult
 
     p = _play("AAPL")
     engine.repo.record_play(p)
@@ -2049,8 +2049,8 @@ def test_what_became_of_a_sent_play_is_saved_without_losing_who_sent_it(engine):
 
 
 def test_a_setup_already_acted_on_isnt_logged_again_when_a_scan_sees_it(engine, monkeypatch):
-    from tos_bot.core.enums import PlayStatus
-    from tos_bot.scanner.scanner import ScanResult
+    from autotradebot.core.enums import PlayStatus
+    from autotradebot.scanner.scanner import ScanResult
 
     engine.autopilot.enabled = False
     found = []
@@ -2072,7 +2072,7 @@ def test_a_setup_already_acted_on_isnt_logged_again_when_a_scan_sees_it(engine, 
 
 
 def test_a_play_already_sent_cant_be_dismissed_and_one_never_logged_is_logged_when_it_is(engine):
-    from tos_bot.core.enums import PlayStatus
+    from autotradebot.core.enums import PlayStatus
 
     p = _play("AAPL")
     engine.board.replace([p])                                               # found by a quick re-check: no row yet
@@ -2139,7 +2139,7 @@ def _until(check, seconds=5.0):
 # ---------------------------------------------------------------- confirmations counted on candles
 def test_any_scan_on_a_newer_candle_confirms_a_day_play_and_the_setting_turns_it_off(engine, monkeypatch):
     import pandas as pd
-    from tos_bot.scanner.scanner import ScanResult
+    from autotradebot.scanner.scanner import ScanResult
 
     engine.autopilot.enabled = False
     opened = pd.Timestamp("2026-03-02 10:00", tz="America/New_York")
@@ -2189,7 +2189,7 @@ def test_the_strategies_panel_says_when_a_day_setup_fires_on_one_candle(engine, 
 
 def test_every_topic_the_app_publishes_has_a_handler_in_the_dashboard():
     """A topic the dashboard ignores is news nobody sees - a stop for the day, a disarmed engine, a skipped play."""
-    app = Path(__file__).resolve().parents[1] / "tos_bot"
+    app = Path(__file__).resolve().parents[1] / "autotradebot"
     published = {m.group(1) for f in app.rglob("*.py")
                  for m in re.finditer(r'(?:_publish|\.publish)\(\s*"([\w.]+)"', f.read_text(encoding="utf-8"))}
     handled = set(re.findall(r'case "([\w.]+)"', (app / "web" / "js" / "events.js").read_text(encoding="utf-8")))
@@ -2207,7 +2207,7 @@ def test_every_panel_about_a_stock_keeps_its_market_price_fresh():
     """A play's panel and chart, its stock on the Signals page, an open trade's record, an exit's confirmation,
     a mover's chart and a pair's chart each show the stock's price through the one shared helper, which asks
     the route the server has for it."""
-    web = Path(__file__).resolve().parents[1] / "tos_bot" / "web" / "js"
+    web = Path(__file__).resolve().parents[1] / "autotradebot" / "web" / "js"
     helper = (web / "price.js").read_text(encoding="utf-8")
     assert "/api/price/${" in helper and "export function watchPrice" in helper
     assert '@app.get("/api/price/{symbol}")' in (web.parents[1] / "server" / "app.py").read_text(encoding="utf-8")
@@ -2222,7 +2222,7 @@ def test_every_panel_about_a_stock_keeps_its_market_price_fresh():
 
 def test_every_name_a_dashboard_script_imports_is_one_the_script_it_names_exports():
     """The scripts load as ES modules: one missing export and the whole dashboard fails to start."""
-    web = Path(__file__).resolve().parents[1] / "tos_bot" / "web" / "js"
+    web = Path(__file__).resolve().parents[1] / "autotradebot" / "web" / "js"
     scripts = {f.name: f.read_text(encoding="utf-8") for f in web.glob("*.js")}
     exports = {name: set(re.findall(r"^export (?:async )?(?:function|const) ([\w$]+)", src, re.M))
                for name, src in scripts.items()}
@@ -2234,7 +2234,7 @@ def test_every_name_a_dashboard_script_imports_is_one_the_script_it_names_export
 
 
 def test_a_click_that_wakes_the_snapshot_loop_leaves_the_position_check_to_its_usual_turn(engine, monkeypatch):
-    from tos_bot.engine import engine as module
+    from autotradebot.engine import engine as module
 
     checks, now = [], {"t": 1_000.0}
     monkeypatch.setattr(engine, "_reconcile_open_trades", lambda force=False: checks.append(now["t"]) or [])

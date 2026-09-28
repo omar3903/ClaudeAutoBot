@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import datetime as dt
 
-from tos_bot.data import candles
-from tos_bot.data.candles import LiveCandles
-from tos_bot.util import clock
+from autotradebot.data import candles
+from autotradebot.data.candles import LiveCandles
+from autotradebot.util import clock
 
 DAY = dt.date(2026, 9, 24)          # a full trading day
 HALF = dt.date(2026, 11, 27)        # a 1 pm close

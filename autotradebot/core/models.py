@@ -2,7 +2,7 @@
 
 These are deliberately framework-free (`dataclass`, not ORM, not pydantic) so
 brokers, strategies and the scanner never import the database or the web layer.
-Persistence maps them to SQLAlchemy rows in :mod:`tos_bot.persistence`.
+Persistence maps them to SQLAlchemy rows in :mod:`autotradebot.persistence`.
 """
 
 from __future__ import annotations

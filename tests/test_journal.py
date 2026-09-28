@@ -8,11 +8,11 @@ import datetime as dt
 import pytest
 
 from test_replay import EXACT, FLAT, _session
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.research.journal import (Journal, build_review, first_sightings, live_records, opened_rows, review_day,
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.research.journal import (Journal, build_review, first_sightings, live_records, opened_rows, review_day,
                                       trade_rows)
-from tos_bot.util import clock
+from autotradebot.util import clock
 
 DAY = dt.date(2026, 9, 10)                     # the day test_replay's candles are for
 
@@ -83,7 +83,7 @@ def test_the_plays_not_taken_are_told_as_not_taken_followed_filled_and_sent(monk
     """The lesson counts every day setup not taken, then the ones followed, then the ones that would have
     filled - past the cap it says only the highest-scoring were followed. A setup seen twice is one setup
     offered, and an entry that went out and never filled is told apart."""
-    import tos_bot.research.journal as journal
+    import autotradebot.research.journal as journal
 
     review = _review()
     assert (review["plays_offered"], review["setups_offered"]) == (4, 2)      # RPL seen twice, DONE twice
@@ -139,7 +139,7 @@ def test_a_play_not_taken_enters_on_the_bar_after_the_scan_that_wrote_its_row_fi
 def test_an_entry_sent_and_never_filled_is_followed_as_sent_even_past_the_cap(monkeypatch):
     """A setup whose entry went out and never filled is followed from the row it was sent from - what it
     was sent on, from the moment it went out - in place of its first sighting, whatever its score."""
-    import tos_bot.research.journal as journal
+    import autotradebot.research.journal as journal
 
     monkeypatch.setattr(journal, "MAX_SHADOWS", 1)
     early = {**_row("q1", "13:52", symbol="AAA"), "score": 0.4, "confirmations": 1}      # first seen unconfirmed
@@ -217,7 +217,7 @@ def test_break_even_is_not_a_loss_and_the_1r_lesson_counts_every_loss_past_1r():
 def test_fill_times_are_a_true_median_over_the_fills_they_say_and_a_slow_market_exit_is_counted():
     """An even count takes the mean of the two middle fills; the note says which fills the times cover; an
     exit goes out at market, so one that took minutes is counted and told, not set aside like a resting limit."""
-    from tos_bot.research.journal import execution_quality
+    from autotradebot.research.journal import execution_quality
 
     def timed(went_in, came_out, entered="2026-09-09T14:00:00"):      # stored in UTC
         return {"entry_time": entered, "exit_time": f"{DAY}T15:00:00", "entry_latency_s": went_in,
@@ -251,7 +251,7 @@ def test_a_check_is_called_helped_or_cost_only_on_a_real_difference():
     """A hundredth of an R between the two sides, or a gap well inside one standard error, is no clear
     difference; a gap of tenths of an R with an ordinary spread is. Only the first is told as the two sides
     doing about as well - the table shows the verdict beside both averages."""
-    from tos_bot.research.journal import _compare
+    from autotradebot.research.journal import _compare
 
     same = _compare(_plays_at(0.257, 12), _plays_at(0.258, 101))
     assert same["verdict"] == "no clear difference - the plays it flags did about as well as the rest"
@@ -287,7 +287,7 @@ def test_the_checks_helped_when_the_plays_they_turned_away_did_worse_and_cost_wh
 
 
 def test_a_flag_that_made_no_clear_difference_gets_no_lesson():
-    from tos_bot.research.journal import lessons
+    from autotradebot.research.journal import lessons
 
     shadows = {"filled": 113, "summary": {"trades": 113, "expectancy_r": 0.26, "total_r": 29.1},
                "checks": {"passed": {"trades": 11, "expectancy_r": 0.30}, "turned_away": {"trades": 102, "expectancy_r": 0.25},
@@ -388,7 +388,7 @@ def test_the_repository_keeps_what_the_review_needs(repo):
 
 
 def test_the_play_log_says_when_the_scan_that_last_wrote_a_play_finished(repo):
-    from tos_bot.scanner.scanner import ScanResult
+    from autotradebot.scanner.scanner import ScanResult
 
     result = ScanResult(kind="wide", finished_at=clock.now_ny())
     scanned = Play(symbol="SCNF", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
@@ -435,8 +435,8 @@ def test_a_position_taken_off_in_parts_is_reviewed_whole_and_keeps_its_planned_e
 
 
 def test_the_play_log_keeps_the_hold_so_a_play_rebuilt_from_it_has_its_window(repo):
-    from tos_bot.execution.executor import _play_from_row
-    from tos_bot.research.journal import _play, held_for
+    from autotradebot.execution.executor import _play_from_row
+    from autotradebot.research.journal import _play, held_for
 
     play = Play(symbol="HLD", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
                 timeframe=Timeframe.INTRADAY, entry=100.0, stop=99.0, targets=[102.0],

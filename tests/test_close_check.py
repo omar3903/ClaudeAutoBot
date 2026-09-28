@@ -14,13 +14,13 @@ import pandas as pd
 import pytest
 
 import fakes
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.engine import TradingEngine
-from tos_bot.indicators import ta
-from tos_bot.scanner.scanner import BENCHMARK
-from tos_bot.scanner.watchlist import Candidate, DayWatchlist
-from tos_bot.util import clock
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.engine import TradingEngine
+from autotradebot.indicators import ta
+from autotradebot.scanner.scanner import BENCHMARK
+from autotradebot.scanner.watchlist import Candidate, DayWatchlist
+from autotradebot.util import clock
 
 DAY = dt.date(2026, 9, 24)                     # a full trading day
 WATCH = ["T01", "T02", "T03", "T04", "T05", "T06"]
@@ -59,7 +59,7 @@ def gateway():
 
 @pytest.fixture
 def engine(tmp_path, gateway, now):
-    from tos_bot.persistence.db import DB
+    from autotradebot.persistence.db import DB
 
     DB.init(url=f"sqlite:///{(tmp_path / 'engine.sqlite').as_posix()}")
     DB.create_all()
@@ -143,8 +143,8 @@ def test_the_check_reads_the_last_hour_of_bars_and_leaves_a_stock_whose_new_bar_
 
 def test_a_5_minute_close_queues_the_check_2_s_on_and_it_stands_in_for_the_fast_cycle(engine, gateway, now,
                                                                                          monkeypatch, caplog):
-    from tos_bot.persistence.db import session_scope
-    from tos_bot.persistence.models_orm import ScanRun
+    from autotradebot.persistence.db import session_scope
+    from autotradebot.persistence.models_orm import ScanRun
 
     limits = _bars_until(gateway, monkeypatch, _at(10, 5))
     now["t"] = _at(10, 5, 0.3)
@@ -165,7 +165,7 @@ def test_a_5_minute_close_queues_the_check_2_s_on_and_it_stands_in_for_the_fast_
     publish = engine._publish
     monkeypatch.setattr(engine, "_publish", lambda topic, **kw: published.append(topic) or publish(topic, **kw))
     now["t"] = _at(10, 5, 2.4)
-    with caplog.at_level(logging.INFO, logger="tos_bot.engine.engine"):
+    with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
         engine._run_scan("close")
     assert "plays.updated" in published and "scan.started" not in published and "watchlist.updated" not in published
     assert engine._close_due is None and time.monotonic() - engine._last_fast_at < 5
@@ -349,7 +349,7 @@ def test_no_stock_is_asked_twice_within_15_s_and_a_late_check_is_dropped(engine,
     assert _asked(gateway, asked) == [] and engine._movers_due == {}
     _later(engine, 15)
     engine._movers_due, engine._mover_why = {"T01": _at(10, 6)}, {"T01": "1-minute candle 1.4 ATRs"}
-    with caplog.at_level(logging.INFO, logger="tos_bot.engine.engine"):
+    with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
         engine._run_scan("close")
     assert _asked(gateway, asked) == [("T01", "5 mins", "3600 S")]
     assert "early-mover check 10:06 ET (T01: 1-minute candle 1.4 ATRs): 1 stock, 1 play - published 0.3 s" in caplog.text
@@ -357,7 +357,7 @@ def test_no_stock_is_asked_twice_within_15_s_and_a_late_check_is_dropped(engine,
     _later(engine, 300)
     limits["at"], asked = _at(10, 10), len(gateway.requests)
     engine._close_due, now["t"] = (_at(10, 10), time.monotonic()), _at(10, 11, 1)
-    with caplog.at_level(logging.DEBUG, logger="tos_bot.engine.engine"):
+    with caplog.at_level(logging.DEBUG, logger="autotradebot.engine.engine"):
         engine._run_scan("close")                                # 61 s after its close: a scan held the thread
     assert _asked(gateway, asked) == [] and engine._close_due is None and "check is dropped" in caplog.text
     engine._close_due, now["t"] = (_at(10, 10), time.monotonic()), _at(10, 10, 59)
@@ -375,7 +375,7 @@ def test_once_a_session_the_live_candles_are_compared_with_ibkrs_bars(engine, ga
         for m in range(5):
             lc.add(s, close, 50_000.0 + volume * (m + 1) / 5, _at(10, m, 30).timestamp())
     lc.roll(_at(10, 5).timestamp())
-    with caplog.at_level(logging.INFO, logger="tos_bot.scanner.scanner"):
+    with caplog.at_level(logging.INFO, logger="autotradebot.scanner.scanner"):
         engine.scanner.run_close(WATCH, _at(10, 5))
         engine.scanner.run_close(WATCH, _at(10, 5))
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("live candles vs IBKR")]
@@ -394,8 +394,8 @@ LIVE = {"TOP_PERC_GAIN": ["T20", "T01", "T21", "T22"], "TOP_PERC_LOSE": ["T23", 
 @pytest.fixture
 def live(engine, monkeypatch):
     """The engine with IBKR's live scans showing LIVE, 3 live-scan slots and every sector but Utilities (T24's)."""
-    from tos_bot.data.sectors import SECTORS
-    from tos_bot.scanner.filters import TradeFilters
+    from autotradebot.data.sectors import SECTORS
+    from autotradebot.scanner.filters import TradeFilters
 
     monkeypatch.setattr(fakes, "SCANS", {code: list(names) for code, names in LIVE.items()})
     monkeypatch.setattr(engine.settings.config.scanner, "live_scan", 3)
@@ -407,7 +407,7 @@ def live(engine, monkeypatch):
 
 def test_the_live_scans_put_the_first_passing_names_right_after_the_hot_list(live, gateway, monkeypatch, caplog):
     live._stream_wake.clear()
-    with caplog.at_level(logging.INFO, logger="tos_bot.engine.engine"):
+    with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
         assert live._live_scan_once() == ["T20", "T26", "T21"]        # interleaved by rank, the first 3 that pass
     assert gateway.scan_calls == ["TOP_PERC_GAIN", "TOP_PERC_LOSE", "HOT_BY_VOLUME"]
     assert live.scanner.live_names == ["T20", "T26", "T21"] and live._stream_wake.is_set()
@@ -424,7 +424,7 @@ def test_the_live_scans_put_the_first_passing_names_right_after_the_hot_list(liv
     # the same names next round: nothing said, the streams left alone
     live._stream_wake.clear()
     caplog.clear()
-    with caplog.at_level(logging.INFO, logger="tos_bot.engine.engine"):
+    with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
         assert live._live_scan_once() == ["T20", "T26", "T21"]
     assert len(gateway.scan_calls) == 6 and not live._stream_wake.is_set() and "live scan" not in caplog.text
     # every scan empty is the scans failing: the names held stay
@@ -433,7 +433,7 @@ def test_the_live_scans_put_the_first_passing_names_right_after_the_hot_list(liv
 
 
 def test_the_live_scan_slots_default_to_10_within_0_to_20():
-    from tos_bot.config import ScannerCfg
+    from autotradebot.config import ScannerCfg
 
     assert ScannerCfg().live_scan == 10
     assert ScannerCfg(live_scan=50).live_scan == 20 and ScannerCfg(live_scan=-1).live_scan == 0

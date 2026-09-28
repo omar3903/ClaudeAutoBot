@@ -26,7 +26,7 @@ learning = ["scikit-learn>=1.5"]                    # the meta-label model (rese
 autotradebot = "run:main"
 
 [tool.setuptools]
-packages = ["tos_bot"]
+packages = ["autotradebot"]
 py-modules = ["run"]
 
 [tool.pytest.ini_options]

@@ -9,12 +9,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.research.replay import (ReplaySettings, SimTrade, noise_report, replay_intraday, strategy_records,
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.research.replay import (ReplaySettings, SimTrade, noise_report, replay_intraday, strategy_records,
                                      summarize)
-from tos_bot.scanner.noise import NoiseSettings
-from tos_bot.data.market_data import quote_from_price
-from tos_bot.strategies.base import Strategy, StrategyContext
+from autotradebot.scanner.noise import NoiseSettings
+from autotradebot.data.market_data import quote_from_price
+from autotradebot.strategies.base import Strategy, StrategyContext
 
 NY = "America/New_York"
 DAY = dt.date(2026, 9, 10)                     # an ordinary full session
@@ -191,7 +191,7 @@ def test_the_news_checks_see_the_stories_out_by_each_bar_and_the_market_model():
 
 def test_session_chunks_carry_the_lookback_and_replay_only_their_own_sessions():
     import fakes
-    from tos_bot.research.runner import LOOKBACK_SESSIONS, session_chunks
+    from autotradebot.research.runner import LOOKBACK_SESSIONS, session_chunks
 
     bars = fakes.intraday_bars("CHK")                            # five sessions
     days = sorted(set(bars.index.date))
@@ -209,9 +209,9 @@ def test_session_chunks_carry_the_lookback_and_replay_only_their_own_sessions():
 
 def test_series_shared_for_a_session_equal_the_ones_computed_per_bar():
     import fakes
-    from tos_bot.indicators import ta
-    from tos_bot.research.replay import session_series
-    from tos_bot.strategies.technical import OpeningRangeBreakout
+    from autotradebot.indicators import ta
+    from autotradebot.research.replay import session_series
+    from autotradebot.strategies.technical import OpeningRangeBreakout
 
     history = fakes.intraday_bars("SHR")
     shared = session_series(history, [OpeningRangeBreakout()])
@@ -239,12 +239,12 @@ def test_the_replay_leaves_out_the_plays_the_board_would_never_show():
     floor = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, breakeven_at_r=0.0, trail_start_r=0.0,
                            min_reward_risk=3.0)
     assert replay_intraday([_LongAtBar()], "FLR", bars, daily, floor, QUIET, sessions=2) == []
-    from tos_bot.config import get_settings
+    from autotradebot.config import get_settings
     assert ReplaySettings.from_exit_rules(get_settings().config.exit_manager, None, 1.5).min_reward_risk == 1.5
 
 
 def test_the_records_count_only_what_autopilot_would_take():
-    from tos_bot.research.replay import taken
+    from autotradebot.research.replay import taken
 
     def sim(rr, conf, tf="INTRADAY", noise=(), confirmed=True):
         return SimTrade(strategy="s", symbol="TKN", side="LONG", timeframe=tf, entered_at="2026-09-10T14:00:00",
@@ -347,8 +347,8 @@ def test_the_replay_runs_in_the_background_downloads_each_session_once_and_keeps
     from types import SimpleNamespace
 
     import fakes
-    from tos_bot.research.history import IntradayHistory
-    from tos_bot.research.runner import ReplayRunner
+    from autotradebot.research.history import IntradayHistory
+    from autotradebot.research.runner import ReplayRunner
 
     silent = SimpleNamespace(publish=lambda *a, **k: None)
     gateway = fakes.FakeGateway(["RPA", "RPB"])
@@ -372,9 +372,9 @@ def test_worker_processes_replay_exactly_what_one_process_does(tmp_path):
     from types import SimpleNamespace
 
     import fakes
-    from tos_bot.research.history import IntradayHistory
-    from tos_bot.research.runner import ReplayRunner
-    from tos_bot.strategies import REGISTRY
+    from autotradebot.research.history import IntradayHistory
+    from autotradebot.research.runner import ReplayRunner
+    from autotradebot.strategies import REGISTRY
 
     silent = SimpleNamespace(publish=lambda *a, **k: None)
     strategies = [REGISTRY[k]() for k in ("abcd_pattern", "vwap_reclaim", "rsi2_mean_reversion")]
@@ -393,7 +393,7 @@ def test_worker_processes_replay_exactly_what_one_process_does(tmp_path):
 
 def test_however_long_the_history_a_replayed_swing_setup_sees_what_it_would_see_live():
     import fakes
-    from tos_bot.research.replay import LIVE_DAILY_BARS, replay_swing
+    from autotradebot.research.replay import LIVE_DAILY_BARS, replay_swing
 
     class _Watcher(Strategy):
         key, kind, timeframe, title, thesis = "watcher", StrategyKind.TECHNICAL, Timeframe.SWING, "Test", "t"
@@ -413,8 +413,8 @@ def test_the_replay_prepares_its_long_history_first_and_runs_on_without_it_if_th
     from types import SimpleNamespace
 
     import fakes
-    from tos_bot.research.history import IntradayHistory
-    from tos_bot.research.runner import ReplayRunner
+    from autotradebot.research.history import IntradayHistory
+    from autotradebot.research.runner import ReplayRunner
 
     silent = SimpleNamespace(publish=lambda *a, **k: None)
     calls = []
@@ -440,7 +440,7 @@ def test_the_replay_prepares_its_long_history_first_and_runs_on_without_it_if_th
 def test_the_replay_times_out_on_the_hold_live_gives_the_play(monkeypatch):
     """Live, a reversal setup's hold comes from its price's half-life (scanner/evaluator.py); the replay
     applies the same helper, so its time stop runs on the same window."""
-    from tos_bot.research import replay as replay_module
+    from autotradebot.research import replay as replay_module
 
     def ten_minutes(play, ctx, style):
         play.expected_hold_typical, play.expected_hold_max = 5.0, 10.0
@@ -452,8 +452,8 @@ def test_the_replay_times_out_on_the_hold_live_gives_the_play(monkeypatch):
 
 
 def test_a_play_not_taken_is_followed_with_the_time_stop_too():
-    from tos_bot.core.models import Play
-    from tos_bot.research.replay import shadow_trade
+    from autotradebot.core.models import Play
+    from autotradebot.research.replay import shadow_trade
 
     play = Play(symbol="RPL", side=Side.LONG, strategy="s", kind=StrategyKind.TECHNICAL, timeframe=Timeframe.INTRADAY,
                 entry=100.0, stop=99.0, targets=[102.0], expected_hold_typical=15.0, expected_hold_max=30.0)
@@ -465,8 +465,8 @@ def test_a_play_not_taken_is_followed_with_the_time_stop_too():
 def test_the_replay_names_the_day_setups_it_only_ever_saw_on_one_candle(tmp_path):
     from types import SimpleNamespace
 
-    from tos_bot.research.history import IntradayHistory
-    from tos_bot.research.runner import ReplayRunner
+    from autotradebot.research.history import IntradayHistory
+    from autotradebot.research.runner import ReplayRunner
 
     runner = ReplayRunner(tmp_path / "replay.json", IntradayHistory(tmp_path / "intraday"),
                           bus=SimpleNamespace(publish=lambda *a, **k: None), workers=1)
@@ -484,8 +484,8 @@ def _checkpointed_run(tmp_path, name, monkeypatch, *, fail_on=None, settings=EXA
     from types import SimpleNamespace
 
     import fakes
-    from tos_bot.research import runner as runner_module
-    from tos_bot.research.history import IntradayHistory
+    from autotradebot.research import runner as runner_module
+    from autotradebot.research.history import IntradayHistory
 
     real, replayed = runner_module.replay_job, []
 
@@ -532,7 +532,7 @@ def test_a_replay_cut_short_picks_up_where_it_stopped_and_ends_where_a_clean_run
 def test_a_checkpoint_from_other_settings_or_code_is_replayed_afresh(tmp_path, monkeypatch):
     import dataclasses
 
-    from tos_bot.research import runner as runner_module
+    from autotradebot.research import runner as runner_module
 
     dearer = dataclasses.replace(EXACT, slippage_bps=9.0)
     _checkpointed_run(tmp_path, "cut", monkeypatch, fail_on=4)

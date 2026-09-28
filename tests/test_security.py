@@ -8,7 +8,7 @@ import pytest
 from fastapi import Depends, FastAPI, WebSocketDisconnect
 from fastapi.testclient import TestClient
 
-from tos_bot.server import security
+from autotradebot.server import security
 
 OK = {"X-ATB-Request": "1"}
 
@@ -58,7 +58,7 @@ def test_remote_client_is_refused(monkeypatch):
 
 def test_the_share_count_fix_is_same_machine_only():
     # it books P/L and can send a market exit; the guard answers before the handler needs an engine
-    from tos_bot.server.app import create_app
+    from autotradebot.server.app import create_app
 
     client = TestClient(create_app(lambda settings: None))
     assert client.get("/api/positions/mismatch/AAA", headers=OK).status_code == 403
@@ -99,7 +99,7 @@ class _Engine:
 def _dashboard(monkeypatch, *, local_client=True):
     """The real app on a stub engine, TestClient's host allowed as this computer (and its client too,
     unless the test wants a remote one)."""
-    from tos_bot.server.app import create_app
+    from autotradebot.server.app import create_app
 
     if local_client:
         monkeypatch.setattr(security, "ALLOWED_CLIENTS", security.ALLOWED_CLIENTS | {"testclient"})
@@ -194,7 +194,7 @@ def test_the_page_runs_only_the_dashboards_own_script_files(monkeypatch):
 def test_the_dashboard_has_no_inline_script():
     # the policy blocks inline script, so any left behind would quietly stop working: the theme picked
     # after first paint, or Enter in a settings field reloading the page and losing what was typed
-    from tos_bot.server.app import WEB_DIR
+    from autotradebot.server.app import WEB_DIR
 
     page = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     assert all(" src=" in tag for tag in re.findall(r"<script\b[^>]*>", page))

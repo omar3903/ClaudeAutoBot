@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tos_bot.brokers.venues import PAPER_PLATFORMS, VenuePlan, normalize_platform, plan_venue, venue_id, venue_label
+from autotradebot.brokers.venues import PAPER_PLATFORMS, VenuePlan, normalize_platform, plan_venue, venue_id, venue_label
 
 
 def test_live_always_trades_on_the_live_account():
@@ -27,7 +27,7 @@ def test_a_read_only_connection_is_a_different_connection():
 
 
 def test_unknown_platforms_fall_back_to_ibkr():
-    assert normalize_platform("schwab") == "ibkr" and normalize_platform(None) == "ibkr"
+    assert normalize_platform("elsewhere") == "ibkr" and normalize_platform(None) == "ibkr"
     assert normalize_platform(" Simulator ") == "simulator"
 
 

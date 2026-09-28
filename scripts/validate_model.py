@@ -19,9 +19,9 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from tos_bot.config import DATA_DIR  # noqa: E402
-from tos_bot.research import validate  # noqa: E402
-from tos_bot.research.dataset import load_csv, training_rows  # noqa: E402
+from autotradebot.config import DATA_DIR  # noqa: E402
+from autotradebot.research import validate  # noqa: E402
+from autotradebot.research.dataset import load_csv, training_rows  # noqa: E402
 
 
 def main() -> int:
@@ -37,8 +37,8 @@ def main() -> int:
     if args.csv:
         rows = load_csv(pathlib.Path(args.csv))
     else:
-        from tos_bot.persistence.db import init_db
-        from tos_bot.persistence.repository import Repository
+        from autotradebot.persistence.db import init_db
+        from autotradebot.persistence.repository import Repository
 
         init_db()
         rows = training_rows(Repository())

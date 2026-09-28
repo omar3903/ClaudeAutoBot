@@ -17,16 +17,16 @@ pytestmark = pytest.mark.slow
 def client(monkeypatch, tmp_path):
     # the flow needs a tradable session: pin the clock to mid regular hours so
     # this doesn't fail every night and weekend (and nothing auto-flattens)
-    from tos_bot.util import clock
+    from autotradebot.util import clock
     monkeypatch.setattr(clock, "current_session", lambda ts=None: clock.Session.REGULAR)
     monkeypatch.setattr(clock, "is_market_open", lambda ts=None: True)
     monkeypatch.setattr(clock, "minutes_to_close", lambda ts=None: 240.0)
 
     from fastapi.testclient import TestClient
-    from tos_bot.engine import TradingEngine
-    from tos_bot.scanner.scanner import BENCHMARK
-    from tos_bot.server import security
-    from tos_bot.server.app import create_app
+    from autotradebot.engine import TradingEngine
+    from autotradebot.scanner.scanner import BENCHMARK
+    from autotradebot.server import security
+    from autotradebot.server.app import create_app
 
     # every request must come from the dashboard on this computer: TestClient reports client
     # "testclient" and Host "testserver", and sends the dashboard's header as its post() does
@@ -140,7 +140,7 @@ def test_settings_round_trip_and_the_dashboard_loads(client):
 def test_an_open_tab_is_told_when_the_dashboards_files_have_changed(client, monkeypatch, tmp_path):
     import importlib
 
-    server = importlib.import_module("tos_bot.server.app")        # the module, not the app the package exports
+    server = importlib.import_module("autotradebot.server.app")        # the module, not the app the package exports
 
     with client.websocket_connect("/ws") as ws:
         hello = ws.receive_json()

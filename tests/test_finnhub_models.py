@@ -13,18 +13,18 @@ import pytest
 
 from test_engine import engine, gateway, port  # noqa: F401 - pytest fixtures
 from test_quant_wiring import DAY, NY, _ctx, _daily_frame, _gap_day
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.quant.market_model import abnormal_move
-from tos_bot.scanner.noise import NoiseSettings, event_flags
-from tos_bot.signals import service as service_module
-from tos_bot.signals.book import SignalBook
-from tos_bot.engine import engine as engine_module
-from tos_bot.signals.calendar import (EarningsCalendarFile, EarningsEvent, next_report, report_before_open,
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.quant.market_model import abnormal_move
+from autotradebot.scanner.noise import NoiseSettings, event_flags
+from autotradebot.signals import service as service_module
+from autotradebot.signals.book import SignalBook
+from autotradebot.engine import engine as engine_module
+from autotradebot.signals.calendar import (EarningsCalendarFile, EarningsEvent, next_report, report_before_open,
                                       sessions_until, surprise)
-from tos_bot.signals.finnhub import CALENDAR_URL, FinnhubNews
-from tos_bot.strategies import REGISTRY
-from tos_bot.util import clock
+from autotradebot.signals.finnhub import CALENDAR_URL, FinnhubNews
+from autotradebot.strategies import REGISTRY
+from autotradebot.util import clock
 
 PREV = clock.prev_trading_day(DAY)                     # DAY is a Thursday
 NEXT = clock.next_trading_day(DAY)

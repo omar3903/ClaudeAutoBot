@@ -11,9 +11,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from tos_bot.core.enums import AssetClass, PlayStatus, Side, StrategyKind, Timeframe
-from tos_bot.core.models import Account, Play, Position
-from tos_bot.execution.autopilot import AutoPilot
+from autotradebot.core.enums import AssetClass, PlayStatus, Side, StrategyKind, Timeframe
+from autotradebot.core.models import Account, Play, Position
+from autotradebot.execution.autopilot import AutoPilot
 
 SILENT = SimpleNamespace(publish=lambda *a, **k: None)
 
@@ -192,7 +192,7 @@ def test_autopilots_own_boxes_cap_what_the_filters_put_on_the_board():
 
 
 def test_no_new_day_trades_in_the_last_minutes_before_the_close(monkeypatch):
-    from tos_bot.execution import autopilot as module
+    from autotradebot.execution import autopilot as module
 
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(trade_types=["INTRADAY", "SWING"], min_minutes_to_close=30), bus=SILENT)
@@ -290,7 +290,7 @@ def test_max_per_strategy_cap():
 
 def test_cooldown_after_loss_skips_a_stopped_name():
     eng = FakeEngine()
-    from tos_bot.util import clock
+    from autotradebot.util import clock
     eng.repo._closed = [{
         "symbol": "AAA", "status": "CLOSED",
         "session_date": clock.session_date().isoformat(),
@@ -654,7 +654,7 @@ def test_proof_also_asks_whether_the_edge_is_luck_drift_or_eaten_by_costs():
 
 
 def test_one_entry_per_scan_cycle_means_a_scan_of_the_market_not_a_recheck_of_the_board(monkeypatch):
-    from tos_bot.execution import autopilot as module
+    from autotradebot.execution import autopilot as module
 
     eng = FakeEngine()
     eng.entry_pace_seconds = lambda timeframe: 60.0 if timeframe == "INTRADAY" else 300.0
@@ -906,7 +906,7 @@ def test_a_play_the_engine_refused_says_why_on_the_bar_not_a_cap_it_would_wait_f
 
 
 def test_the_clock_and_what_is_held_reach_the_bar_as_the_last_passes_reason(monkeypatch):
-    from tos_bot.execution import autopilot as module
+    from autotradebot.execution import autopilot as module
 
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(trade_types=["INTRADAY", "SWING"], min_minutes_to_close=30), bus=SILENT)
@@ -960,7 +960,7 @@ def test_an_entry_that_bought_nothing_hands_its_days_slot_back_once():
 def test_the_slots_that_can_come_back_survive_a_restart_but_not_the_night():
     import datetime as dt
 
-    from tos_bot.util import clock
+    from autotradebot.util import clock
 
     eng, ap = _two_a_day()
     play = mkplay(sym="AAA")
@@ -1158,7 +1158,7 @@ def test_the_loser_settings_are_saved_and_restored():
 @pytest.fixture
 def session_open(monkeypatch):
     """The regular session open, hours from the close - the clock-of-day states have a test of their own."""
-    from tos_bot.execution import autopilot as module
+    from autotradebot.execution import autopilot as module
 
     monkeypatch.setattr(module.clock, "is_market_open", lambda ts=None: True)
     monkeypatch.setattr(module.clock, "minutes_to_close", lambda ts=None: 300.0)
@@ -1255,7 +1255,7 @@ def test_the_strip_says_which_kind_is_full_under_the_split(session_open):
 
 
 def test_the_strip_says_when_the_clock_keeps_day_trades_out(monkeypatch):
-    from tos_bot.execution import autopilot as module
+    from autotradebot.execution import autopilot as module
 
     ap = AutoPilot(FakeEngine(), _cfg(min_minutes_to_close=30), bus=SILENT)
     monkeypatch.setattr(module.clock, "is_market_open", lambda ts=None: True)
@@ -1335,7 +1335,7 @@ def test_todays_tally_groups_the_venues_closed_trades_by_setup():
 def test_a_bare_off_in_config_yaml_means_off():
     import yaml
 
-    from tos_bot.config import AutopilotCfg
+    from autotradebot.config import AutopilotCfg
 
     cfg = AutopilotCfg(**yaml.safe_load("skip_replay_losers: off"))         # YAML reads a bare off as false
     assert cfg.skip_replay_losers == "off"

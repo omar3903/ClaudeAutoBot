@@ -6,7 +6,7 @@
 
 The app trains by itself after each day's review; this is the same thing by hand. The model is saved
 whether or not it is usable - an unusable one only runs in shadow (its odds are logged, never acted
-on). See docs/AutoTradeBot-learning.pdf and tos_bot/research/model.py.
+on). See docs/AutoTradeBot-learning.pdf and autotradebot/research/model.py.
 """
 
 from __future__ import annotations
@@ -17,12 +17,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tos_bot.config import DATA_DIR  # noqa: E402
-from tos_bot.persistence.db import init_db  # noqa: E402
-from tos_bot.persistence.repository import Repository  # noqa: E402
-from tos_bot.research import model as meta  # noqa: E402
-from tos_bot.research.dataset import counts, training_rows  # noqa: E402
-from tos_bot.research.validate import table  # noqa: E402
+from autotradebot.config import DATA_DIR  # noqa: E402
+from autotradebot.persistence.db import init_db  # noqa: E402
+from autotradebot.persistence.repository import Repository  # noqa: E402
+from autotradebot.research import model as meta  # noqa: E402
+from autotradebot.research.dataset import counts, training_rows  # noqa: E402
+from autotradebot.research.validate import table  # noqa: E402
 
 
 def main() -> int:

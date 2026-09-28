@@ -5,12 +5,12 @@ from __future__ import annotations
 import datetime as dt
 from types import SimpleNamespace
 
-from tos_bot.config import SignalsCfg
-from tos_bot.signals.book import SignalBook
-from tos_bot.signals.edgar import LATEST_URL, SUBMISSIONS_URL, TICKERS_URL, daily_index_url
-from tos_bot.signals.sentiment import HeadlineSentiment
-from tos_bot.signals.service import SignalService
-from tos_bot.signals.store import SignalStore
+from autotradebot.config import SignalsCfg
+from autotradebot.signals.book import SignalBook
+from autotradebot.signals.edgar import LATEST_URL, SUBMISSIONS_URL, TICKERS_URL, daily_index_url
+from autotradebot.signals.sentiment import HeadlineSentiment
+from autotradebot.signals.service import SignalService
+from autotradebot.signals.store import SignalStore
 
 TODAY = dt.date(2026, 9, 15)
 SILENT = SimpleNamespace(publish=lambda *a, **k: None)

@@ -7,13 +7,13 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 
-from tos_bot.core.enums import Side
-from tos_bot.core.models import Quote
-from tos_bot.signals.book import SymbolSignals
-from tos_bot.signals.insiders import InsiderSignal
-from tos_bot.strategies.base import StrategyContext
-from tos_bot.strategies.insider import InsiderBuying
-from tos_bot.util import clock
+from autotradebot.core.enums import Side
+from autotradebot.core.models import Quote
+from autotradebot.signals.book import SymbolSignals
+from autotradebot.signals.insiders import InsiderSignal
+from autotradebot.strategies.base import StrategyContext
+from autotradebot.strategies.insider import InsiderBuying
+from autotradebot.util import clock
 
 NOW = dt.datetime(2026, 9, 15, 10, 30, tzinfo=clock.NY)
 

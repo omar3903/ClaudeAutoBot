@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import datetime as dt
 
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.engine.board import PlayBoard
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.engine.board import PlayBoard
 
 NOW = dt.datetime(2026, 9, 15, 15, 0, tzinfo=dt.timezone.utc)
 
