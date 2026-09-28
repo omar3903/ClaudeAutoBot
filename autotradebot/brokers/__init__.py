@@ -1,7 +1,7 @@
 """Broker adapters: the built-in simulator and Interactive Brokers.
 
 ``get_broker(name, **kwargs)`` is the one entry point; which one trades is
-decided by :mod:`tos_bot.brokers.venues`.
+decided by :mod:`autotradebot.brokers.venues`.
 """
 
 from __future__ import annotations

@@ -4,7 +4,7 @@ Two layers:
 
 * ``.env``               -> machine-specific values and secrets (:class:`Secrets`).
                             The dashboard's Connections panel edits the IB Gateway
-                            settings in it (see :mod:`tos_bot.secrets_store`).
+                            settings in it (see :mod:`autotradebot.secrets_store`).
 * ``config/config.yaml`` -> tunable behaviour (:class:`AppConfig`).
 
 ``get_settings()`` returns a cached :class:`Settings` bundle with both.
@@ -29,7 +29,7 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 DATA_DIR = Path(os.getenv("ATB_DATA_DIR") or (PROJECT_ROOT / "data"))
 ENV_PATH = Path(os.getenv("ATB_ENV_PATH") or (PROJECT_ROOT / ".env"))
 #: the dashboard's remembered choices
-RUNTIME_PATH = Path(os.getenv("TOS_RUNTIME_PATH") or (DATA_DIR / "runtime.json"))
+RUNTIME_PATH = Path(os.getenv("ATB_RUNTIME_PATH") or (DATA_DIR / "runtime.json"))
 
 load_dotenv(ENV_PATH)
 
@@ -61,7 +61,7 @@ class Secrets(BaseSettings):
     db_host: str = "127.0.0.1"
     db_port: int = 3306
     db_name: str = "autotradebot"
-    db_user: str = "tos"
+    db_user: str = "autotradebot"
     db_password: str = ""
     db_allow_sqlite_fallback: bool = True
 
@@ -351,7 +351,7 @@ class ReplayCfg(_Model):
 
 
 class PairsCfg(_Model):
-    """Pairs trading - see tos_bot/pairs/."""
+    """Pairs trading - see autotradebot/pairs/."""
 
     enabled: bool = True
     max_pairs: int = 12                   # pairs on the watch list
@@ -386,7 +386,7 @@ class JournalCfg(_Model):
 
 
 class SignalsCfg(_Model):
-    """Insider trades, company news and headline sentiment - see tos_bot/signals/."""
+    """Insider trades, company news and headline sentiment - see autotradebot/signals/."""
 
     enabled: bool = True
     insider_poll_minutes: float = 3.0          # how often SEC's live feed of Form 4 filings is read

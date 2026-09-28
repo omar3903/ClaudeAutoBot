@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from tos_bot.signals.form4 import BUY, SELL, parse_form4
+from autotradebot.signals.form4 import BUY, SELL, parse_form4
 
 
 def _tx(code, shares, price, after, direct="D", note=""):

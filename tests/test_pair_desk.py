@@ -10,17 +10,17 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tos_bot.brokers.base import OrderRejected
-from tos_bot.brokers.paper_adapter import PaperBroker
-from tos_bot.config import PairsCfg
-from tos_bot.core.enums import Side
-from tos_bot.data.market_data import quote_from_price
-from tos_bot.execution.executor import Executor
-from tos_bot.execution.exit_manager import ExitManager
-from tos_bot.pairs import desk as desk_module
-from tos_bot.pairs.desk import PairDesk
-from tos_bot.pairs.model import LONG_SPREAD, PairModel
-from tos_bot.util import clock
+from autotradebot.brokers.base import OrderRejected
+from autotradebot.brokers.paper_adapter import PaperBroker
+from autotradebot.config import PairsCfg
+from autotradebot.core.enums import Side
+from autotradebot.data.market_data import quote_from_price
+from autotradebot.execution.executor import Executor
+from autotradebot.execution.exit_manager import ExitManager
+from autotradebot.pairs import desk as desk_module
+from autotradebot.pairs.desk import PairDesk
+from autotradebot.pairs.model import LONG_SPREAD, PairModel
+from autotradebot.util import clock
 
 SILENT = SimpleNamespace(publish=lambda *a, **k: None)
 VENUE = "pairdesk-test"
@@ -57,7 +57,7 @@ def _model(first, second):
 
 @pytest.fixture
 def setup(repo, tmp_path, monkeypatch):
-    from tos_bot.persistence.db import DB
+    from autotradebot.persistence.db import DB
 
     # a database of its own - these trades would otherwise count in other tests' P/L
     DB.init(url=f"sqlite:///{(tmp_path / 'pairs.sqlite').as_posix()}")

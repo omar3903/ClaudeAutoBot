@@ -30,8 +30,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import select  # noqa: E402
 
-from tos_bot.persistence.db import init_db, session_scope  # noqa: E402
-from tos_bot.persistence.models_orm import OrderAudit, Trade  # noqa: E402
+from autotradebot.persistence.db import init_db, session_scope  # noqa: E402
+from autotradebot.persistence.models_orm import OrderAudit, Trade  # noqa: E402
 
 
 #: the in-app simulator's venue - it fills an order the moment it gets it, so it has no fill time to learn from

@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tos_bot.analysis import (
+from autotradebot.analysis import (
     classify_candle,
     find_levels,
     is_doji,
@@ -16,7 +16,7 @@ from tos_bot.analysis import (
     is_shooting_star,
     read_row,
 )
-from tos_bot.indicators import ta
+from autotradebot.indicators import ta
 
 
 # --------------------------------------------------------------------------- #

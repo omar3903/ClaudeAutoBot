@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import datetime as dt
 
-from tos_bot.signals.edgar import FilingRef
-from tos_bot.signals.form4 import BUY, InsiderTrade
-from tos_bot.signals.insiders import filing_delays
-from tos_bot.signals.news import NewsItem
-from tos_bot.signals.store import SignalStore
+from autotradebot.signals.edgar import FilingRef
+from autotradebot.signals.form4 import BUY, InsiderTrade
+from autotradebot.signals.insiders import filing_delays
+from autotradebot.signals.news import NewsItem
+from autotradebot.signals.store import SignalStore
 
 UTC = dt.timezone.utc
 

@@ -27,9 +27,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import select  # noqa: E402
 
-from tos_bot.persistence.db import init_db, session_scope  # noqa: E402
-from tos_bot.persistence.models_orm import OrderAudit, PlayLog, Trade  # noqa: E402
-from tos_bot.util import clock  # noqa: E402
+from autotradebot.persistence.db import init_db, session_scope  # noqa: E402
+from autotradebot.persistence.models_orm import OrderAudit, PlayLog, Trade  # noqa: E402
+from autotradebot.util import clock  # noqa: E402
 
 SENT = ("ACCEPTED", "SUBMITTED", "WORKING")
 #: when a DAY order's life ends for certain - the extended session's close

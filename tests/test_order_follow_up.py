@@ -7,13 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from tos_bot.brokers.base import BrokerError
-from tos_bot.config import get_settings
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Account, OrderResult, Play, Position, Quote
-from tos_bot.execution import exit_manager as exit_manager_module
-from tos_bot.execution.executor import Executor
-from tos_bot.execution.exit_manager import ExitManager
+from autotradebot.brokers.base import BrokerError
+from autotradebot.config import get_settings
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Account, OrderResult, Play, Position, Quote
+from autotradebot.execution import exit_manager as exit_manager_module
+from autotradebot.execution.executor import Executor
+from autotradebot.execution.exit_manager import ExitManager
 
 VENUE = "ibkr-paper"
 SILENT = SimpleNamespace(publish=lambda *a, **k: None)
@@ -165,7 +165,7 @@ def test_an_exit_still_goes_out_when_the_order_list_is_unknown_capped_by_the_sha
     broker = _Broker({"AAA": 6})                         # the record says 10
     ex = _executor(broker, _Repo([_trade()]))
     broker.list_orders = _unanswered
-    with caplog.at_level(logging.WARNING, logger="tos_bot.execution.executor"):
+    with caplog.at_level(logging.WARNING, logger="autotradebot.execution.executor"):
         assert ex.close_trade("t1")["ok"]
     assert [o.quantity for o in broker.orders] == [6]
     assert "order list unavailable" in caplog.text        # said to be unknown, not taken for "none working"
@@ -214,7 +214,7 @@ def test_an_entry_cancelled_after_a_partial_fill_books_the_shares_bought():
 def test_a_day_trade_entry_not_filled_in_time_is_cancelled_rather_than_left_to_chase():
     import datetime as dt
 
-    from tos_bot.core.enums import PlayStatus
+    from autotradebot.core.enums import PlayStatus
 
     broker, repo, heard = _Broker(), _Repo([]), []
     ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
@@ -365,8 +365,8 @@ def test_how_long_each_order_took_to_fill_is_kept(repo):
     resting at the broker has none - it waits for the price, not for the broker."""
     import datetime as dt
 
-    from tos_bot.core.enums import Side, StrategyKind, Timeframe
-    from tos_bot.core.models import Play
+    from autotradebot.core.enums import Side, StrategyKind, Timeframe
+    from autotradebot.core.models import Play
 
     play = Play(symbol="LAT", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
                 timeframe=Timeframe.INTRADAY, entry=100.0, stop=99.0, targets=[102.0])
@@ -398,7 +398,7 @@ def test_how_long_each_order_took_to_fill_is_kept(repo):
 
 
 def test_an_exit_the_app_sends_records_how_long_the_broker_took(repo):
-    from tos_bot.research.journal import execution_quality
+    from autotradebot.research.journal import execution_quality
 
     trades = [{"entry_latency_s": 2.0, "exit_latency_s": 1.0, "entry_slippage_bps": 1.0, "exit_slippage_bps": 1.0},
               {"entry_latency_s": 30.0, "exit_latency_s": 3.0},
@@ -413,14 +413,14 @@ def test_an_exit_the_app_sends_records_how_long_the_broker_took(repo):
 
 def test_an_entry_taken_back_after_a_restart_has_no_fill_time():
     """Its clock restarted at the restart (for its time-out); that isn't when it went out."""
-    from tos_bot.execution.executor import _Pending
-    from tos_bot.core.enums import Side, StrategyKind, Timeframe
-    from tos_bot.core.models import Play
+    from autotradebot.execution.executor import _Pending
+    from autotradebot.core.enums import Side, StrategyKind, Timeframe
+    from autotradebot.core.models import Play
     import datetime as dt
 
     seen = []
     ex = SimpleNamespace(_open_trade=lambda *a, **k: seen.append(k.get("submitted_at")))
-    from tos_bot.execution.executor import Executor
+    from autotradebot.execution.executor import Executor
 
     play = Play(symbol="ADP", side=Side.LONG, strategy="s", kind=StrategyKind.TECHNICAL, timeframe=Timeframe.SWING,
                 entry=10.0, stop=9.0, targets=[12.0])
@@ -491,7 +491,7 @@ def test_an_entry_that_may_have_bought_something_keeps_its_slot():
     ex.sync_open_orders()                                                  # part of it filled: a trade, not a miss
     assert handed == [] and [t["quantity"] for t in repo.open_trades()] == [4.0]
 
-    from tos_bot.core.models import Fill
+    from autotradebot.core.models import Fill
 
     _entry(ex, "DDD")                                                      # the broker's count says 0, a fill says not
     broker.reports["2"] = OrderResult(order_id="2", status="CANCELED", symbol="DDD", submitted_qty=10,

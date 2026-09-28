@@ -5,11 +5,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from tos_bot.config import ExitManagerCfg
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.engine.chart import candles, chart_payload, exit_routes
-from tos_bot.util import clock
+from autotradebot.config import ExitManagerCfg
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.engine.chart import candles, chart_payload, exit_routes
+from autotradebot.util import clock
 
 
 def _play(side=Side.LONG, timeframe=Timeframe.INTRADAY, entry=100.0, stop=98.0, target=106.0):

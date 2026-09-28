@@ -8,12 +8,12 @@ secrets/
 *.token.json.bak
 *.token.json.enc
 token_key.bin
-data/cache/
-data/paper_state.json
-data/runtime.json
-data/bars/
-data/symbols.json
-data/watchlists/
+/data/cache/
+/data/paper_state.json
+/data/runtime.json
+/data/bars/
+/data/symbols.json
+/data/watchlists/
 logs/
 *.sqlite
 *.sqlite3
@@ -36,5 +36,10 @@ Thumbs.db
 .idea/
 .vscode/
 
-# everything the running app writes (database, replay results, signals state, trades)
-data/
+# everything the running app writes (database, replay results, signals state, trades) - the folder at the
+# top only: the package's own autotradebot/data/ is code
+/data/
+
+# the training books (copyrighted; never upload)
+Financial-Economic books/
+*.epub

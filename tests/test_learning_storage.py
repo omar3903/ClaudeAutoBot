@@ -6,12 +6,12 @@ import datetime as dt
 
 from test_journal import _review
 from test_replay import EXACT, QUIET, _LongAtBar
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.research import dataset
-from tos_bot.research.features import FEATURE_KEYS, FEATURE_SCHEMA, activity_summary, play_features
-from tos_bot.research.replay import SimTrade, replay_intraday
-from tos_bot.util import clock
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.research import dataset
+from autotradebot.research.features import FEATURE_KEYS, FEATURE_SCHEMA, activity_summary, play_features
+from autotradebot.research.replay import SimTrade, replay_intraday
+from autotradebot.util import clock
 
 DAY = dt.date(2026, 9, 10)                                    # a Thursday, an ordinary session
 UTC = dt.timezone.utc
@@ -77,7 +77,7 @@ def test_a_play_row_from_the_database_gives_the_same_features():
 
 
 def test_the_activity_summary_keeps_the_metrics_and_drops_the_rest():
-    from tos_bot.scanner.heat import IntradayMetrics
+    from autotradebot.scanner.heat import IntradayMetrics
 
     m = IntradayMetrics(symbol="ACT", rvol=2.0, change_pct=1.0, gap_pct=0.5, range_atr=1.2, atr_pct=3.0, heat=0.4)
     summary = activity_summary(m)
@@ -186,8 +186,8 @@ def test_the_runner_hands_its_trades_to_the_sink(tmp_path):
     from types import SimpleNamespace
 
     import fakes
-    from tos_bot.research.history import IntradayHistory
-    from tos_bot.research.runner import ReplayRunner
+    from autotradebot.research.history import IntradayHistory
+    from autotradebot.research.runner import ReplayRunner
 
     kept = []
     runner = ReplayRunner(tmp_path / "replay.json", IntradayHistory(tmp_path / "intraday"),
@@ -234,7 +234,7 @@ def test_the_training_set_joins_the_three_populations(repo, tmp_path):
 
 
 def test_a_trade_keeps_what_its_fills_cost_against_the_price_at_the_decision(repo):
-    from tos_bot.research.journal import execution_quality
+    from autotradebot.research.journal import execution_quality
 
     p = _play()
     tid = repo.open_trade(p, 100.06, 10, "paper", decision={"mid": 100.0, "spread_bps": 4.0, "live": True})

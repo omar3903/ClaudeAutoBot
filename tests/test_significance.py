@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from tos_bot.research import significance as sig
-from tos_bot.research.replay import SimTrade, drift_per_bar, records_by_strategy
+from autotradebot.research import significance as sig
+from autotradebot.research.replay import SimTrade, drift_per_bar, records_by_strategy
 
 
 def _rs(mean, n, seed, spread=1.0):

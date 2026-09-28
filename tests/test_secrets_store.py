@@ -9,7 +9,7 @@ import unicodedata
 import pytest
 from dotenv import dotenv_values
 
-from tos_bot import secrets_store as ss
+from autotradebot import secrets_store as ss
 
 _TOUCHED = ("IBKR_HOST", "IBKR_ACCOUNT_ID", "IBKR_CLIENT_ID", "IBKR_PAPER_PORT", "IBKR_READONLY", "IBKR_MARKET_DATA")
 
@@ -59,7 +59,7 @@ def test_unchanged_value_reports_nothing(env):
 
 @pytest.mark.parametrize("updates,msg", [
     ({"DB_PASSWORD": "x"}, "can't be changed"),
-    ({"SCHWAB_API_KEY": "x"}, "can't be changed"),
+    ({"SOME_OTHER_KEY": "x"}, "can't be changed"),
     ({"IBKR_HOST": "abc\nPAPER_PLATFORM=live"}, "line breaks"),
     ({"FINNHUB_API_KEY": "abcd\u2028IBKR_HOST=6.6.6.6"}, "line breaks"),   # splitlines() breaks on these
     ({"IBKR_ACCOUNT_ID": "ab\x0bcd"}, "line breaks"),

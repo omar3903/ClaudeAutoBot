@@ -20,7 +20,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from tos_bot.config import get_settings  # noqa: E402
+from autotradebot.config import get_settings  # noqa: E402
 
 #: the app uses IBKR_CLIENT_ID, and +50 for the dashboard's Test buttons
 DOCTOR_CLIENT_OFFSET = 60
@@ -106,8 +106,8 @@ def main() -> None:
         print(GUIDE)
         return
 
-    from tos_bot.brokers.ibkr_adapter import IbkrBroker
-    from tos_bot.util.net import port_is_open
+    from autotradebot.brokers.ibkr_adapter import IbkrBroker
+    from autotradebot.util.net import port_is_open
 
     s = get_settings().secrets
     host = s.ibkr_host or "127.0.0.1"

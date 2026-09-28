@@ -2,7 +2,7 @@
 
 :class:`Financials` is what the valuation engine consumes. Every field is
 optional and the valuation code degrades gracefully when one is missing.
-Statements come from a provider (:mod:`tos_bot.data.sec_edgar`); the market
+Statements come from a provider (:mod:`autotradebot.data.sec_edgar`); the market
 figures - price, market cap and beta - are filled in by the scanner from the
 candles it already has.
 """

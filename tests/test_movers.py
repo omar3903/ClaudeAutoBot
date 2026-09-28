@@ -7,9 +7,9 @@ import datetime as dt
 
 import pandas as pd
 
-from tos_bot.research.movers import (Move, build_movers, explain, read_session, rolling_capture, session_bounds,
+from autotradebot.research.movers import (Move, build_movers, explain, read_session, rolling_capture, session_bounds,
                                      top_movers)
-from tos_bot.util import clock
+from autotradebot.util import clock
 
 DAY = dt.date(2026, 9, 15)
 NY = "America/New_York"

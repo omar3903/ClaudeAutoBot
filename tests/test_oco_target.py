@@ -6,10 +6,10 @@ from types import SimpleNamespace
 
 from test_native_stop import _StopBroker
 from test_order_follow_up import CFG, _executor, _Repo, _trade
-from tos_bot.brokers.base import BrokerError
-from tos_bot.core.enums import OrderType, Side, TimeInForce
-from tos_bot.core.models import Fill, OrderResult
-from tos_bot.execution.exit_manager import ExitManager, scale_out_plan
+from autotradebot.brokers.base import BrokerError
+from autotradebot.core.enums import OrderType, Side, TimeInForce
+from autotradebot.core.models import Fill, OrderResult
+from autotradebot.execution.exit_manager import ExitManager, scale_out_plan
 
 EXITS = SimpleNamespace(scale_out_pct=50.0, scale_out_lock_r=0.0, breakeven_buffer_bps=5.0)
 

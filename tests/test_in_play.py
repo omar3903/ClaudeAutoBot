@@ -11,11 +11,11 @@ import pandas as pd
 import pytest
 
 from test_replay import EXACT, QUIET, _LongAtBar
-from tos_bot.research.history import IntradayHistory
-from tos_bot.research.in_play import in_play, metrics_history
-from tos_bot.research.runner import ReplayRunner, day_chunks
-from tos_bot.scanner.heat import daily_metrics, liquid, rank_by_daily_heat
-from tos_bot.util import clock
+from autotradebot.research.history import IntradayHistory
+from autotradebot.research.in_play import in_play, metrics_history
+from autotradebot.research.runner import ReplayRunner, day_chunks
+from autotradebot.scanner.heat import daily_metrics, liquid, rank_by_daily_heat
+from autotradebot.util import clock
 
 NY = "America/New_York"
 LAST = dt.date(2026, 9, 10)
@@ -155,7 +155,7 @@ def test_a_stock_is_replayed_on_its_sessions_in_play_with_the_sessions_before_to
     assert [days for _, days in jobs] == [(SESSIONS[60], SESSIONS[70]), (SESSIONS[71],)]    # no candles, no replay
     assert set(jobs[1][0].index.date) == set(SESSIONS[66:72])                # the session and the ones held before it
 
-    from tos_bot.research.replay import replay_intraday
+    from autotradebot.research.replay import replay_intraday
 
     daily = pd.DataFrame({"open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 3e6},
                          index=pd.DatetimeIndex([pd.Timestamp(d, tz=NY) for d in SESSIONS]))
@@ -198,7 +198,7 @@ def test_the_runner_replays_day_trades_on_the_stocks_in_play_and_falls_back_when
 
 
 def test_a_resumed_replay_reads_its_candles_from_disk_and_downloads_none(tmp_path, monkeypatch):
-    from tos_bot.research import runner as runner_module
+    from autotradebot.research import runner as runner_module
 
     real = clock.session_date                    # "now" is the session after LAST, as in the test above
     monkeypatch.setattr(clock, "session_date",

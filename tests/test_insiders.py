@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import datetime as dt
 
-from tos_bot.signals.form4 import BUY, SELL, InsiderTrade
-from tos_bot.signals.insiders import insider_signals
+from autotradebot.signals.form4 import BUY, SELL, InsiderTrade
+from autotradebot.signals.insiders import insider_signals
 
 TODAY = dt.date(2026, 9, 15)
 

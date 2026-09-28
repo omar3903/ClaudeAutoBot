@@ -5,11 +5,11 @@ import pandas as pd
 import pytest
 
 import fakes
-from tos_bot.core.enums import Side
-from tos_bot.strategies import REGISTRY, build_context
-from tos_bot.strategies import base as strategy_base
-from tos_bot.strategies.registry import describe_all
-from tos_bot.util import clock
+from autotradebot.core.enums import Side
+from autotradebot.strategies import REGISTRY, build_context
+from autotradebot.strategies import base as strategy_base
+from autotradebot.strategies.registry import describe_all
+from autotradebot.util import clock
 
 
 def _context(symbol, **kw):
@@ -86,7 +86,7 @@ def _flat_daily(price=100.0, n=120):
 
 
 def _quote(sym, last):
-    from tos_bot.core.models import Quote
+    from autotradebot.core.models import Quote
     return Quote(symbol=sym, bid=last - 0.02, ask=last + 0.02, last=last, volume=1e6)
 
 
@@ -97,7 +97,7 @@ def _douglas_framed(play):
 
 
 def test_bull_flag_fires_on_a_textbook_flag():
-    from tos_bot.strategies.technical import MomentumFlag
+    from autotradebot.strategies.technical import MomentumFlag
     # 12 quiet bars (so ATR(14) is defined), then a pole 100->103 over 5 bars,
     # then a tight 3-bar flag. The live quote (103.25) breaks the flag high.
     closes = ([99.8] * 12
@@ -114,7 +114,7 @@ def test_bull_flag_fires_on_a_textbook_flag():
 
 
 def test_divergence_reversal_reads_bearish_divergence_at_resistance():
-    from tos_bot.strategies.technical import DivergenceReversal
+    from autotradebot.strategies.technical import DivergenceReversal
     n = 90
     ramp = np.concatenate([np.linspace(100, 108, 30), np.linspace(108, 103, 15),
                            np.linspace(103, 111, 30), np.linspace(111, 109, 15)])    # a HIGHER high
@@ -132,8 +132,8 @@ def test_divergence_reversal_reads_bearish_divergence_at_resistance():
 def test_min_stop_floor_widens_noise_tight_stops():
     """A stop closer than ~0.6% (or ~0.9 intraday ATR) to entry is noise, not a
     level - _mk_play must widen it so the reward:risk stops being a fake."""
-    from tos_bot.core.enums import StrategyKind, Timeframe
-    from tos_bot.strategies.base import Strategy
+    from autotradebot.core.enums import StrategyKind, Timeframe
+    from autotradebot.strategies.base import Strategy
 
     class _T(Strategy):
         key, kind, timeframe = "t", StrategyKind.TECHNICAL, Timeframe.INTRADAY
@@ -153,8 +153,8 @@ def test_min_stop_floor_widens_noise_tight_stops():
 def test_a_plays_targets_come_nearest_first_however_the_setup_listed_them():
     """The first target is the one the reward:risk is judged on and the first the exits take, so a
     level further out than the setup's fallback multiple must not pass for it."""
-    from tos_bot.core.enums import StrategyKind, Timeframe
-    from tos_bot.strategies.base import Strategy
+    from autotradebot.core.enums import StrategyKind, Timeframe
+    from autotradebot.strategies.base import Strategy
 
     class _T(Strategy):
         key, kind, timeframe = "t", StrategyKind.TECHNICAL, Timeframe.SWING
@@ -190,7 +190,7 @@ def test_intraday_setups_never_crash_and_stay_framed(key):
 
 
 def test_abcd_needs_a_real_higher_low_on_a_lighter_pullback():
-    from tos_bot.strategies.technical import AbcdPattern
+    from autotradebot.strategies.technical import AbcdPattern
 
     quiet, push = [100.0] * 12, [100.4, 100.9, 101.5, 102.0]
 
@@ -207,8 +207,8 @@ def test_abcd_needs_a_real_higher_low_on_a_lighter_pullback():
 
 
 def test_stops_are_floored_at_a_slice_of_the_stocks_daily_range():
-    from tos_bot.core.enums import StrategyKind, Timeframe
-    from tos_bot.strategies.base import Strategy
+    from autotradebot.core.enums import StrategyKind, Timeframe
+    from autotradebot.strategies.base import Strategy
 
     class _T(Strategy):
         key, kind, timeframe = "t", StrategyKind.TECHNICAL, Timeframe.INTRADAY
@@ -230,7 +230,7 @@ def test_stops_are_floored_at_a_slice_of_the_stocks_daily_range():
 def test_the_52_week_setup_projects_todays_volume_during_the_session(monkeypatch):
     import datetime as dt
 
-    from tos_bot.strategies.technical import Week52Breakout
+    from autotradebot.strategies.technical import Week52Breakout
 
     symbol = "W52"
     daily = fakes.daily_bars(symbol)
@@ -263,7 +263,7 @@ def test_the_52_week_setup_projects_todays_volume_during_the_session(monkeypatch
 
 
 def test_calibrated_probability_shrinks_toward_the_record_as_it_grows():
-    from tos_bot.strategies.base import calibrated_probability
+    from autotradebot.strategies.base import calibrated_probability
 
     assert calibrated_probability(0.55, None) == (0.55, None)
     assert calibrated_probability(0.55, {"trades": 0, "win_rate": 0.9}) == (0.55, None)
@@ -275,7 +275,7 @@ def test_calibrated_probability_shrinks_toward_the_record_as_it_grows():
 
 
 def test_a_play_carries_the_record_its_odds_lean_on():
-    from tos_bot.strategies.base import Strategy
+    from autotradebot.strategies.base import Strategy
 
     class Fixed(Strategy):
         key, title, thesis = "fixed", "Fixed", "t"
@@ -296,8 +296,8 @@ def test_a_play_carries_the_record_its_odds_lean_on():
 
 
 def test_a_reversal_after_a_doji_waits_for_the_next_candle_to_turn():
-    from tos_bot.analysis.candles import CandleRead
-    from tos_bot.strategies.technical import _reversal_triggered
+    from autotradebot.analysis.candles import CandleRead
+    from autotradebot.strategies.technical import _reversal_triggered
 
     doji, hammer = CandleRead("doji", None, True), CandleRead("hammer", True, False)
     bars = pd.DataFrame({"open": [10.0, 10.1], "high": [10.5, 10.4], "low": [9.8, 10.0], "close": [10.1, 10.2]})
@@ -312,7 +312,7 @@ def test_a_reversal_after_a_doji_waits_for_the_next_candle_to_turn():
 
 
 def test_pooled_odds_count_a_real_trade_twice():
-    from tos_bot.research.weights import pooled_odds
+    from autotradebot.research.weights import pooled_odds
 
     assert pooled_odds(None, None) is None
     assert pooled_odds({"trades": 40, "win_rate": 0.5}, None) == {"trades": 40, "win_rate": 0.5}

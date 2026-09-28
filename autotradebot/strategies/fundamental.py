@@ -1,5 +1,5 @@
 """Valuation-driven swing setups, built on the Pignataro engine in
-:mod:`tos_bot.valuation`.
+:mod:`autotradebot.valuation`.
 
 Each one turns a valuation gap into a directional trade:
     trades cheaper than its peers / its DCF / its blended band  -> long

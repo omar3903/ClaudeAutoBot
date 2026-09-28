@@ -169,11 +169,11 @@ def elbow(s: Svg, a, b, label=None, dash=None, end="arr", start=None, via="h", s
 def fig_components() -> str:
     s = Svg(720, 700)
     # browser
-    ui = s.box(20, 15, 680, 58, "Dashboard  (tos_bot/web/  -  index.html, styles.css, 24 ES modules, no build step)",
+    ui = s.box(20, 15, 680, 58, "Dashboard  (autotradebot/web/  -  index.html, styles.css, 24 ES modules, no build step)",
                ["opens http://127.0.0.1:8787  -  REST calls for actions, a WebSocket for live events (every panel"
                 " re-renders from the engine snapshot)"], fill="#f5f9ff", title_fill="#dbe7fb")
     # server
-    srv = s.box(20, 100, 680, 58, "FastAPI app  (tos_bot/server/app.py  +  security.py)",
+    srv = s.box(20, 100, 680, 58, "FastAPI app  (autotradebot/server/app.py  +  security.py)",
                 ["GET/POST /api/*  ->  engine methods           /ws  ->  EventBus queue  ->  JSON events        "
                  "/static  ->  the dashboard files",
                  "same-machine check on every request and on /ws (client, Host, Origin, cross-site /api/, "
@@ -185,7 +185,7 @@ def fig_components() -> str:
 
     # engine
     s.rect(20, 185, 680, 300, "#fbfbf6", "#333", rx=6)
-    s.text(360, 203, "TradingEngine  (tos_bot/engine/engine.py + mixins)  -  one object, 11 background threads",
+    s.text(360, 203, "TradingEngine  (autotradebot/engine/engine.py + mixins)  -  one object, 11 background threads",
            11, "middle", "bold")
     s.text(360, 217, "ResearchOps · JournalOps · PairsOps · CapitalOps · QuitOps  (mixins)      "
                      "EventBus (core/eventbus.py) carries every change to the dashboard", 8.5, "middle", fill="#444")
@@ -757,8 +757,8 @@ def read_const(path, name, default):
 
 
 def build() -> str:
-    journal_s = read_const("tos_bot/engine/journal_ops.py", "JOURNAL_POLL_S", 60.0)
-    pairs_s = read_const("tos_bot/engine/pairs_ops.py", "PAIRS_POLL_S", 30.0)
+    journal_s = read_const("autotradebot/engine/journal_ops.py", "JOURNAL_POLL_S", 60.0)
+    pairs_s = read_const("autotradebot/engine/pairs_ops.py", "PAIRS_POLL_S", 30.0)
     parts = [f"<title>AutoTradeBot Architecture</title><style>{CSS}</style>"]
     A = parts.append
 
@@ -774,8 +774,7 @@ def build() -> str:
 
     # ---- 1 the books ------------------------------------------------------------------------
     A('<h2 class="first">1. The twenty books the app was trained on</h2>')
-    A('<p>The PDFs live in <i>OneDrive/Desktop/Training books &amp; Documentation papers/Financial-Economic books/'
-      'Used books/</i>. The first four gave the app its trade setups and the way it explains a trade; the next '
+    A('<p>The books themselves are not part of this repository. The first four gave the app its trade setups and the way it explains a trade; the next '
       'eight gave it the statistics behind the replay, the noise checks, the volatility model, the market regime '
       'and the pairs desk. The last eight (added 2026-09-18) are about not fooling yourself: whether a record is '
       'luck, what trading really costs, a model that learns which plays pay, and two more books of setups. '
@@ -885,11 +884,11 @@ def build() -> str:
       'record of everything in a database. A browser dashboard on <code>127.0.0.1:8787</code> shows the state '
       'and takes the operator\'s decisions.</p>')
     A('<p><b>In one sentence per layer:</b></p><ul>'
-      '<li><b>Dashboard</b> (<code>tos_bot/web/</code>): static HTML plus ES modules; talks REST for actions '
+      '<li><b>Dashboard</b> (<code>autotradebot/web/</code>): static HTML plus ES modules; talks REST for actions '
       'and listens on a WebSocket for events.</li>'
-      '<li><b>Server</b> (<code>tos_bot/server/app.py</code>): a FastAPI app whose routes are thin wrappers over '
+      '<li><b>Server</b> (<code>autotradebot/server/app.py</code>): a FastAPI app whose routes are thin wrappers over '
       'engine methods; <code>/ws</code> streams the event bus.</li>'
-      '<li><b>Engine</b> (<code>tos_bot/engine/</code>): the conductor. Owns every service, runs nine daemon '
+      '<li><b>Engine</b> (<code>autotradebot/engine/</code>): the conductor. Owns every service, runs nine daemon '
       'threads, and is the only writer of the runtime state.</li>'
       '<li><b>Scanner and strategies</b> (<code>scanner/</code>, <code>strategies/</code>): turn candles into '
       'plays on a schedule.</li>'
@@ -938,7 +937,7 @@ def build() -> str:
     A('<pre>run.py                      boot the engine + dashboard (Ctrl+C follows the quit rules)\n'
       'config/config.yaml          defaults for every panel (config.example.yaml is the template)\n'
       'data/                       everything the app writes (git-ignored): SQLite, candle cache, journal ...\n'
-      'tos_bot/\n'
+      'autotradebot/\n'
       '  config.py                 .env + config.yaml -> Settings (pydantic)\n'
       '  core/                     enums, dataclasses (Play, Account, OrderRequest ...), EventBus\n'
       '  engine/                   TradingEngine + mixins, board, connections, reconcile, runtime, regime\n'
@@ -1370,7 +1369,7 @@ def build() -> str:
 
     # ---- 9 the important functions ---------------------------------------------------------------
     A('<h2>9. The functions that matter most</h2>')
-    A('<p>If you read only thirty things in the code, read these. Paths are relative to <code>tos_bot/</code>.</p>')
+    A('<p>If you read only thirty things in the code, read these. Paths are relative to <code>autotradebot/</code>.</p>')
     fns = [
         ("engine/engine.py", "TradingEngine.start()", "binds the broker, reads the account, launches the nine loops"),
         ("engine/engine.py", "_due_scan()", "decides which scan is due (full / gappers / cycle / fast / plays)"),

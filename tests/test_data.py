@@ -5,13 +5,13 @@ from __future__ import annotations
 import pytest
 
 import fakes
-from tos_bot.data import symbols as symbols_module
-from tos_bot.data.bars import FULL_HISTORY, KEEP_SESSIONS, DailyBarStore
-from tos_bot.data.market_data import MarketData, NoDataSource
-from tos_bot.data.symbols import SymbolMaster
-from tos_bot.research.history import IntradayHistory
-from tos_bot.scanner import schedule
-from tos_bot.util import clock
+from autotradebot.data import symbols as symbols_module
+from autotradebot.data.bars import FULL_HISTORY, KEEP_SESSIONS, DailyBarStore
+from autotradebot.data.market_data import MarketData, NoDataSource
+from autotradebot.data.symbols import SymbolMaster
+from autotradebot.research.history import IntradayHistory
+from autotradebot.scanner import schedule
+from autotradebot.util import clock
 
 
 # ---------------------------------------------------------------- daily candles on disk
@@ -162,7 +162,7 @@ def test_symbols_ibkr_doesnt_know_are_asked_about_again_after_a_month(tmp_path, 
 
 
 def test_the_quick_refresh_merges_the_latest_candles_into_the_cache(tmp_path):
-    from tos_bot.data.market_data import INTRADAY_DURATION, REFRESH_DURATION
+    from autotradebot.data.market_data import INTRADAY_DURATION, REFRESH_DURATION
 
     first_symbol, second_symbol = fakes.SYMBOLS[:2]
     gateway, md = fakes.FakeGateway(), MarketData(DailyBarStore(tmp_path))
@@ -206,7 +206,7 @@ def test_the_research_store_keeps_years_of_candles_for_the_stocks_the_replay_run
 def test_the_latest_price_is_the_newer_of_the_quote_and_the_candles_and_says_when_its_from(tmp_path):
     import datetime as dt
 
-    from tos_bot.data.market_data import quote_from_price
+    from autotradebot.data.market_data import quote_from_price
 
     gateway, md = fakes.FakeGateway(delayed=True), MarketData(DailyBarStore(tmp_path))
     md.attach(gateway)
@@ -250,7 +250,7 @@ def test_on_real_time_data_a_newer_price_to_show_never_reaches_the_quote_either(
     import datetime as dt
     import time
 
-    from tos_bot.data.market_data import quote_from_price
+    from autotradebot.data.market_data import quote_from_price
 
     gateway, md = fakes.StreamingGateway(["AAA"]), MarketData(DailyBarStore(tmp_path))
     gateway.connect()
@@ -270,7 +270,7 @@ def test_the_latest_price_is_the_newer_of_a_price_to_show_and_the_quote(tmp_path
     import datetime as dt
     import time
 
-    from tos_bot.data.market_data import quote_from_price
+    from autotradebot.data.market_data import quote_from_price
 
     gateway, md = fakes.FakeGateway(["AAA"], delayed=True), MarketData(DailyBarStore(tmp_path))
     md.attach(gateway)

@@ -1,12 +1,12 @@
--- tos-trader MySQL schema  (generated - source of truth is tos_bot/persistence/models_orm.py)
+-- AutoTradeBot MySQL schema  (generated - source of truth is autotradebot/persistence/models_orm.py)
 -- Canonical setup:  python scripts/init_db.py   (creates tables + indexes; also auto-adds
 --                   any new columns to an existing database on every start)
 -- Manual setup:
---   CREATE DATABASE tos_trader CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
---   CREATE USER 'tos'@'%' IDENTIFIED BY 'CHANGE_ME';
---   GRANT ALL PRIVILEGES ON tos_trader.* TO 'tos'@'%'; FLUSH PRIVILEGES;
+--   CREATE DATABASE autotradebot CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+--   CREATE USER 'autotradebot'@'%' IDENTIFIED BY 'CHANGE_ME';
+--   GRANT ALL PRIVILEGES ON autotradebot.* TO 'autotradebot'@'%'; FLUSH PRIVILEGES;
 
-USE tos_trader;
+USE autotradebot;
 
 CREATE TABLE IF NOT EXISTS account_snapshots (
 	id INTEGER NOT NULL AUTO_INCREMENT, 

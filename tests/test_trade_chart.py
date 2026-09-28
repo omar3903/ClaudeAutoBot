@@ -9,12 +9,12 @@ import pytest
 
 import fakes
 from test_engine import _connect, engine, gateway, port  # noqa: F401  (the engine on a synthetic Gateway)
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.engine.chart import stop_moves, trade_chart_payload, trade_standing
-from tos_bot.persistence.db import session_scope
-from tos_bot.persistence.models_orm import Trade
-from tos_bot.util import clock
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.engine.chart import stop_moves, trade_chart_payload, trade_standing
+from autotradebot.persistence.db import session_scope
+from autotradebot.persistence.models_orm import Trade
+from autotradebot.util import clock
 
 
 def _play(symbol="T01", side=Side.LONG, timeframe=Timeframe.INTRADAY, stop=95.0, target=110.0):

@@ -9,9 +9,9 @@ import threading
 import time
 
 from test_engine import _connect, engine, gateway, port  # noqa: F401 - pytest fixtures
-from tos_bot.engine import journal_ops
-from tos_bot.scanner import schedule
-from tos_bot.util import clock
+from autotradebot.engine import journal_ops
+from autotradebot.scanner import schedule
+from autotradebot.util import clock
 
 
 def _session(monkeypatch):

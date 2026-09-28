@@ -6,10 +6,10 @@ import datetime as dt
 
 import pytest
 
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.signals.book import BoostSettings, SignalBook, SymbolSignals, nudge
-from tos_bot.signals.insiders import InsiderSignal
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.signals.book import BoostSettings, SignalBook, SymbolSignals, nudge
+from autotradebot.signals.insiders import InsiderSignal
 
 DAY = dt.date(2026, 9, 14)
 

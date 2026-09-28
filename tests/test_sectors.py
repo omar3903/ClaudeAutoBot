@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tos_bot.data.sectors import SECTORS, canonical_sector, clean_sector_list, sector_allowed, sector_from_ibkr
+from autotradebot.data.sectors import SECTORS, canonical_sector, clean_sector_list, sector_allowed, sector_from_ibkr
 
 
 def test_canonical_names():

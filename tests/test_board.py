@@ -7,9 +7,9 @@ import pickle
 
 import pandas as pd
 
-from tos_bot.core.enums import PlayStatus, Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
-from tos_bot.engine.board import PlayBoard
+from autotradebot.core.enums import PlayStatus, Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
+from autotradebot.engine.board import PlayBoard
 
 
 def _play(symbol="AAA", side=Side.LONG, strategy="abcd_pattern", entry=100.0):

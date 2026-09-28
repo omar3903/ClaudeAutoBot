@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tos_bot.indicators import ta
+from autotradebot.indicators import ta
 
 
 @pytest.fixture

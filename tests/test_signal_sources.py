@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import datetime as dt
 
-from tos_bot.signals.edgar import company_filings, daily_index, daily_index_url, latest_filings
-from tos_bot.signals.news import NewsItem, eight_k_headline, eight_k_news, ibkr_headline, is_material
+from autotradebot.signals.edgar import company_filings, daily_index, daily_index_url, latest_filings
+from autotradebot.signals.news import NewsItem, eight_k_headline, eight_k_news, ibkr_headline, is_material
 
 UTC = dt.timezone.utc
 

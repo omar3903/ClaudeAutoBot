@@ -23,12 +23,12 @@ from types import SimpleNamespace
 import pytest
 from ib_async.order import OrderStatus
 
-from tos_bot.brokers import ibkr_adapter as mod
-from tos_bot.brokers.base import DONE_STATUSES, AuthError, BrokerError, OrderRejected
-from tos_bot.brokers.paper_adapter import PaperBroker
-from tos_bot.core.enums import OrderType, Side, TimeInForce
-from tos_bot.core.models import OrderRequest, Quote
-from tos_bot.execution.order_builder import build_exit_order
+from autotradebot.brokers import ibkr_adapter as mod
+from autotradebot.brokers.base import DONE_STATUSES, AuthError, BrokerError, OrderRejected
+from autotradebot.brokers.paper_adapter import PaperBroker
+from autotradebot.core.enums import OrderType, Side, TimeInForce
+from autotradebot.core.models import OrderRequest, Quote
+from autotradebot.execution.order_builder import build_exit_order
 
 
 # --------------------------------------------------------------------------- #
@@ -391,7 +391,7 @@ def test_connected_and_account(broker):
 
 
 def test_a_slow_answer_raises_instead_of_reading_as_an_empty_account(broker):
-    from tos_bot.brokers.base import BrokerError
+    from autotradebot.brokers.base import BrokerError
 
     real = broker._session.call
 
@@ -1030,8 +1030,8 @@ def test_a_snapshot_is_read_though_the_wall_clock_stamped_it_no_later_than_the_l
 
 
 def test_a_refused_snapshot_is_priced_as_a_failed_one_from_the_quote_kept_or_the_latest_candle(broker, tmp_path):
-    from tos_bot.data.bars import DailyBarStore
-    from tos_bot.data.market_data import _QUOTE_TTL_S, MarketData
+    from autotradebot.data.bars import DailyBarStore
+    from autotradebot.data.market_data import _QUOTE_TTL_S, MarketData
 
     ib, md = broker._session.ib, MarketData(DailyBarStore(tmp_path))
     md.attach(broker)

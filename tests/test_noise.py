@@ -6,13 +6,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play, Quote
-from tos_bot.scanner.evaluator import with_today
-from tos_bot.scanner.filters import expected_r, rank_score
-from tos_bot.scanner.noise import NoiseSettings, context_flags, opposing_volume_ratio
-from tos_bot.strategies import build_context
-from tos_bot.util import clock
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play, Quote
+from autotradebot.scanner.evaluator import with_today
+from autotradebot.scanner.filters import expected_r, rank_score
+from autotradebot.scanner.noise import NoiseSettings, context_flags, opposing_volume_ratio
+from autotradebot.strategies import build_context
+from autotradebot.util import clock
 
 NY = "America/New_York"
 

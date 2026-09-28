@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Account, Play
-from tos_bot.risk.pdt_guard import PdtGuard
-from tos_bot.risk.position_sizing import size_play
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Account, Play
+from autotradebot.risk.pdt_guard import PdtGuard
+from autotradebot.risk.position_sizing import size_play
 
 ACC_CFG = SimpleNamespace(
     min_start_equity=2000.0, pdt_equity_threshold=25000.0,
@@ -157,8 +157,8 @@ def test_a_day_trade_sized_at_midday_risks_a_fraction_of_the_usual(monkeypatch):
     import datetime as dt
     from zoneinfo import ZoneInfo
 
-    from tos_bot.risk import position_sizing
-    from tos_bot.risk.position_sizing import time_of_day_factor
+    from autotradebot.risk import position_sizing
+    from autotradebot.risk.position_sizing import time_of_day_factor
 
     ny = ZoneInfo("America/New_York")
     cfg = SimpleNamespace(**RISK_CFG.__dict__, midday_size_pct=60.0)

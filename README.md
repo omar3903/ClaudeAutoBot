@@ -2,6 +2,16 @@
 
 A **human-in-the-loop** trading assistant for Interactive Brokers.
 
+> **Disclaimer.** This is a personal project for education and research, run on an IBKR **paper** account.
+> Nothing in it is financial advice or a recommendation to buy or sell any security. Trading carries a real
+> risk of loss, and automated trading can lose money quickly - through a bug, bad data, a broker outage or
+> a strategy that simply has no edge. Use it at your own risk; the software comes with no warranty (see
+> [LICENSE](LICENSE)).
+
+Built by **Omar Abdeen** ([omarabdeen123@gmail.com](mailto:omarabdeen123@gmail.com)) with
+**[Claude Code](https://claude.com/claude-code)**, Anthropic's AI coding assistant, as a pair programmer - see
+[How it was built](#how-it-was-built).
+
 Once a day before the open it ranks **every US-listed stock and ADR** by how in
 play it is, keeps a **hot list** for the day with a small **buffer of candidates
 per sector** behind it, and through the session rescans those on a cycle. It
@@ -120,7 +130,7 @@ fill, and the data pill reads `data: none`. Nothing is ever made up.
 
 ## How scanning works
 
-`tos_bot/scanner/` — the schedule is in `schedule.py`, the ranking in `heat.py`,
+`autotradebot/scanner/` — the schedule is in `schedule.py`, the ranking in `heat.py`,
 the lists in `watchlist.py` and the two scans in `scanner.py`.
 
 **The full scan — once a day, pre-market** (default 08:30 ET; pick 04:00–09:00 in
@@ -231,7 +241,7 @@ many still queued) and the latest adopt / keep / drop decisions.
 
 Two switches, both in the dashboard and remembered in `data/runtime.json`
 (`.env` only supplies the starting value). The routing lives in
-`tos_bot/brokers/venues.py`:
+`autotradebot/brokers/venues.py`:
 
 | Paper / Live | Paper platform | IB Gateway connection | Orders go to |
 |---|---|---|---|
@@ -354,10 +364,42 @@ day (at least 30 of the session's 390 minutes) is left out for the rest of
 the session, and sizing's `risk.max_adv_pct` cap still limits any order on
 these stocks. The log says `live scan: +A +B -C` when the names change.
 
-> The app manages exits itself (it doesn't attach a native OCO bracket at IBKR,
-> so two exit managers never fight over one position). That means **no stop is
-> resting at IBKR if the app isn't running** — keep it running while positions
-> are open.
+> Every position's stop, and its target as a one-cancels-the-other partner, rests at IBKR as a native
+> order, so a position stays protected while the app is closed. The app's own exit manager moves the stop
+> (break-even, trailing) and handles the time exits - those need the app running.
+
+### Keeping your IBKR account safe
+
+IBKR's API has **no password of its own**: any program that can reach the Gateway's API port can read the
+account and place orders, with no login. Two locks keep that port to this computer:
+
+1. **In IB Gateway** (*Configure → Settings → API → Settings*): tick *Allow connections from localhost only*,
+   keep `127.0.0.1` as the **only** entry under *Trusted IPs* (remove anything else), and use the standard
+   ports (4002 paper, 4001 live). If you only want to watch, leave *Read-Only API* ticked - the app then can't
+   trade. Leave *Master API client ID* empty.
+2. **In the operating system's firewall**, block those ports from the network, so even a Gateway setting
+   changed by mistake can't expose them. On Windows, in PowerShell run as administrator:
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "IBKR API - block from network" -Direction Inbound -Protocol TCP -LocalPort 4001,4002,7496,7497 -Action Block
+   ```
+
+   Windows Firewall doesn't filter traffic on the computer itself (loopback), so the app still connects;
+   everything from another device is dropped, and a block rule wins over any *allow* rule Java or the
+   Gateway's installer added. Check it with `Get-NetFirewallRule -DisplayName "IBKR API - block from network"`.
+   On Linux: `sudo ufw deny 4001:4002/tcp` and `sudo ufw deny 7496:7497/tcp`.
+
+And around it:
+
+- Keep `IBKR_HOST=127.0.0.1`. The API connection isn't encrypted, so never point the app at a Gateway on
+  another machine across a network you don't control.
+- The app never stores your IBKR username or password - the Gateway holds the login. If you use IBC for the
+  daily login, its `config.ini` holds your password in plain text: keep it in IBC's own folder (not in this
+  repository), readable only by your Windows user, and never commit it.
+- Turn on two-factor login for IBKR (*IBKR Mobile* → *Secure Login System*) and for GitHub.
+- Your keys live in `.env`, which is git-ignored - never commit it. On a public GitHub repository, turn on
+  *secret scanning* and *push protection* (Settings → Code security) so a key pushed by mistake is blocked.
+- Keep `WEB_HOST=127.0.0.1` so the dashboard is only served to this computer (see below).
 
 ### Security of settings
 
@@ -388,17 +430,17 @@ these stocks. The log says `live scan: +A +B -C` when the names change.
 ### MySQL (optional — SQLite is the default)
 
 ```sql
-CREATE DATABASE tos_trader CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER 'tos'@'%' IDENTIFIED BY 'your-password';
-GRANT ALL PRIVILEGES ON tos_trader.* TO 'tos'@'%';
+CREATE DATABASE autotradebot CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'autotradebot'@'%' IDENTIFIED BY 'your-password';
+GRANT ALL PRIVILEGES ON autotradebot.* TO 'autotradebot'@'%';
 FLUSH PRIVILEGES;
 ```
 
 ```dotenv
 DB_HOST=127.0.0.1
 DB_PORT=3306
-DB_NAME=tos_trader
-DB_USER=tos
+DB_NAME=autotradebot
+DB_USER=autotradebot
 DB_PASSWORD=your-password
 DB_ALLOW_SQLITE_FALLBACK=0            # set 0 in production so a DB outage is loud
 ```
@@ -599,7 +641,7 @@ positions** with their own **Exit** button. The app doesn't manage their exits.
 ## Learning from what happened - the training set
 
 Every play the app acts on is kept with **what it looked like at the decision**, so a model can
-later learn which plays pay. `tos_bot/research/features.py` turns a play into one flat row of
+later learn which plays pay. `autotradebot/research/features.py` turns a play into one flat row of
 features - the setup's confidence, odds, reward:risk and geometry, its noise flags and
 confirmations, the time of day, the market regime, the stock's relative volume, gap and range,
 the volatility forecast, the price character, the abnormal-move reading, the sessions to
@@ -625,7 +667,7 @@ python scripts/export_training_set.py            # -> data/research/training_set
 The data collection is passive: the app trades as usual and the rows accumulate. See
 `docs/AutoTradeBot-learning.pdf` for how they are meant to be used.
 
-**Judging a model** (`tos_bot/research/validate.py`, `scripts/validate_model.py`): before any model
+**Judging a model** (`autotradebot/research/validate.py`, `scripts/validate_model.py`): before any model
 touches a decision it is judged the way the learning guide says - **purged walk-forward folds**
 (each fold trains on rows that finished before its test window, less an embargo; never a random
 split), against the **baselines** it must beat (the confidence the setup states and the calibrated
@@ -643,7 +685,7 @@ python scripts/validate_model.py --csv data/research/training_set.csv --folds 6 
 It prints the table with the pass marks (`usable: YES` or `no - stays in shadow`) and writes
 `data/research/validation.json`. A model that doesn't pass is not used.
 
-**The model** (`tos_bot/research/model.py`, `scripts/train_model.py`; needs `pip install scikit-learn`,
+**The model** (`autotradebot/research/model.py`, `scripts/train_model.py`; needs `pip install scikit-learn`,
 the `[learning]` extra). López de Prado's meta-labelling: the setups keep choosing the side, entry,
 stop and target, and gradient-boosted trees learn the odds that a play pays. Rows alive together on
 one stock share their weight and old rows count for less (AFML ch. 4); the verdict comes from the
@@ -704,7 +746,7 @@ use — click it to set an amount, or **Use the whole account** to clear it.
 
 ## $2,000 floor & the Pattern-Day-Trader rule  (live mode only)
 
-`tos_bot/risk/pdt_guard.py` runs on every **Assess** before you can confirm.
+`autotradebot/risk/pdt_guard.py` runs on every **Assess** before you can confirm.
 **In paper mode nothing below is enforced** — the day-trade tally is still
 shown so you can see where live would stop you.
 
@@ -724,7 +766,7 @@ shown so you can see where live would stop you.
 
 ## Market sessions, order types & holidays
 
-`tos_bot/util/clock.py` knows the four sessions and the NYSE calendar
+`autotradebot/util/clock.py` knows the four sessions and the NYSE calendar
 (full-day holidays **and** 1:00 pm half-days) through 2028.
 
 * **Regular hours** → the order type from `execution.default_order_type`
@@ -787,7 +829,7 @@ than the replay charges.
 
 **A stop that outlives the app.** On IBKR every open position also has a
 good-till-cancelled **stop order resting at the broker** (`execution.native_stop`,
-on by default; `tos_bot/execution/protective_stops.py`), at the trade's working
+on by default; `autotradebot/execution/protective_stops.py`), at the trade's working
 stop and for exactly the shares held. It protects the position while the app,
 the computer or the connection is down, and on delayed quotes it reacts to the
 real price instead of one fifteen minutes old. The trade record is the source of
@@ -857,7 +899,7 @@ exited from **Shares without a record**, as before.
 The Open orders panel lists them as **stop** and **target** with their trade. The
 simulator keeps its own bracket and gets no such orders.
 
-`tos_bot/execution/exit_manager.py` runs every few seconds on every open trade
+`autotradebot/execution/exit_manager.py` runs every few seconds on every open trade
 held on the active platform — **entries need your click, exits never do**:
 
 | rule | default | config key |
@@ -897,7 +939,7 @@ records the proof rule reads are for the exits actually used.
 
 ## Autopilot — hands-off entry
 
-`tos_bot/execution/autopilot.py`. After each scan it walks the fresh plays and,
+`autotradebot/execution/autopilot.py`. After each scan it walks the fresh plays and,
 for any that clear the gate, calls the same approve/execute path as the
 **Execute ✓ Yes** button. Toggle and tune it from the header (**Autopilot: off /
 day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot`:
@@ -1007,7 +1049,7 @@ shows it (`Autopilot: day ⚡60s`). At each 5-minute close the candle-close chec
 
 ## Signals — insider trades and company news
 
-A background service (`tos_bot/signals/`) watches what happens off the price chart. It is on by default
+A background service (`autotradebot/signals/`) watches what happens off the price chart. It is on by default
 (`signals.enabled` in `config.yaml`; `SIGNALS_ENABLED=0` turns it off, and the tests do).
 
 **Insider trades (SEC Form 4, no key needed)**
@@ -1153,7 +1195,7 @@ A background service (`tos_bot/signals/`) watches what happens off the price cha
 The setups come from Aziz, Murphy and Pignataro. A second shelf of books on
 algorithmic trading and time-series econometrics decides whether a setup can be
 trusted *right now*, how much to risk on it, and how its record is judged. The
-models are plain numpy in `tos_bot/quant/` (no statistics packages), and each one
+models are plain numpy in `autotradebot/quant/` (no statistics packages), and each one
 is tested on simulated series whose answer is known.
 
 | book | what it adds | where |
@@ -1216,7 +1258,7 @@ is tested on simulated series whose answer is known.
   isn't capped; `0` turns it off. Day and swing trades alike; pair legs are
   sized by the pairs desk and are untouched.
 
-**Two statistical day trades** (`tos_bot/strategies/statistical.py`; on even when
+**Two statistical day trades** (`autotradebot/strategies/statistical.py`; on even when
 an older `config.yaml` doesn't list them):
 
 | key | idea |
@@ -1406,7 +1448,7 @@ ranking of the previous day's candles can't see them, and the report says so.
 
 ## Pairs trading
 
-`tos_bot/pairs/`. Two stocks from one industry whose log prices are cointegrated drift
+`autotradebot/pairs/`. Two stocks from one industry whose log prices are cointegrated drift
 apart and come back together. When their spread strays past its band the bot buys one
 and shorts the other, and both legs come off together. From Vidyamurthy's *Pairs
 Trading* and Chan's *Algorithmic Trading* (ch. 2-4 and 8).
@@ -1466,7 +1508,7 @@ randomly around an edge. The plays pushed to the dashboard carry only what the t
 shows, so this text is fetched once the pointer rests on a play; the one-line
 rationale shows until it arrives.
 
-### Technical (`tos_bot/strategies/technical.py`)
+### Technical (`autotradebot/strategies/technical.py`)
 
 Intraday setups carry a `tod_profile` (`momentum` / `reversal` / `trend`) that
 scales confidence by Aziz's session clock. **Every play's stop is floored**: a
@@ -1498,7 +1540,7 @@ Also: `gap_reversion` and `earnings_drift` (see [What the books taught it](#what
 
 ### Valuation — from *Pignataro, Financial Modeling and Valuation* (2nd ed.)
 
-`tos_bot/valuation/` + `tos_bot/strategies/fundamental.py`:
+`autotradebot/valuation/` + `autotradebot/strategies/fundamental.py`:
 
 | key | book chapter | idea |
 |---|---|---|
@@ -1533,11 +1575,11 @@ taking precedence, cached for a week. Companies that don't file US-GAAP figures
 
 ## Adding a broker
 
-Implement `tos_bot/brokers/base.py::BrokerAdapter`, register it in
-`tos_bot/brokers/__init__.py::get_broker`, and add it to the routing in
-`tos_bot/brokers/venues.py` and `tos_bot/engine/connections.py`. To use it as a
+Implement `autotradebot/brokers/base.py::BrokerAdapter`, register it in
+`autotradebot/brokers/__init__.py::get_broker`, and add it to the routing in
+`autotradebot/brokers/venues.py` and `autotradebot/engine/connections.py`. To use it as a
 price source too, give it the `PriceSource` methods from
-`tos_bot/data/market_data.py` (`history_many`, `contract_details_many`,
+`autotradebot/data/market_data.py` (`history_many`, `contract_details_many`,
 `get_quote`, `quotes_from_bars`). Shipped: `paper_adapter.py` (simulator) and
 `ibkr_adapter.py` (`ib_async`, own asyncio-loop thread, auto-reconnect, paper +
 live by port).
@@ -1551,7 +1593,7 @@ run.py                     boot engine + dashboard (Ctrl+C follows the quit rule
 scripts/
   init_db.py               create the MySQL schema
   ibkr_setup.py            IB Gateway connectivity doctor + setup guide  (--guide, --live)
-tos_bot/
+autotradebot/
   config.py                .env + config.yaml loader
   secrets_store.py         the Connections panel's validated, allow-listed .env writer
   engine/                  the conductor
@@ -1615,7 +1657,20 @@ journal on a scripted session. The real IB Gateway isn't exercised in tests.
 
 ## Roadmap
 
-- a native stop resting at the broker as a crash-safety backup, kept in sync with the exit manager
-- streaming IBKR ticks (`reqMktData` subscriptions) for the hot list instead of candle polls
 - options plays
 - equity-curve chart in the dashboard
+
+## How it was built
+
+AutoTradeBot is built by Omar Abdeen with **Claude Code**, Anthropic's AI coding assistant, as a pair
+programmer - and says so openly. Omar Abdeen decided what to build and what the app must never do, set the
+trading rules and risk limits, ran it day after day against an IBKR paper account, and approved every change
+before it was merged. Claude Code wrote much of the code, the tests and the documentation, and ran the reviews
+and replays behind the decisions. That's why most commits carry a `Co-Authored-By: Claude` line and many pull
+requests say they were generated with Claude Code; the pull-request history keeps the reasoning, the test
+results and the reviews behind each change.
+
+## License
+
+[MIT](LICENSE) - use it, change it, share it; keep the copyright notice. No warranty: see the disclaimer at
+the top.

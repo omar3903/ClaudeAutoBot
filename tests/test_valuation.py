@@ -6,8 +6,8 @@ import math
 
 import pytest
 
-from tos_bot.data.fundamentals import Financials
-from tos_bot.valuation import (
+from autotradebot.data.fundamentals import Financials
+from autotradebot.valuation import (
     DcfInputs,
     MethodRange,
     band_verdict,

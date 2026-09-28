@@ -1,4 +1,4 @@
-"""Setups driven by signals from outside the price chart (see tos_bot/signals)."""
+"""Setups driven by signals from outside the price chart (see autotradebot/signals)."""
 
 from __future__ import annotations
 

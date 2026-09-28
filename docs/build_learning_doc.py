@@ -15,7 +15,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(ROOT))
 try:
-    from tos_bot.research.features import FEATURE_KEYS, FEATURE_SCHEMA  # noqa: E402
+    from autotradebot.research.features import FEATURE_KEYS, FEATURE_SCHEMA  # noqa: E402
 except Exception:  # noqa: BLE001 - the guide still builds without the package
     FEATURE_KEYS, FEATURE_SCHEMA = (), 1
 
@@ -285,7 +285,7 @@ def build() -> str:
 
     # ---- 3 --------------------------------------------------------------------------------
     A('<h2>3. The features</h2>')
-    A(f'<p>One function, <code>tos_bot/research/features.py play_features()</code>, turns a play into a flat '
+    A(f'<p>One function, <code>autotradebot/research/features.py play_features()</code>, turns a play into a flat '
       f'dict of {len(FEATURE_KEYS)} keys. The same function runs at a live fill, in the review and inside the '
       f'replay\'s worker processes, so the three sources cannot drift apart. Every key is always present '
       f'(<code>None</code> when the reading was not available), and <code>FEATURE_SCHEMA</code> (now '

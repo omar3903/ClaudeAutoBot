@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tos_bot.data import fx
+from autotradebot.data import fx
 
 RATES = {"USD": 1.08, "CAD": 1.5, "EUR": 1.0}          # units per 1 EUR
 

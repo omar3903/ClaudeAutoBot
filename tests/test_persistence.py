@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from tos_bot.core.enums import Side, StrategyKind, Timeframe
-from tos_bot.core.models import Play
+from autotradebot.core.enums import Side, StrategyKind, Timeframe
+from autotradebot.core.models import Play
 
 
 def _play(**kw):
@@ -123,7 +123,7 @@ def test_the_startup_migration_quotes_names_and_writes_defaults_the_databases_wa
 
     import sqlalchemy as sa
 
-    from tos_bot.persistence import db as dbmod
+    from autotradebot.persistence import db as dbmod
 
     now = sa.MetaData()                              # the table as the models describe it today
     sa.Table("group", now, sa.Column("id", sa.Integer, primary_key=True),
