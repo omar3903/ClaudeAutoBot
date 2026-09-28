@@ -239,7 +239,7 @@ class PairsOps:
         # a pair is a swing trade while the day / swing split is on; with one of the two filter boxes off
         # the split is off, and a pair isn't held to a share it can't have
         acc = self.sizing_account(capital.SWING if self._both_kinds() else None)
-        if acc is None or (acc.equity and self.gross_exposure() > acc.equity * ap.max_gross_exposure_pct / 100.0):
+        if acc is None or (acc.equity and self.gross_exposure() > ap.exposure_ceiling(acc.equity)):
             return
         room = (getattr(acc, "raw", None) or {}).get("capital_room")
         if room is not None and float(room) <= 0:

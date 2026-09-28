@@ -26,6 +26,12 @@ from ..core.models import Account
 DAY, SWING = "INTRADAY", "SWING"
 DEFAULT_DAY_PCT = 75.0
 
+#: what "the whole account" means for the positions held together: its buying power, margin included (MODE_MARGIN),
+#: or only the money in it (MODE_CASH: longs and shorts together never hold more than the account's value, so
+#: nothing is borrowed). A set amount is money the account holds, so it never uses margin either
+MODE_MARGIN, MODE_CASH = "margin", "cash"
+MODES = (MODE_MARGIN, MODE_CASH)
+
 _CURRENCY_SIGN = {"USD": "$", "CAD": "CA$", "EUR": "€", "GBP": "£", "AUD": "A$", "HKD": "HK$"}
 
 
@@ -66,28 +72,50 @@ def share_of(kind: str, day_pct: float) -> float:
     return max(0.0, min(1.0, (day_pct if kind == DAY else 100.0 - day_pct) / 100.0))
 
 
+def capacity_usd(acc: Account, limit: Optional[float], invested: float, mode: str = MODE_MARGIN) -> float:
+    """The most the bot's positions may hold together, in US dollars. A set amount (``limit``, in the account's
+    currency): that much, never more than the account's value. Cash only: the account's value. The whole account
+    with margin: what the positions hold now plus IBKR's buying power - the broker's own figure for what's left
+    after them, with the margin it allows already in it; with no buying power reported, the account's value."""
+    if limit:
+        return min(limit * float(acc.usd_per_base or 0.0), acc.equity)
+    power = float(acc.buying_power or 0.0)
+    if mode == MODE_CASH or power <= 0:
+        return acc.equity
+    return max(0.0, invested) + power
+
+
 def invested_by_kind(acc: Optional[Account], trades: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
     return {kind: invested_usd(acc, [t for t in trades if kind_of(t.get("timeframe")) == kind]) for kind in (DAY, SWING)}
 
 
 def sizing_account(acc: Account, limit: Optional[float], invested: float, *, share: float = 1.0,
-                   invested_in_kind: float = 0.0) -> Account:
-    """The account shrunk to ``limit`` (account currency; None: the whole account) for position sizing.
-    With ``share`` under 1, only that part of it is open to this kind of trade, less what that kind holds."""
-    cap = min(limit * float(acc.usd_per_base or 0.0), acc.equity) if limit else acc.equity
+                   invested_in_kind: float = 0.0, mode: str = MODE_MARGIN) -> Account:
+    """The account as position sizing sees it: ``limit`` (account currency) is a set amount, None the whole account
+    - with margin or cash only, as ``mode`` says. Risk per trade and the per-position limits are measured against
+    the set amount or the account's value, never against margin; new positions only get what's left of the most the
+    positions may hold (capacity_usd), and with ``share`` under 1 only that part of it, less what that kind holds."""
+    base = min(limit * float(acc.usd_per_base or 0.0), acc.equity) if limit else acc.equity
+    cap = capacity_usd(acc, limit, invested, mode)
     room = max(0.0, cap - invested)
     if share < 1.0:
         room = min(room, max(0.0, cap * share - invested_in_kind))
-    return dataclasses.replace(acc, equity=round(cap, 2), cash=round(min(acc.cash, cap), 2),
+    return dataclasses.replace(acc, equity=round(base, 2), cash=round(min(acc.cash, base), 2),
                                buying_power=round(min(acc.buying_power, cap), 2),
                                raw={**(acc.raw or {}), "capital_room": round(room, 2), "capital_share": share})
 
 
 def state(acc: Account, venue: str, label: str, limit: Optional[float], invested: float,
-          day_pct: float = DEFAULT_DAY_PCT, by_kind: Optional[Mapping[str, float]] = None) -> Dict[str, Any]:
+          day_pct: float = DEFAULT_DAY_PCT, by_kind: Optional[Mapping[str, float]] = None,
+          mode: str = MODE_MARGIN) -> Dict[str, Any]:
     worth = in_account_currency(acc)
     rate, value = worth["usd_per_base"], worth["equity"]
-    effective = min(limit, value) if limit else value
+    if limit:
+        effective = min(limit, value)
+    elif mode == MODE_CASH or not rate:
+        effective = value
+    else:                                   # with margin: what the positions hold plus the buying power left
+        effective = capacity_usd(acc, None, invested, mode) / rate
     held = invested / rate if rate else 0.0
 
     def part(kind: str) -> Dict[str, float]:
@@ -99,7 +127,8 @@ def state(acc: Account, venue: str, label: str, limit: Optional[float], invested
                 # kind just takes no new entries until it is back under
                 "over": round(max(0.0, used - size), 2)}
     return {"venue": venue, "venue_label": label, "currency": worth["currency"], "usd_per_base": rate,
-            "limit": limit, "account_value": value, "effective": round(effective, 2),
+            "limit": limit, "mode": "amount" if limit else mode, "buying_power": worth["buying_power"],
+            "account_value": value, "effective": round(effective, 2),
             "invested": round(held, 2), "available": round(max(0.0, effective - held), 2),
             "clipped": bool(limit and limit > value), "fx_missing": not rate,
             "split": {"day_pct": day_pct, "day": part(DAY), "swing": part(SWING)}}
@@ -127,6 +156,13 @@ def parse_size_factor(value: Any) -> float:
     if not math.isfinite(factor) or not 0.0 <= factor <= SIZE_FACTOR_MAX:
         raise ValueError(f"The position size factor has to be between 0 and {SIZE_FACTOR_MAX:g}.")
     return factor
+
+
+def parse_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    if mode not in MODES:
+        raise ValueError("Choose the whole account with margin, or cash only.")
+    return mode
 
 
 def parse_amount(amount: Any) -> float:

@@ -222,7 +222,8 @@ export function renderCapital(c) {
   const b = $("#btn-capital");
   b.classList.remove("limited", "clipped");
   if (!c) { b.textContent = "–"; b.title = "No account data yet"; return; }
-  b.textContent = c.limit ? money(c.effective, c.currency) : "Whole account";
+  const cash = c.mode === "cash";
+  b.textContent = c.limit ? money(c.effective, c.currency) : cash ? "Cash only" : "Whole account (margin)";
   b.classList.toggle("limited", !!c.limit && !c.clipped);
   b.classList.toggle("clipped", !!c.clipped);
   const sp = c.split;
@@ -231,7 +232,10 @@ export function renderCapital(c) {
     ? `The bot uses ${money(c.effective, c.currency)} of this ${money(c.account_value, c.currency)} account` +
       (c.clipped ? ` (you set ${money(c.limit, c.currency)}, but the account is worth less now)` : "") +
       `. ${money(c.available, c.currency)} of it isn't invested.`
-    : `The bot can use the whole ${money(c.account_value, c.currency)} account.`) + split + " Click to change.";
+    : cash
+      ? `Cash only: the bot's positions, long and short together, never hold more than the ${money(c.account_value, c.currency)} the account is worth - nothing is borrowed. ${money(c.available, c.currency)} of it isn't invested.`
+      : `The whole account with margin: new positions may use the ${money(c.buying_power, c.currency)} of buying power IBKR reports (what's left after the open positions, margin included); the account is worth ${money(c.account_value, c.currency)}. Risk per trade is still measured against the account's value.`)
+    + split + " Click to change.";
 }
 
 async function openCapital() {
@@ -240,33 +244,46 @@ async function openCapital() {
   const c = d.capital;
   if (!c) { toast("No account data yet — connect IB Gateway first", "warn"); return; }
   const ccy = c.currency;
-  const save = async amount => {
-    const r = await post("/api/capital", { amount });
+  const save = async body => {
+    const r = await post("/api/capital", body);
     toastResult(r);
     if (r.ok) { S.state.capital = r.capital; renderCapital(r.capital); emit("capital", r.capital); }
   };
+  const now = c.limit ? "amount" : c.mode === "cash" ? "cash" : "margin";
+  const option = (value, title, text) => `<label class="cap-mode"><input type="radio" name="cap-mode" value="${value}"
+      ${now === value ? "checked" : ""}> <b>${title}</b> - ${text}</label>`;
   openModal({
     title: "Trading capital",
-    bodyHTML: `<p>How much of the money in <b>${escapeHtml(c.venue_label)}</b> the bot may use. It's worth
-        <b>${money(c.account_value, ccy)}</b> right now.</p>
+    bodyHTML: `<p>How much of <b>${escapeHtml(c.venue_label)}</b> the bot may use. It's worth
+        <b>${money(c.account_value, ccy)}</b> right now, with <b>${money(c.buying_power, ccy)}</b> of buying power left
+        (IBKR's figure, margin included).</p>
       ${c.clipped ? `<div class="warn-box">You set ${money(c.limit, ccy)}, but the account is worth less now, so the bot uses ${money(c.effective, ccy)}.</div>` : ""}
-      <p><label for="cap-amt">Amount (${escapeHtml(ccy)}) </label>
-        <input type="number" id="cap-amt" min="1" max="${c.account_value}" step="1000" value="${Math.round(c.limit || c.account_value)}"></p>
-      <p class="muted">Risk per trade and position-size limits are measured against this amount, and new positions only use
-        what's left of it. It can't be more than the account holds, and your broker balance isn't touched.</p>
+      <div class="cap-modes">
+        ${option("margin", "Whole account, with margin", "new positions may use the buying power IBKR allows.")}
+        ${option("cash", "Cash only", "longs and shorts together never hold more than the account is worth: nothing is borrowed.")}
+        ${option("amount", "A set amount", `only this much of the account's money, no margin:
+          <input type="number" id="cap-amt" min="1" max="${c.account_value}" step="1000" value="${Math.round(c.limit || c.account_value)}"> ${escapeHtml(ccy)}`)}
+      </div>
+      <p class="muted">Risk per trade and position-size limits are always measured against the account's value (or the set
+        amount), never against margin: margin only lets more positions be open at once. Autopilot fills up to its
+        <i>Max % of trading capital in positions</i>. Your broker balance isn't touched.</p>
+      <p class="muted small">With margin, IBKR closes positions itself if the account's excess liquidity runs out - keeping
+        Autopilot's maximum under 100% leaves a buffer.</p>
       ${ccy !== "USD" && c.usd_per_base ? `<p class="muted small">Your account is in ${escapeHtml(ccy)}. US stocks are sized in
         US dollars at 1 ${escapeHtml(ccy)} = ${num(c.usd_per_base, 4)} USD.</p>` : ""}
-      <div class="row-gap"><button class="ghost mini" id="cap-all">Use the whole account</button></div>
       <p class="muted small">The day/swing split is set with the slider next to the Intraday and Swing filters.</p>`,
     okText: "Save", okClass: "long",
     onOk: () => {
+      const mode = ($("input[name=cap-mode]:checked") || {}).value || "margin";
+      if (mode !== "amount") return save({ amount: null, mode });
       const amt = parseFloat($("#cap-amt").value);
       if (!(amt > 0)) { toast("Enter an amount above zero", "bad"); return; }
       if (amt > c.account_value) { toast(`That's more than the account holds (${money(c.account_value, ccy)})`, "bad"); return; }
-      return save(amt);
+      return save({ amount: amt });
     },
   });
-  $("#cap-all").onclick = () => { closeModal(); save(null); };
+  // typing an amount picks "a set amount"
+  $("#cap-amt").addEventListener("focus", () => { $("input[name=cap-mode][value=amount]").checked = true; });
 }
 
 /* ---------- paper / live ---------- */

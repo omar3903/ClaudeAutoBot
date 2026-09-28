@@ -59,6 +59,14 @@ def _mode(value: Any) -> str:
     return value if value in MODEL_MODES else "shadow"
 
 
+def _exposure_pct(value: Any) -> float:
+    """max_gross_exposure_pct, 10-100: a share of the trading capital, which already has any margin in it."""
+    try:
+        return max(10.0, min(100.0, float(value)))
+    except (TypeError, ValueError):
+        return 100.0
+
+
 def _loser_scope(value: Any) -> str:
     if isinstance(value, bool):                 # YAML reads a bare off / on as false / true
         return "day" if value else "off"
@@ -96,7 +104,7 @@ class AutoPilot:
         self.max_daily_loss_pct: float = float(getattr(cfg, "max_daily_loss_pct", 2.0))
         self.max_giveback_pct: float = float(getattr(cfg, "max_giveback_pct", 30.0))
         self.giveback_floor_pct: float = float(getattr(cfg, "giveback_floor_pct", 0.25))
-        self.max_gross_exposure_pct: float = float(getattr(cfg, "max_gross_exposure_pct", 100.0))
+        self.max_gross_exposure_pct: float = _exposure_pct(getattr(cfg, "max_gross_exposure_pct", 100.0))
         self.min_confirmations: int = int(getattr(cfg, "min_confirmations", 2))
         self.confirm_on_new_candle: bool = bool(getattr(cfg, "confirm_on_new_candle", True))
         self.min_minutes_to_close: int = int(getattr(cfg, "min_minutes_to_close", 30))
@@ -191,6 +199,7 @@ class AutoPilot:
                   "max_daily_loss_pct", "max_giveback_pct"):
             if isinstance(d.get(k), (int, float)):
                 setattr(self, k, float(d[k]))
+        self.max_gross_exposure_pct = _exposure_pct(self.max_gross_exposure_pct)
         for k in ("max_auto_positions", "max_auto_trades_per_day",
                   "max_per_strategy", "max_new_per_cycle", "min_confirmations", "min_minutes_to_close"):
             if isinstance(d.get(k), int):
@@ -260,7 +269,7 @@ class AutoPilot:
         if "require_proven" in kw:
             self.require_proven = bool(kw["require_proven"])
         if isinstance(kw.get("max_gross_exposure_pct"), (int, float)):
-            self.max_gross_exposure_pct = max(10.0, min(400.0, float(kw["max_gross_exposure_pct"])))
+            self.max_gross_exposure_pct = _exposure_pct(kw["max_gross_exposure_pct"])
         if isinstance(kw.get("max_daily_loss_pct"), (int, float)):
             self.max_daily_loss_pct = max(0.0, min(50.0, float(kw["max_daily_loss_pct"])))
         if isinstance(kw.get("max_giveback_pct"), (int, float)):
@@ -733,9 +742,9 @@ class AutoPilot:
                                            f"auto-risk")
                 continue
             est_cost = float(pre["order_preview"].get("est_cost", 0.0) or 0.0)
-            if equity and self.engine.gross_exposure() + est_cost > equity * self.max_gross_exposure_pct / 100.0:
-                self._last_reason[p.id] = (f"would put more than {self.max_gross_exposure_pct:.0f}% of equity "
-                                           "into positions")
+            if equity and self.engine.gross_exposure() + est_cost > self.exposure_ceiling(equity):
+                self._last_reason[p.id] = (f"would put more than {self.max_gross_exposure_pct:.0f}% of the trading "
+                                           "capital into positions")
                 continue
 
             self._acted.add(p.id)
@@ -990,6 +999,17 @@ class AutoPilot:
             except Exception:  # noqa: BLE001
                 pass
         return None
+
+    def exposure_ceiling(self, equity: float) -> float:
+        """The most Autopilot lets the positions hold together, in US dollars: max_gross_exposure_pct of the trading
+        capital - with margin, what the positions hold plus the broker's buying power; cash only, the account's
+        value; or the set amount (engine.exposure_ceiling). The account's value when the engine can't say."""
+        ceiling = getattr(self.engine, "exposure_ceiling", None)
+        try:
+            capacity = float(ceiling()) if callable(ceiling) else float(equity)
+        except Exception:  # noqa: BLE001
+            capacity = float(equity)
+        return (capacity or float(equity)) * self.max_gross_exposure_pct / 100.0
 
     def model_refusal(self, p: Any) -> Optional[str]:
         """Why the learned model keeps Autopilot out of a play, if it does: only in gate or size

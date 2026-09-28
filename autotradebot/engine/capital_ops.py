@@ -39,20 +39,32 @@ class CapitalOps:
     def sizing_account(self, timeframe: Any = None) -> Optional[Account]:
         """The account as position sizing sees it - see capital.py. With a ``timeframe`` (a day trade or a
         swing trade), only that kind's share of the trading capital is open to it."""
-        acc, limit = self._account, self.capital.get(self._venue)
+        acc, limit, mode = self._account, self.capital.get(self._venue), self._capital_mode()
         share = 1.0 if timeframe is None else capital.share_of(capital.kind_of(timeframe), self.effective_day_pct())
-        if acc is None or (not limit and share >= 1.0):
-            return acc
+        if acc is None or (not limit and share >= 1.0 and mode == capital.MODE_MARGIN):
+            return acc                      # the whole account with margin: the broker's buying power is the limit
         held = self._held_by_kind()
-        return capital.sizing_account(acc, limit, sum(held.values()), share=share,
+        return capital.sizing_account(acc, limit, sum(held.values()), share=share, mode=mode,
                                       invested_in_kind=held[capital.kind_of(timeframe)] if timeframe is not None else 0.0)
+
+    def _capital_mode(self) -> str:
+        """With no amount set, what the whole account means on this venue: margin (the default) or cash only."""
+        return self.capital_mode.get(self._venue, capital.MODE_MARGIN)
+
+    def exposure_ceiling(self) -> float:
+        """The most the positions may hold together, in US dollars (capital.capacity_usd) - what Autopilot's and
+        the pair desk's max_gross_exposure_pct is a share of. 0 with no account read yet."""
+        if self._account is None:
+            return 0.0
+        return capital.capacity_usd(self._account, self.capital.get(self._venue), sum(self._held_by_kind().values()),
+                                    self._capital_mode())
 
     def capital_state(self) -> Optional[Dict[str, Any]]:
         if self._account is None:
             return None
         held = self._held_by_kind()
         state = capital.state(self._account, self._venue, venue_label(self._venue), self.capital.get(self._venue),
-                              sum(held.values()), self.effective_day_pct(), held)
+                              sum(held.values()), self.effective_day_pct(), held, mode=self._capital_mode())
         state["split"].update(on=self._both_kinds(), set_pct=self.day_trade_pct)
         state["size_factor"] = self.size_factor
         return state
@@ -119,16 +131,26 @@ class CapitalOps:
                        "nothing is sold for it; they take no new entries until they are back under it."
                        for name, part in over)
 
-    def set_capital(self, amount: Any = None) -> Dict[str, Any]:
-        """How much of the account on the current platform the bot may use, in the
-        account's own currency. Empty = the whole account; never more than it holds."""
+    def set_capital(self, amount: Any = None, mode: Any = None) -> Dict[str, Any]:
+        """How much of the account on the current platform the bot may use, in the account's own currency - never
+        more than it holds. Empty = the whole account: with margin (``mode`` "margin", the default) new positions may
+        use the broker's buying power; cash only ("cash"), the positions never hold more than the account's value."""
         locked = self._locked()
         if locked:
             return {"ok": False, "reason": locked}
         venue, label = self._venue, venue_label(self._venue)
         if amount is None or amount == "":
+            if mode is not None:
+                try:
+                    self.capital_mode[venue] = capital.parse_mode(mode)
+                except ValueError as e:
+                    return {"ok": False, "reason": str(e)}
             self.capital.pop(venue, None)
-            note = f"The bot can use all of {label} again."
+            note = (f"The bot can use all of {label}, cash only: its positions, long and short together, never hold "
+                    "more than the account is worth, so nothing is borrowed."
+                    if self._capital_mode() == capital.MODE_CASH else
+                    f"The bot can use all of {label} with margin: new positions may use its buying power, as IBKR "
+                    "reports it. Risk per trade is still measured against the account's value, not the margin.")
         else:
             try:
                 value = capital.parse_amount(amount)
@@ -146,7 +168,8 @@ class CapitalOps:
             note = (f"The bot will use {capital.money(value, currency)} of the "
                     f"{capital.money(worth['equity'], currency)} in {label}. Position sizes now use this amount.")
         self._save_runtime()
-        log.info("trading capital on %s: %s", venue, self.capital.get(venue) or "the whole account")
+        log.info("trading capital on %s: %s", venue, self.capital.get(venue)
+                 or f"the whole account, {'cash only' if self._capital_mode() == capital.MODE_CASH else 'with margin'}")
         self._settings_changed()
         state = self.capital_state()
         self._publish("capital.updated", capital=state)

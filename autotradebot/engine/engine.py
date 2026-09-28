@@ -104,8 +104,8 @@ from .capital_ops import CapitalOps
 from .quit_ops import QuitOps
 from .connections import Connections
 from .reconcile import PositionCheck
-from .runtime import (RuntimeFile, load_capital, load_day_trade_pct, load_filters, load_size_factor,
-                      load_strategy_overrides)
+from .runtime import (RuntimeFile, load_capital, load_capital_mode, load_day_trade_pct, load_filters,
+                      load_size_factor, load_strategy_overrides)
 
 from .support import _ACTED_ON, duration
 log = logging.getLogger(__name__)
@@ -172,6 +172,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self.strategy_overrides = load_strategy_overrides(saved.get("strategies"))
         #: how much of the account the bot may use, per venue, in the account's currency
         self.capital = load_capital(saved.get("capital"))
+        #: with no amount set, what the whole account means, per venue: margin (the default) or cash only
+        self.capital_mode = load_capital_mode(saved.get("capital_mode"))
         #: the part of the trading capital day trades may hold; swing trades get the rest (engine/capital.py)
         self.day_trade_pct = load_day_trade_pct(saved.get("capital_split"), cfg.account.day_trade_pct)
         #: every position is the usual size times this, 0-5 (the slider over the plays; CapitalOps.set_size_factor)
@@ -368,7 +370,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         with self._runtime_lock:
             payload: Dict[str, Any] = {
                 "mode": self.mode, "paper_platform": self.paper_platform, "filters": self.filters.as_dict(),
-                "strategies": self.strategy_overrides, "capital": self.capital,
+                "strategies": self.strategy_overrides, "capital": self.capital, "capital_mode": self.capital_mode,
                 "capital_split": {"day_pct": self.day_trade_pct}, "sizing": {"factor": self.size_factor},
                 "scan": self.scan_settings.as_dict(),
                 "autopilot": self.autopilot.to_runtime(),
