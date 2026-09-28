@@ -2,6 +2,16 @@
 
 A **human-in-the-loop** trading assistant for Interactive Brokers.
 
+> **Disclaimer.** This is a personal project for education and research, run on an IBKR **paper** account.
+> Nothing in it is financial advice or a recommendation to buy or sell any security. Trading carries a real
+> risk of loss, and automated trading can lose money quickly - through a bug, bad data, a broker outage or
+> a strategy that simply has no edge. Use it at your own risk; the software comes with no warranty (see
+> [LICENSE](LICENSE)).
+
+Built by **Omar Abdeen** ([omarabdeen123@gmail.com](mailto:omarabdeen123@gmail.com)) with
+**[Claude Code](https://claude.com/claude-code)**, Anthropic's AI coding assistant, as a pair programmer - see
+[How it was built](#how-it-was-built).
+
 Once a day before the open it ranks **every US-listed stock and ADR** by how in
 play it is, keeps a **hot list** for the day with a small **buffer of candidates
 per sector** behind it, and through the session rescans those on a cycle. It
@@ -354,10 +364,42 @@ day (at least 30 of the session's 390 minutes) is left out for the rest of
 the session, and sizing's `risk.max_adv_pct` cap still limits any order on
 these stocks. The log says `live scan: +A +B -C` when the names change.
 
-> The app manages exits itself (it doesn't attach a native OCO bracket at IBKR,
-> so two exit managers never fight over one position). That means **no stop is
-> resting at IBKR if the app isn't running** — keep it running while positions
-> are open.
+> Every position's stop, and its target as a one-cancels-the-other partner, rests at IBKR as a native
+> order, so a position stays protected while the app is closed. The app's own exit manager moves the stop
+> (break-even, trailing) and handles the time exits - those need the app running.
+
+### Keeping your IBKR account safe
+
+IBKR's API has **no password of its own**: any program that can reach the Gateway's API port can read the
+account and place orders, with no login. Two locks keep that port to this computer:
+
+1. **In IB Gateway** (*Configure → Settings → API → Settings*): tick *Allow connections from localhost only*,
+   keep `127.0.0.1` as the **only** entry under *Trusted IPs* (remove anything else), and use the standard
+   ports (4002 paper, 4001 live). If you only want to watch, leave *Read-Only API* ticked - the app then can't
+   trade. Leave *Master API client ID* empty.
+2. **In the operating system's firewall**, block those ports from the network, so even a Gateway setting
+   changed by mistake can't expose them. On Windows, in PowerShell run as administrator:
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "IBKR API - block from network" -Direction Inbound -Protocol TCP -LocalPort 4001,4002,7496,7497 -Action Block
+   ```
+
+   Windows Firewall doesn't filter traffic on the computer itself (loopback), so the app still connects;
+   everything from another device is dropped, and a block rule wins over any *allow* rule Java or the
+   Gateway's installer added. Check it with `Get-NetFirewallRule -DisplayName "IBKR API - block from network"`.
+   On Linux: `sudo ufw deny 4001:4002/tcp` and `sudo ufw deny 7496:7497/tcp`.
+
+And around it:
+
+- Keep `IBKR_HOST=127.0.0.1`. The API connection isn't encrypted, so never point the app at a Gateway on
+  another machine across a network you don't control.
+- The app never stores your IBKR username or password - the Gateway holds the login. If you use IBC for the
+  daily login, its `config.ini` holds your password in plain text: keep it in IBC's own folder (not in this
+  repository), readable only by your Windows user, and never commit it.
+- Turn on two-factor login for IBKR (*IBKR Mobile* → *Secure Login System*) and for GitHub.
+- Your keys live in `.env`, which is git-ignored - never commit it. On a public GitHub repository, turn on
+  *secret scanning* and *push protection* (Settings → Code security) so a key pushed by mistake is blocked.
+- Keep `WEB_HOST=127.0.0.1` so the dashboard is only served to this computer (see below).
 
 ### Security of settings
 
@@ -1615,7 +1657,20 @@ journal on a scripted session. The real IB Gateway isn't exercised in tests.
 
 ## Roadmap
 
-- a native stop resting at the broker as a crash-safety backup, kept in sync with the exit manager
-- streaming IBKR ticks (`reqMktData` subscriptions) for the hot list instead of candle polls
 - options plays
 - equity-curve chart in the dashboard
+
+## How it was built
+
+AutoTradeBot is built by Omar Abdeen with **Claude Code**, Anthropic's AI coding assistant, as a pair
+programmer - and says so openly. Omar Abdeen decided what to build and what the app must never do, set the
+trading rules and risk limits, ran it day after day against an IBKR paper account, and approved every change
+before it was merged. Claude Code wrote much of the code, the tests and the documentation, and ran the reviews
+and replays behind the decisions. That's why most commits carry a `Co-Authored-By: Claude` line and many pull
+requests say they were generated with Claude Code; the pull-request history keeps the reasoning, the test
+results and the reviews behind each change.
+
+## License
+
+[MIT](LICENSE) - use it, change it, share it; keep the copyright notice. No warranty: see the disclaimer at
+the top.

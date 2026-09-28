@@ -9,7 +9,7 @@ description = "AutoTradeBot - human-in-the-loop trading assistant for Interactiv
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "omarabdeen123" }]
+authors = [{ name = "Omar Abdeen", email = "omarabdeen123@gmail.com" }]
 dependencies = [
   "numpy>=1.24", "pandas>=2.0", "pydantic>=2.6", "pydantic-settings>=2.2",
   "PyYAML>=6.0", "python-dotenv>=1.0", "SQLAlchemy>=2.0", "PyMySQL>=1.1",
