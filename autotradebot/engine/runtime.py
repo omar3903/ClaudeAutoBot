@@ -12,7 +12,7 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Optional
 
 from ..scanner.filters import TradeFilters
 from ..strategies.registry import REGISTRY
@@ -79,6 +79,14 @@ def load_size_factor(saved: Any, default: float = 1.0) -> float:
     ok = (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
           and 0 <= value <= 5)
     return float(value) if ok else float(default)
+
+
+def load_position_pct(saved: Any) -> Optional[float]:
+    """The most one position may hold (% of the account's value, 1-100) set on the dashboard, or None: config.yaml's."""
+    value = saved.get("max_position_pct") if isinstance(saved, dict) else None
+    ok = (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+          and 1 <= value <= 100)
+    return float(value) if ok else None
 
 
 def load_capital_mode(saved: Any) -> Dict[str, str]:

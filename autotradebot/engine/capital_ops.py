@@ -67,6 +67,7 @@ class CapitalOps:
                               sum(held.values()), self.effective_day_pct(), held, mode=self._capital_mode())
         state["split"].update(on=self._both_kinds(), set_pct=self.day_trade_pct)
         state["size_factor"] = self.size_factor
+        state["max_position_pct"] = float(self.settings.config.risk.max_position_pct_of_equity)
         return state
 
     def _both_kinds(self) -> bool:
@@ -120,6 +121,28 @@ class CapitalOps:
                 "New positions are now sized at nothing - no entries until the factor is above 0")
         return {"ok": True, "capital": state,
                 "note": note + ". The caps on open risk, per stock, liquidity and buying power still hold."}
+
+    def set_max_position_pct(self, pct: Any) -> Dict[str, Any]:
+        """The most one position may hold, 1-100% of the account's value (risk.max_position_pct_of_equity). Day
+        trades' stops are tight, so this cap - not the risk budget - usually decides their size."""
+        locked = self._locked()
+        if locked:
+            return {"ok": False, "reason": locked}
+        try:
+            value = capital.parse_position_pct(pct)
+        except ValueError as e:
+            return {"ok": False, "reason": str(e)}
+        self.position_pct = value
+        self.settings.config.risk.max_position_pct_of_equity = value
+        self._save_runtime()
+        log.info("the most one position may hold set to %g%% of the account", value)
+        self._settings_changed()
+        state = self.capital_state()
+        self._publish("capital.updated", capital=state)
+        return {"ok": True, "capital": state,
+                "note": f"One position may now hold up to {value:g}% of the account's value. A day trade's tight stop "
+                        "usually makes this the cap that decides its size; the open-risk ceiling, 1% of the stock's "
+                        "daily volume and the buying power still hold."}
 
     def _over_share_note(self, state: Optional[Dict[str, Any]]) -> str:
         """Said once, when a change leaves a kind of trade holding more than its share."""

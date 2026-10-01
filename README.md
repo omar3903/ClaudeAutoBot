@@ -730,6 +730,12 @@ Either way:
   measured against the **account's value** (or the set amount), never against
   margin: margin only lets more positions be open at once. New positions only use
   what's left of the trading capital after the bot's open positions.
+- Two sliders over the plays tune position size for you and Autopilot alike:
+  the **Position Size factor** (0-5, every new position's risk times this) and
+  **Max % per position** (1-100, the most one position may hold, as a share of
+  the account's value - `risk.max_position_pct_of_equity`). A day trade's stop
+  is usually tight, so its risk budget would buy far more than this cap allows:
+  for most day trades the cap, not the factor, decides the size.
 - Autopilot and the pair desk fill up to **Max % of trading capital in positions**
   (`autopilot.max_gross_exposure_pct`, 10-100) of it. With margin, IBKR closes
   positions itself if the account's excess liquidity runs out, so a maximum under
