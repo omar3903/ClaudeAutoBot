@@ -488,6 +488,21 @@ def test_counting_confirmations_on_candles_is_a_setting_that_is_remembered():
     assert AutoPilot(FakeEngine(), _cfg(confirm_on_new_candle=False), bus=SILENT).confirm_on_new_candle is False
 
 
+def test_the_exposure_ceiling_is_a_share_of_the_trading_capital_margin_included():
+    eng = FakeEngine()
+    eng.exposure_ceiling = lambda: 340_000.0                     # worth 100k, with margin: 340k all told
+    ap = AutoPilot(eng, _cfg(max_gross_exposure_pct=100.0), bus=SILENT)
+    assert ap.exposure_ceiling(100_000.0) == 340_000.0          # past the account's value: margin is allowed
+    ap.configure(max_gross_exposure_pct=80)
+    assert ap.exposure_ceiling(100_000.0) == pytest.approx(272_000.0)   # a buffer under the broker's own limit
+    ap.configure(max_gross_exposure_pct=400)                    # the capital has the margin in it already
+    assert ap.max_gross_exposure_pct == 100.0
+    again = AutoPilot(eng, _cfg(max_gross_exposure_pct=100.0), bus=SILENT)
+    again.load_runtime({"max_gross_exposure_pct": 150})          # an older file's value
+    assert again.max_gross_exposure_pct == 100.0
+    assert AutoPilot(FakeEngine(), _cfg(max_gross_exposure_pct=100.0), bus=SILENT).exposure_ceiling(100_000.0) == 100_000.0
+
+
 def test_autopilot_takes_only_the_setups_named_and_remembers_them():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(), bus=SILENT)

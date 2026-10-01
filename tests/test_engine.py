@@ -443,6 +443,7 @@ def test_the_size_factor_on_disk_is_read_back_and_a_bad_one_is_the_usual_size():
 # ---------------------------------------------------------------- the split, and changes made while it runs
 def test_entries_still_working_count_in_their_kinds_share_of_the_capital(engine, port):
     _connect(engine, port)
+    engine.set_capital(None, mode="cash")          # the account's own value: the fake's buying power never moves
     engine.set_filters(timeframes=["INTRADAY", "SWING"])
     engine.set_capital_split(50)
     room = lambda kind: engine.sizing_account(kind).raw["capital_room"]          # noqa: E731
@@ -1188,10 +1189,13 @@ def test_trading_capital_is_split_between_day_trades_and_swing_trades(engine):
     r = engine.set_capital_split(50)
     assert r["ok"] and engine.runtime.read()["capital_split"] == {"day_pct": 50.0}
     assert engine.sizing_account("SWING").raw["capital_room"] == 11_000
-    assert engine.set_capital(None)["ok"]                                  # the whole account, still split
+    assert engine.set_capital(None, mode="cash")["ok"]                     # the whole account, cash only, still split
     whole = engine._account.equity
     assert engine.sizing_account("INTRADAY").raw["capital_room"] == pytest.approx(min(whole - 9_000, whole / 2))
 
+    assert engine.set_capital(None, mode="margin")["ok"]                   # with margin: the buying power is split
+    power = engine._account.buying_power
+    assert engine.sizing_account("INTRADAY").raw["capital_room"] == pytest.approx(min(power, (9_000 + power) / 2))
     assert engine.set_filters(timeframes=["SWING"])["ok"]                  # swing trades only: they get all of it
     assert engine.sizing_account("SWING") is engine._account                # no limit and no split: the whole account
     split = engine.capital_state()["split"]

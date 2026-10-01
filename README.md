@@ -715,11 +715,25 @@ p-values, calibration) with nothing but base R. It is an audit, run by hand: not
 
 The header shows the account's **equity, cash and buying power as the broker
 reports them**. Next to them, **Trading capital** is how much of that the bot may
-use — click it to set an amount, or **Use the whole account** to clear it.
+use — click it to choose:
+
+- **Whole account (margin)** - the default. New positions may use the account's
+  **buying power**, as IBKR reports it: what's left after the open positions, with
+  the margin the broker allows already in it.
+- **Cash only** - the bot's positions, long and short together, never hold more
+  than the account is worth, so nothing is borrowed.
+- **A set amount** - only that much of the account's money, no margin.
+
+Either way:
 
 - Risk per trade, the open-risk ceiling and the per-position size limit are
-  measured against the trading capital, and new positions only use what's left
-  of it after the bot's open positions.
+  measured against the **account's value** (or the set amount), never against
+  margin: margin only lets more positions be open at once. New positions only use
+  what's left of the trading capital after the bot's open positions.
+- Autopilot and the pair desk fill up to **Max % of trading capital in positions**
+  (`autopilot.max_gross_exposure_pct`, 10-100) of it. With margin, IBKR closes
+  positions itself if the account's excess liquidity runs out, so a maximum under
+  100% leaves a buffer.
 - It can't be more than the account is worth (net liquidation, in the account's
   own currency). If the account later falls below it, the bot uses the account's
   value and the button turns amber.

@@ -258,7 +258,9 @@ class AutopilotCfg(_Model):
     max_open_risk_pct: float = 4.0
     max_per_strategy: int = 2
     max_new_per_cycle: int = 1
-    max_gross_exposure_pct: float = 100.0  # all positions together, as % of equity - 100 = never on margin
+    max_gross_exposure_pct: float = 100.0  # all positions together, as % of the trading capital (10-100): with
+                                          # the whole account and margin that's the broker's buying power, cash only
+                                          # the account's value - so 100 = all of it, below 100 keeps a buffer
     min_confirmations: int = 2            # a day-trade setup must show up this many times in a row
     confirm_on_new_candle: bool = True    # ...each time on a newer 5-minute candle, not just another scan: the scans read
                                           # one candle several times over, and the replay's proof enters a day setup once

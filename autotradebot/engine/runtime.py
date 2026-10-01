@@ -81,6 +81,12 @@ def load_size_factor(saved: Any, default: float = 1.0) -> float:
     return float(value) if ok else float(default)
 
 
+def load_capital_mode(saved: Any) -> Dict[str, str]:
+    """What the whole account means, per venue: "margin" (its buying power) or "cash" (only the money in it)."""
+    return {str(venue): str(mode) for venue, mode in (saved.items() if isinstance(saved, dict) else ())
+            if mode in ("margin", "cash")}
+
+
 def load_capital(saved: Any) -> Dict[str, float]:
     """Trading capital per venue - positive, finite amounts only."""
     return {str(venue): float(amount)

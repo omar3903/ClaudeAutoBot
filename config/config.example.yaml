@@ -165,7 +165,8 @@ autopilot:
   max_open_risk_pct: 4.0             # open autopilot $-risk must stay under this % of equity
   max_per_strategy: 2                # at most this many concurrent auto trades from ONE strategy
   max_new_per_cycle: 1               # at most this many NEW auto entries per scan (no bursts)
-  max_gross_exposure_pct: 100.0      # all positions together as % of equity - 100 = Autopilot never uses margin
+  max_gross_exposure_pct: 100.0      # all positions together as % of the trading capital (10-100); the header's
+                                      # Trading capital says whether that includes margin (whole account) or not (cash only)
   min_confirmations: 2               # a day-trade setup must show up this many times in a row...
   confirm_on_new_candle: true        # ...each on a newer 5-minute candle, as the replay enters - not the same candle
                                      # read again by the next scan. Setups that fire on one candle (a reclaim, a flag)
