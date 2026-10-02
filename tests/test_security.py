@@ -455,6 +455,7 @@ def test_the_log_masks_every_ibkr_account_id(fresh_logging, tmp_path, monkeypatc
     logging.getLogger("ib_async.wrapper").warning(f"Canceled order: {trade}")
     log = logging.getLogger("autotradebot.test")
     log.warning("positions: %s", [Position("U7654321", stock, 10, 5.0)])
+    log.warning("connected to DUT765432")                                    # a letter more before the digits
     try:
         raise RuntimeError("refused for account F7654321")
     except RuntimeError:
@@ -464,5 +465,6 @@ def test_the_log_masks_every_ibkr_account_id(fresh_logging, tmp_path, monkeypatc
     for text in ((tmp_path / "autotradebot.log").read_text(encoding="utf-8"), fresh_logging.sys.stdout.getvalue()):
         assert "account='…4567'" in text and "acctNumber='…4567'" in text
         assert "Position(account='…4321'" in text and "refused for account …4321" in text
-        assert not re.search(r"DU1234567|U7654321|F7654321", text)
+        assert "connected to …5432" in text
+        assert not re.search(r"DU1234567|U7654321|F7654321|DUT765432", text)
         assert "AAA order 1234567 filled - tag paper_f1234567, U.S. hours" in text

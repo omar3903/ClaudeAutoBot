@@ -10,8 +10,9 @@ from ..secrets_store import mask
 
 _CONFIGURED = False
 
-#: an IBKR account id: U1234567 is a live account, DU1234567 a paper one (F/DF an advisor's, I/DI a broker's)
-_ACCOUNT_ID = re.compile(r"\bD?[UFI]\d{5,9}\b")
+#: an IBKR account id: U1234567 is a live account, DU1234567 a paper one (F/DF an advisor's, I/DI a broker's);
+#: some carry one more letter before the digits (DUT123456)
+_ACCOUNT_ID = re.compile(r"\bD?[UFI][A-Z]?\d{5,9}\b")
 
 
 class _MaskedFormatter(logging.Formatter):
