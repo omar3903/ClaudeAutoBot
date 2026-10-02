@@ -89,6 +89,8 @@ class _Model(BaseModel):
 
 
 class AccountCfg(_Model):
+    allow_live_mode: bool = False             # HARD gate: Live (real orders) is refused unless true, and a saved Live
+                                              # choice starts in Paper. config.yaml only - the dashboard can't set it
     min_start_equity: float = 2000.0          # LIVE only - paper ignores this
     paper_start_cash: float = 100000.0        # opening balance for the built-in simulator
     pdt_equity_threshold: float = 25000.0

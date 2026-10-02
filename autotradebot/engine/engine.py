@@ -114,6 +114,9 @@ log = logging.getLogger(__name__)
 ORDERS_POLL_S = 5.0
 #: how old that list may be before a dashboard request asks the broker again
 ORDERS_MAX_AGE_S = 8.0
+#: why Live is refused while config.yaml's account.allow_live_mode is off - the dashboard shows it
+LIVE_MODE_OFF = ("Live trading is switched off. To allow it, set  account.allow_live_mode: true  in "
+                 "config/config.yaml and restart the app - it can't be turned on from the dashboard.")
 #: the session a price was traded in, as a stock's price line says it
 SESSION_WORDS = {clock.Session.PRE: "pre-market", clock.Session.REGULAR: "regular",
                  clock.Session.POST: "after-hours", clock.Session.CLOSED: "closed"}
@@ -165,8 +168,14 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self.settings, self.md, broker_factory=broker_factory, port_check=port_check,
             simulator_state=(data_dir / "paper_state.json") if self.settings.secrets.paper_persist else None)
 
-        # the dashboard's remembered choices win over config.yaml and .env
+        # the dashboard's remembered choices win over config.yaml and .env - except Live, which config.yaml must allow
         self.mode: str = saved["mode"] if saved.get("mode") in ("paper", "live") else "paper"
+        if self.mode == "live" and not cfg.account.allow_live_mode:
+            log.warning("starting in PAPER: Live was saved in %s, but account.allow_live_mode is off in "
+                        "config/config.yaml", self.runtime.path.name)
+            self.mode = "paper"
+            # saved at once, so turning the switch on later doesn't reopen Live by itself
+            self.runtime.write({**saved, "mode": "paper"})
         self.paper_platform = normalize_platform(saved.get("paper_platform") or self.settings.secrets.paper_platform)
         self.filters = load_filters(saved.get("filters"), cfg.scanner.sectors)
         self.strategy_overrides = load_strategy_overrides(saved.get("strategies"))
@@ -648,6 +657,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             locked = self._locked()
             if locked:
                 return {"ok": False, "reason": locked}
+            if mode == "live" and not self.settings.config.account.allow_live_mode:
+                log.warning("Live refused for %s: account.allow_live_mode is off in config/config.yaml", operator)
+                return {"ok": False, "reason": LIVE_MODE_OFF}
             if mode == self.mode:
                 return {"ok": True, "mode": self.mode, "note": "already in that mode"}
             blocked = self._switch_blocked(venue_id(plan_venue(mode, self.paper_platform)))

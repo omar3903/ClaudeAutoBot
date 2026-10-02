@@ -322,6 +322,22 @@ def test_live_mode_paper_only_gate():
     assert eng2.approved_ids() == [p.id]
 
 
+def test_a_live_venue_needs_allow_live_whatever_the_mode_says():
+    # the gate follows where orders actually go: the live account is held to allow_live even if the mode says paper
+    eng = FakeEngine()
+    eng._venue = "ibkr-live"
+    ap = AutoPilot(eng, _cfg(allow_live=False), bus=SILENT)
+    p = mkplay()
+    assert _run(ap, p) == [] and eng.approved == []
+    status = ap.status()
+    assert status["effective"] is False and "allow_live" in status["blocked_note"]
+    assert ap.day_mode_active(market_open=True) is False
+
+    eng._venue = "ibkr-paper"                                                   # the paper account: taken
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]
+
+
 def test_with_real_money_proof_is_asked_for_whatever_the_setting_says():
     paper, live = FakeEngine(), FakeEngine(mode="live")
     terms = dict(allow_live=True, require_proven=False, min_replay_trades=30, min_replay_expectancy_r=0.05)

@@ -249,6 +249,10 @@ Two switches, both in the dashboard and remembered in `data/runtime.json`
 | Paper | **IBKR paper account** | paper account, trading | your IBKR paper account |
 | Paper | **Built-in simulator** | paper account, read-only (prices only) | the built-in simulator |
 
+- **Live** also needs `account.allow_live_mode: true` in `config/config.yaml`
+  (off by default; read at start, and never set from the dashboard). With it off
+  the Live switch is refused and says why, and a Live choice saved in
+  `data/runtime.json` starts in Paper with a warning in the log.
 - If the Gateway isn't reachable, paper orders fall back to the simulator (which
   has no prices until the Gateway answers) and the header pill turns red with the
   fix. **Live** is never faked: if your live account isn't reachable, the switch
@@ -494,7 +498,8 @@ weighted 0.1.
 
 Filters, strategy switches, scan settings, Paper/Live and the paper platform are
 saved in `data/runtime.json`, so they survive a restart (`config.yaml` supplies
-the defaults), and are pushed over the WebSocket so every open tab updates.
+the defaults; a saved Live needs `account.allow_live_mode`), and are pushed over
+the WebSocket so every open tab updates.
 
 ---
 
@@ -967,7 +972,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | gate | default | key |
 |---|---|---|
 | master switch | off | `enabled` (UI toggle) |
-| **route real orders** | **off** | `allow_live` — *config-file only*; with it off, Autopilot is armed for **paper only** even in Live mode, and says so |
+| **route real orders** | **off** | `allow_live` — *config-file only*; with it off, Autopilot is armed for **paper only** even in Live mode (or whenever orders go to the live account), and says so |
 | which trade types it may take | the **Intraday** / **Swing** boxes over the plays say what is scanned and shown; Autopilot's own **day / swing / pairs** boxes (⚙) say what it may take of that - untick day trades to keep day plays on the board for the review without trading them | `trade_types` |
 | which setups it may take | **Only these setups** (⚙): tick the ones Autopilot may take - none ticked means every setup; the others stay on the board for you to click (the Strategies panel switches a setup off everywhere) | `strategies` |
 | minimum strategy confidence, day trades | 0.5 | `min_confidence` (the replay found higher stated confidence went with worse trades) |
@@ -1141,7 +1146,7 @@ A background service (`autotradebot/signals/`) watches what happens off the pric
 
 ## Dashboard controls
 
-* **Paper / Live** — which side you're trading. Going Live asks for confirmation.
+* **Paper / Live** — which side you're trading. Going Live asks for confirmation, and is refused unless `account.allow_live_mode` is on in `config/config.yaml`.
 * **Data pill** — `data: IBKR`, `data: IBKR (delayed)` or `data: none`.
 * **Market pill** — `market: calm` or `market: turbulent`, from Hamilton's regime model on SPY; hover for the numbers.
 * **Connection pill** — what orders go to and whether it's healthy: `Simulator`,
