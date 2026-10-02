@@ -379,7 +379,9 @@ class Executor(ProtectiveStops):
                     decision_price: Optional[float] = None) -> Dict[str, Any]:
         """Send the order that closes a position - or, with ``qty`` short of the whole position, the
         part of it the exit manager takes off at the first target; ``after_fill`` is the stop and
-        target the rest gets once that part has gone (see Repository.reduce_trade)."""
+        target the rest gets once that part has gone (see Repository.reduce_trade). The stop and target
+        resting at the broker are stood down first - one an earlier run left too, before this run's first
+        pass has taken it over (_take_over_for_exit)."""
         t = self.repo.get_trade(trade_id)
         if not t or t["status"] == "CLOSED":
             return {"ok": False, "reason": "trade not open"}
@@ -396,6 +398,13 @@ class Executor(ProtectiveStops):
             # with nothing at the broker - so nothing is touched until the session opens
             return {"ok": False, "market_closed": True, "reason": closed}
         working = self._working_or_none()
+        # a stop or target an earlier run left, not taken over yet (just after a start), is stood down like this run's
+        wait = self._take_over_for_exit(t, working)
+        if wait:
+            fresh = self.repo.get_trade(trade_id)
+            if not fresh or fresh["status"] == "CLOSED":     # one filled while the app was off, for all of it
+                return {"ok": True, "status": "FILLED", "trade": fresh or t, "by": "broker-stop"}
+            return {"ok": False, "reason": wait}
         if working is None:
             # not known is not "none working": an exit an earlier run left, or one placed by hand, can't be
             # seen - the exits this run is following and the shares the broker holds still cap this one

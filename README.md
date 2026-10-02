@@ -865,6 +865,9 @@ Two rules keep it safe:
   working until IBKR says it filled or is cancelled - and a stop that read cancelled is
   read once more, for a fill landing just behind the cancel, before the exit goes out.
   A stop move IBKR refuses leaves the stop as it was, and it is replaced.
+  An exit right after a start stands down the stop and target an earlier run left
+  too, before the app has taken them over; while IBKR's order list can't be read, or
+  is still reloading after a connect, the exit waits rather than go out beside one.
   A partial exit first shrinks the stop to the shares that remain.
 * **Never a stop without a position.** A stop is placed only while the account shows
   the shares and the broker's orders could be read; a stop whose trade is no longer

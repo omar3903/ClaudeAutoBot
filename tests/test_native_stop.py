@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -389,6 +390,67 @@ def test_executions_that_cannot_be_read_change_nothing():
     ex.sync_open_orders()
     assert repo.get_trade("t1")["quantity"] == 100 and broker.cancelled == []  # left to the share-count warning
     assert ex.protective_stops()[0]["order_id"] == "77" and "trade.reduced" not in [t for t, _ in heard]
+
+
+def test_an_exit_right_after_a_start_stands_down_the_stop_an_earlier_run_left_and_only_one_exit_goes_out():
+    from test_order_follow_up import CFG, SILENT
+    from autotradebot.core.models import Quote
+    from autotradebot.execution.exit_manager import ExitManager
+
+    broker, repo, ex, _ = _setup()
+    broker.live["77"] = _left_stop(qty=10)                                     # an earlier run's stop, still working
+    broker.connected_since = time.monotonic()                                  # just connected: none taken over yet
+    ex.sync_open_orders()
+    assert ex.protective_stops() == [] and broker.cancelled == []
+    em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=97, ask=97, last=97), cfg=CFG,
+                     bus=SILENT, venue=VENUE)
+    em.run_once()                                                              # under the 98 stop: the app's own exit
+    assert broker.cancelled == ["77"]                                          # the old stop stood down first
+    (exit_order,) = broker.exits()
+    assert (exit_order.quantity, exit_order.client_tag) == (10, "exit:t1")
+    em.run_once()
+    ex.sync_open_orders()
+    assert len(broker.exits()) == 1 and broker.stops() == [] and ex.protective_stops() == []
+
+
+def test_no_exit_goes_out_while_the_order_list_is_reloading_or_unreadable_and_no_stop_is_followed():
+    from test_order_follow_up import _unanswered
+
+    broker = _StopBroker({"AAA": 10, "BBB": 10})
+    repo = _Repo([_trade(), _trade(id="p1", symbol="BBB", pair_id="pair_1")])
+    ex = _executor(broker, repo)
+    ex.STAND_DOWN_S = ex.STAND_DOWN_POLL_S = 0.0
+    broker.connected_since = time.monotonic()                                  # an earlier run's stop may not be listed yet
+    out = ex.close_trade("t1", reason="stop")
+    assert not out["ok"] and "reloading" in out["reason"] and broker.orders == []
+    assert ex.close_trade("p1", reason="pair-unwind")["ok"]                    # a pair leg has no stop to wait for
+    broker.connected_since -= ex.RESYNC_GRACE_S + 1
+    listed, broker.list_orders = broker.list_orders, _unanswered
+    out = ex.close_trade("t1", reason="stop")
+    assert not out["ok"] and "couldn't be read" in out["reason"] and len(broker.exits()) == 1
+    broker.list_orders = listed
+    assert ex.close_trade("t1", reason="stop")["ok"]                           # read, and nothing rests: it goes
+    assert [(o.symbol, o.quantity) for o in broker.exits()] == [("BBB", 10), ("AAA", 10)]
+
+
+def test_an_exit_beside_an_earlier_runs_stop_that_filled_in_part_while_the_app_was_off_books_it_and_waits():
+    broker, repo, ex, heard = _setup(_trade(quantity=100), positions={"AAA": 40})
+    broker.live["77"] = _left_stop(filled=60, avg=97.9)                        # 60 of its 100 shares sold while off
+    out = ex.close_trade("t1", reason="manual")
+    assert not out["ok"] and "filled while the app was off" in out["reason"] and broker.exits() == []
+    assert repo.get_trade("t1")["quantity"] == 40 and broker.cancelled == ["77"]
+    out = ex.close_trade("t1", reason="manual")                                # the cancel has landed: the rest goes
+    assert out["ok"] and [o.quantity for o in broker.exits()] == [40]
+    assert [t for t, _ in heard].count("trade.reduced") == 1
+
+
+def test_an_exit_beside_an_earlier_runs_stop_that_filled_whole_while_the_app_was_off_books_it_and_sends_nothing():
+    broker, repo, ex, _ = _setup(_trade(quantity=100), positions={})
+    broker.live["77"] = _left_stop(filled=100, avg=97.8)                       # its shares all sold while off
+    out = ex.close_trade("t1", reason="manual")
+    assert out["ok"] and out["by"] == "broker-stop" and broker.exits() == []
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_reason"], closed["exit_price"]) == ("CLOSED", "stop", 97.8)
 
 
 def test_a_record_closed_some_other_way_takes_its_stop_with_it():

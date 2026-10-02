@@ -21,7 +21,10 @@ Resting orders bring two dangers, and the rules here exist for them:
   is booked, and if it closed the position no second exit goes out. If the broker can't confirm in
   time, no exit goes out on this pass - the exit manager tries again in seconds. A cancel the broker
   refused (IBKR's 10148: the stop is already filling) is no confirmation, nor is an order that reads
-  cancelled without the broker's word on it. While a target
+  cancelled without the broker's word on it. An exit in the minute after a start, before the first
+  pass has taken over what an earlier run left, takes that run's orders for the trade over and stands
+  them down the same way; while the broker's orders can't be read, or are still reloading after a
+  connect with none found, the exit waits. While a target
   rests at the broker the exit manager leaves the target to it.
 * **An order that outlives its position** would open a position the other way when it triggers.
   Orders are only placed while the broker shows the shares and its order list could be read for
@@ -345,31 +348,7 @@ class ProtectiveStops:
     def _place_stop(self, t: Dict[str, Any], qty: float, price: float, working: List[OrderResult]) -> None:
         """Rest the stop for a trade - and, in one one-cancels-all group with it, its target."""
         tid, symbol = t["id"], t["symbol"]
-        left = [o for o in working if o.tag == stop_tag(tid)]
-        if left:                                         # an earlier run's orders: follow them, never double them
-            keep = left[0]
-            targets = [o for o in working if o.tag == target_tag(tid)]
-            if self._book_filled_while_off(t, keep, targets[0] if targets else None):
-                # one that has filled isn't followed - finishing, it would report the shares just booked again: the
-                # pair is cancelled and, once the cancels have landed, placed afresh for what the record now holds
-                for oid in {o.order_id for o in left + targets}:
-                    self._cancel_quietly(oid)
-                self._stop_retry[tid] = time.monotonic() + self.SHARES_RETRY_S
-                log.info("the order(s) resting at the broker for %s filled while the app was off: booked, and "
-                         "replaced by a fresh pair for what the record holds", tid)
-                return
-            self._stops[tid] = _Stop(keep.order_id, tid, symbol, float(keep.submitted_qty or qty),
-                                     float(keep.stop_price or price), group="adopted" if targets else "")
-            if targets:
-                first = targets[0]
-                self._targets[tid] = _Stop(first.order_id, tid, symbol, float(first.submitted_qty or 0.0),
-                                           float(first.limit_price or 0.0), group="adopted")
-            kept = {keep.order_id} | ({targets[0].order_id} if targets else set())
-            for extra in left[1:] + targets[1:]:
-                if extra.order_id not in kept:           # the same order listed twice is not a second order
-                    self._cancel_quietly(extra.order_id)
-            log.info("following the order(s) already resting at the broker for %s: stop %s%s", tid, keep.order_id,
-                     f", target {targets[0].order_id}" if targets else "")
+        if self._follow_left(t, working, qty, price):    # an earlier run's orders: follow them, never double them
             return
         held = self._held_quantity(symbol)
         long = t["side"] == "LONG"
@@ -403,6 +382,74 @@ class ProtectiveStops:
         self.bus.publish("stop.placed", trade_id=tid, symbol=symbol, qty=qty, stop_price=price, order_id=res.order_id)
         if plan:
             self._place_target(tid, symbol, exit_side, min(plan[0], qty), plan[1], group)
+
+    def _follow_left(self, t: Dict[str, Any], working: List[OrderResult], qty: float, price: float,
+                     target_alone: bool = False) -> str:
+        """Take over the stop - and the target - an earlier run left resting at the broker for a trade. Returns
+        "followed" (they are this run's now), "booked" (one had filled while the app was off: what it filled is
+        booked, and the pair is cancelled, to be placed afresh once the cancels have landed) or "" (nothing was
+        left). With ``target_alone`` a target left without its stop is taken over too - for an exit about to go
+        out, which must stand it down; a pass that places stops leaves it to the sweep once the fresh pair rests."""
+        tid, symbol = t["id"], t["symbol"]
+        left = [o for o in working if o.tag == stop_tag(tid)]
+        targets = [o for o in working if o.tag == target_tag(tid)]
+        if not left and not (target_alone and targets):
+            return ""
+        keep = left[0] if left else None
+        if self._book_filled_while_off(t, keep, targets[0] if targets else None):
+            # one that has filled isn't followed - finishing, it would report the shares just booked again: the
+            # pair is cancelled and, once the cancels have landed, placed afresh for what the record now holds
+            for oid in {o.order_id for o in left + targets}:
+                self._cancel_quietly(oid)
+            self._stop_retry[tid] = time.monotonic() + self.SHARES_RETRY_S
+            log.info("the order(s) resting at the broker for %s filled while the app was off: booked, and "
+                     "replaced by a fresh pair for what the record holds", tid)
+            return "booked"
+        if keep is not None:
+            self._stops[tid] = _Stop(keep.order_id, tid, symbol, float(keep.submitted_qty or qty),
+                                     float(keep.stop_price or price), group="adopted" if targets else "")
+        if targets:
+            first = targets[0]
+            self._targets[tid] = _Stop(first.order_id, tid, symbol, float(first.submitted_qty or 0.0),
+                                       float(first.limit_price or 0.0), group="adopted")
+        kept = ({keep.order_id} if keep is not None else set()) | ({targets[0].order_id} if targets else set())
+        for extra in left[1:] + targets[1:]:
+            if extra.order_id not in kept:               # the same order listed twice is not a second order
+                self._cancel_quietly(extra.order_id)
+        followed = ([f"stop {keep.order_id}"] if keep is not None else []) + \
+            ([f"target {targets[0].order_id}"] if targets else [])
+        log.info("following the order(s) already resting at the broker for %s: %s", tid, ", ".join(followed))
+        return "followed"
+
+    def _take_over_for_exit(self, t: Dict[str, Any], working: Optional[List[OrderResult]]) -> str:
+        """Before the app's own exit for a trade this run follows no resting order for - the minute after a start,
+        before the first pass has taken over what an earlier run left: a ``stop:``/``tgt:`` order for it in the
+        broker's ``working`` orders is taken over, so the stand-down cancels it (and books any fill) like one of
+        this run's. Returns "" when the exit may go on, or why it must wait. It waits when one of them filled
+        while the app was off (booked here; the rest is being cancelled), and - for a trade that would have a stop
+        at the broker - when nothing was found but the order list couldn't be read (``working`` None) or the
+        broker is still reloading it after a connect: never a market exit blind beside a stop that may rest."""
+        tid = t["id"]
+        if tid in self._stops or tid in self._targets:
+            return ""                                    # this run's own: the stand-down sees to them
+        if working is not None:
+            qty, price = abs(float(t.get("quantity") or 0.0)), self._record_stop(t)
+            taken = self._follow_left(t, working, qty, price, target_alone=True)
+            if taken == "booked":
+                return ("An order resting at the broker for this position filled while the app was off - booked; "
+                        "waiting for the broker to cancel the rest before sending the exit.")
+            if taken:
+                return ""
+        guarded = self.native_stops_on() and not t.get("pair_id") and bool(self._record_stop(t))
+        if not guarded:
+            return ""
+        if working is None:
+            return ("The broker's working orders couldn't be read - waiting to be sure no stop is resting for this "
+                    "position before sending the exit.")
+        if self._broker_resyncing():
+            return ("The broker has only just connected and is still reloading its orders - waiting to be sure no "
+                    "stop is resting for this position before sending the exit.")
+        return ""
 
     def _place_target(self, tid: str, symbol: str, exit_side: Side, qty: float, price: float, group: str) -> None:
         req = OrderRequest(symbol=symbol, side=exit_side, quantity=qty, order_type=OrderType.LIMIT, limit_price=price,
@@ -674,7 +721,8 @@ class ProtectiveStops:
         if st is not None:
             self._cancel_quietly(st.order_id)
 
-    def _book_filled_while_off(self, t: Dict[str, Any], stop: OrderResult, target: Optional[OrderResult]) -> bool:
+    def _book_filled_while_off(self, t: Dict[str, Any], stop: Optional[OrderResult],
+                               target: Optional[OrderResult]) -> bool:
         """Whether the stop or target an earlier run left at the broker has filled any shares. A resting order's
         fills are booked once it is done, so what one still working has filled came while the app was off: it is
         booked here, before the orders are judged against the record - the target first, from IBKR's executions

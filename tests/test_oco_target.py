@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
+
+import pytest
 
 from test_native_stop import _StopBroker
 from test_order_follow_up import CFG, _executor, _Repo, _trade
@@ -225,6 +228,21 @@ def test_orders_an_earlier_run_left_are_followed_and_a_stray_target_is_cancelled
     described = {o["order_id"]: (o["purpose"], o["trade_id"]) for o in ex.active_orders()}
     assert described["71"] == ("target", "t1")
     assert ex.cancel_working_orders()["stops_kept"] == 2 and broker.cancelled == ["90"]   # neither is touched
+
+
+@pytest.mark.parametrize("with_stop", [True, False])
+def test_an_exit_right_after_a_start_stands_down_the_target_an_earlier_run_left_with_or_without_its_stop(with_stop):
+    broker, _, ex, _ = _setup()
+    left = [OrderResult(order_id="71", status="SUBMITTED", symbol="AAA", submitted_qty=5, side=Side.SHORT,
+                        tag="tgt:t1", order_type="LIMIT", limit_price=104.0)]
+    if with_stop:
+        left.append(OrderResult(order_id="70", status="SUBMITTED", symbol="AAA", submitted_qty=10, side=Side.SHORT,
+                                tag="stop:t1", order_type="STOP", stop_price=98.0))
+    broker.live.update({o.order_id: o for o in left})                          # still working from an earlier run
+    broker.connected_since = time.monotonic()                                  # just connected: none taken over yet
+    out = ex.close_trade("t1", reason="manual")
+    assert out["ok"] and sorted(broker.cancelled) == sorted(o.order_id for o in left)
+    assert [o.quantity for o in broker.exits()] == [10] and not ex.target_resting("t1")
 
 
 def test_a_target_that_filled_in_part_while_the_app_was_off_is_booked_as_the_first_target():
