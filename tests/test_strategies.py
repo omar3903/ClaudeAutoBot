@@ -294,14 +294,14 @@ def test_swing_setups_signal_on_the_last_completed_daily_candle(monkeypatch):
     # today's candle, still forming, has dropped five points: RSI(2) reads a washout on it, but no session
     # has closed on one - until the close, when the same candle is complete
     daily = _daily_through_today(climb + [95.0], today)
-    ctx = _live_context(monkeypatch, "RSI", daily)
+    ctx = _live_context(monkeypatch, "T08", daily)
     assert Rsi2MeanReversion().generate(ctx) == []
     pd.testing.assert_frame_equal(ctx.daily_adx, ta.adx(daily.iloc[:-1], 14))        # the shared ADX too
-    plays = Rsi2MeanReversion().generate(_live_context(monkeypatch, "RSI", daily, minutes=390.0))
+    plays = Rsi2MeanReversion().generate(_live_context(monkeypatch, "T08", daily, minutes=390.0))
     assert len(plays) == 1 and plays[0].side is Side.LONG
 
     # yesterday closed on the washout and today bounces a little: the signal stands, entered at the price now
-    plays = Rsi2MeanReversion().generate(_live_context(monkeypatch, "RSI", _daily_through_today(climb + [95.0, 95.5],
+    plays = Rsi2MeanReversion().generate(_live_context(monkeypatch, "T08", _daily_through_today(climb + [95.0, 95.5],
                                                                                               today)))
     assert len(plays) == 1 and plays[0].side is Side.LONG
     assert plays[0].entry == pytest.approx(95.5) and plays[0].evidence["rsi2"] < 10

@@ -204,19 +204,26 @@ def test_a_day_play_is_stamped_confirmed_once_with_the_values_it_had_then():
     assert "confirmed_at" not in p.evidence                               # seen once: Autopilot wouldn't take it
     second = _on_candle(5)
     second.entry, second.noise = 100.4, ["against_vwap"]
+    second.expected_hold_typical, second.expected_hold_max = 20.0, 40.0
+    second.evidence.update(activity={"change_pct": 2.0}, expected_r=0.4, spark=[1, 2])
     board.replace([second], scanned={"AAA"}, new_candle=True, min_confirmations=2, now=_at(10))
     [p] = board.plays.values()
     assert p.evidence["confirmed_at"] == _at(10).isoformat()
-    assert p.evidence["as_confirmed"] == {"entry": 100.4, "stop": 99.0, "targets": [102.0], "noise": ["against_vwap"],
-                                          "confirmations": 2, "confidence": 0.5, "reward_risk": 1.14, "score": 0.0,
-                                          "probability": 0.5}
+    # its readings too - the review's features and its time stop read them - less the price strip
+    assert p.evidence["as_confirmed"] == {
+        "entry": 100.4, "stop": 99.0, "targets": [102.0], "noise": ["against_vwap"], "confirmations": 2,
+        "confidence": 0.5, "reward_risk": 1.14, "score": 0.0, "probability": 0.5, "tags": [],
+        "evidence": {"bar_at": second.evidence["bar_at"], "counted_bar": second.evidence["bar_at"],
+                     "activity": {"change_pct": 2.0}, "expected_r": 0.4, "expected_hold": [20.0, 40.0]}}
     third = _on_candle(10)
     third.entry = 101.0
+    third.evidence.update(activity={"change_pct": 9.0}, expected_r=0.9)
     board.replace([third], scanned={"AAA"}, new_candle=True, min_confirmations=2, now=_at(15))
     board.replace([_on_candle(30)], scanned={"AAA"}, new_candle=True, min_confirmations=2, now=_at(35))  # starts again
     [p] = board.plays.values()
     assert (p.confirmations, p.entry) == (1, 100.0)
     assert p.evidence["confirmed_at"] == _at(10).isoformat() and p.evidence["as_confirmed"]["entry"] == 100.4
+    assert p.evidence["as_confirmed"]["evidence"]["activity"] == {"change_pct": 2.0}
 
 
 def test_a_play_is_stamped_at_its_first_sighting_with_a_minimum_of_one_and_swing_plays_never():

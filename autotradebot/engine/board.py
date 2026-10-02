@@ -18,9 +18,10 @@ too - so "seen twice" means two candles running, the entry the replay tests.
 
 The moment a day play's confirmations first reach Autopilot's minimum - when
 Autopilot would take it - is kept in its evidence (``confirmed_at``) with the
-play as it stood then (``as_confirmed``): each scan writes the play with the
-prices of its own moment, and the daily review's shadow record follows a play
-not taken from that moment, with those values (research/journal.py). The board
+play as it stood then (``as_confirmed``), its readings too: each scan writes the
+play with the prices and readings of its own moment, and the daily review's
+shadow record follows a play not taken from that moment, with those values and
+the features they make (research/journal.py). The board
 carries these, and a last look that refused the entry (``last_look``, see
 engine.approve_play), on to the scans that find the setup again.
 
@@ -55,9 +56,12 @@ CANDLE = dt.timedelta(minutes=5)
 MAX_CANDLE_GAP = 2
 #: what the board learns about a setup, kept in its play's evidence from one scan's sighting to the next
 KEPT_EVIDENCE = ("confirmed_at", "as_confirmed", "last_look")
-#: the play's values kept as they stood when it was confirmed - what Autopilot would have entered on
+#: the play's values kept as they stood when it was confirmed - what Autopilot would have entered on - with its
+#: evidence then: the readings the review's features (research/features.py) and its time stop are taken from
 AS_CONFIRMED = ("entry", "stop", "targets", "noise", "confirmations", "confidence", "reward_risk", "score",
-                "probability")
+                "probability", "tags")
+#: the evidence not kept with it: the board's own notes, and the price strip the dashboard draws
+NOT_AS_CONFIRMED = (*KEPT_EVIDENCE, "spark")
 
 
 def setup_key(p: Play) -> SetupKey:
@@ -197,13 +201,17 @@ def _confirmations(old: Play, new: Play, confirm: bool, new_candle: bool) -> int
 
 def _stamp_confirmed(p: Play, now: dt.datetime, minimum: int) -> None:
     """Keep the moment a day play's confirmations first reach Autopilot's ``minimum`` - when Autopilot would
-    take it - and the play as it stood then. Kept once: a count that starts again later doesn't move it."""
+    take it - and the play as it stood then, readings and all: a later scan measures the stock's run after the
+    entry. Kept once: a count that starts again later doesn't move it."""
     if (p.status is not PlayStatus.PROPOSED or not p.is_day_trade or p.confirmations < minimum
             or "confirmed_at" in p.evidence):
         return
     row = p.to_row()
+    evidence = {name: value for name, value in p.evidence.items() if name not in NOT_AS_CONFIRMED}
+    # the hold the time stop runs on, kept the way the play log keeps it (persistence/repository.py _play_row)
+    evidence["expected_hold"] = [float(p.expected_hold_typical or 0.0), float(p.expected_hold_max or 0.0)]
     p.evidence["confirmed_at"] = now.isoformat()
-    p.evidence["as_confirmed"] = {name: row[name] for name in AS_CONFIRMED}
+    p.evidence["as_confirmed"] = {**{name: row[name] for name in AS_CONFIRMED}, "evidence": evidence}
 
 
 def _candle(value: object) -> Optional[pd.Timestamp]:

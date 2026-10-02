@@ -451,6 +451,9 @@ def test_the_replay_runs_in_the_background_downloads_each_session_once_and_keeps
     runner.wait(60)
     state = runner.state([], 1)
     assert started["ok"] and state["ran_at"] and not state["running"] and "noise" in state
+    # the costs the records are net of, the per-share commission and the nominal risk it is charged on too
+    assert state["costs"] == {"slippage_bps": 0.0, "commission_bps": 0.0, "commission_per_share": 0.0,
+                              "commission_min": 1.0, "commission_max_pct": 1.0, "nominal_risk_usd": 1000.0}
 
     asked = len(gateway.requests)
     history.load(gateway, ["RPA", "RPB"], 3)

@@ -1449,9 +1449,12 @@ ranking of the previous day's candles can't see them, and the report says so.
   strategy without a proven record;
 * **the plays not taken**, each followed on the session's 5-minute candles as if
   it had been, the way Autopilot enters: from the next bar after its confirmations
-  first reached Autopilot's minimum, with the values it had then (the board keeps
-  that moment and those values in the play's evidence, `confirmed_at` and
-  `as_confirmed` - each scan writes the play at its own prices). A play never
+  first reached Autopilot's minimum, with the values and readings it had then (the
+  board keeps that moment and those values in the play's evidence, `confirmed_at`
+  and `as_confirmed` - each scan writes the play at its own prices, with readings
+  of the stock's run taken after the entry). A setup that left the board and came
+  back is logged again under a new play; when the comeback is the one that reached
+  the minimum, the comeback is followed from then. A play never
   confirmed, or logged before that moment was kept, is followed from the next bar
   after it was on the board with the values it was recorded with (a play's row
   holds the last scan that wrote it, and a scan's plays reach the board when it

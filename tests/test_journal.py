@@ -211,6 +211,55 @@ def test_a_confirmed_play_is_followed_from_when_autopilot_would_have_taken_it_wi
     assert row["if_filled_r"] == 1.5                                     # what it was sent on, from the 10:05 open
 
 
+def test_a_confirmed_play_is_read_as_it_was_then_not_as_a_later_scan_measured_it(monkeypatch):
+    """The readings a later scan wrote into the row - the stock's run so far, the expected R, the hold the
+    time stop runs on - come after the entry: the shadow and the features the model learns from read the
+    ones the play had when it was confirmed, and keep the last look the row carries."""
+    import autotradebot.research.journal as journal
+
+    holds = []
+    real = journal.shadow_trade
+    monkeypatch.setattr(journal, "shadow_trade", lambda play, *a, **kw: holds.append(
+        (play.expected_hold_typical, play.expected_hold_max)) or real(play, *a, **kw))
+    look = {"why": "the spread is too dear to cross", "bid": 99.95, "ask": 100.05}
+    then = {"activity": {"change_pct": 2.0, "range_atr": 0.8}, "expected_r": 0.4, "expected_hold": [20.0, 40.0]}
+    later = {"activity": {"change_pct": 9.0, "range_atr": 2.5}, "expected_r": 0.9, "expected_hold": [5.0, 10.0],
+             "signal_nudge": 0.3, "spark": [1, 2], "last_look": look, "confirmed_at": f"{DAY}T13:57:20+00:00",
+             "as_confirmed": {"entry": 100.0, "stop": 99.5, "targets": [101.5], "noise": [], "confirmations": 2,
+                              "confidence": 0.6, "reward_risk": 3.0, "score": 0.8, "probability": 0.5,
+                              "evidence": then}}
+    row = {**_row("c1", "13:47"), "scan_finished_at": f"{DAY}T15:30:00", "evidence": later}
+    [shadow] = _review(plays=[row])["shadows"]["plays"]
+    features = shadow["features"]
+    assert (features["change_pct"], features["range_atr"], features["expected_r"]) == (2.0, 0.8, 0.4)
+    assert features["signal_nudge"] is None                              # read after the entry: not known then
+    assert holds == [(20.0, 40.0)]
+    assert (shadow["entered_at"], shadow["spread_r"], shadow["r"]) == (f"{DAY}T10:00:00-04:00", 0.2, 2.8)
+
+
+def test_a_setup_confirmed_on_its_comeback_is_followed_from_then_not_from_its_first_sighting():
+    """A setup that leaves the board and comes back is logged again under a new play: when it is the comeback
+    that reaches Autopilot's minimum, the shadow follows the comeback from that moment, with its values and
+    the last look that refused it - the first sighting is an entry Autopilot could never have made. An entry
+    sent still comes first."""
+    look = {"why": "the spread is too dear to cross", "bid": 99.9, "ask": 100.1}
+    once = {**_row("p1", "13:47"), "confirmations": 1}                    # 09:47, gone on the next candle
+    back = {**_row("p1-back", "14:20"), "evidence": {
+        "confirmed_at": f"{DAY}T14:25:10+00:00", "last_look": look,          # 10:25:10 in New York
+        "as_confirmed": {"entry": 101.9, "stop": 100.9, "targets": [103.9], "noise": [], "confirmations": 2,
+                         "confidence": 0.7, "reward_risk": 2.0, "score": 1.0, "probability": 0.5}}}
+    again = {**_row("p1-again", "14:40"), "evidence": {**back["evidence"], "confirmed_at": f"{DAY}T14:45:00+00:00"}}
+    assert [p["id"] for p in first_sightings([once, back, again])] == ["p1-back"]
+    sent = {**_row("p1-sent", "15:00"), "status": "CANCELED"}
+    assert [p["id"] for p in first_sightings([once, back, sent])] == ["p1-sent"]
+
+    [row] = _review(plays=[once, back], passes=lambda r: r["confirmations"] >= 2)["shadows"]["plays"]
+    assert (row["play_id"], row["confirmed_at"], row["offered_at"]) == ("p1-back", f"{DAY}T10:25:10-04:00",
+                                                                      f"{DAY}T10:25:10-04:00")
+    assert (row["confirmations"], row["passed_checks"], row["entered_at"]) == (2, True, f"{DAY}T10:30:00-04:00")
+    assert row["spread_r"] == 0.2
+
+
 def test_a_play_the_last_look_refused_pays_the_spread_that_look_read():
     """A play the last look turned away is followed as if taken, less the spread the look read - a fill
     crosses it and the candles don't show it - in R of the shadow trade's own risk."""

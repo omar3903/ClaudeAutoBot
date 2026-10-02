@@ -60,6 +60,8 @@ MIN_T = 1.0                       # ... and by a standard error or more (Welch's
 SENT_UNFILLED = frozenset({"ACCEPTED", "SUBMITTED", "WORKING", "CANCELED", "ERROR"})
 TURBULENT = 0.7
 TAKEN = frozenset({"ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED"})
+#: what the play board keeps in a play's evidence from one sighting to the next (engine/board.py KEPT_EVIDENCE)
+BOARD_NOTES = ("confirmed_at", "as_confirmed", "last_look")
 LABELS = {**NOISE_LABELS, "unconfirmed": "seen on only one candle"}
 
 
@@ -220,6 +222,11 @@ def _sent(row: Mapping[str, Any]) -> bool:
     return row.get("status") in SENT_UNFILLED
 
 
+def _stamped(row: Mapping[str, Any]) -> bool:
+    """Whether the row reached Autopilot's confirmations - the board stamped when (engine/board.py)."""
+    return bool((row.get("evidence") or {}).get("confirmed_at"))
+
+
 def _capped(ranked: Sequence[Mapping[str, Any]], limit: Optional[int]) -> List[Mapping[str, Any]]:
     """The ``limit`` highest-scoring of ``ranked``, and every entry sent among the rest: what became of an
     order that went out is worth knowing whatever its score."""
@@ -229,8 +236,10 @@ def _capped(ranked: Sequence[Mapping[str, Any]], limit: Optional[int]) -> List[M
 def first_sightings(plays: Sequence[Mapping[str, Any]], limit: Optional[int] = MAX_SHADOWS,
                     booked: Iterable[Any] = ()) -> List[Mapping[str, Any]]:
     """Each day-trade setup the first time it was offered, when it was never taken - or, when its
-    entry was sent and never filled, the row it was sent from, which holds what it was sent on. The
-    highest-scoring ones when there are too many to follow, and the entries sent past them all the
+    entry was sent and never filled, the row it was sent from, which holds what it was sent on; else,
+    when it first reached Autopilot's confirmations on a later row (a setup that leaves the board and
+    comes back is logged again under a new play), that row, which holds the moment and the values.
+    The highest-scoring ones when there are too many to follow, and the entries sent past them all the
     same (``limit=None``: every one). A setup was taken when an entry of it filled or a trade was
     booked from one of its rows (``booked``: those play ids) - a row still marked sent with no trade
     booked is an entry sent that never filled, as sent_unfilled counts it."""
@@ -240,7 +249,9 @@ def first_sightings(plays: Sequence[Mapping[str, Any]], limit: Optional[int] = M
     for p in sorted(plays, key=lambda p: p.get("created_at") or ""):
         if p.get("timeframe") != "INTRADAY" or p.get("kind") != "TECHNICAL" or _key(p) in traded:
             continue
-        if _key(p) not in chosen or (_sent(p) and not _sent(chosen[_key(p)])):
+        held = chosen.get(_key(p))
+        if (held is None or (_sent(p) and not _sent(held))
+                or (_stamped(p) and not _stamped(held) and not _sent(held))):
             chosen[_key(p)] = p
     return _capped(sorted(chosen.values(), key=lambda p: -float(p.get("score") or 0.0)), limit)
 
@@ -306,12 +317,18 @@ def _confirmed(row: Mapping[str, Any]) -> Tuple[Optional[pd.Timestamp], Mapping[
     """When a play row's confirmations first reached Autopilot's minimum - when Autopilot would have taken
     it (engine/board.py stamps it) - and the row with the values the play had then: a row holds the last scan
     that wrote it, and each scan prices the play at its own moment. (None, the row) for a play never confirmed
-    or logged before the moment was kept, and for an entry sent - its row holds what it was sent on."""
+    or logged before the moment was kept, and for an entry sent - its row holds what it was sent on. Its evidence
+    is the play's then too - the readings its features and time stop come from, which a later scan took after
+    the entry - with the notes the board keeps on the row (engine/board.py KEPT_EVIDENCE: the last look)."""
     evidence = row.get("evidence") or {}
     at, values = _ny(evidence.get("confirmed_at")), evidence.get("as_confirmed")
     if at is None or not isinstance(values, Mapping) or _sent(row):
         return None, row
-    return at, {**row, **values}
+    then = values.get("evidence")
+    if not isinstance(then, Mapping):                 # stamped before its readings were kept with it
+        return at, {**row, **values}
+    notes = {k: evidence[k] for k in BOARD_NOTES if k in evidence}
+    return at, {**row, **values, "evidence": {**then, **notes}}
 
 
 def _spread_r(row: Mapping[str, Any], trade: Any, stop: float) -> float:

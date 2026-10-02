@@ -1,5 +1,5 @@
 /* Strategies: switch setups on or off and set their weight. */
-import { $, $$, api, escapeHtml, num, post, pretty } from "./util.js";
+import { $, $$, api, escapeHtml, num, post, pretty, usd } from "./util.js";
 import { S, emit, on } from "./state.js";
 import { drawerOpen, openDrawer, toast, toastResult } from "./ui.js";
 
@@ -106,7 +106,10 @@ function replayHTML() {
         : (rp.intraday_symbols ? ` on ${rp.intraday_symbols} stocks` : "")) +
       `, swing setups over ${rp.swing_sessions}.` +
       (heldFrom.INTRADAY || heldFrom.SWING ? ` Held out to test on: day trades from ${escapeHtml(heldFrom.INTRADAY || "–")}, swing trades from ${escapeHtml(heldFrom.SWING || "–")}.` : "") +
-      (costs.commission_bps != null ? ` Costs: ${num(costs.slippage_bps, 1)} bps slippage on market fills, ${num(costs.commission_bps, 1)} bps commission on every fill.` : "")
+      (costs.commission_bps != null ? ` Costs: ${num(costs.slippage_bps, 1)} bps slippage on market fills, ${num(costs.commission_bps, 1)} bps commission on every fill` +
+        // the per-share commission came later: a replay saved before it says nothing of it
+        (costs.commission_per_share ? ` and IBKR's $${num(costs.commission_per_share, 3)} a share on every order (at least ${usd(costs.commission_min)}${costs.commission_max_pct ? `, at most ${num(costs.commission_max_pct, 1)}% of its value` : ""}), on the shares ${usd(costs.nominal_risk_usd)} at risk would buy` : "") +
+        "." : "")
     : "No replay yet. Autopilot only trades a strategy once the replay has proven it.";
   const learned = new Set(rp.learned_skips || []);
   const noise = rp.noise

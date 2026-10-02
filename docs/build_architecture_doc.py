@@ -1019,8 +1019,9 @@ def build() -> str:
       'publishes <code>plays.updated</code>. A day play counts a confirmation only when it is seen on a newer '
       '5-minute candle (<code>evidence.bar_at</code>), whichever scan reads it; a sighting more than two candles '
       'after the last one counted starts the count again. When a day play\'s confirmations first reach '
-      'Autopilot\'s minimum it keeps that moment and the play as it stood (<code>evidence.confirmed_at</code>, '
-      '<code>as_confirmed</code>), which the daily review follows a play not taken from. The plays it took are '
+      'Autopilot\'s minimum it keeps that moment and the play as it stood, readings and all '
+      '(<code>evidence.confirmed_at</code>, <code>as_confirmed</code>), which the daily review follows a play not '
+      'taken from. The plays it took are '
       'logged to <code>play_logs</code> - not a setup already acted on this session, and never over a row that '
       'was sent, filled or dismissed.</li>'
       '<li><b>Autopilot.</b> <code>AutoPilot.consider()</code> walks the board highest score first and applies '
@@ -1120,8 +1121,8 @@ def build() -> str:
          "mean", "Murphy"),
         ("atr_channel_breakout", "Keltner / ATR Channel Breakout", "swing", "momentum", "a close outside the ATR "
          "channel", "Murphy"),
-        ("week52_breakout", "52-Week High/Low Momentum", "swing", "momentum", "a new 52-week high on projected "
-         "volume", "Murphy"),
+        ("week52_breakout", "52-Week High/Low Momentum", "swing", "momentum", "a push to a new 52-week high/low on "
+         "the last completed session's volume", "Murphy"),
         ("divergence_reversal", "Oscillator Divergence at a Level", "swing", "reversal", "RSI/MACD divergence at "
          "support or resistance", "Murphy"),
         ("failure_test", "Failure Test (spring / upthrust)", "swing", "reversal", "a probe through a swing level "
