@@ -1682,7 +1682,8 @@ trading rules and risk limits, ran it day after day against an IBKR paper accoun
 before it was merged. Claude Code wrote much of the code, the tests and the documentation, and ran the reviews
 and replays behind the decisions. That's why most commits carry a `Co-Authored-By: Claude` line and many pull
 requests say they were generated with Claude Code; the pull-request history keeps the reasoning, the test
-results and the reviews behind each change.
+results and the reviews behind each change. Claude is listed as a co-author in [AUTHORS.md](AUTHORS.md) and in
+the package metadata (`pyproject.toml`).
 
 ## License
 
