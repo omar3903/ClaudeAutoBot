@@ -764,6 +764,167 @@ def test_the_echo_of_a_scans_cancel_is_no_error(broker):
                                           f"Error 162, reqId 7: {other}", None, None))
 
 
+# --------------------------------------------------------------------------- #
+#  what IBKR answers about an order, as ib_async records it
+# --------------------------------------------------------------------------- #
+class IbOrders:
+    """The fake's orders kept the way ib_async keeps them, in its own Trade, OrderStatus and TradeLogEntry: a
+    modify writes "Modify" in the trade's log, a cancel PendingCancel, a fill "Fill n@price" under whatever
+    status the order has then, and an error on an order ib_async doesn't have down as finished marks it
+    Cancelled with the error in the log - whatever IBKR meant, a refused cancel or modify too - before
+    errorEvent hears of it, as ib_async's wrapper.error does (a warning only marks it ValidationError).
+    IBKR answers a cancel with ``answer_cancel`` and a modify with ``answer_modify`` - (code, text) - or, when
+    None, says nothing to a cancel and takes a modify."""
+
+    WARNINGS = {105, 110, 165, 321, 329, 399, 404, 434, 492, 10167}
+
+    def __init__(self, ib):
+        from ib_async import OrderStatus as Status, Trade
+        from ib_async.objects import TradeLogEntry
+
+        self.ib, self.book, self.closed = ib, {}, set()
+        self.answer_cancel = self.answer_modify = None
+        self._Trade, self._Status, self._Entry = Trade, Status, TradeLogEntry
+        ib.placeOrder, ib.cancelOrder = self.place, self.cancel
+        ib.trades = ib.openTrades = lambda: list(self.book.values())
+        # IBKR lists what it still works - an order ib_async took for cancelled among them
+        ib.reqAllOpenOrdersAsync = lambda: _Finished([t for oid, t in self.book.items() if oid not in self.closed])
+
+    def _log(self, trade, status, message="", code=0):
+        trade.log.append(self._Entry(dt.datetime.now(dt.timezone.utc), status, message, code))
+
+    def place(self, contract, order):
+        trade = self.book.get(order.orderId) if order.orderId else None
+        if trade is None:
+            order.orderId = len(self.book) + 1
+            trade = self._Trade(contract, order, self._Status(orderId=order.orderId, status="Submitted"), [], [])
+            self._log(trade, "Submitted")
+            self.book[order.orderId] = trade
+            return trade
+        assert not trade.isDone()                     # ib_async's own check before it sends a modify
+        self._log(trade, trade.orderStatus.status, "Modify")
+        if self.answer_modify:
+            self.error(order.orderId, *self.answer_modify)
+        else:
+            self._log(trade, trade.orderStatus.status, "Modified")
+        return trade
+
+    def cancel(self, order):
+        trade = self.book[order.orderId]
+        if not trade.isDone():
+            trade.orderStatus.status = "PendingCancel"
+            self._log(trade, "PendingCancel")
+        if self.answer_cancel:
+            self.error(order.orderId, *self.answer_cancel)
+        return trade
+
+    def error(self, order_id, code, text):
+        trade = self.book[order_id]
+        if code in self.WARNINGS:
+            trade.orderStatus.status = "ValidationError"
+            self._log(trade, "ValidationError", f"Warning {code}, reqId {order_id}: {text}", code)
+        elif not trade.isDone():
+            trade.orderStatus.status = "Cancelled"
+            self._log(trade, "Cancelled", f"Error {code}, reqId {order_id}: {text}", code)
+        if code == 202:
+            self.closed.add(order_id)
+        self.ib.errorEvent.emit(order_id, code, text, None)
+
+    def fill(self, order_id, shares, price):
+        trade = self.book[order_id]
+        trade.fills.append(SimpleNamespace(execution=SimpleNamespace(shares=shares, price=price)))
+        self._log(trade, trade.orderStatus.status, f"Fill {shares}@{price}")
+
+    def status(self, order_id, status, filled=0.0, avg=0.0):
+        """IBKR's own order status."""
+        trade = self.book[order_id]
+        trade.orderStatus.status, trade.orderStatus.filled, trade.orderStatus.avgFillPrice = status, filled, avg
+        if status in ("Filled", "Cancelled"):
+            self.closed.add(order_id)
+        self._log(trade, status)
+
+
+def _resting_stop(broker, qty=10, price=98.5):
+    return broker.place_order(OrderRequest(symbol="AAA", side=Side.SHORT, quantity=qty, order_type=OrderType.STOP,
+                                           stop_price=price, tif=TimeInForce.GTC, is_entry=False,
+                                           client_tag="stop:trd_1"))
+
+
+@pytest.mark.parametrize("state,reads", [("PendingCancel", "WORKING"), ("Submitted", "WORKING"),
+                                         ("PreSubmitted", "WORKING"), ("Filled", "WORKING"),
+                                         ("Cancelled", "CANCELED")])
+def test_a_cancel_ibkr_refuses_never_reads_as_cancelled(broker, caplog, state, reads):
+    orders = IbOrders(broker._session.ib)
+    res = _resting_stop(broker)
+    orders.answer_cancel = (10148, f"OrderId {res.order_id} that needs to be cancelled cannot be cancelled, "
+                                   f"state: {state}.")
+    with caplog.at_level("INFO", logger=mod.__name__):
+        broker.cancel_order(res.order_id)
+    assert orders.book[1].orderStatus.status == "Cancelled"                   # ib_async's guess
+    got = broker.get_order(res.order_id)
+    assert (got.status, got.filled_qty) == (reads, 0.0)
+    assert got.raw["cancel_confirmed"] is (reads == "CANCELED")
+    if reads == "WORKING":
+        assert any(r.levelname == "WARNING" and res.order_id in r.getMessage() and state in r.getMessage()
+                   for r in caplog.records)                                    # the race shows in the log
+        with pytest.raises(OrderRejected):
+            broker.modify_stop(res.order_id, stop_price=99.0)                  # not until IBKR says what became of it
+
+
+def test_a_stop_ibkr_had_filled_reads_filled_once_its_shares_arrive(broker):
+    orders = IbOrders(broker._session.ib)
+    res = _resting_stop(broker)
+    orders.answer_cancel = (10148, "OrderId 1 that needs to be cancelled cannot be cancelled, state: Filled.")
+    broker.cancel_order(res.order_id)
+    orders.fill(1, 10.0, 98.4)                                                 # the execution lands first...
+    assert broker.get_order(res.order_id).status == "WORKING"
+    orders.status(1, "Filled", filled=10.0, avg=98.4)                          # ...then IBKR's own status
+    got = broker.get_order(res.order_id)
+    assert (got.status, got.filled_qty, got.avg_fill_price) == ("FILLED", 10.0, 98.4)
+
+
+def test_a_refusal_naming_no_state_is_no_cancel_but_ibkrs_202_is(broker):
+    orders = IbOrders(broker._session.ib)
+    res = _resting_stop(broker)
+    orders.answer_cancel = (161, "Cancel attempted when order is not in a cancellable state. Order permId =1234")
+    broker.cancel_order(res.order_id)
+    assert broker.get_order(res.order_id).status == "WORKING"
+    orders.error(1, 202, "Order Canceled - reason:")                           # ib_async logs nothing: it's "done"
+    assert orders.book[1].log[-1].errorCode == 161
+    got = broker.get_order(res.order_id)
+    assert got.status == "CANCELED" and got.raw["cancel_confirmed"] is True
+
+
+def test_a_cancel_reads_confirmed_only_on_ibkrs_word(broker):
+    orders = IbOrders(broker._session.ib)
+    first, second, third = _resting_stop(broker), _resting_stop(broker), _resting_stop(broker)
+    orders.answer_cancel = (202, "Order Canceled - reason:")
+    broker.cancel_order(first.order_id)                                        # IBKR's 202
+    orders.answer_cancel = None
+    broker.cancel_order(second.order_id)
+    orders.status(2, "Cancelled")                                              # IBKR's own order status
+    orders.error(3, 201, "Order rejected - reason:no such order")              # an error ib_async took for the end
+    confirmed = [broker.get_order(r.order_id).raw["cancel_confirmed"] for r in (first, second, third)]
+    assert [broker.get_order(r.order_id).status for r in (first, second, third)] == ["CANCELED"] * 3
+    assert confirmed == [True, True, False]
+
+
+@pytest.mark.parametrize("code,text", [
+    (201, "Order rejected - reason:The order would exceed a limit"),            # an error: ib_async says Cancelled
+    (321, "Error validating request.-'bN' : cause - The order can't be changed"),   # a warning
+])
+def test_a_stop_move_ibkr_refuses_raises_and_the_stop_still_reads_working_where_it_was(broker, code, text):
+    orders = IbOrders(broker._session.ib)
+    res = _resting_stop(broker, price=98.5)
+    broker.modify_stop(res.order_id, stop_price=99.0, quantity=10)            # taken
+    assert broker.get_order(res.order_id).stop_price == 99.0
+    orders.answer_modify = (code, text)
+    with pytest.raises(OrderRejected, match="can't be changed|would exceed a limit"):
+        broker.modify_stop(res.order_id, stop_price=99.5, quantity=10)
+    got = broker.get_order(res.order_id)
+    assert (got.status, got.stop_price, got.submitted_qty) == ("WORKING", 99.0, 10.0)   # what IBKR still holds
+
+
 
 # --------------------------------------------------------------------------- #
 #  the open orders, asked for by several threads at once

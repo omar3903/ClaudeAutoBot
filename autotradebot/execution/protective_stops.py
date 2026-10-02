@@ -19,7 +19,9 @@ Resting orders bring two dangers, and the rules here exist for them:
 * **Two exits on one position.** Before the app sends any exit of its own it *stands the resting
   orders down*: cancels them and waits for the broker to confirm. If one filled first, that fill
   is booked, and if it closed the position no second exit goes out. If the broker can't confirm in
-  time, no exit goes out on this pass - the exit manager tries again in seconds. While a target
+  time, no exit goes out on this pass - the exit manager tries again in seconds. A cancel the broker
+  refused (IBKR's 10148: the stop is already filling) is no confirmation, nor is an order that reads
+  cancelled without the broker's word on it. While a target
   rests at the broker the exit manager leaves the target to it.
 * **An order that outlives its position** would open a position the other way when it triggers.
   Orders are only placed while the broker shows the shares and its order list could be read for
@@ -84,6 +86,12 @@ def tick(price: float) -> float:
 
 def on_tick(price: float) -> float:
     return round(float(price), 2 if price >= 1.0 else 4)
+
+
+def _unconfirmed_cancel(res: OrderResult) -> bool:
+    """The order reads cancelled, but the broker never said it cancelled it (IBKR's 202, or its own order
+    status) - an error read as the order's end. Brokers that don't say count as having confirmed."""
+    return res.status == "CANCELED" and (res.raw or {}).get("cancel_confirmed") is False
 
 
 def stop_exit_reason(initial_stop: Optional[float], trigger: float) -> str:
@@ -495,11 +503,18 @@ class ProtectiveStops:
         Returns "none" (nothing rested), "cancelled" (the way is clear), "filled" (one of them got
         there first and closed the position: send nothing) or "busy" (the broker hasn't confirmed:
         send nothing yet). A fill that left part of the position open is booked, and the way is
-        cleared for the rest."""
+        cleared for the rest.
+
+        A cancel asked for here counts only once the broker confirms it: IBKR refusing it (the stop
+        already filling) reads as working, and an order that reads cancelled without IBKR's word on
+        it (``cancel_confirmed`` False) is waited for like one still working. And before the way is
+        called clear, each order found cancelled is read once more, for a fill that landed just
+        behind the cancel."""
         if trade_id not in self._stops and trade_id not in self._targets:
             return "none"
         deadline = time.monotonic() + self.STAND_DOWN_S
         asked: set = set()
+        cleared: List[Tuple[Dict[str, _Stop], Any, _Stop]] = []     # the orders found cancelled: book, booking, order
         while True:
             waiting, just_asked = False, False
             for book, fill in ((self._targets, self._book_target_fill), (self._stops, self._book_stop_fill)):
@@ -511,6 +526,8 @@ class ProtectiveStops:
                 except Exception:  # noqa: BLE001
                     return "busy"
                 done = res.status in DONE_STATUSES or (res.status == "UNKNOWN" and not self._broker_resyncing())
+                if done and o.order_id in asked and _unconfirmed_cancel(res):
+                    done = False                         # the broker never said the cancel went through: it may fill
                 if res.status == "FILLED" or (done and float(res.filled_qty or 0.0) > 0):
                     fill(o, res)
                     book.pop(trade_id, None)
@@ -521,6 +538,7 @@ class ProtectiveStops:
                     continue
                 if done:
                     book.pop(trade_id, None)
+                    cleared.append((book, fill, o))
                     continue
                 if o.order_id not in asked:
                     self._cancel_quietly(o.order_id)
@@ -528,11 +546,36 @@ class ProtectiveStops:
                     just_asked = True
                 waiting = True
             if not waiting:
-                return "cancelled"
+                return self._last_look(trade_id, cleared)
             if not just_asked and time.monotonic() >= deadline:
                 return "busy"
             if self.STAND_DOWN_POLL_S > 0:
                 time.sleep(self.STAND_DOWN_POLL_S)
+
+    def _last_look(self, trade_id: str, cleared: List[Tuple[Dict[str, _Stop], Any, _Stop]]) -> str:
+        """One more read of the orders a stand-down found cancelled, before the way is called clear: a fill
+        that landed just behind the cancel is booked - "filled" if it closed the position - and an order that
+        reads as working again, or can't be read, is followed again and the exit waits ("busy")."""
+        booked: set = set()
+        for book, fill, o in cleared:
+            try:
+                res = self.broker.get_order(o.order_id)
+            except Exception:  # noqa: BLE001
+                res = None
+            if res is not None and (res.status == "FILLED" or float(res.filled_qty or 0.0) > 0):
+                fill(o, res)
+                booked.add(o.order_id)
+                t = self.repo.get_trade(trade_id)
+                if not t or t.get("status") == "CLOSED":
+                    self._drop_resting(trade_id)
+                    return "filled"
+                continue
+            if res is None or (res.status not in DONE_STATUSES and res.status != "UNKNOWN"):
+                for again, _, order in cleared:
+                    if order.order_id not in booked:      # what was booked here is never booked twice
+                        again.setdefault(trade_id, order)
+                return "busy"
+        return "cancelled"
 
     def _shrink_stop(self, trade_id: str, remaining: float) -> bool:
         """Before the app takes part of a position off itself: the stop covers only what will remain."""

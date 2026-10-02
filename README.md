@@ -860,7 +860,12 @@ Two rules keep it safe:
 * **Never two exits on one position.** Before the app sends an exit of its own it
   cancels the stop and waits for IBKR to confirm; if the stop filled first, that
   fill is booked and nothing else is sent; if IBKR hasn't confirmed, the exit waits
-  for the next pass. A partial exit first shrinks the stop to the shares that remain.
+  for the next pass. A cancel IBKR refuses (the stop is already filling) is no
+  confirmation - ib_async would report that stop as cancelled, the app keeps it as
+  working until IBKR says it filled or is cancelled - and a stop that read cancelled is
+  read once more, for a fill landing just behind the cancel, before the exit goes out.
+  A stop move IBKR refuses leaves the stop as it was, and it is replaced.
+  A partial exit first shrinks the stop to the shares that remain.
 * **Never a stop without a position.** A stop is placed only while the account shows
   the shares and the broker's orders could be read; a stop whose trade is no longer
   open is cancelled; a stop an earlier run left is followed, never doubled. If it (or

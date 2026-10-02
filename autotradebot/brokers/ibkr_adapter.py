@@ -69,6 +69,15 @@ _REFUSED_BUT_OPEN = {10167} | _PARTIAL_DATA_ERRS
 _LINES_FULL, _UNKNOWN_TICKER = 101, 300
 # what a new stream clears off a Ticker it shares with earlier requests, so none of their prices is taken for its own
 _STREAM_RESET_FIELDS = ("bid", "ask", "last", "close", "bidSize", "askSize", "lastSize", "halted")
+# IBKR refusing a cancel: 10148 (it can't be cancelled - the order's state follows) and 161 (not in a cancellable
+# state). ib_async marks the order Cancelled for either, though it is still working, or has filled
+_CANCEL_REFUSED = frozenset({10148, 161})
+# IBKR's word that an order is cancelled
+_CANCEL_CONFIRMED = 202
+# warnings that answer a modify with no: the order works on as it was (ib_async only marks errors as the order's end)
+_MODIFY_REFUSED_WARNINGS = frozenset({105, 110, 321, 329, 434})
+# the states ib_async counts as an order's end - it sends no change for an order in one
+_IB_DONE = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})
 
 
 class _QuietDataErrors(logging.Filter):
@@ -259,6 +268,10 @@ class IbkrBroker(BrokerAdapter):
         #: the request for the open orders that is out now, which any other caller waits on (see _open_orders)
         self._orders_lock = threading.Lock()
         self._orders_asked: Optional[Future] = None
+        #: the orders IBKR has said are cancelled (its 202), and the orders a modify was sent for, with the status
+        #: each had then and where the modify sits in its log - see _true_status. Order id -> ...
+        self._cancels_confirmed: Dict[str, float] = {}
+        self._modifying: Dict[str, Tuple[str, int]] = {}
 
         # real-time streams (set_streams). The loop thread changes them; any thread reads them. Everything below
         # is under _stream_lock, which is never held while waiting on the loop or calling on_tick
@@ -548,6 +561,10 @@ class IbkrBroker(BrokerAdapter):
         }
 
     def _on_error(self, reqId, errorCode, errorString, contract=None) -> None:  # noqa: ANN001
+        if errorCode == _CANCEL_CONFIRMED or errorCode in _CANCEL_REFUSED:
+            self._cancel_answer(reqId, errorCode, errorString)
+            if errorCode in _CANCEL_REFUSED:
+                return
         if errorCode in _SERVERS_BACK or (errorCode in _FARMS_OK and self._servers_lost_code == 2110):
             self._servers_back(errorCode)
             return
@@ -593,6 +610,20 @@ class IbkrBroker(BrokerAdapter):
         self._last_error = f"{errorCode}: {errorString}"
         if errorCode not in (162, 200):        # historical-data / unknown-contract noise
             log.debug("IBKR error %s: %s", errorCode, errorString)
+
+    def _cancel_answer(self, order_id: int, code: int, text: str) -> None:
+        """IBKR's answer to a cancel: 202 confirms it; 10148 / 161 refuse it - the order is still working, or has
+        filled with the fill on its way - unless the refusal says the order is cancelled already. ib_async logs
+        no error on an order it has down as finished, so the 202 that follows a refusal is only heard here.
+        Runs on the loop thread, from _on_error."""
+        state = _refused_state(text) if code in _CANCEL_REFUSED else ""
+        if code == _CANCEL_CONFIRMED or state.lower() in _CANCELLED_STATES:
+            _remember(self._cancels_confirmed, str(order_id), time.monotonic())
+            if state:
+                log.info("IBKR: order %s was already cancelled (%s)", order_id, code)
+            return
+        log.warning("IBKR refused to cancel order %s (%s, state: %s) - it may still fill, so it reads as working "
+                    "until IBKR says it filled or is cancelled", order_id, code, state or "not given")
 
     def _servers_back(self, code: int) -> None:
         """IB Gateway reached IBKR's servers again. Runs on the loop thread, so it calls ib_async directly."""
@@ -1140,20 +1171,76 @@ class IbkrBroker(BrokerAdapter):
         return OrderResult(order_id=oid, status=_norm_status(status), symbol=req.symbol,
                            submitted_qty=req.quantity, raw={"tif": order.tif}, side=req.side, tag=req.client_tag)
 
+    #: how long a stop's move waits for IBKR's answer. A refusal comes back as an error on the order, which
+    #: ib_async takes for the order's end; one later than this still never makes the order read as cancelled.
+    #: (A change IBKR takes on an order not yet live - PreSubmitted - leaves no word in the log: it waits it out)
+    MODIFY_ANSWER_S = 1.0
+
     def modify_stop(self, order_id: str, stop_price: Optional[float] = None,
                     quantity: Optional[float] = None) -> OrderResult:
-        """Change a resting stop's trigger and shares in place - IBKR takes the same order id again."""
+        """Change a resting stop's trigger and shares in place - IBKR takes the same order id again. A change
+        IBKR refuses raises OrderRejected with its reason, and the order goes on reading as the working order it
+        still is."""
         self._guard_orders()
         trade = self._find_trade(order_id)
         if trade is None:
             raise OrderRejected(f"IBKR: no live order {order_id} to modify")
+        if getattr(trade.orderStatus, "status", "") in _IB_DONE:
+            # ib_async sends no change for an order it has down as finished - one whose cancel IBKR refused may
+            # still be working, but nothing is changed until IBKR says what became of it
+            raise OrderRejected(f"IBKR: order {order_id} can't be changed until IBKR says what became of it")
         order = trade.order
+        before = (getattr(order, "auxPrice", None), getattr(order, "totalQuantity", None))
         if stop_price is not None:
             order.auxPrice = float(stop_price)
         if quantity is not None:
             order.totalQuantity = abs(float(quantity))
-        changed = self._session.call(lambda ib: ib.placeOrder(trade.contract, order), timeout=10)
+
+        def _send(ib):
+            # on the loop, so IBKR's answer can't land before the modify is noted: its place in the log is where
+            # ib_async writes "Modify", and what follows it is IBKR's word on the change
+            entries = getattr(trade, "log", None)
+            at = len(entries) if entries is not None else None
+            if at is not None:
+                _remember(self._modifying, str(order_id), (getattr(trade.orderStatus, "status", "") or "", at))
+            try:
+                return ib.placeOrder(trade.contract, order), at
+            except Exception:
+                self._modifying.pop(str(order_id), None)      # never sent: a later error isn't its answer
+                raise
+
+        changed, at = self._session.call(_send, timeout=10)
+        if at is not None:
+            refused = self._modify_answer(changed, str(order_id), at)
+            if refused:
+                order.auxPrice, order.totalQuantity = before        # what IBKR still holds
+                raise OrderRejected(f"IBKR refused to change order {order_id}: {refused}")
         return self._result(changed)
+
+    def _modify_answer(self, trade, order_id: str, at: int) -> str:
+        """Wait a moment for IBKR's word on the modify noted at ``at`` in the order's log: its reason when it
+        refused the change, "" when it took it - or said nothing in time, when the modify stays noted, so a
+        refusal that comes later still reads as one (_true_status)."""
+        async def _wait(ib):
+            end = time.monotonic() + self.MODIFY_ANSWER_S
+            while True:
+                for entry in list(getattr(trade, "log", None) or [])[at + 1:]:
+                    code = int(getattr(entry, "errorCode", 0) or 0)
+                    if code and (getattr(entry, "status", "") == "Cancelled" or code in _MODIFY_REFUSED_WARNINGS):
+                        return "refused", _log_text(entry) or f"error {code}"
+                    if not code:
+                        return "taken", ""                # an order status or a fill: the change went through
+                if time.monotonic() >= end:
+                    return "silent", ""
+                await _sleep(0.05)
+
+        try:
+            verdict, why = self._session.run_coro(_wait, timeout=self.MODIFY_ANSWER_S + 5)
+        except Exception:  # noqa: BLE001 - the answer is read off the order later all the same
+            return ""
+        if verdict == "taken":
+            self._modifying.pop(order_id, None)
+        return why
 
     def _find_trade(self, order_id: str):
         def _find(ib):
@@ -1242,6 +1329,37 @@ class IbkrBroker(BrokerAdapter):
 
         return self._session.run_coro(run, timeout=15 + 10 * len(con_ids)) or {}
 
+    def _true_status(self, t) -> str:
+        """An order's state in the app's words - IBKR's word, not ib_async's guess. ib_async takes any error on
+        an order that isn't finished for its end and marks it Cancelled, but IBKR refusing a cancel (10148 / 161)
+        leaves the order working - or filled, with the fill on its way - and a modify IBKR refuses leaves it
+        working as it was. Such an order reads as working until IBKR's own word comes: its fill (ib_async's
+        Filled status, with the shares), or its cancel (202)."""
+        status = getattr(t.orderStatus, "status", "") or ""
+        if status != "Cancelled":
+            return _norm_status(status)
+        oid = str(getattr(t.order, "orderId", ""))
+        if oid in self._cancels_confirmed:
+            return "CANCELED"
+        at, entry = _status_entry(t)
+        code = int(getattr(entry, "errorCode", 0) or 0) if entry is not None else 0
+        if code in _CANCEL_REFUSED:
+            # IBKR names the order's state: "... cannot be cancelled, state: PendingCancel." Filled means the
+            # fill is on its way - until its shares arrive the order is no more filled than cancelled
+            return "CANCELED" if _refused_state(entry.message).lower() in _CANCELLED_STATES else "WORKING"
+        modify = self._modifying.get(oid)
+        if code and code != _CANCEL_CONFIRMED and modify is not None and at > modify[1]:
+            return _norm_status(modify[0])               # the change was refused: the order works on as it was
+        return "CANCELED"
+
+    def _cancel_confirmed(self, t) -> bool:
+        """IBKR itself said the order is cancelled: its 202, or its own order status - not an error ib_async
+        took for the order's end."""
+        if str(getattr(t.order, "orderId", "")) in self._cancels_confirmed:
+            return True
+        _, entry = _status_entry(t)
+        return entry is not None and int(getattr(entry, "errorCode", 0) or 0) in (0, _CANCEL_CONFIRMED)
+
     def _result(self, t) -> OrderResult:
         o, os_ = t.order, t.orderStatus
         kind = getattr(o, "orderType", "") or ""
@@ -1249,7 +1367,8 @@ class IbkrBroker(BrokerAdapter):
         fills = [Fill(order_id=str(o.orderId), symbol=t.contract.symbol, side=side,
                       quantity=float(f.execution.shares), price=float(f.execution.price))
                  for f in (t.fills or [])]
-        return OrderResult(order_id=str(o.orderId), status=_norm_status(os_.status), symbol=t.contract.symbol,
+        status = self._true_status(t)
+        return OrderResult(order_id=str(o.orderId), status=status, symbol=t.contract.symbol,
                            submitted_qty=float(o.totalQuantity or 0.0), filled_qty=float(os_.filled or 0.0),
                            avg_fill_price=float(os_.avgFillPrice or 0.0), fills=fills, message=_order_message(t),
                            side=side, tag=getattr(o, "orderRef", "") or "",
@@ -1257,7 +1376,9 @@ class IbkrBroker(BrokerAdapter):
                            stop_price=_price(getattr(o, "trailStopPrice" if kind == "TRAIL" else "auxPrice", None)),
                            tif=getattr(o, "tif", "") or "",
                            raw={"mine": getattr(o, "clientId", None) == self.client_id,
-                                "parent_id": str(getattr(o, "parentId", 0) or "") or None})
+                                "parent_id": str(getattr(o, "parentId", 0) or "") or None,
+                                # a cancelled order whose cancel IBKR never confirmed may still fill (_stand_down)
+                                "cancel_confirmed": status == "CANCELED" and self._cancel_confirmed(t)})
 
 
 async def _sleep(seconds: float) -> None:
@@ -1347,9 +1468,44 @@ def _order_message(trade) -> str:
     """IBKR's latest complaint about an order - why it was rejected, say."""
     for entry in reversed(getattr(trade, "log", None) or []):
         if getattr(entry, "errorCode", 0):
-            text = re.sub(r"^(Error|Warning) -?\d+, reqId -?\d+: ", "", entry.message or "")
-            return " ".join(text.replace("<br>", " ").split())
+            return _log_text(entry)
     return ""
+
+
+def _log_text(entry) -> str:
+    """An order log entry's message in plain words, without ib_async's "Error 201, reqId 7: " in front."""
+    text = re.sub(r"^(Error|Warning) -?\d+, reqId -?\d+: ", "", getattr(entry, "message", "") or "")
+    return " ".join(text.replace("<br>", " ").split())
+
+
+# the states a refused cancel can name that mean the order is cancelled after all
+_CANCELLED_STATES = frozenset({"cancelled", "apicancelled"})
+
+
+def _refused_state(message: str) -> str:
+    """The state IBKR names when it refuses a cancel ("... cannot be cancelled, state: PendingCancel."), as it
+    spells it; "" when it names none."""
+    found = re.search(r"state:\s*([A-Za-z]+)", message or "")
+    return found.group(1) if found else ""
+
+
+def _status_entry(trade) -> Tuple[int, Any]:
+    """The log entry behind an order's status, and where it sits in the log: the latest that isn't one of its
+    fills (ib_async logs each fill under whatever status the order had then). (-1, None) when there's none."""
+    entries = list(getattr(trade, "log", None) or [])
+    for i in range(len(entries) - 1, -1, -1):
+        entry = entries[i]
+        if getattr(entry, "errorCode", 0) or not str(getattr(entry, "message", "") or "").startswith("Fill "):
+            return i, entry
+    return -1, None
+
+
+def _remember(book: Dict[str, Any], key: str, value: Any, cap: int = 4096) -> None:
+    """Note ``value`` for an order; past ``cap`` orders the older half is forgotten - order ids never come back."""
+    book[key] = value
+    if len(book) > cap:
+        for old in list(book)[:cap // 2]:
+            book.pop(old, None)
 
 
 def _bars_to_df(bars) -> pd.DataFrame:

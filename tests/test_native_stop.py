@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from test_order_follow_up import VENUE, _Broker, _executor, _Repo, _trade
 from autotradebot.brokers.base import BrokerError
 from autotradebot.core.enums import OrderType, Side, TimeInForce
@@ -19,6 +21,7 @@ class _StopBroker(_Broker):
         super().__init__(positions, working)
         self.live, self.modified, self.can_modify = {}, [], can_modify
         self.slow_cancel = False                 # the broker hasn't confirmed the cancel yet
+        self.unconfirmed = False                 # the stop reads cancelled, but the broker never said it cancelled it
 
     def place_order(self, req):
         res = super().place_order(req)
@@ -34,6 +37,7 @@ class _StopBroker(_Broker):
         super().cancel_order(order_id)
         if order_id in self.live and not self.slow_cancel:
             self.live[order_id].status = "CANCELED"
+            self.live[order_id].raw = {"cancel_confirmed": not self.unconfirmed}
 
     def modify_stop(self, order_id, stop_price=None, quantity=None):
         if not self.can_modify:
@@ -154,6 +158,81 @@ def test_no_exit_goes_out_until_the_broker_confirms_the_stop_is_cancelled():
     broker.slow_cancel = False
     broker.live["1"].status = "CANCELED"
     assert ex.close_trade("t1", reason="target")["ok"] and len(broker.exits()) == 1
+
+
+def test_a_cancel_the_broker_never_confirmed_holds_the_exit_back_and_the_stop_that_then_fills_is_booked():
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()
+    broker.unconfirmed = True                                                  # it reads cancelled: an error, no 202
+    out = ex.close_trade("t1", reason="stop")
+    assert not out["ok"] and "confirm" in out["reason"] and broker.exits() == []
+    assert ex.protective_stops()[0]["order_id"] == "1"                         # still followed
+    broker.live["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                   avg_fill_price=97.9)
+    out = ex.close_trade("t1", reason="stop")
+    assert out["ok"] and out["by"] == "broker-stop" and broker.exits() == []
+    assert repo.get_trade("t1")["status"] == "CLOSED"
+
+
+def test_a_stop_found_cancelled_is_read_once_more_and_a_fill_landing_behind_the_cancel_is_booked():
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()
+    looks, read = [], broker.get_order
+
+    def get_order(order_id):
+        res = read(order_id)
+        looks.append(res.status)
+        if looks.count("CANCELED") > 1:                                        # the last look: the fill has landed
+            return OrderResult(order_id=order_id, status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                               avg_fill_price=97.9)
+        return res
+
+    broker.get_order = get_order
+    out = ex.close_trade("t1", reason="stop")
+    assert out["ok"] and out["by"] == "broker-stop" and broker.exits() == []
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
+
+
+def _ibkr_broker(monkeypatch):
+    """The real IBKR adapter around the adapter tests' fake ib_async, its orders kept as ib_async keeps them,
+    and past the re-sync after connecting."""
+    from test_ibkr_adapter import FakeSession, IbOrders
+    from autotradebot.brokers import ibkr_adapter
+
+    async def _fast(*_a):
+        return None
+
+    monkeypatch.setattr(ibkr_adapter, "port_is_open", lambda *a, **k: True)
+    monkeypatch.setattr(ibkr_adapter, "_sleep", _fast)
+    broker = ibkr_adapter.IbkrBroker(port=4002, mode="paper", session_factory=FakeSession)
+    broker.connect()
+    broker.connected_since -= 3600.0
+    held = SimpleNamespace(contract=SimpleNamespace(symbol="AAA"), position=10.0, averageCost=100.0, marketPrice=100.0)
+    broker._session.ib.portfolio = lambda acct="": [held]
+    return broker, IbOrders(broker._session.ib)
+
+
+@pytest.mark.parametrize("state", ["PendingCancel", "Filled"])
+def test_a_stop_whose_cancel_ibkr_refuses_is_never_taken_for_cancelled_and_no_exit_goes_out(monkeypatch, state):
+    broker, orders = _ibkr_broker(monkeypatch)                                 # the account holds the 10 shares
+    repo = _Repo([_trade()])
+    ex = _executor(broker, repo)
+    ex.STAND_DOWN_S = ex.STAND_DOWN_POLL_S = 0.0
+    ex.sync_open_orders()
+    assert ex.protective_stops()[0]["order_id"] == "1"
+    # the stop is triggering as the app's own exit comes: IBKR refuses the cancel, and ib_async calls it cancelled
+    orders.answer_cancel = (10148, f"OrderId 1 that needs to be cancelled cannot be cancelled, state: {state}.")
+    out = ex.close_trade("t1", reason="stop")
+    assert not out["ok"] and "confirm" in out["reason"]
+    assert orders.book[1].orderStatus.status == "Cancelled"
+    orders.fill(1, 10.0, 97.9)
+    orders.status(1, "Filled", filled=10.0, avg=97.9)
+    out = ex.close_trade("t1", reason="stop")
+    assert out["ok"] and out["by"] == "broker-stop"
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
+    assert [t.order.orderType for t in orders.book.values()] == ["STP"]       # no market exit ever went out
 
 
 def test_a_stop_that_filled_first_is_booked_and_no_second_exit_is_sent():
