@@ -13,12 +13,18 @@ at the broker are taken over (see :meth:`Executor.adopt_working_orders`), so an
 exit is never sent twice. An entry that finished while the app was off, or that
 the broker no longer knows (the connection was down when it filled), is booked
 from the broker's executions, so its shares get their record and their stop.
+
+The sync loop, the dashboard's buttons, a quit's closes and Autopilot call in from
+threads of their own. They take turns: the order sync, an entry being placed, a
+take-over, a cancel and an exit each run under the executor's lock (``_lock``), so
+an order is always followed before anything else looks for it.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
+import threading
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -80,6 +86,17 @@ class Executor(ProtectiveStops):
         self.repo = repo
         self.cfg = cfg
         self.bus = bus
+        #: one caller at a time sends, follows or calls off orders: the order sync (the loop's, or the dashboard's
+        #: Refresh), an entry being placed, a take-over, the cancels, a close of shares without a record and an exit
+        #: each hold it throughout. It is taken before a trade's claim on its resting orders (_claim_resting) and every
+        #: claim is let go before it is, so while one caller holds it no other thread holds a claim: a claim is never
+        #: waited for across threads. The engine's locks come before it (a quit or an approval holds its own lock while
+        #: it calls in here); nothing done while it is held waits on one of those - the hooks below reach only
+        #: Autopilot's counts, the runtime file and the database, whose locks are never held around a call in here
+        self._lock = threading.RLock()
+        #: trades whose exit a thread is sending this moment -> that thread (close_trade): a second close for one comes
+        #: back at once instead of queueing behind the first, whose outcome settles it
+        self._sending: Dict[str, int] = {}
         self._pending: Dict[str, _Pending] = {}
         self._open_by_symbol: Dict[str, str] = {}   # symbol -> trade_id
         #: the exit manager takes part of a position off at the first target, so a native bracket
@@ -105,23 +122,25 @@ class Executor(ProtectiveStops):
         """Point at a different broker (paper <-> live / platform switch).
         In-flight order tracking is broker-specific, so it is dropped; open
         trades in the database are untouched."""
-        self.broker = broker
-        self.venue = venue or broker.name
-        self._pending.clear()
-        self._open_by_symbol.clear()
-        self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
-        self._entries_retry_at = 0.0
-        self._init_stops()              # the other venue's stops stay where they are; they are found again by their tags
+        with self._lock:                # never under an order sync's feet, nor an exit's
+            self.broker = broker
+            self.venue = venue or broker.name
+            self._pending.clear()
+            self._open_by_symbol.clear()
+            self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
+            self._entries_retry_at = 0.0
+            self._init_stops()          # the other venue's stops stay where they are; found again by their tags
 
     def cancel_pending_entries(self) -> int:
         """Cancel entry orders still working at the broker (used when quitting)."""
         n = 0
-        for oid, p in list(self._pending.items()):
-            if p.kind != "entry":
-                continue
-            self._cancel_quietly(oid)
-            self._pending.pop(oid, None)
-            n += 1
+        with self._lock:
+            for oid, p in list(self._pending.items()):
+                if p.kind != "entry":
+                    continue
+                self._cancel_quietly(oid)
+                self._pending.pop(oid, None)
+                n += 1
         return n
 
     def flatten_untracked(self, symbol: str, position_side: str, qty: float) -> bool:
@@ -132,14 +151,15 @@ class Executor(ProtectiveStops):
     def close_untracked(self, symbol: str, position_side: str, qty: float) -> Dict[str, Any]:
         """Send the market order that closes ``qty`` shares held without a record, and say how it went."""
         req = build_exit_order(symbol, position_side, qty, cfg=self.cfg, tag=f"unwind:{symbol}")
-        try:
-            res = self.broker.place_order(req)
-        except BrokerError as e:
-            self._audit("PLACE", req, {"error": str(e)}, ok=False, msg=str(e))
-            log.error("could not close %s %s shares that have no trade record: %s", qty, symbol, e)
-            return {"ok": False, "reason": str(e)}
-        self._audit("PLACE", req, res.raw or {"status": res.status}, ok=True,
-                    msg="closing shares without a trade record")
+        with self._lock:                # not beside an order sync, nor an exit counting the shares held
+            try:
+                res = self.broker.place_order(req)
+            except BrokerError as e:
+                self._audit("PLACE", req, {"error": str(e)}, ok=False, msg=str(e))
+                log.error("could not close %s %s shares that have no trade record: %s", qty, symbol, e)
+                return {"ok": False, "reason": str(e)}
+            self._audit("PLACE", req, res.raw or {"status": res.status}, ok=True,
+                        msg="closing shares without a trade record")
         log.warning("closing %s %s shares held without a trade record (order %s, %s)", qty, symbol, res.order_id,
                     res.status)
         return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id}
@@ -152,12 +172,13 @@ class Executor(ProtectiveStops):
     def cancel_entries_for(self, play_id: str) -> int:
         """Call off the entry orders still working for one play - a pair leg whose other leg failed."""
         n = 0
-        for oid, p in list(self._pending.items()):
-            if p.kind == "entry" and p.play.id == play_id:
-                self._cancel_quietly(oid)
-                self._pending.pop(oid, None)
-                p.play.status = PlayStatus.CANCELED
-                n += 1
+        with self._lock:
+            for oid, p in list(self._pending.items()):
+                if p.kind == "entry" and p.play.id == play_id:
+                    self._cancel_quietly(oid)
+                    self._pending.pop(oid, None)
+                    p.play.status = PlayStatus.CANCELED
+                    n += 1
         return n
 
     def pending_exit_trade_ids(self) -> set:
@@ -237,34 +258,39 @@ class Executor(ProtectiveStops):
         its tag.
 
         A broker whose orders can't be listed has told us nothing, not that none are
-        working: each order sync tries again until the list comes back."""
-        working = self._working_or_none()
-        if working is None:
-            if not self._adopt_due:
-                log.warning("the orders working at %s couldn't be listed - taking them over is tried again at "
-                            "each order sync", venue_label(self.venue))
-            self._adopt_due = True
-            return []
-        self._adopt_due = False
-        if not working:
-            return []
-        trades = [t for t in self.repo.open_trades() if (t.get("broker") or "paper") == self.venue]
-        adopted: List[Dict[str, Any]] = []
-        for t in sorted(trades, key=lambda t: t.get("entry_time") or ""):
-            order = _match_exit(t, working, set(self._pending))
-            if order is not None and t["id"] not in self.pending_exit_trade_ids():
-                self._track_exit(t, order, reason="exit")
-                adopted.append({"kind": "exit", "symbol": t["symbol"], "order_id": order.order_id,
-                                "trade_id": t["id"], "qty": _remaining(order)})
-        for order in working:
-            play = self._play_for(order) if order.order_id not in self._pending else None
-            if play is not None:
-                # its clock starts again from here: a day-trade entry gets entry_timeout_min more minutes
-                self._pending[order.order_id] = _Pending(order.order_id, play, "entry", qty=_remaining(order),
-                                                         submitted_at=dt.datetime.now(dt.timezone.utc), adopted=True)
-                adopted.append({"kind": "entry", "symbol": play.symbol, "order_id": order.order_id,
-                                "play_id": play.id, "qty": _remaining(order)})
-        cancelled = self._cancel_extra_exits(working, trades)
+        working: each order sync tries again until the list comes back.
+
+        Under the executor's lock: an entry or an exit being placed this moment is followed by the
+        caller placing it before this looks - never taken over as an earlier run's beside it."""
+        with self._lock:
+            working = self._working_or_none()
+            if working is None:
+                if not self._adopt_due:
+                    log.warning("the orders working at %s couldn't be listed - taking them over is tried again at "
+                                "each order sync", venue_label(self.venue))
+                self._adopt_due = True
+                return []
+            self._adopt_due = False
+            if not working:
+                return []
+            trades = [t for t in self.repo.open_trades() if (t.get("broker") or "paper") == self.venue]
+            adopted: List[Dict[str, Any]] = []
+            for t in sorted(trades, key=lambda t: t.get("entry_time") or ""):
+                order = _match_exit(t, working, set(self._pending))
+                if order is not None and t["id"] not in self.pending_exit_trade_ids():
+                    self._track_exit(t, order, reason="exit")
+                    adopted.append({"kind": "exit", "symbol": t["symbol"], "order_id": order.order_id,
+                                    "trade_id": t["id"], "qty": _remaining(order)})
+            for order in working:
+                play = self._play_for(order) if order.order_id not in self._pending else None
+                if play is not None:
+                    # its clock starts again from here: a day-trade entry gets entry_timeout_min more minutes
+                    self._pending[order.order_id] = _Pending(order.order_id, play, "entry", qty=_remaining(order),
+                                                             submitted_at=dt.datetime.now(dt.timezone.utc),
+                                                             adopted=True)
+                    adopted.append({"kind": "entry", "symbol": play.symbol, "order_id": order.order_id,
+                                    "play_id": play.id, "qty": _remaining(order)})
+            cancelled = self._cancel_extra_exits(working, trades)
         if adopted or cancelled:
             msg = (f"Following {len(adopted)} order(s) already working at {venue_label(self.venue)}"
                    + (f"; cancelled {len(cancelled)} duplicate exit(s): "
@@ -433,42 +459,45 @@ class Executor(ProtectiveStops):
         native_bracket = plan.get("bracket_mode") == "native" and (
             self.broker.supports_bracket_native or self.broker.paper
         )
-        submitted_at = dt.datetime.now(dt.timezone.utc)
-        try:
-            if native_bracket:
-                res = self.broker.place_bracket(entry, None if self.scale_out else play.primary_target, play.stop)
-            else:
-                res = self.broker.place_order(entry)      # exit manager will protect it
-        except BrokerError as e:
-            self._audit("PLACE", entry, {"error": str(e)}, ok=False, play_id=play.id, msg=str(e))
-            play.status = PlayStatus.ERROR
-            return {"ok": False, "reason": str(e)}
+        # placed and followed (or booked) in one go: an order sync or a take-over never finds the order at the
+        # broker before it is followed here, and never books its fill beside this
+        with self._lock:
+            submitted_at = dt.datetime.now(dt.timezone.utc)
+            try:
+                if native_bracket:
+                    res = self.broker.place_bracket(entry, None if self.scale_out else play.primary_target, play.stop)
+                else:
+                    res = self.broker.place_order(entry)      # exit manager will protect it
+            except BrokerError as e:
+                self._audit("PLACE", entry, {"error": str(e)}, ok=False, play_id=play.id, msg=str(e))
+                play.status = PlayStatus.ERROR
+                return {"ok": False, "reason": str(e)}
 
-        self._audit("PLACE", entry, res.raw or {"status": res.status}, ok=True,
-                    play_id=play.id, msg=res.message)
-        play.status = PlayStatus.SUBMITTED
-        ot, osess = plan.get("order_type", "LIMIT"), plan.get("order_session", "REGULAR")
+            self._audit("PLACE", entry, res.raw or {"status": res.status}, ok=True,
+                        play_id=play.id, msg=res.message)
+            play.status = PlayStatus.SUBMITTED
+            ot, osess = plan.get("order_type", "LIMIT"), plan.get("order_session", "REGULAR")
 
-        # immediate fill (paper / marketable) -> open the trade now
-        if res.status in ("FILLED",) or res.filled_qty >= qty > 0:
-            fill_price = res.avg_fill_price or (res.fills[-1].price if res.fills else play.entry)
-            tid = self._open_trade(play, fill_price, res.filled_qty or qty, res.order_id, ot, osess,
-                                   context=context, submitted_at=submitted_at, decision=decision)
-            return {"ok": True, "status": "FILLED", "trade_id": tid,
-                    "fill_price": round(fill_price, 4), "qty": res.filled_qty or qty,
-                    "order_id": res.order_id, "order_type": ot, "order_session": osess,
-                    "bracket_mode": plan.get("bracket_mode")}
+            # immediate fill (paper / marketable) -> open the trade now
+            if res.status in ("FILLED",) or res.filled_qty >= qty > 0:
+                fill_price = res.avg_fill_price or (res.fills[-1].price if res.fills else play.entry)
+                tid = self._open_trade(play, fill_price, res.filled_qty or qty, res.order_id, ot, osess,
+                                       context=context, submitted_at=submitted_at, decision=decision)
+                return {"ok": True, "status": "FILLED", "trade_id": tid,
+                        "fill_price": round(fill_price, 4), "qty": res.filled_qty or qty,
+                        "order_id": res.order_id, "order_type": ot, "order_session": osess,
+                        "bracket_mode": plan.get("bracket_mode")}
 
-        # otherwise track it; sync_open_orders() will pick up the fill. The play log says it went out
-        # before the sync loop can hear how it ended, so the ending is never overwritten by this
-        p = _Pending(res.order_id, play, "entry", qty=qty)
-        p.order_type, p.order_session = ot, osess
-        p.context, p.submitted_at, p.decision = context, submitted_at, decision
-        self._note(play, PlayStatus.SUBMITTED)
-        self._pending[res.order_id] = p
-        return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id,
-                "order_type": ot, "order_session": osess,
-                "note": "order working - will confirm on fill"}
+            # otherwise track it; sync_open_orders() will pick up the fill. The play log says it went out
+            # before the sync loop can hear how it ended, so the ending is never overwritten by this
+            p = _Pending(res.order_id, play, "entry", qty=qty)
+            p.order_type, p.order_session = ot, osess
+            p.context, p.submitted_at, p.decision = context, submitted_at, decision
+            self._note(play, PlayStatus.SUBMITTED)
+            self._pending[res.order_id] = p
+            return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id,
+                    "order_type": ot, "order_session": osess,
+                    "note": "order working - will confirm on fill"}
 
     # ------------------------------------------------------------------ #
     def close_trade(self, trade_id: str, reason: str = "manual", limit_price: Optional[float] = None,
@@ -480,7 +509,29 @@ class Executor(ProtectiveStops):
         resting at the broker are stood down first - one an earlier run left too, before this run's first
         pass has taken it over (_take_over_for_exit). An exit that must wait on the broker for that (a cancel
         to confirm, its orders reloading after a connect) comes back ``wait``: not a failed exit, one to try
-        again in seconds."""
+        again in seconds.
+
+        One exit per trade at a time: a close for a trade whose exit another thread is sending this moment comes
+        back at once, ``wait`` too - that one's outcome settles it, and one queued behind it would only find its exit
+        working. The rest runs under the executor's lock, from the first check until the exit is followed."""
+        me = threading.get_ident()
+        with self._claims_lock:
+            sender = self._sending.get(trade_id)
+            if sender is None:
+                self._sending[trade_id] = me
+        if sender not in (None, me):
+            return {"ok": False, "wait": True, "reason": "An exit for this position is already being sent"}
+        try:
+            with self._lock:
+                return self._close_trade(trade_id, reason, limit_price, qty, after_fill, decision_price)
+        finally:
+            if sender is None:          # (a close within a close, on one thread, leaves it to the outer one)
+                with self._claims_lock:
+                    self._sending.pop(trade_id, None)
+
+    def _close_trade(self, trade_id: str, reason: str, limit_price: Optional[float], qty: Optional[float],
+                     after_fill: Optional[Dict[str, float]], decision_price: Optional[float]) -> Dict[str, Any]:
+        """close_trade's checks and its exit, under the executor's lock."""
         t = self.repo.get_trade(trade_id)
         if not t or t["status"] == "CLOSED":
             return {"ok": False, "reason": "trade not open"}
@@ -496,9 +547,9 @@ class Executor(ProtectiveStops):
             # a market exit would be rejected, and standing the stop down for it would leave the position
             # with nothing at the broker - so nothing is touched until the session opens
             return {"ok": False, "market_closed": True, "reason": closed}
-        # one caller at a time stands the trade's resting orders down - a manual close or a quit can come from
-        # another thread - and the order sync leaves them alone until the exit is placed or refused (and holds them
-        # itself for the moment it places, moves or books one: a close waits a moment for that)
+        # one caller at a time stands the trade's resting orders down, and the order sync leaves them alone until the
+        # exit is placed or refused. (Claims are taken only under the executor's lock, which this holds, so no other
+        # thread holds one now; the short wait stays as a guard)
         if not self._claim_resting(trade_id, wait_s=self.STAND_DOWN_S):
             return {"ok": False, "wait": True,
                     "reason": f"An exit for this {t['symbol']} position is already being sent, or its orders at the "
@@ -642,30 +693,33 @@ class Executor(ProtectiveStops):
         close IBKR holds a market exit for the next open; stopping the quit must not leave it
         there to sell the position on Monday."""
         n = 0
-        for oid, p in list(self._pending.items()):
-            if p.kind == "exit" and p.reason in reasons:
-                self._cancel_quietly(oid)
-                n += 1
+        with self._lock:
+            for oid, p in list(self._pending.items()):
+                if p.kind == "exit" and p.reason in reasons:
+                    self._cancel_quietly(oid)
+                    n += 1
         return n
 
     def cancel_working_orders(self) -> Dict[str, int]:
         """Cancel every order working at the broker - entries, the app's own exits, anything else on
         the account - except the stops protecting open positions: those go when their position
         does. A cancelled order's fills, if it had any, are booked when the broker reports it."""
-        counts = {"entries": 0, "exits": 0, "others": 0, "stops_kept": len(self._stops)}
-        for oid, p in list(self._pending.items()):
-            self._cancel_quietly(oid)
-            counts["entries" if p.kind == "entry" else "exits"] += 1
-        counts["stops_kept"] += len(self._targets)       # a target resting with a stop is part of the same protection
-        followed = set(self._pending) | {s.order_id for book in (self._stops, self._targets) for s in book.values()}
-        for o in self._working_at_broker():
-            if o.order_id in followed:
-                continue
-            if o.tag.startswith((STOP_TAG, TARGET_TAG)):
-                counts["stops_kept"] += 1
-                continue
-            self._cancel_quietly(o.order_id)
-            counts["others"] += 1
+        with self._lock:                # an order being placed is followed first, and a stop placed now is kept
+            counts = {"entries": 0, "exits": 0, "others": 0, "stops_kept": len(self._stops)}
+            for oid, p in list(self._pending.items()):
+                self._cancel_quietly(oid)
+                counts["entries" if p.kind == "entry" else "exits"] += 1
+            counts["stops_kept"] += len(self._targets)   # a target resting with a stop is part of the same protection
+            followed = set(self._pending) | {s.order_id for book in (self._stops, self._targets)
+                                             for s in book.values()}
+            for o in self._working_at_broker():
+                if o.order_id in followed:
+                    continue
+                if o.tag.startswith((STOP_TAG, TARGET_TAG)):
+                    counts["stops_kept"] += 1
+                    continue
+                self._cancel_quietly(o.order_id)
+                counts["others"] += 1
         log.warning("cancelled the working orders: %s", counts)
         return counts
 
@@ -683,9 +737,23 @@ class Executor(ProtectiveStops):
         return sum(p.qty for p in list(self._pending.values()) if p.kind == "exit" and p.play.symbol == symbol)
 
     # ------------------------------------------------------------------ #
-    def sync_open_orders(self) -> None:
+    def sync_open_orders(self, wait: bool = True) -> bool:
         """Poll the broker for fills on anything we're tracking. Also drives
-        the paper broker's internal clock and detects bracket stop/target hits."""
+        the paper broker's internal clock and detects bracket stop/target hits.
+
+        One pass at a time, under the executor's lock: two passes side by side (the sync loop's and the
+        dashboard's Refresh) could each book the same fill. With ``wait`` False a pass is skipped, and
+        False returned, while another caller holds the lock - the sync loop mid-pass, which covers it."""
+        if not self._lock.acquire(blocking=wait):
+            return False
+        try:
+            self._sync_pass()
+        finally:
+            self._lock.release()
+        return True
+
+    def _sync_pass(self) -> None:
+        """One order sync, under the executor's lock."""
         # 0) take over the orders an earlier run left working, if the broker couldn't list them before
         if self._adopt_due:
             try:

@@ -787,6 +787,21 @@ def test_a_paper_quit_never_gets_stuck_on_a_close_that_wont_fill(engine):
     assert done.wait(3)
 
 
+def test_a_quit_sends_one_round_of_closes_while_the_sync_loop_checks_on_it(engine):
+    tid = _open(engine, "AAPL")
+    sent = []
+
+    def close(trade_id, reason="manual"):
+        sent.append(trade_id)
+        if len(sent) == 1:
+            engine._check_quit_progress()                                    # the sync loop's pass, meanwhile
+        return {"ok": True, "status": "WORKING", "order_id": f"o{len(sent)}"}
+
+    engine.executor.close_trade = close
+    assert engine.begin_quit()["ok"] and engine.quit_state
+    assert sent == [tid]                                                    # no second round beside the first
+
+
 def test_live_quit_can_be_cancelled_and_leaves_positions_alone(engine):
     _open(engine, "AAPL")
     closed = _closes_fill(engine)

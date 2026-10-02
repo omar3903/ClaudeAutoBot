@@ -2138,7 +2138,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._check_arm()
         if self.executor:
             try:
-                self.executor.sync_open_orders()
+                # never a second pass beside the sync loop's: while it is mid-pass (or an order is going out) this one
+                # is skipped - the loop's pass reads the orders all the same, within seconds
+                if not self.executor.sync_open_orders(wait=False):
+                    log.debug("Refresh: the order sync is mid-pass (or an order is going out) - no second pass")
             except Exception:  # noqa: BLE001
                 log.debug("order sync failed", exc_info=True)
         priced = self.refresh_prices() if read else 0
@@ -2443,8 +2446,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         return {"ok": not failed, "note": note, "results": results}
 
     def _close_all(self, trades: List[Dict[str, Any]], reason: str) -> List[Dict[str, Any]]:
-        """Send every close at once - the broker calls are independent, so a thread
-        per position turns N round-trips into about one."""
+        """Send every close, a thread per position - the executor still sends them one at a
+        time (Executor._lock), never beside the order sync or one another."""
         if not trades:
             return []
 

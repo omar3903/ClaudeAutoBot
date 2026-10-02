@@ -74,6 +74,32 @@ def test_refresh_fetches_the_prices_too_and_says_how_many(engine, port, monkeypa
     assert out["ok"] and asked == [True] and out["note"] == "Account, positions and orders re-read, and 7 prices fetched."
 
 
+def test_refresh_never_runs_a_second_order_sync_beside_the_loops(engine, monkeypatch):
+    import threading
+
+    ex = engine.executor
+    passes, mid_pass, finish = [], threading.Event(), threading.Event()
+    expire = ex.expire_entries
+
+    def expire_entries(*a, **k):                                          # every order sync runs it
+        passes.append(threading.current_thread().name)
+        if threading.current_thread().name == "sync-loop":
+            mid_pass.set()
+            finish.wait(5)                                                # the loop's pass is still going
+        return expire(*a, **k)
+
+    monkeypatch.setattr(ex, "expire_entries", expire_entries)
+    loop = threading.Thread(target=ex.sync_open_orders, name="sync-loop", daemon=True)
+    loop.start()
+    assert mid_pass.wait(2)
+    began = time.monotonic()
+    out = engine.refresh_account_now()                                    # the Refresh button, meanwhile
+    assert out["ok"] and time.monotonic() - began < 2 and passes == ["sync-loop"]   # no second pass, no wait
+    finish.set()
+    loop.join(5)
+    assert engine.refresh_account_now()["ok"] and passes == ["sync-loop", threading.current_thread().name]
+
+
 def test_refresh_says_when_ibkr_doesnt_answer(engine, port, gateway, monkeypatch):
     from autotradebot.brokers.base import BrokerError
 

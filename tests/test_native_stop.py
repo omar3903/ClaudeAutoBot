@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import threading
 import time
 from types import SimpleNamespace
 
@@ -1174,3 +1175,140 @@ def test_an_exit_looks_in_the_executions_of_a_stop_the_broker_no_longer_knows_be
     else:                                                                      # not known whether it filled: it waits
         assert not out["ok"] and out["wait"] and broker.exits() == [] and t["status"] == "OPEN"
         assert ex.protective_stops()[0]["order_id"] == "1"
+
+
+# ---------------------------------------------------------------- one caller at a time: threads side by side
+def test_two_closes_sent_together_send_one_exit_and_the_second_hears_at_once():
+    broker, _, ex, _ = _setup()
+    ex.sync_open_orders()                                                      # stop 1 rests
+    ex.STAND_DOWN_S, ex.STAND_DOWN_POLL_S = 2.0, 0.01
+    sending, place = threading.Event(), broker.place_order
+
+    def place_order(req):                                                      # the first close's exit is on its way
+        sending.set()
+        time.sleep(0.5)
+        return place(req)
+
+    broker.place_order = place_order
+    first = []
+    closing = threading.Thread(target=lambda: first.append(ex.close_trade("t1", reason="stop")))
+    closing.start()
+    assert sending.wait(2)
+    began = time.monotonic()
+    second = ex.close_trade("t1", reason="manual")                             # the Close button, meanwhile
+    waited = time.monotonic() - began
+    closing.join(5)
+    assert first[0]["ok"] and [o.quantity for o in broker.exits()] == [10]
+    assert not second["ok"] and second["wait"] and second["reason"] == "An exit for this position is already being sent"
+    assert waited < 0.3                                                        # not queued behind the first
+
+
+def test_two_order_syncs_side_by_side_book_an_entry_filled_while_the_app_was_off_once_and_rest_one_stop():
+    broker, repo = _StopBroker({"AAA": 10}), _Repo([])
+    repo.submitted_plays = lambda since, until: [_sent("play_off", "AAA")]
+    filled = [Fill(order_id="11", symbol="AAA", side=Side.LONG, quantity=10, price=100.0, tag="play_off")]
+    broker.get_fills = lambda symbol=None: time.sleep(0.1) or list(filled)    # IBKR takes a moment to answer...
+    opened = repo.open_trade
+    repo.open_trade = lambda *a, **k: time.sleep(0.1) or opened(*a, **k)       # ...and so does the database
+    ex = _executor(broker, repo)
+    together = threading.Barrier(2)
+
+    def sync():                                                                # the sync loop, and the Refresh button
+        together.wait(2)
+        ex.sync_open_orders()
+
+    passes = [threading.Thread(target=sync) for _ in range(2)]
+    for p in passes:
+        p.start()
+    for p in passes:
+        p.join(10)
+    [t] = repo.open_trades()
+    assert (t["symbol"], t["quantity"]) == ("AAA", 10)
+    assert [(s.quantity, s.client_tag) for s in broker.stops()] == [(10, f"stop:{t['id']}")]
+
+
+def test_the_order_sync_books_nothing_of_a_stop_fill_an_exit_took_and_booked_first():
+    broker, repo, ex, heard = _setup()
+    ex.sync_open_orders()                                                      # stop 1 rests
+    stop = broker.live["1"]
+    stop.status, stop.filled_qty, stop.avg_fill_price = "CANCELED", 4, 97.9   # four filled, then it was cancelled
+    read, inside = broker.get_order, []
+
+    def get_order(order_id):                                                   # an exit's stand-down finds it done
+        if order_id == "1" and not inside:                                     # just as the pass reads it, and books
+            inside.append(1)                                                   # its fill first
+            ex._stand_down("t1")
+        return read(order_id)
+
+    broker.get_order = get_order
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["quantity"] == 6 and [t for t, _ in heard].count("trade.reduced") == 1
+
+
+def test_an_exit_books_nothing_of_a_stop_fill_the_order_sync_took_and_booked_first():
+    broker, repo, ex, heard = _setup()
+    ex.sync_open_orders()                                                      # stop 1 rests
+    stop = broker.live["1"]
+    stop.status, stop.filled_qty, stop.avg_fill_price = "CANCELED", 4, 97.9   # four filled, then it was cancelled
+    read, inside = broker.get_order, []
+
+    def get_order(order_id):                                                   # the order sync's watch finds it done
+        if order_id == "1" and not inside:                                     # just as the stand-down reads it, and
+            inside.append(1)                                                   # books its fill first
+            ex._watch_one(ex._stops, ex._book_stop_fill, ex._stops["t1"])
+        return read(order_id)
+
+    broker.get_order = get_order
+    out = ex.close_trade("t1", reason="manual")
+    assert repo.get_trade("t1")["quantity"] == 6 and [t for t, _ in heard].count("trade.reduced") == 1
+    assert not out["ok"] and out["wait"] and broker.exits() == []              # the rest goes on its next try
+    assert ex.close_trade("t1", reason="manual")["ok"] and [o.quantity for o in broker.exits()] == [6]
+
+
+def test_syncs_exits_entries_take_overs_and_cancels_from_many_threads_never_deadlock():
+    from test_order_follow_up import PLAN
+    from autotradebot.core.enums import StrategyKind, Timeframe
+    from autotradebot.core.models import Account, Play
+
+    broker = _StopBroker({"AAA": 10, "BBB": 10, "CCC": 5, "EEE": 5})
+    repo = _Repo([_trade(id="t1"), _trade(id="t2", symbol="BBB")])
+    repo.submitted_plays = lambda since, until: [_sent("play_off", "EEE")]
+    ex = _executor(broker, repo)
+    ex.STAND_DOWN_S, ex.STAND_DOWN_POLL_S = 1.0, 0.01
+    ex._entries_due = False
+    ex.sync_open_orders()                                                      # both positions' stops rest
+    ex._entries_due = True                                                     # an entry filled while the app was off
+    filled = [Fill(order_id="11", symbol="EEE", side=Side.LONG, quantity=5, price=30.0, tag="play_off")]
+    broker.get_fills = lambda symbol=None: time.sleep(0.05) or [f for f in filled if symbol in (None, f.symbol)]
+    opened = repo.open_trade
+    repo.open_trade = lambda *a, **k: time.sleep(0.05) or opened(*a, **k)
+
+    def slow(fn):                                                              # every broker call takes a moment
+        return lambda *a, **k: time.sleep(0.005) or fn(*a, **k)
+
+    for name in ("place_order", "get_order", "cancel_order", "list_orders", "get_account", "modify_stop"):
+        setattr(broker, name, slow(getattr(broker, name)))
+    entry = Play(symbol="DDD", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                 timeframe=Timeframe.SWING, entry=50.0, stop=48.0, targets=[56.0])
+    entry.suggested_qty = 10
+    jobs = [lambda: [ex.sync_open_orders() for _ in range(5)],                 # the sync loop...
+            lambda: [ex.sync_open_orders() for _ in range(5)],                 # ...a second one beside it...
+            lambda: [ex.sync_open_orders(wait=False) for _ in range(5)],       # ...and the Refresh button
+            lambda: ex.close_trade("t1", reason="manual"),                     # a click, and a quit, on one position
+            lambda: ex.close_trade("t1", reason="quit"),
+            lambda: ex.close_trade("t2", reason="quit"),
+            lambda: ex.close_untracked("CCC", "LONG", 5),
+            lambda: ex.execute_play(entry, Account(account_id="DU"), plan=PLAN),   # Autopilot
+            ex.adopt_working_orders,
+            lambda: ex.cancel_exits(reasons=("none",)),
+            lambda: ex.cancel_entries_for("play_none")]
+    together = threading.Barrier(len(jobs))
+    threads = [threading.Thread(target=lambda job=job: (together.wait(5), job()), daemon=True) for job in jobs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert not any(t.is_alive() for t in threads)                              # every one of them finished
+    assert sorted(o.client_tag for o in broker.exits() if o.client_tag.startswith("exit:")) == ["exit:t1", "exit:t2"]
+    [booked] = [t for t in repo.open_trades() if t["symbol"] == "EEE"]          # booked once, with one stop
+    assert [s.quantity for s in broker.stops() if s.client_tag == f"stop:{booked['id']}"] == [5]

@@ -24,7 +24,9 @@ Resting orders bring two dangers, and the rules here exist for them:
   asked to cancel that reads cancelled without the broker's word on it (waited for, pass after pass,
   for ``CANCEL_UNCONFIRMED_S``). While an exit stands a trade's orders down - and while a cancel it
   asked for awaits the broker's word - the order sync leaves them alone; and the sync holds a trade's
-  orders itself while it places, moves or books one. An exit in the minute after a start, before the first
+  orders itself while it places, moves or books one. (Both take their turn under the executor's
+  lock, and a resting order that is done is taken out of its book before its fill is booked, so it
+  is booked once.) An exit in the minute after a start, before the first
   pass has taken over what an earlier run left, takes that run's orders for the trade over and stands
   them down the same way; while the broker's orders can't be read (the connection down too), or are
   still reloading after a connect with none found, the exit waits - until a full list has shown
@@ -264,12 +266,15 @@ class ProtectiveStops:
         except Exception:  # noqa: BLE001
             return
         if res.status == "FILLED":
-            fill(o, res)
+            if self._take_resting(book, o):              # its fill is booked once, by whoever takes it out of its book
+                fill(o, res)
         elif _unconfirmed_cancel(res) and self._cancel_unconfirmed(o.order_id):
             # an exit asked for its cancel and the broker never said it went through: the stand-down settles it,
             # pass after pass, and until then it is followed like one working - it may yet fill
             return
         elif res.status in DONE_STATUSES:
+            if not self._take_resting(book, o):
+                return                                   # another caller has taken it, to book or drop it
             if float(res.filled_qty or 0.0) > 0:
                 fill(o, res)
             self._lose(book, o, f"the broker {res.status.lower()} it: {res.message or 'no reason given'}")
@@ -298,9 +303,9 @@ class ProtectiveStops:
     def _filled_unseen(self, book: Dict[str, _Stop], fill, o: _Stop) -> Optional[bool]:
         """Before a resting order the broker no longer knows is given up: whether the broker's executions show it
         filled while the app wasn't following it (the connection was down when it finished, say). What they show
-        is booked as the order's own fill would have been. Only the executions of this order count - every stop a
-        trade has had carries the same tag. False when they show none (or the record is closed already), None when
-        they can't be read."""
+        is booked as the order's own fill would have been - one still in its book is taken out of it first, so it is
+        booked once (_take_resting). Only the executions of this order count - every stop a trade has had carries the
+        same tag. False when they show none (or the record is closed already), None when they can't be read."""
         t = self.repo.get_trade(o.trade_id)
         if not t or t.get("status") == "CLOSED":
             return False
@@ -314,6 +319,8 @@ class ProtectiveStops:
                                        and (getattr(f, "tag", "") or tag) == tag])
         if qty <= 1e-9:
             return False
+        if book.get(o.trade_id) is o and not self._take_resting(book, o):
+            return True                                  # another caller took it out of its book just now, to book it
         log.warning("%s AT BROKER FILLED UNSEEN  %s order %s is no longer known to the broker, but its executions "
                     "show %s shares @ %.4f - booked", "STOP" if book is self._stops else "TARGET", o.symbol,
                     o.order_id, qty, price)
@@ -763,7 +770,11 @@ class ProtectiveStops:
         """Take a trade's resting orders for an exit (or a rebuild) about to stand them down - False when another
         caller has them (still, after ``wait_s`` seconds). While claimed, the order sync neither moves, places, books
         nor loses them: a move the broker refused there would drop the stop from under the stand-down, which would
-        then take it for cancelled. The sync holds them itself only for the moment it places, moves or books one."""
+        then take it for cancelled. The sync holds them itself only for the moment it places, moves or books one.
+
+        A claim is only ever taken under the executor's lock (Executor._lock: the order sync, an exit), and let go
+        before it: the lock always comes first, so the two can't deadlock - and while a caller holds the lock, no
+        other thread holds a claim."""
         deadline = time.monotonic() + wait_s
         while True:
             with self._claims_lock:
@@ -782,6 +793,17 @@ class ProtectiveStops:
         with self._claims_lock:
             return set(self._standing_down)
 
+    def _take_resting(self, book: Dict[str, _Stop], o: _Stop) -> bool:
+        """Take a resting order that is done out of its book, before what it filled is booked: True for the one
+        caller that takes it - the order sync's watch or an exit's stand-down - so a fill is booked once. False when
+        it is no longer there (another caller has taken it, to book or drop it), and then nothing else - another
+        order placed for the trade since - is touched."""
+        with self._claims_lock:
+            if book.get(o.trade_id) is not o:
+                return False
+            book.pop(o.trade_id, None)
+            return True
+
     def _stand_down(self, trade_id: str) -> str:
         """Take a trade's resting orders out of the way of an exit the app is about to send.
         Returns "none" (nothing rested), "cancelled" (the way is clear), "filled" (one of them got
@@ -794,7 +816,9 @@ class ProtectiveStops:
         without IBKR's word on it (``cancel_confirmed`` False) is waited for like one still working -
         on the next stand-down too, for up to ``CANCEL_UNCONFIRMED_S``. The orders it began with are
         read by their ids until each is done: one gone from the books meanwhile is no more cancelled
-        for that. One the broker no longer knows at all is looked for in its executions (_filled_unseen):
+        for that. A done one is taken out of its book before what it filled is booked (_take_resting): one
+        another caller took out first is theirs to book, and the exit waits for its next try. One the
+        broker no longer knows at all is looked for in its executions (_filled_unseen):
         what it filled is booked, and while they can't be read the exit waits. And before the way is
         called clear, each order found cancelled is read once more, for a fill that landed just behind
         the cancel."""
@@ -829,8 +853,14 @@ class ProtectiveStops:
                         continue                         # booked (popped from the books); the rest of it is gone
                 if done or res.status == "FILLED":
                     self._cancels_sent.pop(o.order_id, None)
-                    if book.get(trade_id) is o:
-                        book.pop(trade_id, None)
+                    if not self._take_resting(book, o):
+                        # another caller took it out of its book, to book what it filled or to drop it: theirs, never
+                        # booked twice. The exit waits for its next try, by when the record says what was booked
+                        t = self.repo.get_trade(trade_id)
+                        if not t or t.get("status") == "CLOSED":
+                            self._drop_resting(trade_id)
+                            return "filled"
+                        return self._still_resting(trade_id, still + left[i + 1:])
                 if res.status == "FILLED" or (done and float(res.filled_qty or 0.0) > 0):
                     fill(o, res)
                     t = self.repo.get_trade(trade_id)

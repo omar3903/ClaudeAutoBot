@@ -314,6 +314,39 @@ def test_orders_that_couldnt_be_listed_after_a_restart_are_taken_over_by_a_later
     assert told == [["play_left"]] and broker.cancelled == []                   # taken over once
 
 
+def test_an_entry_being_placed_is_never_taken_over_as_an_earlier_runs_beside_it():
+    import threading
+    import time
+
+    broker, repo, told, heard = _Broker(), _Repo([]), [], []
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append(topic)))
+    ex.on_entries_adopted = told.append
+    at_broker = threading.Event()
+
+    def place_order(req):                                # the broker has the order; its answer is on the way
+        broker.orders.append(req)
+        res = OrderResult(order_id="5", status="SUBMITTED", symbol=req.symbol, submitted_qty=req.quantity,
+                          side=req.side, tag=req.client_tag)
+        broker.working.append(res)
+        at_broker.set()
+        time.sleep(0.3)
+        return res
+
+    broker.place_order = place_order
+    play = Play(symbol="AAA", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=100.0, stop=98.0, targets=[104.0], id="play_left")
+    play.suggested_qty = 10
+    sent = []
+    placing = threading.Thread(target=lambda: sent.append(ex.execute_play(play, Account(account_id="DU"), plan=PLAN)))
+    placing.start()
+    assert at_broker.wait(2)
+    taken = ex.adopt_working_orders()                    # an order sync's take-over, meanwhile
+    placing.join(5)
+    assert sent[0]["ok"] and sent[0]["order_id"] == "5"
+    assert taken == [] and told == [] and "orders.adopted" not in heard        # followed once, as the entry it is
+    assert [(w["order_id"], w["play_id"]) for w in ex.working_entries()] == [("5", "play_left")]
+
+
 # ---------------------------------------------------------------- the dashboard's list of working orders
 def test_each_working_order_says_what_it_is_for():
     broker = _Broker({"AAA": 10}, working=[

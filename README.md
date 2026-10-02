@@ -880,8 +880,13 @@ Two rules keep it safe:
   the next move - which goes once IBKR's list of its orders shows the stop still working.
   A close that waited while another (a second click, a quit, the order sync booking the
   stop's fill) had the position's orders looks again: if that one sent its exit or closed
-  the record, nothing more goes out. A stop IBKR no longer knows at all is looked for in its
-  executions before an exit stands it down; while they can't be read the exit waits.
+  the record, nothing more goes out. The order sync, the dashboard's buttons, a quit's
+  closes and Autopilot's entries take turns at the broker, one at a time: a second close
+  for a position whose exit is being sent comes back at once, a Refresh while the sync is
+  mid-pass doesn't start a second pass beside it, and a stop's fill is booked once, by
+  whichever of them takes it off the books first. A stop IBKR no longer knows at all is
+  looked for in its executions before an exit stands it down; while they can't be read the
+  exit waits.
   An exit right after a start stands down the stop and target an earlier run left
   too, before the app has taken them over; while IBKR's order list can't be read (the
   connection down too: no list is no empty list), or is still reloading after a connect,

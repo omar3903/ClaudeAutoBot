@@ -84,6 +84,9 @@ class QuitOps:
             log.warning("quit by %s: closing %d position(s) on %s, cancelled %d working entr%s",
                         operator, len(held), self._venue, cancelled, "y" if cancelled == 1 else "ies")
             self._publish("quit.started", quit=self._quit_status())
+            # the sync loop checks the quit's progress meanwhile: with no retry time set yet it would send a second
+            # round of closes beside this one. (Set again once they are out: the wait counts from then)
+            self._quit_retry_at = time.monotonic() + self.QUIT_RETRY_S
             results = self._close_all(held, reason="quit")
             self._quit_retry_at = time.monotonic() + self.QUIT_RETRY_S
         self._check_quit_progress()
