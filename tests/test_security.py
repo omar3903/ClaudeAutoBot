@@ -1,8 +1,13 @@
-"""Same-machine guard: on every request, and again (header included) on the secrets endpoints."""
+"""Same-machine guard: on every request, and again (header included) on the secrets endpoints; and the
+server run.py starts, which only listens on this computer and never trusts proxy headers."""
 
 from __future__ import annotations
 
+import importlib.util
+import pathlib
 import re
+import sys
+from types import SimpleNamespace
 
 import pytest
 from fastapi import Depends, FastAPI, WebSocketDisconnect
@@ -302,3 +307,92 @@ def test_the_api_and_the_live_feed_take_only_the_dashboards_own_requests():
             assert (security.refusal("127.0.0.1", headers, "GET", path) is None) is allowed, (site, path)
     # a link from another page still opens the dashboard itself
     assert security.refusal("127.0.0.1", {**home, "sec-fetch-site": "same-site"}, "GET", "/") is None
+
+
+# ---- the server itself: run.py and the app it serves ------------------------------------------ #
+RUN_PY = pathlib.Path(__file__).resolve().parents[1] / "run.py"
+
+
+@pytest.fixture
+def run_py(monkeypatch):
+    """run.py loaded as a module with the server and the steps around it stubbed: main() records the
+    server it would start (or what it would hand uvicorn.run) instead of starting it."""
+    from autotradebot.server.app import app
+
+    spec = importlib.util.spec_from_file_location("atb_run", RUN_PY)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    served = []
+
+    class _Server:
+        def __init__(self, config, app):
+            served.append(config)
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(module, "GuardedServer", _Server)
+    monkeypatch.setattr(module, "setup_logging", lambda level: None)     # the real one writes the project's log
+    monkeypatch.setattr(module, "keep_awake", lambda: False)
+    monkeypatch.setattr(module.uvicorn, "run", lambda target, **options: served.append(options))
+    monkeypatch.setattr(module.uvicorn.Config, "configure_logging", lambda self: None)
+    monkeypatch.setattr(app.state, "shutdown", app.state.shutdown)        # main() wires it to the stub server
+    module.served = served
+    return module
+
+
+def _start(run_py, monkeypatch, *args):
+    monkeypatch.setattr(sys, "argv", ["run.py", "--no-browser", *args])
+    run_py.main()
+    return run_py.served
+
+
+def test_the_server_never_trusts_proxy_headers(run_py, monkeypatch):
+    # an X-Forwarded-For header could otherwise stand in for the address the same-machine check goes by
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    config = _start(run_py, monkeypatch)[0]
+    assert config.host == "127.0.0.1"
+    assert config.proxy_headers is False and config.forwarded_allow_ips == ""
+    config.load()
+    assert not isinstance(config.loaded_app, ProxyHeadersMiddleware)
+    # the dev auto-reload starts its own server, the same way
+    options = _start(run_py, monkeypatch, "--reload")[-1]
+    assert options["reload"] is True
+    assert options["proxy_headers"] is False and options["forwarded_allow_ips"] == ""
+
+
+def test_the_dashboard_is_only_served_on_this_computers_own_names(run_py):
+    for host in ("127.0.0.1", "localhost", "::1", "LOCALHOST"):
+        assert run_py.host_problem(host) == "", host
+    for host in ("0.0.0.0", "::", "", "192.168.1.20", "my-pc"):            # every device on the network
+        problem = run_py.host_problem(host)
+        assert repr(host) in problem and "--allow-network" in problem, host
+        assert run_py.host_problem(host, allow_network=True) == "", host
+
+
+def test_a_network_host_is_refused_before_anything_starts(run_py, monkeypatch, capsys):
+    for args in (["--host", "0.0.0.0"], ["--host", "192.168.1.20", "--reload"]):
+        with pytest.raises(SystemExit) as refused:
+            _start(run_py, monkeypatch, *args)
+        assert refused.value.code == run_py.REFUSED == 2                  # scripts/run_24_7.bat stops on it
+        assert "--allow-network" in capsys.readouterr().err
+    # WEB_HOST in .env is held to it too
+    real = run_py.get_settings()
+    lan = SimpleNamespace(secrets=real.secrets.model_copy(update={"web_host": "0.0.0.0"}), config=real.config)
+    monkeypatch.setattr(run_py, "get_settings", lambda: lan)
+    with pytest.raises(SystemExit):
+        _start(run_py, monkeypatch)
+    assert run_py.served == []
+    # ...unless the network is asked for, out loud
+    config = _start(run_py, monkeypatch, "--allow-network")[0]
+    assert config.host == "0.0.0.0" and config.proxy_headers is False
+
+
+def test_the_app_serves_no_generated_api_docs(monkeypatch):
+    # they'd hand anything that reaches the port a map of every endpoint that trades
+    client, engine = _dashboard(monkeypatch)
+    for path in ("/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"):
+        assert client.get(path).status_code == 404, path
+    assert client.get("/").status_code == 200
+    assert engine.calls == []

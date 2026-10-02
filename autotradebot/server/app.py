@@ -105,7 +105,10 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
         finally:
             engine.stop()
 
-    app = FastAPI(title="AutoTradeBot", version="0.4.0", lifespan=lifespan)
+    # no generated API docs: /docs, /redoc and /openapi.json would hand anything that reaches the port a map
+    # of every endpoint that trades, and the dashboard never uses them
+    app = FastAPI(title="AutoTradeBot", version="0.4.0", lifespan=lifespan,
+                  docs_url=None, redoc_url=None, openapi_url=None)
     app.state.shutdown = None           # run.py wires this to the uvicorn server
     # the snapshot and the plays are tens of KB of JSON, fetched all session: gzipped they're a fraction of
     # that. A small answer isn't worth compressing, and the WebSocket doesn't pass through here

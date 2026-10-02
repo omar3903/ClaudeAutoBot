@@ -412,7 +412,8 @@ And around it:
 - Turn on two-factor login for IBKR (*IBKR Mobile* → *Secure Login System*) and for GitHub.
 - Your keys live in `.env`, which is git-ignored - never commit it. On a public GitHub repository, turn on
   *secret scanning* and *push protection* (Settings → Code security) so a key pushed by mistake is blocked.
-- Keep `WEB_HOST=127.0.0.1` so the dashboard is only served to this computer (see below).
+- Keep `WEB_HOST=127.0.0.1` so the dashboard is only served to this computer (see below). `run.py`
+  refuses to start on any other host (`0.0.0.0`, a network address) unless you pass `--allow-network`.
 
 ### Security of settings
 
@@ -433,6 +434,10 @@ And around it:
   line your clicks up with its buttons. And the page only runs the dashboard's
   own script files (a Content-Security-Policy), so a headline or filing that
   ever reached it unescaped still couldn't run as script.
+- The server goes by the address a request really came from: it never reads
+  proxy headers (`X-Forwarded-For`), so no header can make a request look
+  local. The API's generated docs (`/docs`, `/redoc`, `/openapi.json`) are
+  switched off, so the port doesn't hand out a map of every endpoint.
 - Only the IB Gateway settings can be written. Values are validated (no line
   breaks or hidden characters, no `$`, ports in range), `.env` is read without
   expanding `${...}` so one setting can't show another's value, it is replaced
@@ -582,7 +587,8 @@ The app is built to be left running:
 * **Sleep.** While the app runs it asks Windows not to go to sleep (the screen can still turn off);
   set `app.keep_awake: false` to stop that.
 * **Crashes.** `scripts\run_24_7.bat` starts the app and starts it again 30 seconds after it stops
-  unexpectedly; quitting from the dashboard ends it. A shortcut to it in the Startup folder
+  unexpectedly; quitting from the dashboard ends it. So does a refused start (a bad option, or a host
+  other than this computer), which starting again wouldn't fix. A shortcut to it in the Startup folder
   (`Win+R`, `shell:startup`) brings the app back after a reboot - Windows Update's included.
 
 ## Quitting
