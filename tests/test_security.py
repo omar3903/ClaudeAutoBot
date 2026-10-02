@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from autotradebot.server import security
 
 OK = {"X-ATB-Request": "1"}
+HOME = {"Host": "127.0.0.1:8787"}           # the dashboard as run.py opens it
 
 
 def _app() -> FastAPI:
@@ -43,8 +44,17 @@ def test_foreign_origin_is_refused(client):
     assert client.post("/secret", headers={**OK, "Origin": "https://evil.example"}).status_code == 403
 
 
-def test_local_origin_is_allowed(client):
-    assert client.post("/secret", headers={**OK, "Origin": "http://127.0.0.1:8787"}).status_code == 200
+@pytest.mark.parametrize("origin", ["http://127.0.0.1:8787", "http://localhost:8787"])
+def test_local_origin_is_allowed(client, origin):
+    # the dashboard's own page, by either of this computer's names, on the same port
+    assert client.post("/secret", headers={**OK, **HOME, "Origin": origin}).status_code == 200
+
+
+def test_a_page_on_another_local_port_is_refused(client):
+    # a dev server or a notebook on this computer: the same site to the browser, but not the dashboard
+    assert client.post("/secret", headers={**OK, **HOME, "Origin": "http://localhost:3000"}).status_code == 403
+    assert client.post("/secret", headers={**OK, "Sec-Fetch-Site": "same-site"}).status_code == 403
+    assert client.post("/secret", headers={**OK, "Sec-Fetch-Site": "same-origin"}).status_code == 200
 
 
 def test_rebound_host_is_refused(client):
@@ -145,6 +155,23 @@ def test_a_rebound_host_is_refused_on_every_route(monkeypatch):
     assert engine.calls == []
 
 
+def test_only_the_dashboards_own_origin_gets_through(monkeypatch):
+    client, engine = _dashboard(monkeypatch)
+    for host in ("127.0.0.1:8787", "localhost:8787"):
+        for origin in ("http://127.0.0.1:8787", "http://localhost:8787"):
+            own = {**OK, "Host": host, "Origin": origin, "Sec-Fetch-Site": "same-origin"}
+            assert client.post("/api/plays/P01/approve", headers=own).status_code == 200, (host, origin)
+    # a script sends no Origin and no Sec-Fetch-Site, only the dashboard's header
+    assert client.post("/api/plays/P02/approve", headers=OK).status_code == 200
+    # a page another program serves on this computer, with the header too
+    other = {**HOME, "Origin": "http://localhost:3000"}
+    assert client.post("/api/plays/P03/approve", headers={**OK, **other}).status_code == 403
+    assert client.get("/api/state", headers=other).status_code == 403
+    # an <img> or <script> on it sends no Origin, but the browser marks it same-site
+    assert client.get("/api/price/AAA", headers={"Sec-Fetch-Site": "same-site"}).status_code == 403
+    assert engine.calls == [("approve", "P01")] * 4 + [("approve", "P02")]
+
+
 def test_another_sites_page_cant_load_the_api(monkeypatch):
     # an <img> or <script> on another website sends no Origin, but the browser marks it cross-site
     client, engine = _dashboard(monkeypatch)
@@ -209,14 +236,17 @@ def test_the_dashboard_has_no_inline_script():
 # ---- the live feed: the WebSocket, which the HTTP middleware never sees ------------------------ #
 def test_the_dashboards_own_live_feed_opens(monkeypatch):
     client, engine = _dashboard(monkeypatch)
-    with client.websocket_connect("/ws", headers={"Origin": "http://127.0.0.1:8787"}) as ws:
+    own = {**HOME, "Origin": "http://127.0.0.1:8787", "Sec-Fetch-Site": "same-origin"}
+    with client.websocket_connect("/ws", headers=own) as ws:
         assert ws.receive_json()["topic"] == "hello"
         assert ws.receive_json()["topic"] == "plays.updated"
     assert engine.calls == [("snapshot",), ("plays",)]
 
 
 @pytest.mark.parametrize("headers", [{"Origin": "https://evil.example"},      # another website's page
-                                     {"Host": "rebind.evil:8787"}])           # a rebound domain
+                                     {"Host": "rebind.evil:8787"},            # a rebound domain
+                                     {**HOME, "Origin": "http://localhost:3000"},   # another program's page
+                                     {"Sec-Fetch-Site": "same-site"}])        # ...as the browser marks it
 def test_a_foreign_live_feed_is_refused_before_the_snapshot(monkeypatch, headers):
     client, engine = _dashboard(monkeypatch)
     with pytest.raises(WebSocketDisconnect) as refused:
@@ -238,3 +268,37 @@ def test_an_ipv6_loopback_request_is_allowed():
     host = {"host": "[::1]:8787"}
     assert security.refusal("::1", host, "POST", "/api/mode") == "Missing dashboard request header."
     assert security.refusal("::1", {**host, "x-atb-request": "1"}, "POST", "/api/mode") is None
+
+
+def test_an_origin_must_be_this_requests_own():
+    def why(origin, host="127.0.0.1:8787"):
+        headers = {"host": host, "origin": origin, "x-atb-request": "1"}
+        return security.refusal("127.0.0.1", headers, "POST", "/api/mode")
+
+    # the same scheme, port and name - or another of this computer's names on the same port
+    for origin, host in [("http://127.0.0.1:8787", "127.0.0.1:8787"), ("http://localhost:8787", "127.0.0.1:8787"),
+                         ("http://[::1]:8787", "localhost:8787"), ("http://localhost", "localhost")]:
+        assert why(origin, host) is None, origin
+    refused = [("http://localhost:3000", "127.0.0.1:8787"),          # another program on this computer
+               ("http://localhost:8787", "localhost"),               # the Host's port is the default, 80
+               ("http://localhost", "localhost:8787"),
+               ("https://127.0.0.1:8787", "127.0.0.1:8787"),         # other schemes
+               ("ws://127.0.0.1:8787", "127.0.0.1:8787"),
+               ("chrome-extension://abc", "127.0.0.1:8787"),
+               ("null", "127.0.0.1:8787"),                           # a file, a sandboxed frame
+               ("http://127.0.0.1:8787/", "127.0.0.1:8787"),         # not an origin as browsers send one
+               ("http://x@127.0.0.1:8787", "127.0.0.1:8787"),
+               ("http://127.0.0.1:port", "127.0.0.1:8787")]
+    for origin, host in refused:
+        assert why(origin, host) == "Cross-site request refused.", origin
+
+
+def test_the_api_and_the_live_feed_take_only_the_dashboards_own_requests():
+    home = {"host": "127.0.0.1:8787"}
+    for site, allowed in [(None, True), ("none", True), ("same-origin", True),
+                          ("same-site", False), ("cross-site", False), ("something-new", False)]:
+        headers = home if site is None else {**home, "sec-fetch-site": site}
+        for path in ("/api/state", "/ws"):
+            assert (security.refusal("127.0.0.1", headers, "GET", path) is None) is allowed, (site, path)
+    # a link from another page still opens the dashboard itself
+    assert security.refusal("127.0.0.1", {**home, "sec-fetch-site": "same-site"}, "GET", "/") is None

@@ -417,13 +417,18 @@ And around it:
 ### Security of settings
 
 - The app only answers **this computer**. Every request needs a loopback
-  client, a `localhost`/`127.0.0.1` Host header and no foreign `Origin`; an
-  `/api/` request made by another website's page is refused, and anything that
+  client, a `localhost`/`127.0.0.1` Host header and, when the browser sends an
+  `Origin`, the dashboard's own: `http`, the same port, and `localhost`,
+  `127.0.0.1` or `[::1]`. An `/api/` or live-feed request the browser marks as
+  coming from any other page (`Sec-Fetch-Site` other than `same-origin` or
+  `none`) is refused, and anything that
   changes something needs the dashboard's own request header (the Connections,
   share-count and quit endpoints want it on reads too). The live feed's
   WebSocket gets the same check before it opens. So another website open in
-  your browser can't approve a play, close a position or read your account and
-  positions, and a device on your network can't open the dashboard. No other
+  your browser - or a page another program serves on this computer, such as a
+  dev server or a notebook on another port - can't approve a play, close a
+  position or read your account and positions, and a device on your network
+  can't open the dashboard. No other
   website can show the dashboard inside a frame either, so a hidden page can't
   line your clicks up with its buttons. And the page only runs the dashboard's
   own script files (a Content-Security-Policy), so a headline or filing that
