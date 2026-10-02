@@ -3,10 +3,13 @@ noise check removes.
 
 The replay walks recorded candles the way the scans see them live. At the close
 of every 5-minute bar (day trades) or every session (swing trades) it builds the
-same context the evaluator builds, runs the strategies, flags each play the same
-way, and follows it the way the automatic exits would: stop, target, break-even,
-trailing stop, the flatten before the close, the swing time limit. Results are
-in R - multiples of the risk taken - so a $5 stock and a $400 stock count alike.
+same context the evaluator builds - a day setup's candles end, as they do at the
+live candle-close check, in the one just begun (priced at its open, no volume
+yet), so it confirms on the bar that has just closed - runs the strategies,
+flags each play the same way, and follows it the way the automatic exits would:
+stop, target, break-even, trailing stop, the flatten before the close, the swing
+time limit. Results are in R - multiples of the risk taken - so a $5 stock and a
+$400 stock count alike.
 
 Two things come out of it:
 
@@ -226,13 +229,17 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
         if closed_at >= flatten_at:
             break
         end = history.index.searchsorted(session.index[i], side="right")
-        window = history.iloc[max(0, end - LIVE_INTRADAY_BARS):end]
+        start = max(0, end - LIVE_INTRADAY_BARS)
+        # the window live reads at this close ends in the candle just begun, and the setups confirm on the one
+        # before it: the replay hands them the same shape, the new candle priced at the open it fills at
+        price = float(next_bar["open"])
+        window = _with_forming(history.iloc[start:end], next_at, price)
         ctx = StrategyContext(symbol=symbol, intraday=window, daily=with_today(prior_daily, window),
-                              quote=quote_from_price(symbol, float(window["close"].iloc[-1])),
+                              quote=quote_from_price(symbol, price),
                               now=closed_at.to_pydatetime(), signals=signals, market=dict(market),
                               news=news_at(stories, closed_at),
                               benchmark=benchmark.closes_at(closed_at) if benchmark is not None else None,
-                              shared=shared, records=records)
+                              shared=_shared_through(shared, start, end, window.index), records=records)
         signals_now = _signals(strategies, ctx, noise, settings.min_reward_risk)
         activity = intraday_metrics(symbol, window, prior_daily) if signals_now else None
         for strategy, play, flags in signals_now:
@@ -361,6 +368,31 @@ def session_series(history: pd.DataFrame, strategies: Sequence[Strategy]) -> Dic
         minutes = strategy.params.get("or_minutes") if isinstance(strategy.params, dict) else None
         if minutes:
             out.setdefault(f"opening_range_{int(minutes)}", ta.opening_range(history, int(minutes)))
+    return out
+
+
+def _with_forming(closed: pd.DataFrame, at: pd.Timestamp, price: float) -> pd.DataFrame:
+    """``closed`` and the candle that has just begun at ``at``, the way the candle-close check reads IBKR's
+    bars seconds after a close: open, high, low and close all ``price``, and no volume yet. The setups take
+    the candle before it as the last closed one, as they do live. (Built from arrays: it runs at every bar.)"""
+    begun = [0.0 if c == "volume" else price if c in ("open", "high", "low", "close") else np.nan
+             for c in closed.columns]
+    return pd.DataFrame(np.vstack([closed.to_numpy(dtype=float), begun]), columns=closed.columns,
+                        index=closed.index.append(pd.DatetimeIndex([at], name=closed.index.name)))
+
+
+def _shared_through(shared: Mapping[str, Any], start: int, end: int, index: pd.Index) -> Dict[str, Any]:
+    """The session's shared series (session_series) for a window of the history's rows ``start:end`` and
+    the candle just begun after them - ``index`` is the window's. The series hold the real candle at that
+    time - reading it would be looking ahead - so the new candle takes the last closed one's values: with
+    no volume yet it leaves the session VWAP where it was, and the opening range is the same at every bar
+    of a session."""
+    out: Dict[str, Any] = {}
+    for key, series in shared.items():
+        values = series.to_numpy()
+        rows = np.concatenate([values[start:end], values[end - 1:end]])
+        out[key] = (pd.Series(rows, index=index, name=series.name) if isinstance(series, pd.Series)
+                    else pd.DataFrame(rows, index=index, columns=series.columns))
     return out
 
 

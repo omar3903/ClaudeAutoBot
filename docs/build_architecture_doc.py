@@ -1242,7 +1242,9 @@ def build() -> str:
       'sessions, swings on three years of daily candles (700 sessions; each setup still sees the 300 it would see '
       'live), fills at the next bar or next open, 5 bps slippage '
       'and 1 bp commission each way, the same exit rules as the exit manager (including scale-out), news flags '
-      'from the stored headlines, and the market regime as it was known that day. The latest third of sessions '
+      'from the stored headlines, and the market regime as it was known that day. At each 5-minute close a day '
+      'setup\'s candles end in the one just begun (priced at its open, no volume yet), as they do at the live '
+      'candle-close check, so it confirms on the bar that has just closed. The latest third of sessions '
       'is <b>held out</b>: a strategy must also work on data it was not tuned on.</p>')
     A('<p><b>Which stocks, and which way in.</b> Day-trade setups only ever see the morning\'s hot list, so each '
       'past session is replayed on the stocks the scan would have picked <i>that morning</i> '

@@ -1343,6 +1343,11 @@ follows every play the way the automatic exits would. Its settings are in
   worker process, and a day-trade replay is cut into jobs of `sessions_per_job` (10) sessions so the
   long ones don't leave workers idle at the end. Series that are the same for every bar of a session
   (the session VWAP, the opening range) are computed once per session.
+* **The candles live sees.** At each 5-minute close a day setup is handed the candle that has just begun
+  as well - priced at its open, no volume yet - the way the candle-close check reads IBKR's bars seconds
+  after a close. So a setup confirms on the bar that has just closed, on the same bar as live, and fills at
+  that new candle's open; before, the replayed candles stopped at the closed bar and every closed-bar
+  confirmation came a bar late.
 * **Only the plays the app would show and take.** A play under the scanner's reward:risk floor
   (`risk.min_reward_risk`) is never on the board, so the replay never trades it; and a strategy's
   Autopilot record counts only the trades Autopilot would take - its skipped flags, its confirmations,

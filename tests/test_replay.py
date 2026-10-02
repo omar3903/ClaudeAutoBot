@@ -22,6 +22,12 @@ EXACT = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, breakeven_at_r=0.0,
 QUIET = NoiseSettings(min_expected_r=-99.0)
 
 
+def _closed_today(ctx):
+    """Today's closed candles: the newest one is still forming, as at the live candle-close check."""
+    today = ctx.today_intraday()
+    return None if today is None else today.iloc[:-1]
+
+
 class _LongAtBar(Strategy):
     """Buys at the close of one chosen bar of the session: stop 1 below, target 2 above."""
 
@@ -32,10 +38,10 @@ class _LongAtBar(Strategy):
         self.at_bar = at_bar
 
     def generate(self, ctx):
-        today = ctx.today_intraday()
-        if today is None or len(today) != self.at_bar + 1:
+        closed = _closed_today(ctx)
+        if closed is None or len(closed) != self.at_bar + 1:
             return []
-        entry = float(today["close"].iloc[-1])
+        entry = float(closed["close"].iloc[-1])
         play = self._mk_play(ctx, Side.LONG, entry, entry - 1.0, [entry + 2.0], 0.7, "r", "d", {}, tags=["intraday"])
         return [play] if play else []
 
@@ -46,10 +52,10 @@ class _LongTwoTargets(_LongAtBar):
     key = "long_two_targets"
 
     def generate(self, ctx):
-        today = ctx.today_intraday()
-        if today is None or len(today) != self.at_bar + 1:
+        closed = _closed_today(ctx)
+        if closed is None or len(closed) != self.at_bar + 1:
             return []
-        entry = float(today["close"].iloc[-1])
+        entry = float(closed["close"].iloc[-1])
         play = self._mk_play(ctx, Side.LONG, entry, entry - 1.0, [entry + 2.0, entry + 4.0], 0.7, "r", "d", {},
                              tags=["intraday"])
         return [play] if play else []
@@ -230,6 +236,73 @@ def test_series_shared_for_a_session_equal_the_ones_computed_per_bar():
     pd.testing.assert_series_equal(plain.vwap_series[today], ctx.vwap_series[today], check_names=False)
 
 
+class _ClosedBreakout(Strategy):
+    """Confirms on the last closed candle, the way the day setups do (technical._last_closed): the first
+    close above 100.5 makes a long at the price now. It notes the closed candle it fired on."""
+
+    key, kind, timeframe, title, thesis = "closed_breakout", StrategyKind.TECHNICAL, Timeframe.INTRADAY, "Test", "t"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fired_on: list = []
+
+    def generate(self, ctx):
+        from autotradebot.strategies.technical import _last_closed
+
+        today = ctx.today_intraday()
+        last = _last_closed(today)
+        if last is None or len(today) < 3 or float(last["close"]) <= 100.5 or float(today["close"].iloc[-3]) > 100.5:
+            return []
+        self.fired_on.append(last.name)
+        entry = ctx.price
+        play = self._mk_play(ctx, Side.LONG, entry, entry - 1.0, [entry + 2.0], 0.7, "r", "d", {}, tags=["intraday"])
+        return [play] if play else []
+
+
+def test_a_setup_confirming_on_the_closed_bar_fires_on_the_same_bar_in_the_replay_as_live():
+    from autotradebot.scanner.evaluator import with_today
+
+    # the 10:00 candle is the first to close above 100.5; the next one opens at 100.95
+    session = _session(FLAT + [(100.0, 101.0, 99.95, 100.9), (100.95, 101.1, 100.8, 101.0)])
+    replayed = _ClosedBreakout()
+    [t] = replay_intraday([replayed], "RPL", session, _daily(), EXACT, QUIET)
+    # live, seconds after the 10:05 close, IBKR's bars end in the candle that has just begun
+    begun = pd.DataFrame({"open": [100.95], "high": [100.97], "low": [100.94], "close": [100.96], "volume": [2e3]},
+                         index=session.index[7:8])
+    window = pd.concat([session.iloc[:7], begun])
+    live = _ClosedBreakout()
+    ctx = StrategyContext(symbol="RPL", intraday=window, daily=with_today(_daily(), window),
+                          quote=quote_from_price("RPL", 100.96),
+                          now=(session.index[7] + pd.Timedelta(seconds=2)).to_pydatetime())
+    assert live.generate(ctx)
+    assert replayed.fired_on == live.fired_on == [session.index[6]]                # the same closed candle
+    # ...and the replay fills at the open of the candle live saw begin, not a bar later
+    assert pd.Timestamp(t.entered_at) == session.index[7] and t.entry == pytest.approx(100.95)
+
+
+def test_the_candle_just_begun_shows_its_open_and_nothing_of_how_it_went_on():
+    import fakes
+    from autotradebot.indicators import ta
+
+    class _Reader(Strategy):
+        key, kind, timeframe, title, thesis = "reader", StrategyKind.TECHNICAL, Timeframe.INTRADAY, "Test", "t"
+        seen: list = []
+
+        def generate(self, ctx):
+            self.seen.append((ctx.intraday, ctx.price, ctx.vwap))
+            return []
+
+    bars = fakes.intraday_bars("BGN")
+    replay_intraday([_Reader()], "BGN", bars, fakes.daily_bars("BGN"), EXACT, QUIET, sessions=1)
+    assert len(_Reader.seen) > 50
+    for window, price, vwap in _Reader.seen:
+        begun, real = window.iloc[-1], bars.loc[window.index[-1]]
+        assert price == pytest.approx(real["open"], abs=1e-4) and begun["volume"] == 0.0     # the quote: 4 decimals
+        assert (begun["open"], begun["high"], begun["low"], begun["close"]) == (real["open"],) * 4
+        # the session VWAP stands where the closed candles left it: the real candle's volume isn't in it
+        assert vwap == pytest.approx(float(ta.session_vwap(window.iloc[:-1]).iloc[-1]))
+
+
 def test_the_replay_leaves_out_the_plays_the_board_would_never_show():
     import fakes
 
@@ -320,10 +393,10 @@ class _LongWhileQuiet(Strategy):
     key, kind, timeframe, title, thesis = "long_while_quiet", StrategyKind.TECHNICAL, Timeframe.INTRADAY, "Test", "t"
 
     def generate(self, ctx):
-        today = ctx.today_intraday()
-        if today is None or len(today) < 6:
+        closed = _closed_today(ctx)
+        if closed is None or len(closed) < 6:
             return []
-        entry = float(today["close"].iloc[-1])
+        entry = float(closed["close"].iloc[-1])
         play = self._mk_play(ctx, Side.LONG, entry, entry - 1.0, [entry + 2.0], 0.7, "r", "d", {}, tags=["intraday"])
         return [play] if play else []
 
