@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
+import logging
 from types import SimpleNamespace
 
 import numpy as np
@@ -67,6 +69,25 @@ def test_a_model_is_trained_judged_kept_and_scores_plays(tmp_path):
     never_seen = scorer.score({"strategy": "brand_new_setup", "noise": ["a_new_flag"]})      # gaps are fine
     assert 0.0 < never_seen["p"] < 1.0
     assert meta.Scorer(tmp_path / "empty").score({"reward_risk": 3.0}) is None              # no model: no score
+
+
+def test_a_card_naming_anything_but_a_model_the_app_trained_is_never_opened(tmp_path, monkeypatch, caplog):
+    import joblib
+
+    opened = []
+    bundle = {"model": None, "calibrator": None, "columns": [],
+              "card": {"id": "gbm_20260105143000", "schema": meta.FEATURE_SCHEMA, "usable": False}}
+    monkeypatch.setattr(joblib, "load", lambda path: opened.append(path) or bundle)
+    with caplog.at_level(logging.WARNING, logger=meta.log.name):
+        for named in ["../elsewhere/gbm_20260105143000", str(tmp_path.parent / "gbm_20260105143000"),
+                      r"\\server\share\gbm_20260105143000", "gbm_2026", "gbm_20260105143000.joblib", 7]:
+            (tmp_path / meta.CARD).write_text(json.dumps({"id": named}), encoding="utf-8")
+            assert meta.Scorer(tmp_path).card is None
+    assert opened == [] and "not a model this app trained" in caplog.text
+
+    (tmp_path / meta.CARD).write_text(json.dumps({"id": "gbm_20260105143000"}), encoding="utf-8")
+    assert meta.Scorer(tmp_path).card["id"] == "gbm_20260105143000"           # the names train() writes load
+    assert opened == [tmp_path / "gbm_20260105143000.joblib"]
 
 
 def test_too_few_rows_train_nothing(tmp_path):

@@ -177,7 +177,7 @@ function headlinesHTML(rows, withStock) {
     const [label, cls] = KIND[h.kind] || [h.kind, ""], url = safeUrl(h.url);
     return `<li><span class="muted small">${escapeHtml(fmtEt(h.published_at))}</span>
       ${withStock ? `<button class="link" data-open-stock="${escapeHtml(h.symbol)}"><b>${escapeHtml(h.symbol)}</b></button>` : ""}
-      <span class="badge ${cls}">${label}</span>
+      <span class="badge ${cls}">${escapeHtml(label)}</span>
       ${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(h.headline)}</a>` : escapeHtml(h.headline)}
       <span class="muted small">${escapeHtml(h.provider || h.source)}</span>
       ${h.sentiment != null ? `<b class="small ${toneCls(h.sentiment)}" title="FinBERT: -1 negative to +1 positive">tone ${signed(h.sentiment)}</b>` : ""}</li>`;

@@ -73,9 +73,9 @@ function rowsHTML(rows) {
       <td><b>${escapeHtml(r.symbol)}</b><div class="muted small">${escapeHtml(r.sector || "–")}</div></td>
       <td class="num"><b class="${tone(r.change_pct)}">${signed(r.change_pct)}</b> <span class="muted small">$${num(r.close)}</span>
         <div class="muted small nowrap">${how}</div></td>
-      <td class="why"><span class="badge ${catCls}">${catLabel}</span>${r.catalyst.before_open ? ` <span class="badge">before the open</span>` : ""}
+      <td class="why"><span class="badge ${catCls}">${escapeHtml(catLabel)}</span>${r.catalyst.before_open ? ` <span class="badge">before the open</span>` : ""}
         ${NEWS.has(r.catalyst.kind) ? `<div class="small">${escapeHtml(shorten(r.catalyst.label, 120))}</div>` : ""}</td>
-      <td><span class="badge ${stCls}">${stLabel}</span> ${[...new Set(r.bot.plays.map(p => p.timeframe))].map(typeBadge).join(" ")}
+      <td><span class="badge ${stCls}">${escapeHtml(stLabel)}</span> ${[...new Set(r.bot.plays.map(p => p.timeframe))].map(typeBadge).join(" ")}
         <span class="small ${tone(r.bot.r)}">${result}</span></td>
       <td class="row-tools"><button class="chart-btn" data-chart="${escapeHtml(r.symbol)}" title="Charts: the session and the days around it" aria-label="Chart">📈</button></td>
     </tr>

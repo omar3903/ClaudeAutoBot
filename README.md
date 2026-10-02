@@ -441,6 +441,8 @@ And around it:
 - Turn on two-factor login for GitHub too.
 - Your keys live in `.env`, which is git-ignored - never commit it. On a public GitHub repository, turn on
   *secret scanning* and *push protection* (Settings → Code security) so a key pushed by mistake is blocked.
+  Book files (every PDF but the guides in `docs/`, and e-books) and stray logs and state files are
+  git-ignored wherever they land too.
 - Keep `WEB_HOST=127.0.0.1` so the dashboard is only served to this computer (see below). `run.py`
   refuses to start on any other host (`0.0.0.0`, a network address) unless you pass `--allow-network`.
 - Never expose port 8787 through a tunnel or port forwarder (ngrok, Cloudflare Tunnel, Tailscale Funnel, VS
@@ -484,6 +486,9 @@ And around it:
   stock symbol (capital letters and digits, a share class after a space), so a
   symbol from outside data, such as an insider filing, can't point the app at
   a file somewhere else.
+- The trained model is only opened when its card (`current.json`) names it
+  the way the app does (`gbm_` and 14 digits). Opening a model file can run
+  code, so an edited card can't point the app at a file somewhere else.
 
 ### MySQL (optional — SQLite is the default)
 
@@ -1150,7 +1155,8 @@ A background service (`autotradebot/signals/`) watches what happens off the pric
 - Headlines are scored from -1 (negative) to +1 (positive) by FinBERT on this computer when it is installed:
   `pip install transformers torch` (about 140 MB of packages); the model itself (ProsusAI/finbert, 438 MB) is
   downloaded from Hugging Face the first time a headline is scored and cached under `~/.cache/huggingface`.
-  Without it headlines carry no sentiment and the news nudge does nothing.
+  It is pinned to one upload of the model, and once that is in the cache it loads from there without
+  contacting Hugging Face. Without FinBERT headlines carry no sentiment and the news nudge does nothing.
 
 **What the signals do**
 - **Insider buying** (`insider_buying`, a swing setup): unusual buying in the last 10 days, while the stock is no

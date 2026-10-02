@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import threading
 from importlib.util import find_spec
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -16,11 +17,33 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 log = logging.getLogger(__name__)
 
 MODEL = "ProsusAI/finbert"
+# The exact upload of the model the app runs, so a later change on its Hugging Face page never
+# reaches this computer by itself.
+REVISION = "4556d13015211d73dccd3fdd39d39232506f3e43"
+# The files that upload is made of: with all of them in the local cache FinBERT loads from there
+# without asking huggingface.co anything.
+FILES = ("config.json", "pytorch_model.bin", "special_tokens_map.json", "tokenizer_config.json", "vocab.txt")
+
+
+def _cached(model: str, revision: str) -> Optional[str]:
+    """The folder holding ``revision`` of ``model`` in the local Hugging Face cache, or None
+    while any of its files is missing (the first load downloads them)."""
+    from huggingface_hub import try_to_load_from_cache  # installed with transformers
+    paths = [try_to_load_from_cache(model, name, revision=revision) for name in FILES]
+    return os.path.dirname(paths[0]) if all(isinstance(p, str) for p in paths) else None
 
 
 def _load_pipeline(model: str) -> Callable[..., Any]:
+    # Without this, a load by name has transformers ask Hugging Face's converter in the background
+    # for a safetensors copy of the weights (they are a pickle file) - one more call out.
+    os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
     from transformers import pipeline  # optional dependency, imported only when used
-    return pipeline("text-classification", model=model, top_k=None)
+    revision = REVISION if model == MODEL else None
+    # A cached model loads from its folder: loaded by name, huggingface_hub still looks something
+    # up on huggingface.co once a day, even with local_files_only.
+    folder = _cached(model, revision) if revision else None
+    return pipeline("text-classification", model=folder or model, top_k=None, revision=revision,
+                    local_files_only=folder is not None)
 
 
 class HeadlineSentiment:
