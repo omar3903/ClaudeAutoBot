@@ -18,7 +18,8 @@ from autotradebot.strategies.base import Strategy, StrategyContext
 
 NY = "America/New_York"
 DAY = dt.date(2026, 9, 10)                     # an ordinary full session
-EXACT = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, breakeven_at_r=0.0, trail_start_r=0.0)
+EXACT = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, commission_per_share=0.0, breakeven_at_r=0.0,
+                       trail_start_r=0.0)
 QUIET = NoiseSettings(min_expected_r=-99.0)
 
 
@@ -100,7 +101,8 @@ def test_half_comes_off_at_the_first_target_and_the_rest_runs_on():
     [t] = replay_intraday([_LongTwoTargets()], "RPL", bars, _daily(), EXACT, QUIET)
     assert (t.exit_reason, t.scaled, t.r) == ("trailing-stop", True, 1.0)
     # switched off, the position exits whole at the first target
-    whole = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, breakeven_at_r=0.0, trail_start_r=0.0, scale_out_pct=0.0)
+    whole = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, commission_per_share=0.0, breakeven_at_r=0.0,
+                           trail_start_r=0.0, scale_out_pct=0.0)
     bars = _session(FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9), (102.0, 104.2, 101.9, 104.0)])
     [t] = replay_intraday([_LongTwoTargets()], "RPL", bars, _daily(), whole, QUIET)
     assert (t.exit_reason, t.scaled, t.r) == ("target", False, 2.0)
@@ -414,6 +416,22 @@ def test_a_day_setup_is_also_entered_the_way_autopilot_enters_it_after_two_bars_
     # a setup that shows on one bar only is never entered Autopilot's way
     once = replay_intraday([_LongAtBar()], "RPL", _session(bars), _daily(), EXACT, QUIET)
     assert [t.entry_rule for t in once] == ["first"]
+
+
+def test_a_day_setup_is_entered_on_sight_once_a_session_the_way_the_board_settles_it():
+    # the setup shows on every bar from the fifth on; its trade on sight hits the target at once and the setup
+    # goes on showing at the new price - the board wouldn't offer it again today, so it isn't a new trade
+    bars = FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9)]
+    today = _session(bars)
+    trades = replay_intraday([_LongWhileQuiet()], "RPL", today, _daily(), EXACT, QUIET)
+    first = [t for t in trades if t.entry_rule == "first"]
+    assert [(t.exit_reason, t.r) for t in first] == [("target", 2.0)]
+    # the next session it is a setup of its own again
+    tomorrow = today.copy()
+    tomorrow.index = tomorrow.index + pd.Timedelta(days=1)
+    trades = replay_intraday([_LongWhileQuiet()], "RPL", pd.concat([today, tomorrow]), _daily(), EXACT, QUIET)
+    days = [t.entered_at[:10] for t in trades if t.entry_rule == "first"]
+    assert days == [str(DAY), str(DAY + dt.timedelta(days=1))]
 
 
 def test_the_replay_runs_in_the_background_downloads_each_session_once_and_keeps_its_results(tmp_path):

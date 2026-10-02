@@ -25,7 +25,12 @@ Two things come out of it:
 Chan's rules for a backtest worth believing (*Quantitative Trading*, ch. 3):
 
 * **costs** - every fill pays ``commission_bps``, and market fills ``slippage_bps`` on
-  top; a strategy that only wins before costs doesn't win.
+  top; a strategy that only wins before costs doesn't win. Every order also pays IBKR's
+  fixed commission - ``commission_per_share``, at least ``commission_min`` and at most
+  ``commission_max_pct`` of its value - taken off the trade's R. The replay has no size,
+  so that is charged on the shares a trade risking ``nominal_risk_usd`` would buy:
+  $0.005 a share over the risk a share is the same R at any size, and only the minimum
+  and the cap depend on that assumption.
 * **out of sample** - the latest third of the sessions replayed is held out: every
   record and every noise verdict is also given for those sessions alone, and Autopilot
   wants a strategy to have made money there too. A result that holds up only on the
@@ -40,10 +45,11 @@ Chan's rules for a backtest worth believing (*Quantitative Trading*, ch. 3):
 (``entry_rule`` "first": the record of every trade, and Autopilot's when it takes a
 play on sight) and, separately, from the bar after it has shown twice in a row
 ("second": how Autopilot enters when it asks a day trade to be seen on two candles
-running - one bar later, at another price, and only once a session per setup, the
-way the board settles a setup it has acted on). Autopilot's record is built from
-the way in it really uses; before, nearly every replayed trade was entered on
-sight, so almost none counted towards a day setup's proof.
+running - one bar later, at another price). Either way a setup is entered only once
+a session, the way the board settles a setup it has acted on: one that shows again
+after its trade has closed isn't offered again, so it isn't a new trade. Autopilot's
+record is built from the way in it really uses; before, nearly every replayed trade
+was entered on sight, so almost none counted towards a day setup's proof.
 
 **Which stocks.** Day trades are for stocks in play. The runner replays each past
 session on the stocks that were in play *that morning* (research/in_play.py), not
@@ -52,7 +58,8 @@ momentum setup its own hindsight.
 
 What it can't know: a fill is assumed at the next bar's open (and skipped when
 that open has already run away from the entry), a stop and a target in the same
-bar count as the stop, and slippage is a flat fraction of price.
+bar count as the stop, slippage is a flat fraction of price, and the commission is
+charged on a nominal size.
 """
 
 from __future__ import annotations
@@ -98,6 +105,10 @@ HELD_OUT_FRACTION = 1 / 3
 class ReplaySettings:
     slippage_bps: float = 5.0             # on market fills, each way
     commission_bps: float = 1.0           # on every fill
+    commission_per_share: float = 0.005   # IBKR's fixed commission on top, on every fill: this much a share...
+    commission_min: float = 1.0           # ...at least this much an order...
+    commission_max_pct: float = 1.0       # ...and at most this % of the order's value (0 = no cap)
+    nominal_risk_usd: float = 1000.0      # ...on the shares a trade risking this much would buy (see _commission)
     max_entry_drift_atr: float = 0.5      # skip a day-trade fill whose open ran this many intraday ATRs from the entry
     max_entry_drift_daily_atr: float = 1.0
     warmup_bars: int = 3                  # bars into the session before the first signal
@@ -118,7 +129,11 @@ class ReplaySettings:
         ``min_reward_risk``: the scanner's floor (risk.min_reward_risk), so the replay only trades
         plays the board would have shown."""
         extra = {} if costs is None else {"slippage_bps": float(costs.slippage_bps),
-                                          "commission_bps": float(costs.commission_bps)}
+                                          "commission_bps": float(costs.commission_bps),
+                                          "commission_per_share": float(costs.commission_per_share),
+                                          "commission_min": float(costs.commission_min),
+                                          "commission_max_pct": float(costs.commission_max_pct),
+                                          "nominal_risk_usd": float(costs.nominal_risk_usd)}
         return cls(min_reward_risk=float(min_reward_risk or 0.0),
                    breakeven_at_r=float(cfg.breakeven_at_r), breakeven_lock_r=float(cfg.breakeven_lock_r),
                    trail_start_r=float(cfg.trail_start_r), trail_lock_ratio=float(cfg.trail_lock_ratio),
@@ -172,6 +187,7 @@ class _Position:
     features: Dict[str, Any] = field(default_factory=dict)
     drift_per_bar: float = 0.0            # the stock's average return per bar over the replayed window
     cost: float = 0.0                     # slippage and commission paid so far, per share of the whole position
+    fees: float = 0.0                     # ...of it the commission per share, which comes off the result, not the price
 
     @property
     def sign(self) -> int:
@@ -229,6 +245,8 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
     open_positions: Dict[str, _Position] = {}
     waited: Dict[str, _Position] = {}               # the same setups, entered Autopilot's way (entry_rule "second")
     settled: set = set()                            # (strategy, side) already entered that way this session
+    entered: set = set()                            # ...and entered on sight: the board offers a setup once a
+                                                    # session, so one that shows again later isn't a new trade
     seen_before: set = set()
     records = {k: dict(v) for k, v in (records or {}).items()}
     shared = session_series(history, strategies)
@@ -251,8 +269,9 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
         signals_now = _signals(strategies, ctx, noise, settings.min_reward_risk)
         activity = intraday_metrics(symbol, window, prior_daily) if signals_now else None
         for strategy, play, flags in signals_now:
-            if strategy.key not in open_positions:
-                confirmed = (strategy.key, play.side) in seen_before
+            setup = (strategy.key, play.side)
+            if strategy.key not in open_positions and setup not in entered:
+                confirmed = setup in seen_before
                 position = _enter(strategy.key, play, flags, confirmed, next_at,
                                   float(next_bar["open"]), settings.max_entry_drift_atr * ctx.intraday_atr, settings,
                                   features=play_features(play, now=ctx.now, market=ctx.market, noise=flags,
@@ -260,7 +279,7 @@ def _replay_session(strategies: Sequence[Strategy], symbol: str, session: pd.Dat
                 if position is not None:
                     position.drift_per_bar = drift
                     open_positions[strategy.key] = position
-            setup = (strategy.key, play.side)
+                    entered.add(setup)
             if setup in seen_before and setup not in settled and strategy.key not in waited:
                 # seen on two bars running: the entry Autopilot makes when it asks for confirmation
                 position = _enter(strategy.key, play, flags, True, next_at, float(next_bar["open"]),
@@ -502,8 +521,25 @@ def _enter(key: str, play: Play, flags: List[str], confirmed: bool, at: pd.Times
     risk = (fill - play.stop) * sign
     if risk <= 0:
         return None                                  # opened through the stop
+    fee = _commission(settings, risk, fill)
     return _Position(key, play, fill, play.stop, risk, at, list(flags), confirmed, best=fill,
-                     features=dict(features or {}), cost=abs(fill - open_price))
+                     features=dict(features or {}), cost=abs(fill - open_price) + fee, fees=fee)
+
+
+def _commission(settings: ReplaySettings, risk: float, price: float, part: float = 1.0) -> float:
+    """IBKR's fixed commission on one order for ``part`` of a position at ``price``, per share of the whole
+    position. The replay counts in R and has no size, so the shares are nominal: what a trade risking
+    ``nominal_risk_usd`` buys at ``risk`` a share. Per share that is ``commission_per_share`` at any size -
+    over the risk a share, the same R - and only the order's minimum and its cap at a percentage of the
+    order's value depend on the nominal size."""
+    if settings.commission_per_share <= 0 or settings.nominal_risk_usd <= 0 or risk <= 0 or part <= 0:
+        return 0.0
+    whole = settings.nominal_risk_usd / risk                    # the nominal shares of the whole position
+    shares = part * whole
+    fee = max(shares * settings.commission_per_share, settings.commission_min)
+    if settings.commission_max_pct > 0:                         # IBKR: the cap wins even over the minimum
+        fee = min(fee, shares * price * settings.commission_max_pct / 100.0)
+    return fee / whole
 
 
 def _time_limit_bars(play: Play, settings: ReplaySettings) -> Optional[int]:
@@ -535,7 +571,9 @@ def _step(position: _Position, bar: pd.Series, bar_end: pd.Timestamp, settings: 
             # Aziz: part off at the first target, stop to break-even, the rest runs to the second
             part = settings.scale_out_pct / 100.0
             fill = price * (1 - position.sign * settings.commission_bps / 1e4)          # a limit fill
-            position.cost += part * abs(price - fill)
+            fee = _commission(settings, position.risk, price, part)                    # an order of its own
+            position.cost += part * abs(price - fill) + fee
+            position.fees += fee
             position.banked_r += part * (fill - position.entry) * position.sign / position.risk
             position.fraction -= part
             position.scaled = True
@@ -565,15 +603,17 @@ def _tighten(position: _Position, stop: float) -> None:
 def _close(position: _Position, price: float, at: pd.Timestamp, reason: str, settings: ReplaySettings,
            limit: bool = False) -> SimTrade:
     cost_bps = settings.commission_bps + (0.0 if limit else settings.slippage_bps)
-    paid = position.cost + position.fraction * price * cost_bps / 1e4
+    fee = _commission(settings, position.risk, price, position.fraction)
+    paid = position.cost + position.fraction * price * cost_bps / 1e4 + fee
     price *= 1 - position.sign * cost_bps / 1e4
     play = position.play
     drift = position.sign * position.drift_per_bar * position.bars_held * position.entry
     rest = position.fraction * (price - position.entry) * position.sign / position.risk
+    fees_r = (position.fees + fee) / position.risk
     return SimTrade(strategy=position.strategy, symbol=play.symbol, side=play.side.value,
                     timeframe=play.timeframe.value, entered_at=position.entered_at.isoformat(),
                     exited_at=at.isoformat(), entry=round(position.entry, 4), exit=round(price, 4),
-                    r=round(position.banked_r + rest, 3), exit_reason=reason,
+                    r=round(position.banked_r + rest - fees_r, 3), exit_reason=reason,
                     noise=list(position.noise), confirmed=position.confirmed, entry_rule=position.entry_rule,
                     mfe_r=round(max(0.0, (position.best - position.entry) * position.sign / position.risk), 3),
                     scaled=position.scaled, features=dict(position.features),
@@ -635,7 +675,7 @@ def summarize(trades: Iterable[SimTrade]) -> Dict[str, Any]:
 
 
 def on_sight(trades: Iterable[SimTrade]) -> List[SimTrade]:
-    """The trades entered the bar their setup first showed - one per setup, the base every record of
+    """The trades entered the bar their setup first showed - one per setup a session, the base every record of
     all trades and every noise verdict is measured on (the "second" entries are the same setups again)."""
     return [t for t in trades if t.entry_rule == "first"]
 

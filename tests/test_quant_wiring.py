@@ -177,11 +177,59 @@ def test_the_evidence_weight_is_shrunk_bounded_and_never_raises_a_record_that_fa
 
 # ---------------------------------------------------------------- the replay
 def test_every_fill_pays_commission_and_market_fills_pay_slippage_too():
-    costly = ReplaySettings(slippage_bps=0.0, commission_bps=10.0, breakeven_at_r=0.0, trail_start_r=0.0)
+    costly = ReplaySettings(slippage_bps=0.0, commission_bps=10.0, commission_per_share=0.0, breakeven_at_r=0.0,
+                            trail_start_r=0.0)
     session = _session(FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9)])
     [t] = replay_intraday([_LongAtBar()], "RPL", session, _daily(), costly, QUIET)
     assert t.exit_reason == "target" and t.entry == pytest.approx(100.1) and t.exit == pytest.approx(101.898)
     assert t.r == pytest.approx(1.798 / 1.1, abs=0.001) and t.mfe_r == pytest.approx(1.9 / 1.1, abs=0.001)
+
+
+def test_every_order_pays_ibkr_commission_per_share_off_the_trades_r():
+    import dataclasses
+
+    from test_replay import _LongTwoTargets
+
+    # the stop 1 below the fill: a nominal $1,000 at risk buys 1,000 shares, $5 an order - 0.005R in and out
+    ibkr = dataclasses.replace(EXACT, commission_per_share=0.005, commission_min=1.0, commission_max_pct=1.0,
+                               nominal_risk_usd=1000.0)
+    session = _session(FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9)])
+    [t] = replay_intraday([_LongAtBar()], "RPL", session, _daily(), ibkr, QUIET)
+    assert (t.exit_reason, t.entry, t.exit) == ("target", 100.0, 102.0)          # it comes off the R, not the prices
+    assert t.r == pytest.approx(1.99) and t.cost_r == pytest.approx(0.01)
+    # a small nominal size: 100 shares come to $0.50 an order, so each pays IBKR's $1 minimum - 0.01R
+    small = dataclasses.replace(ibkr, nominal_risk_usd=100.0)
+    [t] = replay_intraday([_LongAtBar()], "RPL", session, _daily(), small, QUIET)
+    assert t.r == pytest.approx(1.98) and t.cost_r == pytest.approx(0.02)
+    # half off at the first target is an order of its own: three orders, three minimums
+    bars = _session(FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9), (102.0, 104.2, 101.9, 104.0)])
+    [t] = replay_intraday([_LongTwoTargets()], "RPL", bars, _daily(), small, QUIET)
+    assert t.scaled and t.r == pytest.approx(2.97) and t.cost_r == pytest.approx(0.03)
+
+
+def test_the_commission_is_the_rate_a_share_at_any_ordinary_size_and_capped_on_a_cheap_stock():
+    import dataclasses
+
+    from autotradebot.config import ReplayCfg
+    from autotradebot.research.replay import _commission
+
+    s = ReplaySettings()
+    assert _commission(s, 1.0, 100.0) == pytest.approx(0.005)                      # per share of the position
+    assert _commission(dataclasses.replace(s, nominal_risk_usd=50_000.0), 1.0, 100.0) == pytest.approx(0.005)
+    # $0.40 a share risking $0.02: 50,000 nominal shares would pay $250, capped at 1% of $20,000
+    assert _commission(s, 0.02, 0.40) == pytest.approx(200.0 / 50_000)
+    assert _commission(dataclasses.replace(s, commission_per_share=0.0), 1.0, 100.0) == 0.0
+    # the config's replay settings carry it, and their defaults are the replay's
+    cfg = ReplayCfg(commission_per_share=0.01, commission_min=2.0, commission_max_pct=0.5, nominal_risk_usd=500.0)
+    exits = SimpleNamespace(breakeven_at_r=1.3, breakeven_lock_r=0.3, trail_start_r=2.0, trail_lock_ratio=0.5,
+                            flatten_intraday_before_close_min=10, max_swing_hold_days=10)
+    carried = ReplaySettings.from_exit_rules(exits, cfg)
+    assert (carried.commission_per_share, carried.commission_min, carried.commission_max_pct,
+            carried.nominal_risk_usd) == (0.01, 2.0, 0.5, 500.0)
+    defaults = ReplaySettings.from_exit_rules(exits, ReplayCfg())
+    assert (defaults.commission_per_share, defaults.commission_min, defaults.commission_max_pct,
+            defaults.nominal_risk_usd) == (s.commission_per_share, s.commission_min, s.commission_max_pct,
+                                           s.nominal_risk_usd)
 
 
 def _sim(r, day, noise=(), strategy="s"):

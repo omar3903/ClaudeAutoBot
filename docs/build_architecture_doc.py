@@ -654,7 +654,7 @@ def fig_states() -> str:
 def fig_research() -> str:
     s = Svg(720, 420)
     a = s.box(20, 30, 200, 70, "Replay (backtest)", ["research/replay.py + runner.py",
-                                                    "5-bps slippage, 1-bp commission,", "latest third held out"],
+                                                    "5-bps slippage, IBKR commission,", "latest third held out"],
               lsize=8.5, fill="#f3f0ff")
     b = s.box(260, 30, 200, 70, "Records per strategy", ["trades, win rate, expectancy R,",
                                                         "out_of_sample block,", "learned noise skips"],
@@ -1241,7 +1241,9 @@ def build() -> str:
       'same strategy code propose plays as if it were live: day trades on 5-minute candles over the last 60 '
       'sessions, swings on three years of daily candles (700 sessions; each setup still sees the 300 it would see '
       'live), fills at the next bar or next open, 5 bps slippage '
-      'and 1 bp commission each way, the same exit rules as the exit manager (including scale-out), news flags '
+      'and 1 bp commission each way plus IBKR\'s $0.005 a share on every order (at least $1, at most 1% of its '
+      'value; charged on the shares a nominal $1,000 at risk buys, since the replay counts in R and has no size), '
+      'the same exit rules as the exit manager (including scale-out), news flags '
       'from the stored headlines, and the market regime as it was known that day. At each 5-minute close a day '
       'setup\'s candles end in the one just begun (priced at its open, no volume yet), as they do at the live '
       'candle-close check, so it confirms on the bar that has just closed. The latest third of sessions '
@@ -1252,7 +1254,8 @@ def build() -> str:
       'biggest opening gaps) - not on today\'s hot list, which is hot because of what it has just done and hands '
       'a momentum setup its own hindsight. Each day setup is followed twice: entered on sight '
       '(<code>entry_rule</code> first - the record of all trades) and entered once it has shown two bars in a row '
-      '(second - how Autopilot enters when it asks for two candles running); Autopilot\'s record, the one the '
+      '(second - how Autopilot enters when it asks for two candles running), either way once a session per '
+      'setup, as the board settles a setup it has acted on; Autopilot\'s record, the one the '
       'proof rule reads, uses the way in it really uses. The replay reads 5-minute candles with flat costs: it '
       'is good at throwing out a setup that loses, and a setup it likes still has to show it on paper.</p>')
     A('<p><b>Runner</b> (<code>research/runner.py</code>). Splits the work into jobs (one stock, or ten sessions '
@@ -1522,7 +1525,8 @@ def build() -> str:
         ("Half-Kelly", "the Kelly criterion gives the bet fraction that maximises log growth from win rate and "
          "payoff; half of it is the conventional safe version. It can only lower the configured risk %."),
         ("Slippage, commission, bps", "the cost of a fill vs the quoted price, and the broker's fee. 1 bp = 0.01%. "
-         "The replay charges 5 bps slippage and 1 bp commission on every fill."),
+         "The replay charges 5 bps slippage and 1 bp commission on every fill, and IBKR's $0.005 a share "
+         "(at least $1, at most 1% of the order) on top."),
         ("Bracket order", "an entry order with a stop order and a target order attached; the broker cancels one "
          "when the other fills. IBKR supports it natively."),
         ("Day trade vs swing", "a day trade opens and closes the same session (and counts against the "

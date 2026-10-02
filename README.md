@@ -1326,11 +1326,13 @@ next replays go on from there until the sixty sessions are covered. A request th
 asked again; a session IBKR really has nothing for is remembered and isn't.
 
 Every day setup is followed twice: **entered on sight** (the record of all trades) and **entered
-after it has shown two bars in a row**, one bar later and once a session per setup - which is how
-Autopilot enters when it asks a day trade to be seen on two candles running. Autopilot's record,
-the one the proof rule reads, is built from the way in it really uses. Before, nearly every
-replayed day trade was entered on sight, so 27 of 1,466 counted and no day setup could ever
-reach the 30 trades proof asks for.
+after it has shown two bars in a row**, one bar later - which is how Autopilot enters when it asks a
+day trade to be seen on two candles running. Either way a setup is entered once a session, the way
+the board settles a setup it has acted on: one that shows again after its trade has closed isn't
+offered again, so it isn't a new trade (before, the entries on sight re-entered it every time it
+fired). Autopilot's record, the one the proof rule reads, is built from the way in it really uses.
+Before, nearly every replayed day trade was entered on sight, so 27 of 1,466 counted and no day
+setup could ever reach the 30 trades proof asks for.
 
 What the day-trade replay still can't know: it reads 5-minute candles, so a stop and a target
 inside one candle count as the stop, fills are the next candle's open with a flat slippage, the
@@ -1372,7 +1374,13 @@ follows every play the way the automatic exits would. Its settings are in
   after that the live store's candles keep it current for nothing. However long the
   history, a replayed setup sees the 300 sessions it would see live. Up to 120
   day-trade sessions can be asked for — 5-minute candles are downloaded once and kept.
-* **Costs**: 5 bps slippage on every market fill and 1 bp commission on every fill.
+* **Costs**: 5 bps slippage on every market fill and 1 bp commission on every fill, and on every
+  order IBKR's fixed commission as well - $0.005 a share, at least $1, at most 1% of the order's value
+  (`commission_per_share`, `commission_min`, `commission_max_pct`) - taken off the trade's R. The
+  replay counts in R and has no size, so the shares are the ones a trade risking
+  `nominal_risk_usd` ($1,000, 1% of a nominal $100k account) would buy. A share's commission over
+  its risk is the same R at any size; only the $1 minimum (a wide stop, or the half taken off at a
+  first target) and the 1% cap (a stock under 50 cents) depend on that assumption.
 * **Held out**: the latest third of the sessions. Every strategy record and every
   noise verdict is also given for those sessions alone, and Autopilot wants a
   strategy to have made money there too.
