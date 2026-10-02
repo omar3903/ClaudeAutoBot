@@ -302,6 +302,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         # guards the queue only - it is never held across a request, the scanner, the board or Autopilot
         self._close_lock = threading.Lock()
         self._close_due: Optional[Tuple[dt.datetime, float]] = None   # the 5-minute close, and the monotonic time due
+        self._close_only: Optional[List[str]] = None       # ...the stocks its second ask is for (None = the whole tier)
         self._movers_due: Dict[str, dt.datetime] = {}      # early movers to check: the minute each was found in
         self._mover_why: Dict[str, str] = {}               # ...and why, for the check's log line
         self._mover_at: Dict[str, float] = {}              # when each stock was last queued as a mover (epoch)
@@ -811,7 +812,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _next_scan_wait(self) -> float:
         """How long the scan loop waits before its next pass: 5 s, or until a candle-close check is due if that
-        is sooner - so the check starts CLOSE_GRACE_S after the close without the candle thread sleeping."""
+        is sooner - so the check starts scanner.close_grace_s after the close (and its second ask CLOSE_RETRY_S
+        after it read) without the candle thread sleeping."""
         with self._close_lock:
             due = self._close_due
         return 5.0 if due is None else max(0.0, min(5.0, due[1] - time.monotonic()))
@@ -1012,13 +1014,14 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             except Exception:  # noqa: BLE001
                 log.exception("live candles: the minute roll failed")
 
-    #: the candle-close check starts this long after a 5-minute close, so IBKR has finished the bar
-    CLOSE_GRACE_S = 2.0
     #: a check that can't start within this long of its close is dropped - a long scan held the thread; the fast
     #: cycle and the next close cover it
     CLOSE_STALE_S = 60.0
     #: no stock is asked for its bars by two checks within this long: IBKR refuses identical requests within 15 s
     CLOSE_ASK_GAP_S = 15.0
+    #: the stocks whose new bar a check at a close (it starts scanner.close_grace_s after it) didn't find are asked
+    #: once more this long after it read - no sooner than IBKR's 15 s rule lets the same request go again
+    CLOSE_RETRY_S = 15.0
     #: a stock is queued as an early mover at most this often
     MOVER_EVERY_S = 300.0
     #: a new high or low of the day counts as a move on this many times the stream's mean minute volume...
@@ -1029,8 +1032,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def _on_minute(self, minute: float) -> Dict[str, Candle]:
         """The minute ending at ``minute`` (epoch seconds) is over: close its live candles, and the 5-minute ones
         on a :00/:05... boundary. Then, in regular hours on real-time data, queue the candle-close check at a
-        5-minute close (due CLOSE_GRACE_S later, over the whole watch tier) or, between closes, the watch stocks
-        whose minute was a move (_find_movers), and wake the scan loop. Here on the candle thread it only reads
+        5-minute close (due scanner.close_grace_s later, over the whole watch tier) or, between closes, the watch
+        stocks whose minute was a move (_find_movers), and wake the scan loop. Here on the candle thread it only reads
         and queues: the scan thread fetches the bars, runs the setups and lets Autopilot enter. Returns {symbol:
         the 1-minute candle just closed}."""
         closed = self.md.candles.roll(minute)
@@ -1048,8 +1051,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             movers = self._find_movers(closed, watch, at)
         queued = boundary
         with self._close_lock:
-            if boundary:
-                self._close_due = (at, time.monotonic() + self.CLOSE_GRACE_S)
+            if boundary:                                 # it covers the last close's second ask, if still due
+                self._close_due = (at, time.monotonic() + float(cfg.scanner.close_grace_s))
+                self._close_only = None
             if movers:
                 self._mover_at = {s: t for s, t in self._mover_at.items() if minute - t < self.MOVER_EVERY_S}
             for symbol, why in movers.items():
@@ -1233,11 +1237,11 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         with self._close_lock:
             close_due, movers = self._close_due, bool(self._movers_due)
         # the early movers wait for a 5-minute close queued behind them: it covers them, and run now it would read
-        # IBKR's bars before CLOSE_GRACE_S has let IBKR finish them
+        # IBKR's bars before scanner.close_grace_s has let IBKR finish them (a close's second ask takes them along)
         if (close_due is not None and mono >= close_due[1]) or (close_due is None and movers):
             return "close"
-        # a candle-close check starts within seconds: it stands in for the fast cycle, and the quick re-check
-        # waits for it rather than hold it up
+        # a candle-close check (or its second ask) starts within seconds: it stands in for the fast cycle, and the
+        # quick re-check waits for it rather than hold it up
         waiting = close_due is not None
         if mono - self._last_cycle_at >= self.scan_settings.cycle_minutes * 60:
             return "cycle"
@@ -1334,9 +1338,11 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if quick:
             self._last_plays_at = mono
         elif kind == "close":
-            # a check at a 5-minute close stood in for the fast cycle: the next one comes fast_cycle_seconds on.
-            # An early-mover check covered a few stocks only, so it moves no timer
-            if self._close_ran is not None and self._close_ran["boundary"] is not None:
+            # a check at a 5-minute close that read at least half the stocks it asked stood in for the fast cycle:
+            # the next one comes fast_cycle_seconds on. One that found most new bars not printed yet leaves the
+            # fast cycle due. An early-mover check covered a few stocks only, so it moves no timer
+            ran = self._close_ran
+            if ran is not None and ran["boundary"] is not None and 2 * len(result.symbols) >= ran["asked"]:
                 self._last_fast_at = mono
         else:
             self._scan_retry_at = 0.0
@@ -1390,35 +1396,41 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._thin_live_names(result)
         self._note_changes(changes)
 
-    def _take_close_queue(self) -> Tuple[Optional[dt.datetime], Dict[str, dt.datetime], Dict[str, str]]:
-        """Take what the candle loop queued (_on_minute): the 5-minute close once it is due, and the early movers
-        with why. A close not due yet stays queued, and the movers with it - it covers them, and IBKR is still
-        finishing its bar (CLOSE_GRACE_S); the scan loop wakes for it when it is due."""
+    def _take_close_queue(self) -> Tuple[Optional[dt.datetime], Dict[str, dt.datetime], Dict[str, str],
+                                         Optional[List[str]]]:
+        """Take what the candle loop queued (_on_minute): the 5-minute close once it is due - with the stocks it
+        is for when it is a close's second ask, None for the whole tier - and the early movers with why. A close
+        not due yet stays queued, and the movers with it - it covers them, and IBKR is still finishing its bar
+        (scanner.close_grace_s); the scan loop wakes for it when it is due."""
         with self._close_lock:
             due = self._close_due
             if due is not None and time.monotonic() < due[1]:
-                return None, {}, {}
-            movers, why = self._movers_due, self._mover_why
-            self._close_due, self._movers_due, self._mover_why = None, {}, {}
-        return (due[0] if due is not None else None), movers, why
+                return None, {}, {}, None
+            movers, why, only = self._movers_due, self._mover_why, self._close_only
+            self._close_due, self._movers_due, self._mover_why, self._close_only = None, {}, {}, None
+        return (due[0] if due is not None else None), movers, why, (only if due is not None else None)
 
-    def _close_check(self, queued: Optional[Tuple[Optional[dt.datetime], Dict[str, dt.datetime],
-                                                  Dict[str, str]]] = None) -> Optional[ScanResult]:
+    def _close_check(self, queued: Optional[Tuple[Optional[dt.datetime], Dict[str, dt.datetime], Dict[str, str],
+                                                  Optional[List[str]]]] = None) -> Optional[ScanResult]:
         """The check the candle loop queued (_on_minute), on the scan thread - ``queued`` as _take_close_queue
         took it (taken here when not given): at a 5-minute close the whole watch tier, else the early movers still
-        in it, on IBKR's newest 5-minute bars (Scanner.run_close). A check that couldn't start within
-        CLOSE_STALE_S of its close is dropped, and no stock is asked twice within CLOSE_ASK_GAP_S. None when
-        nothing is left to check."""
-        boundary, movers, why = queued if queued is not None else self._take_close_queue()
+        in it, on IBKR's newest 5-minute bars (Scanner.run_close). The stocks whose new bar a close's check didn't
+        find are queued for a second ask CLOSE_RETRY_S after it read - once: that ask leaves the rest to the fast
+        cycle and the next close. A check that couldn't start within CLOSE_STALE_S of its close is dropped, and no
+        stock is asked twice within CLOSE_ASK_GAP_S. None when nothing is left to check."""
+        boundary, movers, why, only = queued if queued is not None else self._take_close_queue()
         now = clock.now_ny()
         if boundary is not None and (now - boundary).total_seconds() > self.CLOSE_STALE_S:
-            log.debug("the %s ET candle-close check is dropped: it couldn't start until %.0f s after the close",
-                      boundary.strftime("%H:%M"), (now - boundary).total_seconds())
-            boundary = None
+            log.debug("the %s ET candle-close check%s is dropped: it couldn't start until %.0f s after the close",
+                      boundary.strftime("%H:%M"), "'s second ask" if only is not None else "",
+                      (now - boundary).total_seconds())
+            boundary = only = None
         movers = {s: m for s, m in movers.items() if (now - m).total_seconds() <= self.CLOSE_STALE_S}
         watch = self.scanner.watch_symbols(int(self.settings.config.execution.stream_watch or 0))
         if boundary is not None:
-            symbols, since = watch, boundary
+            # a second ask is for the stocks still in the tier - and any early mover that waited behind it
+            again = None if only is None else set(only) | set(movers)
+            symbols, since = [s for s in watch if again is None or s in again], boundary
         else:
             tier = set(watch)
             symbols = [s for s in movers if s in tier]
@@ -1429,10 +1441,18 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if not symbols:
             return None
         self._close_asked.update(dict.fromkeys(symbols, mono))
-        self._close_ran = {"boundary": boundary, "asked": len(symbols),
+        self._close_ran = {"boundary": boundary, "asked": len(symbols), "again": only is not None,
                            "minute": max((movers[s] for s in symbols if s in movers), default=since),
                            "why": {s: why[s] for s in symbols if s in why}}
-        return self.scanner.run_close(symbols, since)
+        result = self.scanner.run_close(symbols, since)
+        if boundary is not None and only is None:
+            # IBKR prints some stocks' new bars later than others: those are asked once more, past its 15 s rule
+            read = set(result.symbols)
+            late = [s for s in symbols if s not in read]
+            with self._close_lock:
+                if late and self._close_due is None:       # a newer close queued meanwhile covers them
+                    self._close_due, self._close_only = (boundary, time.monotonic() + self.CLOSE_RETRY_S), late
+        return result
 
     def _log_close_check(self, result: ScanResult, changes: List[Any]) -> None:
         """The check's one INFO line: what it read and found, and how long after the close its plays were out."""
@@ -1442,8 +1462,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         plays = f"{n} play{'' if n == 1 else 's'}"
         boundary = ran.get("boundary")
         if boundary is not None:
-            log.info("close check %s ET: %d of %d stocks read, %s (%d new) - published %.1f s after the candle closed "
-                     "(candles %.1f s, setups %.1f s)", boundary.strftime("%H:%M"), len(result.symbols),
+            log.info("close check %s ET%s: %d of %d stocks read, %s (%d new) - published %.1f s after the candle "
+                     "closed (candles %.1f s, setups %.1f s)", boundary.strftime("%H:%M"),
+                     " (second ask)" if ran.get("again") else "", len(result.symbols),
                      ran.get("asked", 0), plays, new, (now - boundary).total_seconds(),
                      result.timings.get("intraday_candles", 0.0), result.timings.get("setups", 0.0))
             return

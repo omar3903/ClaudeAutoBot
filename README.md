@@ -225,8 +225,8 @@ next buffer names.
 
 Also in `config.yaml`: `gapper_symbols` (400), `gapper_min_gap_pct` (2), `gapper_min_volume`
 (50,000), `buffer_picks_per_sector` (2), `kept_per_sector` (2),
-`fast_cycle_seconds` (60), `close_check` (true) and `mover_atr` (1.0) (see
-**Candle-close check**), `live_scan` (10; see **Live scans**),
+`fast_cycle_seconds` (60), `close_check` (true), `close_grace_s` (8) and
+`mover_atr` (1.0) (see **Candle-close check**), `live_scan` (10; see **Live scans**),
 `fundamentals_leaders` (8), the liquidity `prefilter`,
 and `max_universe` (0 = every listing; `SCANNER_MAX_UNIVERSE` caps it without
 editing the file).
@@ -334,19 +334,26 @@ speed and show only: the setups, confirmations and the replay still run on
 IBKR's own 5-minute candles.
 
 **Candle-close check.** At every 5-minute close in regular hours (09:35 to
-15:55) the watch tier's setups are checked on IBKR's just-closed bars about 2
-seconds after the close - one request per stock for the last hour of bars - so
-a setup is typically published 5-8 seconds after its candle closes instead of
-up to a couple of minutes later. The check stands in for the fast cycle due
-then. Between closes, a watch stock whose streamed 1-minute candle spans at
-least `scanner.mover_atr` (1.0; 0 = off) of its 5-minute ATRs, or makes a new
+15:55) the watch tier's setups are checked on IBKR's just-closed bars
+`scanner.close_grace_s` (8; 0-30) seconds after the close - one request per
+stock for the last hour of bars - so a setup is typically published within a
+few seconds of that instead of up to a couple of minutes later. IBKR prints a
+stock's new bar a few seconds after the close, and a check much sooner finds
+few of them; the stocks whose new bar isn't in yet are asked once more about
+15 seconds after the check read (IBKR refuses the same request within 15 s),
+and any still missing then wait for the fast cycle or the next close. A check
+that read at least half its stocks stands in for the fast cycle due then; one
+that read fewer leaves the fast cycle to its second ask. Between closes, a
+watch stock whose streamed 1-minute candle spans at least
+`scanner.mover_atr` (1.0; 0 = off) of its 5-minute ATRs, or makes a new
 high or low of the day on 3x its average minute volume, gets an early-mover
 check at once (at most once per 5 minutes). An early-mover check can't add a
 candle confirmation - its 5-minute candle hasn't closed - so it catches
 price-level setups and refreshes the stock's plays. `scanner.close_check:
 false` turns both off (the fast cycle as before). The log says `close check
-10:05 ET: ... published 5.4 s after the candle closed` or `early-mover check
-10:07 ET (...)` for each one, and once a session `live candles vs IBKR
+10:05 ET: ... published 9.4 s after the candle closed` (`close check 10:05 ET
+(second ask): ...` for the second ask) or `early-mover check 10:07 ET (...)`
+for each one, and once a session `live candles vs IBKR
 5-minute bars` with the volume ratio that tells whether the stream counts
 shares or lots of 100.
 
@@ -1063,7 +1070,8 @@ lists what is skipped now, and each trade keeps that list.
 the regular session is open, the hot list is rescanned every
 `scanner.fast_cycle_seconds` (60) between the regular cycles. The header button
 shows it (`Autopilot: day ⚡60s`). At each 5-minute close the candle-close check
-(see **Candle-close check**) takes the place of the fast cycle due then.
+(see **Candle-close check**) takes the place of the fast cycle due then, once it
+has read at least half the watch stocks.
 
 ---
 

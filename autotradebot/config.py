@@ -119,9 +119,12 @@ class ScannerCfg(_Model):
     cycle_minutes: int = 5                # intraday rescan of the hot list + buffer (3-5)
     fast_cycle_seconds: int = 60          # hot list only, while Autopilot is day-trading
     plays_refresh_seconds: int = 15       # re-check the stocks with plays on the board (0 = off)
-    close_check: bool = True              # at each 5-minute candle close in regular hours, +2 s, check the watch
-                                          # tier's setups on IBKR's just-closed bars at once - it stands in for the
-                                          # fast cycle due then; false = off, the fast cycle as before
+    close_check: bool = True              # at each 5-minute candle close in regular hours, +close_grace_s, check the
+                                          # watch tier's setups on IBKR's just-closed bars at once - it stands in for
+                                          # the fast cycle due then; false = off, the fast cycle as before
+    close_grace_s: float = 8.0            # ...this many seconds after the close: IBKR prints a stock's new bar a few
+                                          # seconds on, and a check sooner finds few of them; the stocks still without
+                                          # one are asked once more about 15 s after it read (0-30)
     mover_atr: float = 1.0                # a watch stock whose streamed 1-minute candle spans at least this many of
                                           # its 5-minute ATRs, or makes a new high/low of the day on 3x its average
                                           # minute volume, is checked at once, at most once per 5 minutes (0-5; 0 = off)
@@ -149,6 +152,12 @@ class ScannerCfg(_Model):
     max_universe: int = 0                 # 0 = every listing (smoke tests cap it)
     sectors: list = Field(default_factory=list)
     prefilter: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("close_grace_s", mode="after")
+    @classmethod
+    def _within_the_grace(cls, value: float) -> float:
+        """A check later than 30 s, with its second ask after it, would near the minute a late check is dropped at."""
+        return max(0.0, min(30.0, value))
 
     @field_validator("mover_atr", mode="after")
     @classmethod

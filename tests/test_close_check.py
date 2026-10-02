@@ -141,7 +141,7 @@ def test_the_check_reads_the_last_hour_of_bars_and_leaves_a_stock_whose_new_bar_
         assert pd.Timestamp(p.evidence["bar_at"]) == pd.Timestamp(_at(10, 0)) and p.scan_run_id == result.run_id
 
 
-def test_a_5_minute_close_queues_the_check_2_s_on_and_it_stands_in_for_the_fast_cycle(engine, gateway, now,
+def test_a_5_minute_close_queues_the_check_8_s_on_and_it_stands_in_for_the_fast_cycle(engine, gateway, now,
                                                                                          monkeypatch, caplog):
     from autotradebot.persistence.db import session_scope
     from autotradebot.persistence.models_orm import ScanRun
@@ -151,12 +151,12 @@ def test_a_5_minute_close_queues_the_check_2_s_on_and_it_stands_in_for_the_fast_
     engine._scan_wake.clear()
     engine._on_minute(_at(10, 5).timestamp())
     boundary, due = engine._close_due
-    assert boundary == _at(10, 5) and 1.5 < due - time.monotonic() <= 2.0 and engine._scan_wake.is_set()
-    assert engine._next_scan_wait() <= 2.0 and engine._movers_due == {}
+    assert boundary == _at(10, 5) and 7.5 < due - time.monotonic() <= 8.0 and engine._scan_wake.is_set()
+    assert 0 < engine._next_scan_wait() <= 5.0 and engine._movers_due == {}
     assert engine._due_scan() == "cycle"                         # not due yet: the cycle that is goes first
     engine._last_cycle_at = time.monotonic()
     monkeypatch.setattr(engine, "_autopilot_day_active", lambda: True)
-    assert engine._due_scan() is None                            # the fast cycle waits the 2 s for it
+    assert engine._due_scan() is None                            # the fast cycle waits the 8 s for it
     engine._close_due = (boundary, time.monotonic())
     engine._last_cycle_at = float("-inf")
     assert engine._due_scan() == "close"                         # due: ahead of the cycle
@@ -164,7 +164,7 @@ def test_a_5_minute_close_queues_the_check_2_s_on_and_it_stands_in_for_the_fast_
     published = []
     publish = engine._publish
     monkeypatch.setattr(engine, "_publish", lambda topic, **kw: published.append(topic) or publish(topic, **kw))
-    now["t"] = _at(10, 5, 2.4)
+    now["t"] = _at(10, 5, 8.4)
     with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
         engine._run_scan("close")
     assert "plays.updated" in published and "scan.started" not in published and "watchlist.updated" not in published
@@ -173,7 +173,7 @@ def test_a_5_minute_close_queues_the_check_2_s_on_and_it_stands_in_for_the_fast_
     assert engine._due_scan() is None                            # it counted as the fast cycle
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("close check")]
     assert len(lines) == 1 and lines[0].startswith("close check 10:05 ET: 6 of 6 stocks read, 6 plays (6 new) - "
-                                                   "published 2.4 s after the candle closed (candles ")
+                                                   "published 8.4 s after the candle closed (candles ")
     with session_scope() as s:
         assert s.get(ScanRun, engine._last_scans["close"]["run_id"]).kind == "close"
 
@@ -252,6 +252,84 @@ def test_an_early_mover_waits_for_the_close_queued_behind_it_until_ibkr_has_fini
     assert sorted(r[0] for r in _asked(gateway, asked)) == sorted(WATCH) and engine._movers_due == {}
     [result] = got
     assert result.symbols == WATCH and engine._close_due is None
+
+
+def test_the_wait_after_the_close_is_a_setting_of_8_s_within_0_to_30(engine, now, monkeypatch):
+    from autotradebot.config import ScannerCfg
+
+    assert ScannerCfg().close_grace_s == 8.0
+    assert ScannerCfg(close_grace_s=90).close_grace_s == 30.0 and ScannerCfg(close_grace_s=-1).close_grace_s == 0.0
+    monkeypatch.setattr(engine.settings.config.scanner, "close_grace_s", 4.0)
+    now["t"] = _at(10, 5, 0.3)
+    engine._on_minute(_at(10, 5).timestamp())
+    assert 3.5 < engine._close_due[1] - time.monotonic() <= 4.0
+
+
+def test_the_stocks_whose_new_bar_wasnt_printed_are_asked_once_more_15_s_after_the_check(engine, gateway, now,
+                                                                                         monkeypatch, caplog):
+    limits = _bars_until(gateway, monkeypatch, _at(10, 5))
+    limits["T02"] = limits["T03"] = _at(10, 0)                   # IBKR hasn't printed their 10:05 bars yet
+    got = _spy_run_close(engine, monkeypatch)
+    engine._close_due, now["t"] = (_at(10, 5), time.monotonic()), _at(10, 5, 8.5)
+    engine._run_scan("close")
+    assert got[0].symbols == ["T01", "T04", "T05", "T06"]
+    boundary, due = engine._close_due                            # queued again, for those two only
+    assert boundary == _at(10, 5) and engine._close_only == ["T02", "T03"] and 14 < due - time.monotonic() <= 15
+    assert engine._due_scan() != "close"
+
+    # due, past IBKR's 15 s rule: only those two are asked - T02's bar is in by now, T03's still isn't
+    limits["T02"] = _at(10, 5)
+    _later(engine, 15)
+    engine._close_due, now["t"] = (boundary, time.monotonic()), _at(10, 5, 24)
+    asked = len(gateway.requests)
+    assert engine._due_scan() == "close"
+    with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
+        engine._run_scan("close")
+    assert sorted(r[0] for r in _asked(gateway, asked)) == ["T02", "T03"] and got[1].symbols == ["T02"]
+    assert [pd.Timestamp(p.evidence["bar_at"]) for p in got[1].plays] == [pd.Timestamp(_at(10, 0))]
+    assert engine._close_due is None and engine._close_only is None              # once: T03 waits for the next
+    assert "close check 10:05 ET (second ask): 1 of 2 stocks read, 1 play" in caplog.text
+
+
+@pytest.mark.parametrize("printed", [True, False])
+def test_a_check_that_reads_under_half_the_stocks_leaves_the_fast_cycle_to_its_second_ask(engine, gateway, now,
+                                                                                         monkeypatch, printed):
+    limits = _bars_until(gateway, monkeypatch, _at(10, 0))       # IBKR has printed only T01's and T02's 10:05 bars
+    limits["T01"] = limits["T02"] = _at(10, 5)
+    monkeypatch.setattr(engine, "_autopilot_day_active", lambda: True)
+    engine._close_due, now["t"] = (_at(10, 5), time.monotonic()), _at(10, 5, 8.5)
+    engine._run_scan("close")                                    # 2 of 6 read: it doesn't stand in for the fast cycle
+    assert engine._last_fast_at == float("-inf") and engine._close_only == WATCH[2:]
+    engine._last_cycle_at = engine._last_plays_at = time.monotonic()
+    assert engine._due_scan() is None                            # ...which waits for the second ask
+
+    if printed:
+        limits["at"] = _at(10, 5)
+    _later(engine, 15)
+    engine._close_due, now["t"] = (_at(10, 5), time.monotonic()), _at(10, 5, 24)
+    engine._run_scan("close")
+    engine._last_plays_at = time.monotonic()
+    if printed:                                                  # 4 of 4 read: that stands in for it
+        assert time.monotonic() - engine._last_fast_at < 5 and engine._due_scan() is None
+    else:                                                        # none read: the fast cycle goes now
+        assert engine._last_fast_at == float("-inf") and engine._due_scan() == "fast"
+
+
+def test_a_newer_close_or_a_late_start_drops_a_second_ask(engine, gateway, now, monkeypatch, caplog):
+    limits = _bars_until(gateway, monkeypatch, _at(10, 5))
+    limits["T02"] = _at(10, 0)
+    engine._close_due = (_at(10, 5), time.monotonic())
+    engine._run_scan("close")
+    assert engine._close_only == ["T02"]
+    engine._on_minute(_at(10, 10).timestamp())                   # the next close covers the whole tier
+    assert engine._close_due[0] == _at(10, 10) and engine._close_only is None
+
+    engine._close_due, engine._close_only = (_at(10, 5), time.monotonic()), ["T02"]
+    _later(engine, 15)
+    now["t"], asked = _at(10, 6, 1), len(gateway.requests)
+    with caplog.at_level(logging.DEBUG, logger="autotradebot.engine.engine"):
+        engine._run_scan("close")                                # 61 s after its close: a scan held the thread
+    assert _asked(gateway, asked) == [] and engine._close_due is None and "check's second ask is dropped" in caplog.text
 
 
 # ---------------------------------------------------------------- early movers
