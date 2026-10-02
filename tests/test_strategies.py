@@ -189,21 +189,57 @@ def test_intraday_setups_never_crash_and_stay_framed(key):
                 assert p.reward_risk >= 2.0
 
 
-def test_abcd_needs_a_real_higher_low_on_a_lighter_pullback():
+def _begun(bars, price, volume=0.0):
+    """*bars* plus the candle just begun after them, as at the live candle-close check: priced at *price*,
+    with only *volume* traded so far."""
+    at = bars.index[-1] + pd.Timedelta(minutes=5)
+    return pd.concat([bars, pd.DataFrame({"open": [price], "high": [price], "low": [price], "close": [price],
+                                          "volume": [volume]}, index=[at])])
+
+
+def _abcd(pullback, *, now=None, pullback_volume=3e5, push_volume=8e5, begun_volume=0.0, last_low=None):
+    """ABCD on 12 quiet candles, a push to 102 and the closed *pullback* candles (the last one's low
+    pulled down to *last_low* when given), with the price *now* (the last close unless given) on a
+    candle just begun."""
     from autotradebot.strategies.technical import AbcdPattern
 
-    quiet, push = [100.0] * 12, [100.4, 100.9, 101.5, 102.0]
+    closes = [100.0] * 12 + [100.4, 100.9, 101.5, 102.0] + list(pullback)
+    vol = [3e5] * 12 + [push_volume] * 4 + [pullback_volume] * len(pullback)
+    bars = _session_intraday(100.0, closes, vol=vol)
+    if last_low is not None:
+        bars.iloc[-1, bars.columns.get_loc("low")] = last_low
+    now = closes[-1] if now is None else now
+    ctx = build_context("ABCD", _begun(bars, now, begun_volume), _flat_daily(100.0), _quote("ABCD", now),
+                        activity={"rvol": 2.0})
+    return AbcdPattern().generate(ctx)
 
-    def abcd(pullback, pullback_volume):
-        closes = quiet + push + pullback
-        vol = [3e5] * 12 + [8e5] * 4 + [pullback_volume] * len(pullback)
-        ctx = build_context("ABCD", _session_intraday(100.0, closes, vol=vol), _flat_daily(100.0),
-                            _quote("ABCD", pullback[-1] - 0.05), activity={"rvol": 2.0})
-        return AbcdPattern().generate(ctx)
 
-    assert abcd([101.7, 101.4, 101.3], 3e5)                  # a shallow pullback on drying volume
-    assert not abcd([101.2, 100.7, 100.4], 3e5)              # gave back most of the push
-    assert not abcd([101.7, 101.4, 101.3], 1.2e6)            # sold harder than it was bought
+def test_abcd_needs_a_real_higher_low_on_a_lighter_pullback():
+    assert _abcd([101.7, 101.4, 101.3])                                  # a shallow pullback on drying volume
+    assert not _abcd([101.2, 100.7, 100.4])                              # gave back most of the push
+    assert not _abcd([101.7, 101.4, 101.3], pullback_volume=1.2e6)       # sold harder than it was bought
+
+
+def test_abcd_draws_its_pullback_on_closed_candles_only():
+    # the push has just topped out: the candle just begun dipping on its first trades is not a pullback yet
+    assert not _abcd([], now=101.4, begun_volume=1e5)
+    # two closed candles pulled back to a low of 101.55: a price under it is C breaking, not a lower C
+    assert _abcd([101.75, 101.6])
+    [p] = _abcd([101.75, 101.6], now=101.58)
+    assert p.evidence["C"] == pytest.approx(101.55) and p.entry == pytest.approx(101.58)
+    assert not _abcd([101.75, 101.6], now=101.3, begun_volume=1e5)
+    # a pullback sold harder than the push was bought isn't thinned out by the begun candle's empty volume
+    assert _abcd([101.75, 101.6], push_volume=1.5e6)
+    assert not _abcd([101.75, 101.6], push_volume=1.5e6, pullback_volume=9e5)
+
+
+def test_abcd_refuses_a_last_candle_that_collapsed_through_the_pullback_low():
+    assert _abcd([101.75, 101.6])                     # stepped down to just under the first pullback low
+    assert not _abcd([101.75, 101.3])                 # closed half an ATR through it
+    # the first candle after B is measured against B's close: a long wick that closed near it holds,
+    # a candle that closed half an ATR under it collapsed
+    assert _abcd([101.92], last_low=101.5, now=101.55)
+    assert not _abcd([101.6], now=101.55)
 
 
 def test_stops_are_floored_at_a_slice_of_the_stocks_daily_range():

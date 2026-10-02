@@ -1543,7 +1543,7 @@ volume, the S/R map, the daily trend) are computed once per stock per scan.
 
 | key | timeframe | idea |
 |---|---|---|
-| `abcd_pattern` | intraday | hard push A→B, pullback to a **higher low C**; enter near C, target the B retest and measured move |
+| `abcd_pattern` | intraday | hard push A→B, pullback to a **higher low C**, drawn on **closed candles only** (the one still printing can't make the pullback, and a last candle that closed half an ATR through the pullback's low is refused); enter near C, never under it, target the B retest and measured move |
 | `bull_bear_flag` | intraday | near-vertical pole + tight sideways flag; enter on the flag break |
 | `opening_range_breakout` | intraday | break of the first N-min range **only when that range < the daily ATR**, VWAP-side stop |
 | `vwap_reclaim` | intraday | a **5-min close** back across session VWAP after ≥ 3 bars on the other side |
