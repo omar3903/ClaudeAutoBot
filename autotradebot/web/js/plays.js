@@ -452,7 +452,7 @@ function evidenceHTML(ev) {
   }
   const skip = new Set(["signal", "dcf", "football_field", "spark", "verdict", "peer_median", "target_multiples", "peers",
     "price_character", "vol_forecast", "market_regime", "evidence_weight", "at_entry", "hold_from_half_life",
-    "market_move", "next_earnings"]);
+    "market_move", "next_earnings", "as_confirmed", "last_look"]);
   const rest = Object.entries(ev).filter(([k]) => !skip.has(k));
   if (rest.length) {
     blocks.push(`<h4>Signal detail</h4><div class="kv">` +

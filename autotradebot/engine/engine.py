@@ -1363,11 +1363,13 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._size_plays(result.plays)
         # the cycles don't re-check valuation setups, so those stay. A quick re-check isn't a scan confirming
         # a setup - but with confirm_on_new_candle a day play counts candles, not scans, and a newer candle
-        # counts whichever scan read it
+        # counts whichever scan read it. A day play reaching Autopilot's confirmations is stamped confirmed:
+        # the review follows a play not taken from then
         self._score_plays(result.plays)
         changes = self.board.replace(result.plays, None if kind == "full" else result.symbols,
                                      keep=lambda p: p.kind.value == "FUNDAMENTAL", confirm=not quick,
-                                     new_candle=self.autopilot.confirm_on_new_candle)
+                                     new_candle=self.autopilot.confirm_on_new_candle,
+                                     min_confirmations=self.autopilot.min_confirmations)
         self._last_scans[kind] = result.summary()
         self._day_changed()
         if not quick:
@@ -2261,6 +2263,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             seen: Dict[str, Any] = {}
             chased = self._chase_check(p, pre["order_plan"], seen)
             if chased:
+                self._keep_last_look(p, chased, seen, operator)
                 return {"ok": False, "reason": chased}
 
             p.status = PlayStatus.ACCEPTED
@@ -2295,6 +2298,20 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self._snapshot_wake.set()
             self._day_changed(now=True)                   # a restart mustn't offer this setup again today
             return {"ok": out.get("ok", False), **out}
+
+    def _keep_last_look(self, p: Play, why: str, seen: Mapping[str, Any], operator: str) -> None:
+        """Keep a last look that refused an entry with its play, and the quote it read: the daily review follows
+        the setup as if it had been taken, and charges it the spread a fill would have crossed
+        (research/journal.py). The first is kept - the look when the entry was first wanted - and the board
+        carries it on to the scans that find the setup again (engine/board.py)."""
+        if p.status is not PlayStatus.PROPOSED or "last_look" in p.evidence:
+            return
+        p.evidence["last_look"] = {"at": dt.datetime.now(dt.timezone.utc).isoformat(), "by": operator, "why": why,
+                                   **{k: seen.get(k) for k in ("mid", "bid", "ask", "spread_bps")}}
+        try:
+            self.repo.record_play(p)                      # a setup the next scans don't find again keeps it too
+        except Exception:  # noqa: BLE001
+            log.debug("could not keep the last look at %s", p.id, exc_info=True)
 
     @staticmethod
     def _too_thin_reason(p: Play, risk) -> str:

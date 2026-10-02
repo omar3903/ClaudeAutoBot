@@ -1018,8 +1018,11 @@ def build() -> str:
       '<li><b>Board.</b> <code>PlayBoard.replace()</code> keeps the top 80, notes what joined and left, and '
       'publishes <code>plays.updated</code>. A day play counts a confirmation only when it is seen on a newer '
       '5-minute candle (<code>evidence.bar_at</code>), whichever scan reads it; a sighting more than two candles '
-      'after the last one counted starts the count again. The plays it took are logged to <code>play_logs</code> '
-      '- not a setup already acted on this session, and never over a row that was sent, filled or dismissed.</li>'
+      'after the last one counted starts the count again. When a day play\'s confirmations first reach '
+      'Autopilot\'s minimum it keeps that moment and the play as it stood (<code>evidence.confirmed_at</code>, '
+      '<code>as_confirmed</code>), which the daily review follows a play not taken from. The plays it took are '
+      'logged to <code>play_logs</code> - not a setup already acted on this session, and never over a row that '
+      'was sent, filled or dismissed.</li>'
       '<li><b>Autopilot.</b> <code>AutoPilot.consider()</code> walks the board highest score first and applies '
       'the gates in the next table. The first failing gate is the reason shown on the dashboard: the play\'s own '
       'checks live in one <code>_play_check()</code>, which the gate and the play\'s robot badge both call.</li>'
@@ -1081,7 +1084,8 @@ def build() -> str:
          "says which, and how old): refused when the spread is over 0.10R of the risk or the price has "
          "run 0.25R past the entry; within that the limit is priced off the quote; a day-trade entry unfilled "
          "after 10 minutes is cancelled; any entry filled in part 30 seconds ago and still working has the rest "
-         "cancelled, so the shares bought get their record and stop", "execution.max_spread_r, max_chase_r, "
+         "cancelled, so the shares bought get their record and stop; the first refusal and its quote are kept "
+         "with the play (evidence.last_look)", "execution.max_spread_r, max_chase_r, "
          "entry_timeout_min, partial_entry_wait_s"),
     ]))
     A(fig_states())
@@ -1191,7 +1195,9 @@ def build() -> str:
          "flag, and what the stock's own drift made (drift_r) and costs took (cost_r) while it was held",
          "the runner's sink -> repo.save_sim_trades"),
         ("shadow_trades", "one play shown and not taken, followed to its outcome on the session's candles, with "
-         "its features", "the 16:15 review -> repo.save_shadow_trades"),
+         "its features - from the moment it was confirmed, with the values it had then; an entry sent that never "
+         "filled is no fill, and a play the last look refused pays the spread it read",
+         "the 16:15 review -> repo.save_shadow_trades"),
     ]))
     A('<p>Three of the columns above are the learning storage: <code>trades.entry_context</code> holds the '
       'play\'s features at the fill (with <code>submitted_at</code> and <code>mfe_at</code>), and the two '
@@ -1428,9 +1434,10 @@ def build() -> str:
         ("execution/autopilot.py", "replay_loser(), replay_losers()", "with proof not asked for, a day setup with "
          "evidence it loses - its replay and held-out sessions, or its own trades - is skipped; listed for the "
          "settings and kept with each trade"),
-        ("engine/board.py", "PlayBoard.replace(new_candle=...), MAX_CANDLE_GAP", "a day play's confirmation counts "
-         "only on a newer 5-minute candle (evidence.bar_at), whichever scan reads it; more than 2 candles between "
-         "sightings starts the count again"),
+        ("engine/board.py", "PlayBoard.replace(new_candle=..., min_confirmations=...), MAX_CANDLE_GAP",
+         "a day play's confirmation counts only on a newer 5-minute candle (evidence.bar_at), whichever scan reads "
+         "it; more than 2 candles between sightings starts the count again; reaching Autopilot's minimum stamps "
+         "evidence.confirmed_at"),
         ("risk/position_sizing.py", "liquidity_cap()", "one order's shares are at most risk.max_adv_pct (1%) of the "
          "stock's median daily volume over 20 completed sessions (evidence.adv_shares); under one share the engine "
          "refuses the play as too thin"),

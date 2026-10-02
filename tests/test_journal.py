@@ -138,7 +138,8 @@ def test_a_play_not_taken_enters_on_the_bar_after_the_scan_that_wrote_its_row_fi
 
 def test_an_entry_sent_and_never_filled_is_followed_as_sent_even_past_the_cap(monkeypatch):
     """A setup whose entry went out and never filled is followed from the row it was sent from - what it
-    was sent on, from the moment it went out - in place of its first sighting, whatever its score."""
+    was sent on, from the moment it went out - in place of its first sighting, whatever its score. It made
+    nothing, so it is no fill; what it would have made had it filled is kept apart."""
     import autotradebot.research.journal as journal
 
     monkeypatch.setattr(journal, "MAX_SHADOWS", 1)
@@ -156,11 +157,15 @@ def test_an_entry_sent_and_never_filled_is_followed_as_sent_even_past_the_cap(mo
     rows = {r["play_id"]: r for r in shadows["plays"]}
     assert set(rows) == {"p1", "q2"}
     assert (rows["q2"]["sent"], rows["q2"]["passed_checks"], rows["q2"]["confirmations"]) == (True, True, 2)
-    assert (rows["q2"]["offered_at"], rows["q2"]["entered_at"]) == (f"{DAY}T10:01:10-04:00", f"{DAY}T10:05:00-04:00")
+    assert rows["q2"]["offered_at"] == f"{DAY}T10:01:10-04:00"
+    assert (rows["q2"]["filled"], rows["q2"]["r"], rows["q2"]["entered_at"]) == (False, None, None)
+    assert rows["q2"]["exit_reason"] == "no fill - the entry was sent and never filled"
+    assert rows["q2"]["if_filled_r"] == 1.5                              # from the 10:05 open, had its limit filled
     assert rows["q2"]["features"]["minutes_since_open"] == 31.2          # its features as it was sent, not first seen
-    assert rows["p1"]["sent"] is False
+    assert rows["p1"]["sent"] is False and (rows["p1"]["filled"], rows["p1"]["if_filled_r"]) == (True, None)
+    assert (shadows["filled"], shadows["summary"]["trades"]) == (1, 1)  # the entry that made nothing isn't a trade
     assert ("3 day setups weren't taken; the 1 highest-scoring and the 1 entry sent below them were followed on the "
-            "session's candles") in " ".join(review["lessons"])
+            "session's candles and 1 would have filled") in " ".join(review["lessons"])
 
 
 def test_an_entry_still_marked_sent_with_no_trade_booked_is_followed_not_counted_as_taken():
@@ -178,6 +183,50 @@ def test_an_entry_still_marked_sent_with_no_trade_booked_is_followed_not_counted
         assert first_sightings(plays, limit=None, booked=["p2"]) == []
         taken = _review(plays=plays, opened=[booked])["shadows"]
         assert (taken["eligible"], taken["followed"], taken["sent_unfilled"]) == (0, 0, 0)
+
+
+def test_a_confirmed_play_is_followed_from_when_autopilot_would_have_taken_it_with_the_values_it_had_then():
+    """Autopilot takes a day play when its confirmations reach its minimum: the shadow enters on the next bar
+    after that moment, with the values the play had then - a later scan rewrote its row at its own prices. A
+    play never stamped is followed as before; an entry sent is followed from when it went out, as sent."""
+    late = {**_row("c1", "13:47"), "confirmations": 3, "scan_finished_at": f"{DAY}T14:05:30"}     # last written 10:05:30
+    [row] = _review(plays=[late])["shadows"]["plays"]
+    assert (row["confirmed_at"], row["offered_at"]) == (None, f"{DAY}T10:05:30-04:00")
+    assert (row["filled"], row["exit_reason"]) == (False, "no fill - the price had already moved away")
+
+    stamp = {"confirmed_at": f"{DAY}T13:57:20+00:00",                                           # 09:57:20 in New York
+             "as_confirmed": {"entry": 100.0, "stop": 99.5, "targets": [101.5], "noise": [], "confirmations": 2,
+                              "confidence": 0.6, "reward_risk": 3.0, "score": 0.8, "probability": 0.5}}
+    confirmed = {**late, "evidence": stamp}
+    [row] = _review(plays=[confirmed])["shadows"]["plays"]
+    assert row["confirmed_at"] == row["offered_at"] == f"{DAY}T09:57:20-04:00"
+    assert (row["entered_at"], row["entry"], row["r"]) == (f"{DAY}T10:00:00-04:00", 100.0, 3.0)   # 1.50 over 0.50
+    assert (row["confirmations"], row["reward_risk"], row["score"]) == (2, 3.0, 0.8)
+    assert row["features"]["minutes_since_open"] == 27.3 and row["features"]["confirmations"] == 2
+
+    sent = {**confirmed, "status": "CANCELED", "scan_finished_at": f"{DAY}T14:00:05",
+            "evidence": {**stamp, "at_entry": {"at": f"{DAY}T10:01:10-04:00"}}}
+    [row] = _review(plays=[sent])["shadows"]["plays"]
+    assert (row["confirmed_at"], row["offered_at"], row["filled"]) == (None, f"{DAY}T10:01:10-04:00", False)
+    assert row["if_filled_r"] == 1.5                                     # what it was sent on, from the 10:05 open
+
+
+def test_a_play_the_last_look_refused_pays_the_spread_that_look_read():
+    """A play the last look turned away is followed as if taken, less the spread the look read - a fill
+    crosses it and the candles don't show it - in R of the shadow trade's own risk."""
+    look = {"at": f"{DAY}T13:57:30+00:00", "by": "autopilot", "why": "the spread is too dear to cross",
+            "bid": 99.9, "ask": 100.1, "mid": 100.0, "spread_bps": 20.0}
+    refused = {**_row("p1", "13:57"), "evidence": {"last_look": look}}
+    shadows = _review(plays=[refused])["shadows"]
+    [row] = shadows["plays"]
+    assert (row["filled"], row["spread_r"], row["r"]) == (True, 0.2, 1.8)    # 2R less a 0.20 spread on a 1.00 risk
+    assert shadows["summary"]["total_r"] == 1.8
+    quoted = {**refused, "evidence": {"last_look": {**look, "bid": None, "ask": None}}}   # the spread in bps only
+    [row] = _review(plays=[quoted])["shadows"]["plays"]
+    assert (row["spread_r"], row["r"]) == (0.2, 1.8)
+    blind = {**refused, "evidence": {"last_look": {**look, "bid": None, "ask": None, "spread_bps": None}}}
+    [row] = _review(plays=[blind])["shadows"]["plays"]                       # a look that read no quote
+    assert (row["spread_r"], row["r"]) == (None, 2.0)
 
 
 def test_the_lessons_and_the_strategies_real_record_against_the_replay():

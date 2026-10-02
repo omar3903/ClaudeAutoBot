@@ -839,9 +839,11 @@ match too, so check the untracked shares first).
 trade record stores the fill against it: `decision_price`, `spread_bps`,
 `entry_slippage_bps`, and for exits `exit_decision_price`, `exit_slippage_bps` -
 the implementation shortfall. On live quotes an entry is refused when the spread
-is more than `execution.max_spread_r` (0.10) of the distance to the stop. The
-daily review averages the measured slippage and says when the account pays more
-than the replay charges.
+is more than `execution.max_spread_r` (0.10) of the distance to the stop. A look
+that refuses an entry keeps its quote with the play (`last_look`, the first
+refusal), and the daily review charges that spread to the play's shadow trade.
+The daily review averages the measured slippage and says when the account pays
+more than the replay charges.
 
 ---
 
@@ -1414,7 +1416,7 @@ and they're added once it is. For each mover:
 * **what the bot made of it** — *traded* (with the move or against it, R and P/L),
   *sent, not filled* (an entry went out — Autopilot's or yours — and no trade came of it;
   the row it was sent from is listed beside the setup's first sighting, with what it would
-  have made followed on the candles),
+  have made had it filled, followed on the candles),
   *offered, not taken* (and what the setup would have made, followed on the candles),
   *watched, no setup* (on the hot list, adopted into it, or scanned from a sector buffer),
   or *not watched* — and why: the morning's ranking put it #412 of 2,950, it was too thin
@@ -1446,11 +1448,19 @@ ranking of the previous day's candles can't see them, and the report says so.
   before it was confirmed, going straight back into a stock that had just lost, a
   strategy without a proven record;
 * **the plays not taken**, each followed on the session's 5-minute candles as if
-  it had been, from the next bar after it was on the board with the values it was
-  recorded with (a play's row holds the last scan that wrote it, and a scan's plays
-  reach the board when it finishes); an entry sent that never filled (a sent row
-  no trade was booked from, even one still marked submitted) is followed
-  from the row it was sent from, from the moment it went out, however it scored —
+  it had been, the way Autopilot enters: from the next bar after its confirmations
+  first reached Autopilot's minimum, with the values it had then (the board keeps
+  that moment and those values in the play's evidence, `confirmed_at` and
+  `as_confirmed` - each scan writes the play at its own prices). A play never
+  confirmed, or logged before that moment was kept, is followed from the next bar
+  after it was on the board with the values it was recorded with (a play's row
+  holds the last scan that wrote it, and a scan's plays reach the board when it
+  finishes). A play the last look refused pays the spread that look read, in R of
+  its risk - the refusal and its quote are kept with the play (`last_look`). An
+  entry sent that never filled (a sent row no trade was booked from, even one
+  still marked submitted) is followed from the row it was sent from, from the
+  moment it went out, however it scored, and counts as no fill: it made nothing,
+  and what it would have made had it filled is kept apart for the Reports page —
   grouped by noise flag and by whether Autopilot's checks passed
   it, so every check is tested on live plays every day. The checks are the ones in
   force that session, as the last Autopilot entry recorded them (a rebuild keeps
