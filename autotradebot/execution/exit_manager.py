@@ -103,7 +103,7 @@ class ExitManager:
         self.bus = bus
         self._tries: Dict[str, Tuple[int, float]] = {}  # trade id -> (exits sent, monotonic time the next may go)
         self._last_failure: Dict[str, str] = {}         # trade id -> the failure last published
-        self._waiting: Dict[str, Tuple[float, float]] = {}   # trade id -> (when its exit began waiting, last waited)
+        self._waiting: Dict[str, float] = {}                 # trade id -> when its exit began waiting on the broker
         self._wait_warned: Dict[str, float] = {}             # trade id -> when that wait was last reported
         self._overdue_seen: set = set()     # trade ids we've already flagged as overdue
         self._not_held: set = set()         # trade ids whose position the broker doesn't show
@@ -236,12 +236,9 @@ class ExitManager:
     def _note_wait(self, tid: str, reason: str, why: str, tries: int, now: float) -> None:
         """Log an exit's wait on the broker - and once it has gone on past WAIT_WARN_S, report it like a failed exit,
         again every WAIT_REPEAT_S: a wait is no failed try, but one that doesn't end leaves the position without its
-        exit, and that must not go unseen. An exit not tried for a while (the price came back) starts a fresh wait."""
-        since, last = self._waiting.get(tid, (now, now))
-        if now - last > 3 * self.WAIT_RETRY_S:
-            since = now
-            self._wait_warned.pop(tid, None)
-        self._waiting[tid] = (since, now)
+        exit, and that must not go unseen. It ends when a full pass wants no exit for the trade (the price came back:
+        _manage) - never for the time between tries, which one waiting out an order list that times out stretches."""
+        since = self._waiting.setdefault(tid, now)
         if self._last_failure.get(tid) != why:
             self._last_failure[tid] = why
             log.info("AUTO-EXIT %s (%s) waits - next try in %.0fs: %s", tid, reason, self.WAIT_RETRY_S, why)
@@ -408,6 +405,11 @@ class ExitManager:
                     return close("time-stop")
             except Exception:  # noqa: BLE001
                 pass
+
+        if full:
+            # no exit wanted on a full pass: a wait its exit had on the broker is over - wanted again, it starts afresh
+            self._waiting.pop(t["id"], None)
+            self._wait_warned.pop(t["id"], None)
 
         # --- 3. move the protective stop in our favour ------------ #
         if not managed or risk_ps <= 0:

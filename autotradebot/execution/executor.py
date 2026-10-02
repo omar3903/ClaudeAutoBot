@@ -288,7 +288,10 @@ class Executor(ProtectiveStops):
 
     def _working_or_none(self) -> Optional[List[OrderResult]]:
         """The orders working at the broker, or None when it couldn't be asked - for the callers that
-        must tell "nothing is working" from "not known"."""
+        must tell "nothing is working" from "not known". A broker that isn't connected isn't asked:
+        it can say nothing of its orders then."""
+        if getattr(self.broker, "is_connected", True) is False:
+            return None
         try:
             return [o for o in self.broker.list_orders("WORKING")
                     if o.status not in DONE_STATUSES and o.side is not None]
@@ -501,7 +504,17 @@ class Executor(ProtectiveStops):
                     "reason": f"An exit for this {t['symbol']} position is already being sent, or its orders at the "
                               f"broker are being changed this moment - try again in a few seconds."}
         try:
-            return self._send_exit(t, reason, limit_price, qty, after_fill, decision_price)
+            # whoever held the trade's orders while this close waited for them may have sent its exit, or booked the
+            # stop's fill: the record and the exits working are read again before anything goes to the broker
+            fresh = self.repo.get_trade(trade_id)
+            if not fresh:
+                return {"ok": False, "reason": "trade not open"}
+            if fresh["status"] == "CLOSED":
+                return {"ok": True, "status": "FILLED", "trade": fresh}
+            if trade_id in self.pending_exit_trade_ids():
+                return {"ok": False,
+                        "reason": f"An exit order for this {t['symbol']} position is already working."}
+            return self._send_exit(fresh, reason, limit_price, qty, after_fill, decision_price)
         finally:
             self._release_resting(trade_id)
 

@@ -28,6 +28,12 @@ class OrderRejected(BrokerError):
     pass
 
 
+class OrderInDoubt(OrderRejected):
+    """The broker won't change an order until it says what became of it - a cancel or a change it refused has left
+    it working, as far as anyone knows. No refusal of the change: the order may well still rest, so it is waited
+    for, never replaced."""
+
+
 class AuthError(BrokerError):
     pass
 

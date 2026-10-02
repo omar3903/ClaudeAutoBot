@@ -312,7 +312,26 @@ def test_a_rebuild_leaves_the_pair_alone_while_an_exit_is_standing_it_down():
     ex.sync_open_orders()
     repo.update_trade_risk("t1", target_price=106.0)                          # the pair has the wrong shape now
     assert ex._claim_resting("t1")                                             # a close on another thread holds it
-    assert ex._rebuild(repo.get_trade("t1")) is False
+    assert ex._rebuild(repo.get_trade("t1"), ex._orders_for_certain()) is False
     assert broker.cancelled == [] and len(broker.orders) == 2                  # nothing stood down, nothing placed
     ex._release_resting("t1")
-    assert ex._rebuild(repo.get_trade("t1")) is True and sorted(broker.cancelled) == ["1", "2"]
+    assert ex._rebuild(repo.get_trade("t1"), ex._orders_for_certain()) is True
+    assert sorted(broker.cancelled) == ["1", "2"]
+
+
+def test_a_pair_is_never_stood_down_to_be_placed_afresh_while_the_order_list_cant_be_read():
+    from test_order_follow_up import _unanswered
+
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()                                                      # stop 1 and target 2 rest together
+    broker.live["2"].status, broker.live["2"].raw = "CANCELED", {"cancel_confirmed": True}   # the target is gone
+    ex.sync_open_orders()
+    assert ex.resting_targets() == [] and ex.protective_stops()[0]["order_id"] == "1"
+    ex._target_retry.clear()                                                   # a fresh pair is due...
+    listed, broker.list_orders = broker.list_orders, _unanswered               # ...but the broker's orders can't be read
+    ex.sync_open_orders()
+    assert broker.cancelled == [] and ex.protective_stops()[0]["order_id"] == "1"   # the stop rests on
+    broker.list_orders = listed
+    ex.sync_open_orders()                                                      # read: stood down and placed afresh
+    assert broker.cancelled == ["1"] and ex.protective_stops()[0]["order_id"] == "3"
+    assert broker.stops()[-1].oca_group == broker.targets()[-1].oca_group != broker.stops()[0].oca_group

@@ -34,7 +34,7 @@ from ..config import get_settings
 from ..core.enums import OrderType, Side, TimeInForce
 from ..core.models import Account, Fill, OrderRequest, OrderResult, Position, Quote
 from ..util.net import port_is_open
-from .base import AuthError, BrokerAdapter, BrokerError, OrderRejected
+from .base import DONE_STATUSES, AuthError, BrokerAdapter, BrokerError, OrderInDoubt, OrderRejected
 
 log = logging.getLogger(__name__)
 
@@ -370,8 +370,9 @@ class IbkrBroker(BrokerAdapter):
             self._session.run_coro(lambda ib: _sleep(1.0), timeout=5)
         except Exception:  # noqa: BLE001
             pass
-        self._connected = True
+        # the time first: no one may see the connection up with an earlier one's time - its re-sync not yet begun
         self.connected_since, self.down_since = time.monotonic(), None
+        self._connected = True
         self._servers_lost_at, self._servers_lost_code = None, 0
         if not self.account_id:
             try:
@@ -570,7 +571,7 @@ class IbkrBroker(BrokerAdapter):
             if errorCode in _CANCEL_REFUSED:
                 return
         else:
-            self._modify_heard(reqId)
+            self._modify_heard(reqId, errorCode)
         if errorCode in _SERVERS_BACK or (errorCode in _FARMS_OK and self._servers_lost_code == 2110):
             self._servers_back(errorCode)
             return
@@ -631,14 +632,16 @@ class IbkrBroker(BrokerAdapter):
         log.warning("IBKR refused to cancel order %s (%s, state: %s) - it may still fill, so it reads as working "
                     "until IBKR says it filled or is cancelled", order_id, code, state or "not given")
 
-    def _modify_heard(self, order_id: int) -> None:
-        """An error on an order a modify was sent for. Within MODIFY_REFUSED_WITHIN_S of the modify it is IBKR's
-        answer to it - the order works on as it was (_true_status), its trigger and shares put back to what IBKR
-        still holds, so a move refused after modify_stop took IBKR's silence for a yes reads as not made. Later, it
-        is IBKR's word on the order itself (a stop rejected as it triggers, say), and the note goes: what ends the
-        order then must read as its end, not as a refused move. (ib_async logs no error on an order it already has
-        down as finished - after a refused move, say - so it is only heard here.) Runs on the loop thread, from
-        _on_error."""
+    def _modify_heard(self, order_id: int, code: int = 0) -> None:
+        """An error on an order a modify was sent for. Within MODIFY_REFUSED_WITHIN_S of the modify, one that refuses
+        it - an error ib_async took for the order's end, or a warning that says no (_MODIFY_REFUSED_WARNINGS), as
+        _modify_answer reads them - is IBKR's answer to it: the order works on as it was (_true_status), its trigger
+        and shares put back to what IBKR still holds, so a move refused after modify_stop took IBKR's silence for a
+        yes reads as not made. Any other warning (an order message IBKR sends with a change it took - 399, held until
+        the open, say) leaves the change made. Later, an error is IBKR's word on the order itself (a stop rejected as
+        it triggers, say), and the note goes: what ends the order then must read as its end, not as a refused move.
+        (ib_async logs no error on an order it already has down as finished - after a refused move, say - so it is
+        only heard here.) Runs on the loop thread, from _on_error."""
         note = self._modifying.get(str(order_id))
         if note is None:
             return
@@ -647,7 +650,8 @@ class IbkrBroker(BrokerAdapter):
             return
         try:
             trade = next((t for t in self._ib.trades() if str(getattr(t.order, "orderId", "")) == str(order_id)), None)
-            if trade is not None:
+            if trade is not None and (getattr(trade.orderStatus, "status", "") == "Cancelled"
+                                      or code in _MODIFY_REFUSED_WARNINGS):
                 trade.order.auxPrice, trade.order.totalQuantity = note[3]
         except Exception:  # noqa: BLE001 - IBKR's own list puts the order right when it is next read
             log.debug("could not put order %s back as IBKR holds it", order_id, exc_info=True)
@@ -669,8 +673,8 @@ class IbkrBroker(BrokerAdapter):
                 self._ib.client.reqPositions()
             except Exception:  # noqa: BLE001
                 pass
-        self._connected = True
         self.connected_since, self.down_since = time.monotonic(), None
+        self._connected = True
         log.warning("IBKR: IB Gateway reached IBKR's servers again (%s)", code)
 
     # ---- contracts ------------------------------------------------------ #
@@ -1232,9 +1236,12 @@ class IbkrBroker(BrokerAdapter):
         if trade is None:
             raise OrderRejected(f"IBKR: no live order {order_id} to modify")
         if getattr(trade.orderStatus, "status", "") in _IB_DONE:
-            # ib_async sends no change for an order it has down as finished - one whose cancel IBKR refused may
-            # still be working, but nothing is changed until IBKR says what became of it
-            raise OrderRejected(f"IBKR: order {order_id} can't be changed until IBKR says what became of it")
+            # ib_async sends no change for an order it has down as finished. One whose cancel or last change IBKR
+            # refused is still working, as far as IBKR has said - nothing is changed until it says what became of it
+            # (its list of open orders puts ib_async right), and the order is no refusal to be replaced for that
+            if self._true_status(trade) not in DONE_STATUSES:
+                raise OrderInDoubt(f"IBKR: order {order_id} can't be changed until IBKR says what became of it")
+            raise OrderRejected(f"IBKR: order {order_id} is finished - nothing to change")
         order = trade.order
         before = (getattr(order, "auxPrice", None), getattr(order, "totalQuantity", None))
         if stop_price is not None:
@@ -1334,7 +1341,8 @@ class IbkrBroker(BrokerAdapter):
 
     def list_orders(self, status: Optional[str] = None) -> List[OrderResult]:
         if not self.is_connected:
-            return []
+            # no list at all - an empty one would read as "nothing is working" beside a stop that rests
+            raise AuthError("IBKR not connected")
         if status in (None, "OPEN", "WORKING"):
             trades = self._open_orders()
         else:
