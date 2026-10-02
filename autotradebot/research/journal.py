@@ -28,7 +28,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-import math
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -40,6 +39,7 @@ from ..scanner.noise import LABELS as NOISE_LABELS
 from ..util import clock
 from .features import play_features
 from .replay import ReplaySettings, shadow_trade
+from .significance import welch_t
 
 log = logging.getLogger(__name__)
 
@@ -299,17 +299,6 @@ def _offered_at(row: Mapping[str, Any], seen_at: pd.Timestamp) -> pd.Timestamp:
     return max([seen_at, *(t for t in later if t is not None)])
 
 
-def _welch_t(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
-    """How many standard errors apart two groups' averages are (Welch's t, which doesn't assume the two
-    spreads are alike). None when either group has no spread to measure, so a difference must stand on its size."""
-    if len(a) < 2 or len(b) < 2:
-        return None
-    ma, mb = sum(a) / len(a), sum(b) / len(b)
-    se = math.sqrt(sum((x - ma) ** 2 for x in a) / (len(a) - 1) / len(a)
-                   + sum((x - mb) ** 2 for x in b) / (len(b) - 1) / len(b))
-    return (ma - mb) / se if se else None
-
-
 def _compare(flagged: Sequence[Mapping[str, Any]], rest: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     def avg(rows):
         return round(sum(r["r"] for r in rows) / len(rows), 3) if rows else None
@@ -318,7 +307,7 @@ def _compare(flagged: Sequence[Mapping[str, Any]], rest: Sequence[Mapping[str, A
         out["verdict"] = "too few plays to tell"
         return out
     f_rs, r_rs = [r["r"] for r in flagged], [r["r"] for r in rest]
-    diff, t = sum(f_rs) / len(f_rs) - sum(r_rs) / len(r_rs), _welch_t(f_rs, r_rs)
+    diff, t = sum(f_rs) / len(f_rs) - sum(r_rs) / len(r_rs), welch_t(f_rs, r_rs)
     out["t"] = round(t, 2) if t is not None else None
     # a few hundredths of an R, or a gap one lucky play could make, is a session's noise, not the check's doing -
     # and only the first is told as the two sides doing about as well: a wide gap that noisy isn't a tie either

@@ -111,8 +111,8 @@ function replayHTML() {
   const learned = new Set(rp.learned_skips || []);
   const noise = rp.noise
     ? `<table class="ev-table replay-noise"><tr><th>Noise check</th><th class="num">Removes</th><th class="num">Their average</th><th class="num">Kept average</th><th>Verdict</th><th>Held-out sessions</th></tr>` +
-      Object.entries(rp.noise).map(([check, n]) => `<tr><td>${escapeHtml(labels[check] || check)}${learned.has(check) ? ` <span class="badge good" title="It removed losers on every session and on the held-out ones, so Autopilot skips it">Autopilot skips it</span>` : ""}</td><td class="num">${n.removes}</td>
-        <td class="num">${inR(n.removed_avg_r)}</td><td class="num">${inR(n.kept_avg_r)}</td><td>${escapeHtml(n.verdict)}</td><td>${escapeHtml((n.held_out || {}).verdict || "–")}</td></tr>`).join("") +
+      Object.entries(rp.noise).map(([check, n]) => `<tr><td>${escapeHtml(labels[check] || check)}${learned.has(check) ? ` <span class="badge good" title="The trades it removed averaged 0.05R or more worse over every session, two standard errors or more apart, and worse on the held-out sessions too, so Autopilot skips it">Autopilot skips it</span>` : ""}</td><td class="num">${n.removes}</td>
+        <td class="num">${inR(n.removed_avg_r)}</td><td class="num">${inR(n.kept_avg_r)}</td><td${n.t != null ? ` title="The two averages are ${num(Math.abs(n.t), 1)} standard errors apart (Welch's t ${num(n.t, 2)}); Autopilot learns a skip from -2 or lower"` : ""}>${escapeHtml(n.verdict)}</td><td>${escapeHtml((n.held_out || {}).verdict || "–")}</td></tr>`).join("") +
       `</table>`
     : "";
   return `<div class="replay-box">

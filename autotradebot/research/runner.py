@@ -370,7 +370,7 @@ class ReplayRunner:
         summary["trade_count"] = len(trades)
         summary["records"] = strategy_records(trades, split=data["held_out_from"])
         summary["noise"] = {check: {"removes": row["removes"], "removed_avg_r": row["removed_avg_r"],
-                                    "kept_avg_r": row["kept_avg_r"], "verdict": row["verdict"],
+                                    "kept_avg_r": row["kept_avg_r"], "t": row.get("t"), "verdict": row["verdict"],
                                     "held_out_verdict": (row.get("held_out") or {}).get("verdict")}
                             for check, row in data["noise"].items()}
         try:

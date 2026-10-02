@@ -204,6 +204,38 @@ def test_records_and_noise_verdicts_are_also_given_for_the_held_out_sessions():
     assert learned_skips(report) == ["not_trending"]                            # it has to hold up on both
 
 
+def _spread(avg, n, day, noise=(), spread=0.5):
+    """``n`` trades on ``day`` averaging ``avg``R, ``spread``R either side of it."""
+    return [_sim(avg + (spread if i % 2 else -spread), day, noise) for i in range(n)]
+
+
+def test_the_noise_report_says_how_many_standard_errors_apart_the_removed_and_kept_trades_are():
+    row = noise_report(_spread(-0.5, 10, "2026-08-20", ["not_trending"]) + _spread(0.5, 10, "2026-08-20"))["not_trending"]
+    assert row["t"] == -4.24                    # 1R apart over sqrt(2 x 0.5^2 x 10/9 / 10): Welch's t, removed minus kept
+    few = noise_report(_spread(-0.5, 4, "2026-08-20", ["not_trending"]) + _spread(0.5, 10, "2026-08-20"))
+    assert few["not_trending"]["verdict"] == "too few trades to tell" and few["not_trending"]["t"] is None
+
+
+def test_a_check_is_learned_only_on_a_gap_that_matters_stands_out_of_the_noise_and_holds_up_held_out():
+    split, early, late = {"INTRADAY": "2026-09-01", "SWING": None}, "2026-08-20", "2026-09-03"
+    kept = _spread(0.3, 40, early, spread=0.05) + _spread(0.3, 20, late, spread=0.05)
+
+    def removing(avg, spread, held_avg=None):
+        flagged = (_spread(avg, 30, early, ["not_trending"], spread)
+                   + _spread(avg if held_avg is None else held_avg, 16, late, ["not_trending"], spread))
+        report = noise_report(kept + flagged, split)
+        return learned_skips(report), report["not_trending"]
+
+    skips, row = removing(0.1, 0.5)                    # 0.2R worse, about 2.7 standard errors, and worse held out
+    assert skips == ["not_trending"] and row["t"] <= -2
+    skips, row = removing(0.27, 0.05)                  # far out of the noise, but 0.03R is too small a gap to matter
+    assert skips == [] and row["verdict"].startswith("helps") and row["t"] <= -2
+    skips, row = removing(0.0, 2.0)                    # 0.3R worse, but about one standard error: inside the noise
+    assert skips == [] and row["verdict"].startswith("helps") and -2 < row["t"] < 0
+    skips, row = removing(-0.3, 0.3, held_avg=0.5)     # clearly worse over every session, better on the held-out ones
+    assert skips == [] and row["t"] <= -2 and row["held_out"]["verdict"].startswith("hurts")
+
+
 def test_the_held_out_sessions_are_the_latest_third():
     assert held_out_from(DAY, 3) == "2026-09-10"
     assert held_out_from(DAY, 60) == sorted(clock.last_n_sessions(DAY, 60))[40].isoformat()

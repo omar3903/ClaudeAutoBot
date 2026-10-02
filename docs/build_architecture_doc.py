@@ -1259,7 +1259,8 @@ def build() -> str:
       'of one stock for day trades), runs them on a <code>ProcessPoolExecutor</code> with every core but two, '
       'and merges the simulated trades into per-strategy records: trade count, win rate, expectancy in R, '
       'profit factor, worst drawdown, and the same block for the held-out sample. It also learns which noise '
-      'checks are worth skipping (<code>learned_skips</code>).</p>')
+      'checks are worth skipping (<code>learned_skips</code>): only one whose removed trades averaged 0.05R or '
+      'more worse than the kept ones, with a Welch t of -2 or lower, and worse on the held-out sessions too.</p>')
     A('<p><b>Proof rule.</b> Autopilot, with <code>require_proven</code> on, refuses a strategy whose record '
       'does not show at least 30 trades averaging +0.05R with a positive held-out sample of at least 10. That is '
       'why no swing trade was taken on 16 September: the records were negative or too thin. In <b>Live</b> the '

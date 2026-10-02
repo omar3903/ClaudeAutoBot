@@ -1033,8 +1033,12 @@ taken, averaging at least `min_replay_expectancy_r` (+0.05R) — **and** at leas
 of them in the held-out latest third of the sessions, averaging more than 0R
 there. The statistical noise checks (`not_trending`, `not_mean_reverting`,
 `turbulent_market`) and the two news checks (`news_driven_move`,
-`move_without_news`) are skipped by themselves once the replay shows that the
-trades they remove did worse on every session and on the held-out ones. Each
+`move_without_news`) are skipped by themselves once the replay shows real
+evidence that the trades they remove are worse: over every session they averaged
+at least 0.05R a trade below the ones kept, two standard errors or more apart
+(Welch's t of -2 or lower), and they did worse on the held-out sessions too. A
+gap of a few hundredths of an R, or one inside the noise, would flip the skip on
+and off from one replay to the next. Each
 entry risks no more than `risk.max_risk_per_trade_pct`, lowered to **half-Kelly**
 when the strategy's record calls for less.
 

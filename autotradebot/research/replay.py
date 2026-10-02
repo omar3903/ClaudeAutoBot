@@ -18,7 +18,9 @@ Two things come out of it:
   the plays it would actually take - is good enough (see AutoPilot).
 * per noise check, the trades it would have removed against the ones it keeps.
   A check whose removed trades did better than the kept ones is throwing winners
-  away, and shows up that way.
+  away, and shows up that way. Autopilot skips a statistical or news check by
+  itself only on real evidence: the trades it removes averaged 0.05R or more worse,
+  two standard errors apart (Welch's t), and worse in the held-out sessions too.
 
 Chan's rules for a backtest worth believing (*Quantitative Trading*, ch. 3):
 
@@ -73,7 +75,7 @@ from .features import play_features
 from ..scanner.noise import CHECKS, LEARNABLE_CHECKS, NoiseSettings, context_flags
 from ..strategies.base import Strategy, StrategyContext
 from ..util import clock
-from .significance import judge, reality_check
+from .significance import judge, reality_check, welch_t
 
 NY = "America/New_York"
 BAR = pd.Timedelta(minutes=5)
@@ -82,6 +84,12 @@ LIVE_DAILY_BARS = 300                # ...and at the daily candles the live stor
                                      # however long the replayed history, a setup sees what it would have seen live
 #: fewer removed trades than this and a check's verdict is only noise itself
 MIN_SAMPLE = 10
+#: Autopilot learns to skip a check only on real evidence: over every session the trades it removes averaged
+#: at least this much worse a trade than the ones it keeps...
+LEARN_MIN_GAP_R = 0.05
+#: ...this many standard errors or more below them (Welch's t; -2 is about the 5% level), and the held-out
+#: sessions lean the same way. A gap of a few hundredths of an R, or one inside the noise, flips from run to run
+LEARN_MAX_T = -2.0
 MEASURED_CHECKS = CHECKS + ("unconfirmed",)
 HELD_OUT_FRACTION = 1 / 3
 
@@ -667,24 +675,39 @@ def _partition(trades: Sequence[SimTrade], test) -> Tuple[List[SimTrade], List[S
 
 def learned_skips(report: Optional[Mapping[str, Mapping[str, Any]]]) -> List[str]:
     """The checks from the books' statistics and the news that the replay shows are worth
-    skipping: the trades they remove did worse over every session and over the held-out
-    sessions too."""
+    skipping: over every session the trades they remove did clearly worse - LEARN_MIN_GAP_R a
+    trade or more, and LEARN_MAX_T standard errors or further below the ones they keep - and over
+    the held-out sessions they did worse too. A result from before the replay measured its t
+    teaches nothing until the next replay."""
     out = []
     for check in LEARNABLE_CHECKS:
         row = (report or {}).get(check) or {}
-        if str(row.get("verdict", "")).startswith("helps") and \
-                str((row.get("held_out") or {}).get("verdict", "")).startswith("helps"):
+        removed, kept, t = row.get("removed_avg_r"), row.get("kept_avg_r"), row.get("t")
+        if removed is None or kept is None or t is None:
+            continue
+        # the averages are kept to a thousandth, so a gap of exactly the margin isn't lost to rounding
+        clear = kept - removed >= LEARN_MIN_GAP_R - 1e-9 and t <= LEARN_MAX_T
+        if clear and str((row.get("held_out") or {}).get("verdict", "")).startswith("helps"):
             out.append(check)
     return out
 
 
 def _compare(removed: Sequence[SimTrade], kept: Sequence[SimTrade]) -> Dict[str, Any]:
-    def avg(ts):
-        return round(sum(t.r for t in ts) / len(ts), 3) if ts else None
-    out = {"removes": len(removed), "keeps": len(kept), "removed_avg_r": avg(removed), "kept_avg_r": avg(kept)}
+    """The trades a check removes against the ones it keeps: their averages, the verdict on which did
+    worse, and ``t`` - how many standard errors apart the two averages are (Welch's t, removed minus
+    kept, so negative when the removed trades did worse; None with too few trades or no spread)."""
+    removed_rs, kept_rs = [t.r for t in removed], [t.r for t in kept]
+
+    def avg(rs):
+        return round(sum(rs) / len(rs), 3) if rs else None
+    out = {"removes": len(removed), "keeps": len(kept), "removed_avg_r": avg(removed_rs), "kept_avg_r": avg(kept_rs),
+           "t": None}
     if len(removed) < MIN_SAMPLE or not kept:
         out["verdict"] = "too few trades to tell"
-    elif out["removed_avg_r"] < out["kept_avg_r"]:
+        return out
+    t = welch_t(removed_rs, kept_rs)
+    out["t"] = round(t, 2) if t is not None else None
+    if out["removed_avg_r"] < out["kept_avg_r"]:
         out["verdict"] = "helps - the trades it removes did worse"
     else:
         out["verdict"] = "hurts - the trades it removes did as well or better"
