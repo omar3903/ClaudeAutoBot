@@ -1,9 +1,14 @@
-"""Same-machine guard: on every request, and again (header included) on the secrets endpoints; and the
-server run.py starts, which only listens on this computer and never trusts proxy headers."""
+"""Same-machine guard: on every request, and again (header included) on the secrets endpoints; the
+server run.py starts, which only listens on this computer and never trusts proxy headers; and the log,
+which masks the IBKR account id and which the tests write to their own folder."""
 
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
+import io
+import logging
+import os
 import pathlib
 import re
 import sys
@@ -332,7 +337,7 @@ def run_py(monkeypatch):
             pass
 
     monkeypatch.setattr(module, "GuardedServer", _Server)
-    monkeypatch.setattr(module, "setup_logging", lambda level: None)     # the real one writes the project's log
+    monkeypatch.setattr(module, "setup_logging", lambda level: None)     # the real one stays for the whole run
     monkeypatch.setattr(module, "keep_awake", lambda: False)
     monkeypatch.setattr(module.uvicorn, "run", lambda target, **options: served.append(options))
     monkeypatch.setattr(module.uvicorn.Config, "configure_logging", lambda self: None)
@@ -396,3 +401,68 @@ def test_the_app_serves_no_generated_api_docs(monkeypatch):
         assert client.get(path).status_code == 404, path
     assert client.get("/").status_code == 200
     assert engine.calls == []
+
+
+# ---- the log: where it is written, and what it never shows ------------------------------------ #
+@pytest.fixture
+def fresh_logging(monkeypatch):
+    """logging_setup as at a first start, its console a string (``.sys.stdout``); the root logger is put back
+    afterwards."""
+    from autotradebot.util import logging_setup
+
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    noisy = {name: logging.getLogger(name).level for name in ("httpx", "urllib3", "asyncio", "ib_async")}
+    monkeypatch.setattr(logging_setup, "_CONFIGURED", False)
+    monkeypatch.setattr(logging_setup, "sys", SimpleNamespace(stdout=io.StringIO(), stderr=io.StringIO()))
+    yield logging_setup
+    for handler in [h for h in root.handlers if h not in handlers]:
+        root.removeHandler(handler)
+        handler.close()
+    root.setLevel(level)
+    for name, was in noisy.items():
+        logging.getLogger(name).setLevel(was)
+
+
+def _flushed():
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+
+def test_the_log_goes_where_atb_log_dir_says_so_tests_never_write_yours(fresh_logging, tmp_path, monkeypatch):
+    from autotradebot import config
+
+    # conftest points it at this run's own folder: an engine a test starts logs there, not to logs/
+    assert config.LOG_DIR == pathlib.Path(os.environ["ATB_LOG_DIR"])
+    assert config.PROJECT_ROOT not in config.LOG_DIR.parents
+    monkeypatch.setattr(fresh_logging, "LOG_DIR", tmp_path / "run" / "logs")
+    fresh_logging.setup_logging("INFO")
+    logging.getLogger("autotradebot.test").warning("a line for the log")
+    _flushed()
+    assert "a line for the log" in (tmp_path / "run" / "logs" / "autotradebot.log").read_text(encoding="utf-8")
+
+
+def test_the_log_masks_every_ibkr_account_id(fresh_logging, tmp_path, monkeypatch):
+    # ib_async's own warning prints the whole order and its fills when IBKR rejects or cancels one
+    from ib_async import CommissionReport, Execution, Fill, Order, Position, Stock, Trade
+
+    monkeypatch.setattr(fresh_logging, "LOG_DIR", tmp_path)
+    fresh_logging.setup_logging("INFO")
+    stock = Stock("AAA", "SMART", "USD")
+    trade = Trade(contract=stock, order=Order(action="SELL", totalQuantity=10, orderType="MKT", account="DU1234567"))
+    trade.fills.append(Fill(stock, Execution(acctNumber="DU1234567", shares=10), CommissionReport(),
+                            dt.datetime(2026, 1, 2, 15, 0)))
+    logging.getLogger("ib_async.wrapper").warning(f"Canceled order: {trade}")
+    log = logging.getLogger("autotradebot.test")
+    log.warning("positions: %s", [Position("U7654321", stock, 10, 5.0)])
+    try:
+        raise RuntimeError("refused for account F7654321")
+    except RuntimeError:
+        log.exception("a traceback names it too")
+    log.warning("AAA order 1234567 filled - tag paper_f1234567, U.S. hours")      # nothing else looks like one
+    _flushed()
+    for text in ((tmp_path / "autotradebot.log").read_text(encoding="utf-8"), fresh_logging.sys.stdout.getvalue()):
+        assert "account='…4567'" in text and "acctNumber='…4567'" in text
+        assert "Position(account='…4321'" in text and "refused for account …4321" in text
+        assert not re.search(r"DU1234567|U7654321|F7654321", text)
+        assert "AAA order 1234567 filled - tag paper_f1234567, U.S. hours" in text

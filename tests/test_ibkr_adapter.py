@@ -433,6 +433,14 @@ def test_an_account_id_the_login_doesnt_have_is_refused(quick):
     assert b.is_connected and b.account_id == "DU999999"
 
 
+def test_the_connect_line_logs_the_account_masked(quick, caplog):
+    b = mod.IbkrBroker(port=4002, mode="paper", session_factory=lambda: _logged_in(["DU111111"]))
+    with caplog.at_level("INFO", logger=mod.__name__):
+        b.connect()
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("IBKR connected")]
+    assert len(lines) == 1 and "account=…1111" in lines[0] and "DU111111" not in lines[0]
+
+
 def test_every_reconnect_checks_the_account_again(broker, monkeypatch, caplog):
     ib = broker._session.ib
     broker._connected, broker._reconnecting = False, True

@@ -28,6 +28,7 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 # overridable so tests never read or write yours
 DATA_DIR = Path(os.getenv("ATB_DATA_DIR") or (PROJECT_ROOT / "data"))
 ENV_PATH = Path(os.getenv("ATB_ENV_PATH") or (PROJECT_ROOT / ".env"))
+LOG_DIR = Path(os.getenv("ATB_LOG_DIR") or (PROJECT_ROOT / "logs"))
 #: the dashboard's remembered choices
 RUNTIME_PATH = Path(os.getenv("ATB_RUNTIME_PATH") or (DATA_DIR / "runtime.json"))
 
@@ -492,6 +493,6 @@ def _apply_env_overrides(cfg: AppConfig) -> None:
 def get_settings() -> Settings:
     cfg = AppConfig(**_load_yaml())
     _apply_env_overrides(cfg)
-    for d in (DATA_DIR, DATA_DIR / "cache", PROJECT_ROOT / "logs"):
+    for d in (DATA_DIR, DATA_DIR / "cache", LOG_DIR):
         d.mkdir(parents=True, exist_ok=True)
     return Settings(secrets=Secrets(), config=cfg)

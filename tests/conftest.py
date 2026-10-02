@@ -1,5 +1,5 @@
-"""Every test run gets its own database, .env, data folder and runtime file, so
-nothing a test does can touch yours."""
+"""Every test run gets its own database, .env, data folder, log folder and runtime
+file, so nothing a test does can touch yours."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(_RUN_DIR, "tests.sqlite
 os.environ["ATB_ENV_PATH"] = os.path.join(_RUN_DIR, "tests.env")
 os.environ["ATB_DATA_DIR"] = os.path.join(_RUN_DIR, "data")
 os.environ["ATB_RUNTIME_PATH"] = os.path.join(_RUN_DIR, "runtime.json")
+os.environ["ATB_LOG_DIR"] = os.path.join(_RUN_DIR, "logs")    # an engine started in a test logs here, not logs/
 os.environ["OPEN_BROWSER_ON_START"] = "0"
 os.environ["PAPER_PERSIST"] = "0"
 os.environ["SIGNALS_ENABLED"] = "0"            # no test reaches SEC, IBKR news or Finnhub

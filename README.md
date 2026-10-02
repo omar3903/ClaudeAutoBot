@@ -444,7 +444,8 @@ And around it:
   atomically with your comments and other lines preserved, and the account id
   is **never sent back** — the panel
   and the live feed only show that it's set and its last four characters.
-  `.env` is git-ignored.
+  The log masks it the same way (`…1234`), in ib_async's own warnings about
+  a rejected or cancelled order too. `.env` is git-ignored.
 - A stock's candle file is only named after it when the name looks like a
   stock symbol (capital letters and digits, a share class after a space), so a
   symbol from outside data, such as an insider filing, can't point the app at
@@ -1689,7 +1690,8 @@ pytest -m slow      # boots the engine on a synthetic Gateway: scan → approve 
 
 Tests run against a synthetic IB Gateway (`tests/fakes.py`: seeded random-walk
 candles, contract details and an account), with a throwaway `.env`, database,
-data folder and runtime file — never yours. Coverage includes the scans (full
+data folder, log folder (`ATB_LOG_DIR`) and runtime file — never yours.
+Coverage includes the scans (full
 scan ranking, hot list, cycle decisions), the schedule, the watchlist, heat,
 the listings directory, SEC financials, the daily bar store, the strategies, the
 Autopilot gate, the exit manager, the IBKR adapter against a fake `ib_async.IB`,

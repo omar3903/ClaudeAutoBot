@@ -362,7 +362,7 @@ class IbkrBroker(BrokerAdapter):
             self.account_id = accounts[0]
         self._check_data_entitlement()
         log.info("IBKR connected  %s:%s  account=%s  data=%s", self.host, self.port,
-                 self.account_id or "?", "delayed" if self._data_is_delayed else "live")
+                 mask(self.account_id) or "?", "delayed" if self._data_is_delayed else "live")
 
     def _check_data_entitlement(self) -> None:
         """One quick live quote at connect. Without a real-time subscription IBKR
