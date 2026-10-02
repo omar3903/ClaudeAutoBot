@@ -120,6 +120,33 @@ async function saveSize() {
   toast(r.note, "good");
 }
 
+/* ---------- the most one position may hold, % of the account's value ---------- */
+let posDragging = false;
+
+function renderPos() {
+  const c = S.state.capital;
+  if (!c || c.max_position_pct == null || posDragging) return;
+  $("#pos-range").value = c.max_position_pct;
+  labelPos(c.max_position_pct);
+}
+
+function labelPos(pct) {
+  $("#pos-label").textContent = `${Math.round(Number(pct))}%`;
+  const c = S.state.capital || {};
+  $("#pos-range").title = `One position may hold up to ${Math.round(Number(pct))}% of the account's value` +
+    (c.account_value ? ` - about ${money(c.account_value * Number(pct) / 100, c.currency)}` : "") +
+    ". Day trades usually hit this cap first, because their stops are tight.";
+}
+
+async function savePos() {
+  posDragging = false;
+  const r = await post("/api/capital/max_position_pct", { pct: parseFloat($("#pos-range").value) });
+  if (!r.ok) { toast("Not changed: " + (r.reason || ""), "bad"); renderPos(); return; }
+  S.state.capital = r.capital;
+  emit("capital", r.capital);
+  toast(r.note, "good");
+}
+
 function renderSectorsButton() {
   const sel = (S.state.filters || {}).sectors || [];
   const b = $("#btn-sectors");
@@ -174,6 +201,10 @@ export function initFilters() {
   $("#split-range").onchange = saveSplit;
   on("state", renderSize);
   on("capital", renderSize);
+  on("state", renderPos);
+  on("capital", renderPos);
+  $("#pos-range").oninput = e => { posDragging = true; labelPos(parseFloat(e.target.value)); };
+  $("#pos-range").onchange = savePos;
   $("#size-range").oninput = e => { sizeDragging = true; labelSize(parseFloat(e.target.value)); };
   $("#size-range").onchange = saveSize;
   Object.keys(BOXES).forEach(id => { $("#" + id).onchange = e => changeFilter(e.target); });

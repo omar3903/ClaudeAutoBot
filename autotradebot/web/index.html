@@ -83,6 +83,11 @@
             <input type="range" id="size-range" min="0" max="5" step="0.1" value="1" aria-label="Position size factor" />
             <b id="size-label">1.0x</b>
           </span>
+          <span class="split-ctl lockable" id="pos-ctl" data-term="position_pct">
+            <span class="muted">Max % per position</span>
+            <input type="range" id="pos-range" min="1" max="100" step="1" value="15" aria-label="Most one position may hold, % of the account" />
+            <b id="pos-label">15%</b>
+          </span>
           <label data-term="hide_done"><input type="checkbox" id="f-hide-done" /> Hide executed</label>
           <label data-term="hide_noisy"><input type="checkbox" id="f-hide-noisy" checked /> Hide noise</label>
           <button id="btn-sectors" class="ghost mini lockable">Sectors: all</button>

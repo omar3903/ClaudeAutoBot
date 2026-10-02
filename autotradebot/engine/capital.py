@@ -165,6 +165,17 @@ def parse_mode(value: Any) -> str:
     return mode
 
 
+def parse_position_pct(value: Any) -> float:
+    """The most one position may hold, as % of the account's value: 1-100."""
+    try:
+        pct = round(float(value), 1)
+    except (TypeError, ValueError):
+        raise ValueError("Enter the most one position may hold as a percentage, like 15.") from None
+    if not math.isfinite(pct) or not 1.0 <= pct <= 100.0:
+        raise ValueError("The most one position may hold has to be between 1% and 100% of the account.")
+    return pct
+
+
 def parse_amount(amount: Any) -> float:
     try:
         value = round(float(amount), 2)

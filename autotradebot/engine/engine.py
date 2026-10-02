@@ -105,7 +105,7 @@ from .quit_ops import QuitOps
 from .connections import Connections
 from .reconcile import PositionCheck
 from .runtime import (RuntimeFile, load_capital, load_capital_mode, load_day_trade_pct, load_filters,
-                      load_size_factor, load_strategy_overrides)
+                      load_position_pct, load_size_factor, load_strategy_overrides)
 
 from .support import _ACTED_ON, duration
 log = logging.getLogger(__name__)
@@ -178,6 +178,11 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self.day_trade_pct = load_day_trade_pct(saved.get("capital_split"), cfg.account.day_trade_pct)
         #: every position is the usual size times this, 0-5 (the slider over the plays; CapitalOps.set_size_factor)
         self.size_factor = load_size_factor(saved.get("sizing"))
+        #: the most one position may hold, % of the account's value, when set on the dashboard (the slider beside the
+        #: size factor) - it then stands in for config.yaml's risk.max_position_pct_of_equity; None leaves that be
+        self.position_pct = load_position_pct(saved.get("sizing"))
+        if self.position_pct is not None:
+            cfg.risk.max_position_pct_of_equity = self.position_pct
         sc = cfg.scanner
         self.scan_settings = ScanSettings.load(saved.get("scan"), ScanSettings(
             premarket_time=sc.premarket_time, gapper_time=sc.gapper_time, cycle_minutes=sc.cycle_minutes,
@@ -371,7 +376,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             payload: Dict[str, Any] = {
                 "mode": self.mode, "paper_platform": self.paper_platform, "filters": self.filters.as_dict(),
                 "strategies": self.strategy_overrides, "capital": self.capital, "capital_mode": self.capital_mode,
-                "capital_split": {"day_pct": self.day_trade_pct}, "sizing": {"factor": self.size_factor},
+                "capital_split": {"day_pct": self.day_trade_pct},
+                "sizing": {"factor": self.size_factor,
+                           **({"max_position_pct": self.position_pct} if self.position_pct is not None else {})},
                 "scan": self.scan_settings.as_dict(),
                 "autopilot": self.autopilot.to_runtime(),
             }

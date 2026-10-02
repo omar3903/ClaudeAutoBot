@@ -2,6 +2,8 @@
 Autopilot's max_gross_exposure_pct is a share of."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from autotradebot.core.models import Account
@@ -62,6 +64,8 @@ def test_the_engine_keeps_the_mode_per_venue_and_sizes_by_it(tmp_path):
         def __init__(self):
             self._account, self._venue, self.capital, self.capital_mode = ACC, "paper", {}, {}
             self.day_trade_pct, self.size_factor, self.saved = 100.0, 1.0, 0
+            risk = SimpleNamespace(max_position_pct_of_equity=12.0)
+            self.settings = SimpleNamespace(config=SimpleNamespace(risk=risk))
 
         def _locked(self): return None
         def _save_runtime(self): self.saved += 1

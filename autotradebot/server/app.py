@@ -255,6 +255,10 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
     def set_size_factor(body: dict):
         return _result(eng().set_size_factor((body or {}).get("factor")))
 
+    @app.post("/api/capital/max_position_pct")
+    def set_max_position_pct(body: dict):
+        return _result(eng().set_max_position_pct((body or {}).get("pct")))
+
     # ---- quitting (same machine only) ----------------------------------- #
     @app.get("/api/quit", dependencies=LOCAL_ONLY)
     def quit_preview():

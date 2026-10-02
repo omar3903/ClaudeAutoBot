@@ -440,6 +440,45 @@ def test_the_size_factor_on_disk_is_read_back_and_a_bad_one_is_the_usual_size():
     assert load_size_factor({"factor": True}) == 1.0 and load_size_factor({"factor": "2"}) == 1.0
 
 
+# ---------------------------------------------------------------- the most one position may hold
+def test_the_most_one_position_may_hold_resizes_the_plays_is_remembered_and_refuses_what_is_out_of_range(
+        engine, port, monkeypatch):
+    risk = engine.settings.config.risk
+    monkeypatch.setattr(risk, "max_position_pct_of_equity", risk.max_position_pct_of_equity)  # put back afterwards
+    _connect(engine, port)
+    assert engine.position_pct is None
+    assert engine.capital_state()["max_position_pct"] == risk.max_position_pct_of_equity    # config.yaml's, unset
+    p = _play()                                                                 # entry 100, stop 95
+    engine.board.replace([p])
+    engine._size_plays([p])
+    usual = p.suggested_qty
+    out = engine.set_max_position_pct(2)
+    assert out["ok"] and out["capital"]["max_position_pct"] == 2.0 and "up to 2%" in out["note"]
+    assert risk.max_position_pct_of_equity == 2.0 and 0 < p.suggested_qty < usual  # the cap binds, sized again
+    assert engine.runtime.read()["sizing"] == {"factor": 1.0, "max_position_pct": 2.0}   # remembered
+    for bad in (0, 0.5, 101, "lots", None, float("nan"), float("inf")):
+        assert not engine.set_max_position_pct(bad)["ok"] and engine.position_pct == 2.0
+    assert engine.set_max_position_pct("100")["ok"] and p.suggested_qty == usual      # a cap that doesn't bind
+
+
+def test_the_most_one_position_may_hold_on_disk_stands_in_for_the_config_and_absent_leaves_it(
+        tmp_path, gateway, port, monkeypatch):
+    import json
+    from autotradebot.engine.runtime import load_position_pct
+    assert load_position_pct({"max_position_pct": 25}) == 25.0 and load_position_pct({"factor": 2}) is None
+    assert load_position_pct(None) is None and load_position_pct({"max_position_pct": 0}) is None
+    assert load_position_pct({"max_position_pct": True}) is None
+    assert load_position_pct({"max_position_pct": "9"}) is None
+    risk = _new_engine(tmp_path / "a", gateway, port).settings.config.risk
+    before = risk.max_position_pct_of_equity
+    monkeypatch.setattr(risk, "max_position_pct_of_equity", before)
+    assert _new_engine(tmp_path / "a", gateway, port).position_pct is None and risk.max_position_pct_of_equity == before
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "runtime.json").write_text(json.dumps({"sizing": {"factor": 1.5, "max_position_pct": 25}}))
+    e = _new_engine(tmp_path / "b", gateway, port)
+    assert e.position_pct == 25.0 and risk.max_position_pct_of_equity == 25.0 and e.size_factor == 1.5
+
+
 # ---------------------------------------------------------------- the split, and changes made while it runs
 def test_entries_still_working_count_in_their_kinds_share_of_the_capital(engine, port):
     _connect(engine, port)
