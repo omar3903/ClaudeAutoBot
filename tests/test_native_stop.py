@@ -43,7 +43,9 @@ class _StopBroker(_Broker):
         if not self.can_modify:
             raise NotImplementedError("no modify here")
         o = self.live[order_id]
-        o.stop_price, o.submitted_qty = stop_price, quantity
+        o.stop_price = stop_price
+        if quantity is not None:                 # None leaves the size as the broker holds it
+            o.submitted_qty = quantity
         self.modified.append((order_id, stop_price, quantity))
         return o
 
@@ -122,7 +124,8 @@ def test_the_stop_follows_the_record_as_the_exit_manager_ratchets_it_but_not_eve
     assert broker.modified == []                                               # moved a moment ago: wait
     ex.STOP_MOVE_S = 0.0
     ex.sync_open_orders()
-    assert broker.modified == [("1", 100.35, 10.0)] and ex.protective_stops()[0]["stop_price"] == 100.35
+    assert broker.modified == [("1", 100.35, None)] and ex.protective_stops()[0]["stop_price"] == 100.35   # the price alone
+    assert broker.live["1"].submitted_qty == 10 and ex.protective_stops()[0]["qty"] == 10.0
     assert heard[-1][0] == "stop.moved" and len(broker.stops()) == 1
 
 
@@ -304,7 +307,22 @@ def test_the_part_coming_off_shrinks_the_stop_first():
                                       avg_fill_price=104.0)
     ex.STOP_MOVE_S = 0.0
     ex.sync_open_orders()
-    assert repo.get_trade("t1")["quantity"] == 5 and broker.modified[-1] == ("1", 100.05, 5.0)   # ...then to break-even
+    assert repo.get_trade("t1")["quantity"] == 5 and broker.modified[-1] == ("1", 100.05, None)  # ...then to break-even
+    assert broker.live["1"].submitted_qty == 5 and len(broker.modified) == 2
+
+
+def test_a_stop_cut_for_a_part_exit_that_never_went_grows_back_only_for_shares_the_account_shows():
+    broker, _, ex, _ = _setup()
+    ex.sync_open_orders()
+    ex.close_trade("t1", reason="target-1", qty=5, after_fill={"stop_price": 100.05, "target_price": 106.0})
+    assert broker.modified == [("1", 98.0, 5.0)]
+    broker.reports["2"] = OrderResult(order_id="2", status="REJECTED", symbol="AAA", submitted_qty=5)   # it never went
+    broker.positions["AAA"] = 5                                                # and the account shows five
+    ex.sync_open_orders()
+    assert len(broker.modified) == 1 and broker.live["1"].submitted_qty == 5  # never an order it can't cover
+    broker.positions["AAA"] = 10
+    ex.sync_open_orders()
+    assert broker.modified[-1] == ("1", 98.0, 10.0) and ex.protective_stops()[0]["qty"] == 10.0
 
 
 def test_a_stop_an_earlier_run_left_is_followed_and_strays_are_cancelled():

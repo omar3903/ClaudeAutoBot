@@ -925,6 +925,18 @@ def test_a_stop_move_ibkr_refuses_raises_and_the_stop_still_reads_working_where_
     assert (got.status, got.stop_price, got.submitted_qty) == ("WORKING", 99.0, 10.0)   # what IBKR still holds
 
 
+def test_a_stop_moved_without_a_size_keeps_the_shares_ibkr_holds(broker):
+    orders = IbOrders(broker._session.ib)
+    res = _resting_stop(broker, qty=10)
+    trade = orders.book[1]
+    trade.orderStatus.remaining = 7.0                    # IBKR's status: the target's group has cut it to seven...
+    broker.modify_stop(res.order_id, stop_price=99.0)    # ...ahead of the order's own update
+    assert (trade.order.totalQuantity, trade.order.auxPrice) == (7.0, 99.0)
+    trade.order.totalQuantity = trade.orderStatus.remaining = 6.0     # the order's update, and IBKR's status
+    got = broker.modify_stop(res.order_id, stop_price=99.5)
+    assert (trade.order.totalQuantity, got.submitted_qty, got.stop_price) == (6.0, 6.0, 99.5)
+
+
 
 # --------------------------------------------------------------------------- #
 #  the open orders, asked for by several threads at once

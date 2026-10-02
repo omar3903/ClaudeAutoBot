@@ -1178,9 +1178,10 @@ class IbkrBroker(BrokerAdapter):
 
     def modify_stop(self, order_id: str, stop_price: Optional[float] = None,
                     quantity: Optional[float] = None) -> OrderResult:
-        """Change a resting stop's trigger and shares in place - IBKR takes the same order id again. A change
-        IBKR refuses raises OrderRejected with its reason, and the order goes on reading as the working order it
-        still is."""
+        """Change a resting stop's trigger and shares in place - IBKR takes the same order id again. With no
+        ``quantity`` the size is left as IBKR holds it (a target in the stop's group that filled in part has cut
+        it). A change IBKR refuses raises OrderRejected with its reason, and the order goes on reading as the
+        working order it still is."""
         self._guard_orders()
         trade = self._find_trade(order_id)
         if trade is None:
@@ -1195,6 +1196,13 @@ class IbkrBroker(BrokerAdapter):
             order.auxPrice = float(stop_price)
         if quantity is not None:
             order.totalQuantity = abs(float(quantity))
+        else:
+            # the whole order goes again, its size too: IBKR's order status can show the group's cut a moment
+            # before the order's own update does, and the size sent is never more than IBKR shows it holds
+            status = trade.orderStatus
+            shown = _num(getattr(status, "filled", 0.0)) + _num(getattr(status, "remaining", 0.0))
+            if 0 < shown < _num(order.totalQuantity) - 1e-9:
+                order.totalQuantity = shown
 
         def _send(ib):
             # on the loop, so IBKR's answer can't land before the modify is noted: its place in the log is where

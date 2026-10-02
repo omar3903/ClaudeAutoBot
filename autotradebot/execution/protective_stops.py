@@ -33,7 +33,10 @@ Resting orders bring two dangers, and the rules here exist for them:
 
 The trade record is the single source of truth: each pass compares the record's shares, stop and
 target with the orders at the broker. The stop's price is moved in place (the break-even and
-trailing ratchets), at most once every ``STOP_MOVE_S``. Anything structural - no target resting
+trailing ratchets), at most once every ``STOP_MOVE_S``, leaving its size as the broker holds it: a
+target that filled in part has already taken its shares off the stop. A resize (a scale-out booked)
+asks for the record's shares less what the target has filled, and grows the stop past what the broker
+holds only with no target resting and for shares the account shows. Anything structural - no target resting
 where one belongs, a target for the wrong shares or price, the scale-out just taken - has the pair
 stood down and placed afresh in a new group, because an order can't change its group. A broker
 that refuses the pair gets a plain stop, and the app works the target itself as before.
@@ -254,8 +257,14 @@ class ProtectiveStops:
                 self._target_retry[tid] = now + self.TARGET_RETRY_S     # one try per while, whatever comes of it
                 placed = self._rebuild(t) or placed
                 continue
-            if abs(st.qty - qty) > 1e-9 or (abs(st.price - price) >= tick(price) and now - st.moved_at >= self.STOP_MOVE_S):
-                self._move_stop(st, qty, price)
+            if abs(st.qty - qty) > 1e-9:
+                # the record's shares changed (a scale-out booked) - or the target's group took some off at the broker
+                size = self._stop_size(st, qty, t["side"])
+                if size is not None and abs(size - st.qty) > 1e-9:
+                    self._move_stop(st, price, size)
+                    continue
+            if abs(st.price - price) >= tick(price) and now - st.moved_at >= self.STOP_MOVE_S:
+                self._move_stop(st, price)               # the price alone: the size stays as the broker holds it
         self._watch_unprotected(trades, exiting, now)
         if now - self._swept_at >= self.SWEEP_S:
             self._swept_at = now
@@ -428,21 +437,50 @@ class ProtectiveStops:
         self._place_stop(fresh, qty, price, working)
         return True
 
-    def _move_stop(self, st: _Stop, qty: float, price: float) -> bool:
-        """Change the resting stop's shares and trigger. A broker that can't modify an order has
-        it cancelled; the next pass places a fresh one."""
+    def _move_stop(self, st: _Stop, price: float, qty: Optional[float] = None) -> bool:
+        """Change the resting stop's trigger - and its shares, when ``qty`` is given. Without it the size
+        is left as the broker holds it: a target in the stop's group that filled in part has already taken
+        those shares off the stop, and resending the app's count would put them back. A broker that can't
+        modify an order has it cancelled; the next pass places a fresh one."""
         try:
-            self.broker.modify_stop(st.order_id, stop_price=price, quantity=qty)
+            res = self.broker.modify_stop(st.order_id, stop_price=price, quantity=qty)
         except Exception as e:  # noqa: BLE001 - no modify on this venue, or the broker refused
             log.warning("could not move the stop for %s (%s) - replacing it", st.trade_id, e)
             self._drop_resting(st.trade_id)
             self._stop_retry[st.trade_id] = time.monotonic() + 5.0      # let the cancel land before looking again
             return False
         moved = abs(st.price - price) >= tick(price)
-        st.qty, st.price, st.moved_at = qty, price, time.monotonic()
+        held = float(getattr(res, "submitted_qty", 0.0) or 0.0)
+        st.qty = float(qty) if qty is not None else (held or st.qty)  # in step with what the broker now holds
+        st.price, st.moved_at = price, time.monotonic()
         if moved:
-            self.bus.publish("stop.moved", trade_id=st.trade_id, symbol=st.symbol, qty=qty, stop_price=price)
+            self.bus.publish("stop.moved", trade_id=st.trade_id, symbol=st.symbol, qty=st.qty, stop_price=price)
         return True
+
+    def _stop_size(self, st: _Stop, qty: float, side: Optional[str] = None) -> Optional[float]:
+        """The shares a trade's stop should hold for ``qty`` shares on the record: those less what its resting
+        target has filled while still working (the broker's group has already taken them off the stop; the record
+        hears of them only when the target finishes), and no more than the broker holds the stop for now. Reading
+        the stop brings ``st.qty`` in step with the broker. None when the broker can't say, or nothing would be
+        left for the stop.
+
+        A stop is grown back past what the broker holds - one shrunk for a part exit that never went - only given
+        the trade's ``side``, with no target resting (its group may have cut the stop further than the target's
+        fill read here shows) and while the account shows the shares: never an order the account can't cover."""
+        try:
+            held = float(self.broker.get_order(st.order_id).submitted_qty or 0.0)
+            tg = self._targets.get(st.trade_id)
+            filled = float(self.broker.get_order(tg.order_id).filled_qty or 0.0) if tg is not None else 0.0
+        except Exception:  # noqa: BLE001
+            return None
+        size = qty - filled
+        if held > 0:
+            st.qty = held
+            if size > held + 1e-9:
+                account = self._held_quantity(st.symbol) if side and tg is None else None
+                if account is None or (account > 0) != (side == "LONG") or abs(account) < size - 1e-9:
+                    size = held
+        return size if size > 1e-9 else None
 
     def _drop_resting(self, trade_id: str) -> None:
         """Cancel and forget whatever rests for a trade."""
@@ -582,7 +620,12 @@ class ProtectiveStops:
         st = self._stops.get(trade_id)
         if st is None or remaining >= st.qty - 1e-9:
             return True
-        return self._move_stop(st, remaining, st.price)
+        size = self._stop_size(st, remaining)
+        if size is None:
+            return False                                 # not known what the broker holds: no exit beside it yet
+        if size >= st.qty - 1e-9:
+            return True                                  # the broker's group has already cut it that far
+        return self._move_stop(st, st.price, size)
 
     # ------------------------------------------------------------------ #
     #  Booking what the broker filled                                    #
@@ -621,7 +664,9 @@ class ProtectiveStops:
             self._book_exit(tg.symbol, tg.trade_id, price, filled, "target-1", True, plan[1] if plan else {}, tg.price)
             st = self._stops.get(tg.trade_id)
             if st is not None:
-                st.qty = max(0.0, st.qty - filled)       # the broker's group has already shrunk the stop by this much
+                # the broker's group has already shrunk the stop to what the position has left - some of it maybe
+                # seen already, when a move read the stop while the target was still filling
+                st.qty = min(st.qty, max(0.0, abs(float(t["quantity"])) - filled))
             self._target_retry.pop(tg.trade_id, None)    # the rest gets its own pair on the next pass
             return
         self._book_exit(tg.symbol, tg.trade_id, price, filled, "target", False, None, tg.price)

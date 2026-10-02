@@ -879,8 +879,11 @@ that comes off at the first target when the position scales out, for all of it
 otherwise. The two share a **one-cancels-all group** at IBKR (type 3: when one fills,
 the other is reduced by the shares filled) - the target taking half off shrinks the
 stop to the other half, the stop filling cancels the target, and the two can never
-both fill for the whole position. IBKR works them on real prices, so profit is taken
-at the target even on delayed quotes, and while the app is off. When the first
+both fill for the whole position. Moving the stop's price leaves its size as IBKR holds
+it, so a target that has filled in part keeps the stop cut to what is left, and a resize
+never asks for more than the record holds less what the target has filled. IBKR works
+them on real prices, so profit is taken at the target even on delayed quotes, and while
+the app is off. When the first
 target fills, the app books the scale-out (stop to break-even, second target) and
 rests a fresh pair for what is left; while a target rests the exit manager leaves
 the target to the broker. A plain stop left by an earlier version is stood down and

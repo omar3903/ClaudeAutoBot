@@ -79,8 +79,8 @@ class BrokerAdapter(abc.ABC):
 
     def modify_stop(self, order_id: str, stop_price: Optional[float] = None,
                     quantity: Optional[float] = None) -> OrderResult:
-        """Change a resting stop order's trigger and shares in place. Venues that can't raise, and
-        the stop is cancelled and placed again."""
+        """Change a resting stop order's trigger and shares in place; a ``quantity`` of None leaves the
+        shares as the venue holds them. Venues that can't raise, and the stop is cancelled and placed again."""
         raise NotImplementedError(f"{self.name} can't modify a resting order")
 
     @abc.abstractmethod

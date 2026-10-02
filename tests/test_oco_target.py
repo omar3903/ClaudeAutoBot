@@ -33,14 +33,18 @@ class _OcaBroker(_StopBroker):
                 self.groups[res.order_id] = (req.oca_group, req.oca_type)
         return res
 
-    def fill(self, order_id, qty, price):
+    def fill(self, order_id, qty, price, working=False):
+        """The order has filled ``qty`` shares in all - with ``working`` only part of it, and it works on."""
         o = self.live[order_id]
-        o.status, o.filled_qty, o.avg_fill_price = "FILLED", qty, price
+        new = qty - float(o.filled_qty or 0.0)
+        o.filled_qty, o.avg_fill_price = qty, price
+        if not working:
+            o.status = "FILLED"
         group = self.groups.get(order_id, ("", 0))[0]
         for other_id, (g, _) in self.groups.items():
             other = self.live[other_id]
             if g and g == group and other_id != order_id and other.status not in ("FILLED", "CANCELED"):
-                other.submitted_qty -= qty
+                other.submitted_qty -= new
                 if other.submitted_qty <= 0:
                     other.status = "CANCELED"
 
@@ -140,6 +144,35 @@ def test_an_exit_after_the_target_took_its_part_covers_only_what_is_left():
     out = ex.close_trade("t1", reason="manual")
     assert out["ok"] and repo.get_trade("t1")["quantity"] == 5                 # the target's part was booked first
     assert broker.exits()[0].quantity == 5 and ex.protective_stops() == []
+
+
+def test_moving_the_stop_while_the_target_fills_in_part_keeps_the_size_the_group_cut_it_to():
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()
+    broker.fill("2", 3, 104.0, working=True)                                   # three of the target's five...
+    assert broker.live["1"].submitted_qty == 7                                 # ...and the group cuts the stop to seven
+    repo.update_trade_risk("t1", stop_price=100.35)                           # the record's stop moves meanwhile
+    ex.sync_open_orders()
+    assert broker.modified == [("1", 100.35, None)]                           # the price alone
+    assert broker.live["1"].submitted_qty == 7 and ex.protective_stops()[0]["qty"] == 7.0   # seven, not ten
+    assert repo.get_trade("t1")["quantity"] == 10                              # booked when the target finishes
+    ex.sync_open_orders()
+    assert len(broker.modified) == 1 and broker.exits() == []                  # nothing resent
+    broker.fill("2", 5, 104.0)                                                 # the target's last two
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["quantity"] == 5 and "1" in broker.cancelled
+    stop, target = broker.stops()[-1], broker.targets()[-1]
+    assert (stop.quantity, stop.stop_price, target.quantity, target.limit_price) == (5, 100.05, 5, 110.0)
+
+
+def test_a_part_the_app_takes_off_beside_a_target_that_filled_in_part_leaves_the_stop_what_will_be_left():
+    broker, _, ex, _ = _setup()
+    ex.sync_open_orders()
+    broker.fill("2", 3, 104.0, working=True)                                   # the group cuts the stop to seven
+    broker.positions["AAA"] = 7
+    out = ex.close_trade("t1", reason="manual", qty=4)
+    assert out["ok"] and broker.exits()[0].quantity == 4
+    assert broker.modified == [("1", 98.0, 3.0)]                               # ten on record, less the target's three and these four
 
 
 def test_while_a_target_rests_at_the_broker_the_exit_manager_leaves_the_target_to_it():
