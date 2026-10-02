@@ -272,6 +272,9 @@ class IbkrBroker(BrokerAdapter):
         #: each had then and where the modify sits in its log - see _true_status. Order id -> ...
         self._cancels_confirmed: Dict[str, float] = {}
         self._modifying: Dict[str, Tuple[str, int]] = {}
+        #: order id -> IBKR's permId, noted when an order is placed or read. An order that finishes while the
+        #: connection is down comes back from IBKR's list of finished orders with no order id, only the permId
+        self._perm_ids: Dict[str, int] = {}
 
         # real-time streams (set_streams). The loop thread changes them; any thread reads them. Everything below
         # is under _stream_lock, which is never held while waiting on the loop or calling on_tick
@@ -1167,6 +1170,7 @@ class IbkrBroker(BrokerAdapter):
             order.account = self.account_id
         trade = self._session.call(lambda ib: ib.placeOrder(contract, order), timeout=10)
         oid = str(getattr(trade.order, "orderId", "") or getattr(trade.order, "permId", ""))
+        self._note_perm(oid, trade)                    # IBKR gives the permId a moment later: a read notes it then
         status = getattr(trade.orderStatus, "status", "") or "Submitted"
         return OrderResult(order_id=oid, status=_norm_status(status), symbol=req.symbol,
                            submitted_qty=req.quantity, raw={"tif": order.tif}, side=req.side, tag=req.client_tag)
@@ -1251,8 +1255,19 @@ class IbkrBroker(BrokerAdapter):
         return why
 
     def _find_trade(self, order_id: str):
+        """The order by its id. One that finished while the connection was down comes back - ib_async rebuilds it
+        from IBKR's list of finished orders - with no order id (0): it is found by the permId noted for it, or by
+        its executions, which still carry the order id."""
+        oid, perm, me = str(order_id), self._perm_ids.get(str(order_id)), self.client_id
+
         def _find(ib):
-            return next((t for t in ib.trades() if str(getattr(t.order, "orderId", "")) == str(order_id)), None)
+            trades = list(ib.trades())
+            hit = next((t for t in trades if str(getattr(t.order, "orderId", "")) == oid), None)
+            if hit is None and perm:
+                hit = next((t for t in trades if int(getattr(t.order, "permId", 0) or 0) == perm), None)
+            if hit is None:
+                hit = next((t for t in trades if any(_executed_for(f, oid, me) for f in (t.fills or []))), None)
+            return hit
         return self._session.call(_find, timeout=8)
 
     def cancel_order(self, order_id: str) -> None:
@@ -1260,6 +1275,9 @@ class IbkrBroker(BrokerAdapter):
         trade = self._find_trade(order_id)
         if trade is None:
             raise OrderRejected(f"IBKR: no live order {order_id} to cancel")
+        if not int(getattr(trade.order, "orderId", 0) or 0):
+            # rebuilt from IBKR's list of finished orders: a cancel would go out for order 0
+            raise OrderRejected(f"IBKR: order {order_id} is finished - nothing to cancel")
         self._session.call(lambda ib: ib.cancelOrder(trade.order), timeout=8)
 
     def get_order(self, order_id: str) -> OrderResult:
@@ -1268,7 +1286,7 @@ class IbkrBroker(BrokerAdapter):
         t = self._find_trade(order_id)
         if t is None:
             return OrderResult(order_id=str(order_id), status="UNKNOWN", symbol="?", submitted_qty=0.0)
-        return self._result(t)
+        return self._result(t, str(order_id))
 
     def list_orders(self, status: Optional[str] = None) -> List[OrderResult]:
         if not self.is_connected:
@@ -1366,19 +1384,47 @@ class IbkrBroker(BrokerAdapter):
         if str(getattr(t.order, "orderId", "")) in self._cancels_confirmed:
             return True
         _, entry = _status_entry(t)
-        return entry is not None and int(getattr(entry, "errorCode", 0) or 0) in (0, _CANCEL_CONFIRMED)
+        # no log at all: ib_async built the order from IBKR's own lists at a connect, its status IBKR's word
+        return entry is None or int(getattr(entry, "errorCode", 0) or 0) in (0, _CANCEL_CONFIRMED)
 
-    def _result(self, t) -> OrderResult:
+    def _note_perm(self, order_id: str, t) -> None:
+        """Note an order's permId under its order id, once IBKR has given it one."""
+        perm = int(getattr(t.order, "permId", 0) or 0) or int(getattr(t.orderStatus, "permId", 0) or 0)
+        if perm > 0 and order_id and order_id != "0" and self._perm_ids.get(order_id) != perm:
+            _remember(self._perm_ids, order_id, perm)
+
+    def _order_id(self, t) -> str:
+        """The order id the app knows an order by. One ib_async rebuilt from IBKR's list of finished orders has
+        none (0): its id is the one noted for its permId, or the one on its executions."""
+        own = getattr(t.order, "orderId", 0) or 0
+        if own:
+            return str(own)
+        perm = int(getattr(t.order, "permId", 0) or 0)
+        noted = next((oid for oid, p in list(self._perm_ids.items()) if p == perm), None) if perm else None
+        if noted:
+            return noted
+        executed = next((f.execution for f in (t.fills or []) if _executed_for(f, None, self.client_id)), None)
+        return str(executed.orderId) if executed is not None else str(own)
+
+    def _result(self, t, order_id: Optional[str] = None) -> OrderResult:
         o, os_ = t.order, t.orderStatus
+        oid = order_id or self._order_id(t)
+        self._note_perm(oid, t)
         kind = getattr(o, "orderType", "") or ""
         side = Side.LONG if o.action == "BUY" else Side.SHORT
-        fills = [Fill(order_id=str(o.orderId), symbol=t.contract.symbol, side=side,
+        fills = [Fill(order_id=oid, symbol=t.contract.symbol, side=side,
                       quantity=float(f.execution.shares), price=float(f.execution.price))
                  for f in (t.fills or [])]
+        filled, avg = float(os_.filled or 0.0), float(os_.avgFillPrice or 0.0)
+        shares = sum(f.quantity for f in fills)
+        if filled <= 0 < shares:
+            # IBKR's status carries no count - an order rebuilt from its list of finished orders, or a fill that
+            # landed ahead of the status: the executions say what filled, and at what price
+            filled, avg = shares, sum(f.quantity * f.price for f in fills) / shares
         status = self._true_status(t)
-        return OrderResult(order_id=str(o.orderId), status=status, symbol=t.contract.symbol,
-                           submitted_qty=float(o.totalQuantity or 0.0), filled_qty=float(os_.filled or 0.0),
-                           avg_fill_price=float(os_.avgFillPrice or 0.0), fills=fills, message=_order_message(t),
+        return OrderResult(order_id=oid, status=status, symbol=t.contract.symbol,
+                           submitted_qty=float(o.totalQuantity or 0.0), filled_qty=filled,
+                           avg_fill_price=avg, fills=fills, message=_order_message(t),
                            side=side, tag=getattr(o, "orderRef", "") or "",
                            order_type=_ORDER_TYPES.get(kind, kind), limit_price=_price(getattr(o, "lmtPrice", None)),
                            stop_price=_price(getattr(o, "trailStopPrice" if kind == "TRAIL" else "auxPrice", None)),
@@ -1506,6 +1552,15 @@ def _status_entry(trade) -> Tuple[int, Any]:
         if getattr(entry, "errorCode", 0) or not str(getattr(entry, "message", "") or "").startswith("Fill "):
             return i, entry
     return -1, None
+
+
+def _executed_for(fill, order_id: Optional[str], client_id: int) -> bool:
+    """Whether an ib_async fill is an execution of an order this API client placed - of order ``order_id``, when
+    given. Order ids are each client's own: another client's order can carry the same number."""
+    execution = getattr(fill, "execution", None)
+    oid = int(getattr(execution, "orderId", 0) or 0)
+    return (oid > 0 and (order_id is None or str(oid) == order_id)
+            and getattr(execution, "clientId", client_id) == client_id)
 
 
 def _remember(book: Dict[str, Any], key: str, value: Any, cap: int = 4096) -> None:

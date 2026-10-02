@@ -937,6 +937,54 @@ def test_a_stop_moved_without_a_size_keeps_the_shares_ibkr_holds(broker):
     assert (trade.order.totalQuantity, got.submitted_qty, got.stop_price) == (6.0, 6.0, 99.5)
 
 
+def _rebuilt(orders, contract, perm, status, fills=(), **order):
+    """What ib_async holds after a reconnect for an order that finished while the connection was down: the order
+    rebuilt from IBKR's list of finished orders, with no order id (0) and nothing in its log - its permId, and the
+    executions the connect's request for them hands it."""
+    from ib_async import Order
+
+    trade = orders._Trade(contract, Order(orderId=0, permId=perm, **order), orders._Status(orderId=0, status=status),
+                          list(fills), [])
+    orders.book[f"perm:{perm}"] = trade
+    return trade
+
+
+def _execution(order_id, shares, price, client_id):
+    return SimpleNamespace(execution=SimpleNamespace(orderId=order_id, clientId=client_id, shares=shares, price=price))
+
+
+def test_a_stop_cancelled_while_the_connection_was_down_is_found_by_its_permid_on_ibkrs_word(broker):
+    orders = IbOrders(broker._session.ib)
+    res = _resting_stop(broker)
+    contract = orders.book[1].contract
+    orders.book[1].order.permId = 9001                         # IBKR gives the order its permId...
+    assert broker.get_order(res.order_id).status == "WORKING"   # ...noted when the app reads it
+    orders.book.clear()                                         # the connection drops: ib_async starts afresh
+    _rebuilt(orders, contract, 9001, "Cancelled", action="SELL", totalQuantity=10, orderType="STP", auxPrice=98.5,
+             orderRef="stop:trd_1")
+    got = broker.get_order(res.order_id)
+    assert (got.order_id, got.status, got.tag, got.raw["cancel_confirmed"]) == (res.order_id, "CANCELED", "stop:trd_1",
+                                                                                True)
+    with pytest.raises(OrderRejected, match="finished"):
+        broker.cancel_order(res.order_id)                       # no cancel goes out for order 0
+
+
+def test_an_entry_that_filled_while_the_connection_was_down_is_found_by_its_executions(broker):
+    orders = IbOrders(broker._session.ib)
+    res = broker.place_order(OrderRequest(symbol="AAA", side=Side.LONG, quantity=10, order_type=OrderType.LIMIT,
+                                          limit_price=100.0, client_tag="play_t01"))
+    contract, me = orders.book[1].contract, broker.client_id
+    orders.book.clear()                                         # dropped before the app read its permId
+    _rebuilt(orders, contract, 9002, "Filled", [_execution(1, 5.0, 7.0, me + 1)], action="BUY",
+             totalQuantity=5)                                   # another client's order 1: not the app's
+    _rebuilt(orders, contract, 9001, "Filled", [_execution(1, 6.0, 99.9, me), _execution(1, 4.0, 100.0, me)],
+             action="BUY", totalQuantity=10, orderType="LMT", lmtPrice=100.0, orderRef="play_t01")
+    got = broker.get_order(res.order_id)
+    assert (got.order_id, got.status, got.filled_qty, got.tag) == ("1", "FILLED", 10.0, "play_t01")
+    assert got.avg_fill_price == pytest.approx(99.94) and [f.order_id for f in got.fills] == ["1", "1"]
+    assert "1" in [o.order_id for o in broker.list_orders("FILLED")]           # listed under its own id too
+
+
 
 # --------------------------------------------------------------------------- #
 #  the open orders, asked for by several threads at once

@@ -107,6 +107,25 @@ def test_short_trade_pnl(repo):
     assert out["realized_pl"] == 40.0              # short: profit when price falls
 
 
+def test_the_plays_sent_whose_ending_was_never_heard_are_listed_for_the_start(repo):
+    import datetime as dt
+
+    start = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)
+    sent, filled, cancelled = _play(symbol="T90"), _play(symbol="T91"), _play(symbol="T92")
+    for p in (sent, filled, cancelled):
+        repo.record_play(p)
+        repo.set_play_status(p.id, "ACCEPTED", "autopilot")
+        repo.settle_play(p.id, "SUBMITTED")
+    repo.open_trade(filled, 100.0, 10, "ibkr-paper")                   # its fill was heard: it has its trade...
+    repo.set_play_status(filled.id, "SUBMITTED", "autopilot")          # ...whatever its row says
+    repo.settle_play(cancelled.id, "CANCELED")
+    until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1)
+    found = {r["id"]: r for r in repo.submitted_plays(start, until)}
+    assert sent.id in found and filled.id not in found and cancelled.id not in found
+    assert (found[sent.id]["symbol"], found[sent.id]["status"]) == ("T90", "SUBMITTED")
+    assert sent.id not in {r["id"] for r in repo.submitted_plays(start - dt.timedelta(days=1), start)}
+
+
 def test_day_trade_counter(repo):
     for i in range(2):
         p = _play(symbol=f"DT{i}")

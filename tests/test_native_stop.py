@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import time
 from types import SimpleNamespace
 
@@ -573,3 +574,106 @@ def test_the_shares_of_a_part_filled_entry_get_their_stop_once_the_stalled_rest_
     ex.sync_open_orders()                                                 # booked, and protected in the same pass
     [stop] = broker.stops()
     assert (stop.quantity, stop.stop_price, stop.side) == (4.0, 98.0, Side.SHORT)
+
+
+# ---------------------------------------------------------------- orders that finished while the app wasn't following them
+def _day_entry(ex, symbol="AAA"):
+    from test_order_follow_up import PLAN
+    from autotradebot.core.enums import StrategyKind, Timeframe
+    from autotradebot.core.models import Account, Play
+
+    play = Play(symbol=symbol, side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=100.0, stop=98.0, targets=[104.0])
+    play.suggested_qty = 10
+    ex.execute_play(play, Account(account_id="DU"), plan=PLAN)
+    return play
+
+
+def test_an_entry_the_broker_no_longer_knows_is_booked_from_its_executions_and_gets_its_stop():
+    broker, repo, heard = _StopBroker({"AAA": 10}), _Repo([]), []
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    play = _day_entry(ex)
+    # it filled while the connection was down: the broker no longer knows the order, its executions show the fill
+    broker.reports["1"] = OrderResult(order_id="1", status="UNKNOWN", symbol="?", submitted_qty=0)
+    broker.get_fills = lambda symbol=None: [
+        Fill(order_id="1", symbol="AAA", side=Side.LONG, quantity=10, price=99.97, tag=play.id),
+        Fill(order_id="5", symbol="AAA", side=Side.SHORT, quantity=3, price=101.0, tag="exit:t9")]   # another order's
+    for _ in range(ex.LOST_AFTER_POLLS):
+        ex.sync_open_orders()
+    [t] = repo.open_trades()
+    assert (t["symbol"], t["quantity"], t["entry_price"]) == ("AAA", 10, 99.97)
+    [stop] = broker.stops()
+    assert (stop.quantity, stop.stop_price, stop.side, stop.client_tag) == (10, 98.0, Side.SHORT, f"stop:{t['id']}")
+    assert "order.failed" not in [topic for topic, _ in heard] and ex.working_entries() == []
+
+
+def test_an_entry_found_filled_after_a_reconnect_is_booked_and_protected(monkeypatch):
+    from test_ibkr_adapter import _execution, _rebuilt
+
+    broker, orders = _ibkr_broker(monkeypatch)                                 # the account holds the 10 shares
+    repo = _Repo([])
+    ex = _executor(broker, repo)
+    play = _day_entry(ex)
+    contract = orders.book[1].contract
+    orders.book.clear()                                                        # the connection drops as it fills
+    _rebuilt(orders, contract, 9001, "Filled", [_execution(1, 10.0, 99.96, broker.client_id)], action="BUY",
+             totalQuantity=10, orderType="LMT", lmtPrice=100.0, orderRef=play.id)
+    ex.sync_open_orders()
+    [t] = repo.open_trades()
+    assert (t["quantity"], t["entry_price"]) == (10.0, 99.96)
+    stop = ex.protective_stops()[0]
+    assert (stop["trade_id"], stop["qty"], stop["stop_price"]) == (t["id"], 10.0, 98.0)
+
+
+def _sent(play_id, symbol, tags=()):
+    """A play-log row an earlier run sent and never heard the end of."""
+    return {"id": play_id, "symbol": symbol, "side": "LONG", "strategy": "vwap_reclaim", "kind": "TECHNICAL",
+            "timeframe": "INTRADAY", "entry": 100.0, "stop": 98.0, "targets": [104.0], "confidence": 0.7,
+            "sector": "", "tags": list(tags), "evidence": {}, "status": "SUBMITTED"}
+
+
+def test_an_entry_an_earlier_run_sent_that_filled_while_the_app_was_off_is_booked_at_the_start_and_protected():
+    from test_order_follow_up import _working
+
+    broker = _StopBroker({"AAA": 10, "BBB": 2, "CCC": 5, "FFF": 3},
+                         working=[_working("31", side=Side.LONG, tag="play_rest")])
+    repo, asked = _Repo([]), []
+    rows = [_sent("play_off", "AAA"), _sent("play_rest", "BBB"), _sent("play_leg", "CCC", tags=["pair-leg"]),
+            _sent("play_none", "DDD"), _sent("play_sold", "EEE"), _sent("play_part", "FFF")]
+    repo.submitted_plays = lambda since, until: asked.append((since, until)) or rows
+    broker.get_fills = lambda symbol=None: [
+        Fill(order_id="11", symbol="AAA", side=Side.LONG, quantity=6, price=100.0, tag="play_off"),
+        Fill(order_id="11", symbol="AAA", side=Side.LONG, quantity=4, price=100.05, tag="play_off"),
+        Fill(order_id="31", symbol="BBB", side=Side.LONG, quantity=2, price=50.0, tag="play_rest"),   # still working
+        Fill(order_id="41", symbol="CCC", side=Side.LONG, quantity=5, price=20.0, tag="play_leg"),    # the desk's
+        Fill(order_id="51", symbol="EEE", side=Side.LONG, quantity=5, price=30.0, tag="play_sold"),   # sold by hand
+        Fill(order_id="61", symbol="FFF", side=Side.LONG, quantity=8, price=40.0, tag="play_part")]   # 3 still held
+    ex = _executor(broker, repo)
+    broker.is_connected = False
+    ex.sync_open_orders()
+    assert repo.open_trades() == [] and asked == []                            # looked for once it is connected
+    broker.is_connected = True
+    ex.sync_open_orders()
+    t, part = repo.open_trades()
+    assert (t["symbol"], t["quantity"]) == ("AAA", 10) and t["entry_price"] == pytest.approx(100.02)
+    assert (part["symbol"], part["quantity"], part["entry_price"]) == ("FFF", 3, 40.0)   # what the account holds
+    assert [(s.symbol, s.quantity, s.stop_price, s.client_tag) for s in broker.stops()] == [
+        ("AAA", 10, 98.0, f"stop:{t['id']}"), ("FFF", 3, 98.0, f"stop:{part['id']}")]
+    ex.sync_open_orders()
+    assert len(repo.open_trades()) == 2 and len(asked) == 1                    # once
+    since, until = asked[0]
+    assert until - since == dt.timedelta(hours=ex.ENTRY_LOOKBACK_H)
+
+
+def test_a_stop_the_broker_no_longer_knows_is_booked_from_its_executions_before_it_is_given_up():
+    broker, repo, ex, heard = _setup()
+    ex.sync_open_orders()                                                      # the stop rests: order 1
+    broker.reports["1"] = OrderResult(order_id="1", status="UNKNOWN", symbol="?", submitted_qty=0)
+    broker.get_fills = lambda symbol=None: [
+        Fill(order_id="1", symbol="AAA", side=Side.SHORT, quantity=10, price=97.95, tag="stop:t1"),
+        Fill(order_id="9", symbol="AAA", side=Side.SHORT, quantity=10, price=97.0, tag="stop:t1")]  # another stop's
+    for _ in range(ex.LOST_AFTER_POLLS):
+        ex.sync_open_orders()
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_reason"], closed["exit_price"]) == ("CLOSED", "stop", 97.95)
+    assert "stop.lost" not in [topic for topic, _ in heard] and broker.stops()[1:] == []

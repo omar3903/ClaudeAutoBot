@@ -193,6 +193,17 @@ class Repository:
                 row.evidence = {**(row.evidence or {}), "entry_outcome": dict(outcome)}
             return True
 
+    def submitted_plays(self, since: dt.datetime, until: dt.datetime) -> List[Dict[str, Any]]:
+        """The plays sent to a broker from ``since`` to ``until`` (when they were decided, else recorded) whose
+        ending was never heard: still SUBMITTED, with no trade record - an entry that may have filled while the
+        app was off (Executor._book_entries_filled_while_off). Oldest first."""
+        sent = func.coalesce(PlayLog.decided_at, PlayLog.created_at)
+        with session_scope() as s:
+            rows = s.execute(select(PlayLog).where(PlayLog.status == "SUBMITTED", ~PlayLog.trade.has(),
+                                                   sent >= _naive(since), sent < _naive(until))
+                             .order_by(sent)).scalars().all()
+            return [play_to_dict(r) for r in rows]
+
     def set_play_status(self, play_id: str, status: str, decided_by: str = "") -> None:
         with session_scope() as s:
             row = s.get(PlayLog, play_id)

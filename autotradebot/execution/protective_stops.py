@@ -32,7 +32,9 @@ Resting orders bring two dangers, and the rules here exist for them:
   cancels any ``stop:<trade id>`` / ``tgt:<trade id>`` order at the broker whose trade isn't open,
   or that duplicates another. Before placing, the broker's working orders are searched for orders
   an earlier run left - they are adopted, never doubled. One that filled while the app was off has
-  what it filled booked first, and is replaced by a fresh pair for what the record then holds.
+  what it filled booked first, and is replaced by a fresh pair for what the record then holds. One
+  the broker no longer knows at all is looked for in its executions before it is given up: what it
+  filled (the connection down as it finished, say) is booked like a fill heard live.
 
 The trade record is the single source of truth: each pass compares the record's shares, stop and
 target with the orders at the broker. The stop's price is moved in place (the break-even and
@@ -98,6 +100,12 @@ def _unconfirmed_cancel(res: OrderResult) -> bool:
     """The order reads cancelled, but the broker never said it cancelled it (IBKR's 202, or its own order
     status) - an error read as the order's end. Brokers that don't say count as having confirmed."""
     return res.status == "CANCELED" and (res.raw or {}).get("cancel_confirmed") is False
+
+
+def shares_and_price(fills: List[Any]) -> Tuple[float, float]:
+    """The shares the executions in ``fills`` add up to, and their average price; (0, 0) for none."""
+    qty = sum(float(f.quantity) for f in fills)
+    return (qty, sum(float(f.price) * float(f.quantity) for f in fills) / qty) if qty > 1e-9 else (0.0, 0.0)
 
 
 def stop_exit_reason(initial_stop: Optional[float], trigger: float) -> str:
@@ -224,10 +232,44 @@ class ProtectiveStops:
                     if self._broker_resyncing():
                         continue
                     o.unseen += 1
-                    if o.unseen >= self.LOST_AFTER_POLLS:
+                    if o.unseen >= self.LOST_AFTER_POLLS and not self._filled_unseen(book, fill, o):
                         self._lose(book, o, "the broker no longer knows it")
                 else:
                     o.unseen = 0
+
+    def _filled_unseen(self, book: Dict[str, _Stop], fill, o: _Stop) -> bool:
+        """Before a resting order the broker no longer knows is given up: whether the broker's executions show it
+        filled while the app wasn't following it (the connection was down when it finished, say). What they show
+        is booked as the order's own fill would have been. Only the executions of this order count - every stop a
+        trade has had carries the same tag. False when they show none, or can't be read."""
+        t = self.repo.get_trade(o.trade_id)
+        if not t or t.get("status") == "CLOSED":
+            return False
+        tag = stop_tag(o.trade_id) if book is self._stops else target_tag(o.trade_id)
+        exit_side = Side.SHORT if t["side"] == "LONG" else Side.LONG
+        qty, price = shares_and_price([f for f in self._executions(o.symbol) or []
+                                       if str(f.order_id) == str(o.order_id) and f.side is exit_side
+                                       and (getattr(f, "tag", "") or tag) == tag])
+        if qty <= 1e-9:
+            return False
+        log.warning("%s AT BROKER FILLED UNSEEN  %s order %s is no longer known to the broker, but its executions "
+                    "show %s shares @ %.4f - booked", "STOP" if book is self._stops else "TARGET", o.symbol,
+                    o.order_id, qty, price)
+        fill(o, OrderResult(order_id=o.order_id, status="FILLED", symbol=o.symbol, submitted_qty=o.qty,
+                            filled_qty=qty, avg_fill_price=price))
+        return True
+
+    def _executions(self, symbol: Optional[str]) -> Optional[List[Any]]:
+        """The broker's executions this session - of ``symbol``, or the whole account's - oldest first; None when
+        the broker can't say."""
+        get = getattr(self.broker, "get_fills", None)
+        if not callable(get):
+            return None
+        try:
+            return list(get(symbol) or [])
+        except Exception:  # noqa: BLE001
+            log.debug("executions for %s unavailable", symbol or "the account", exc_info=True)
+            return None
 
     def _protect_positions(self) -> None:
         """Make the broker's resting orders match the trade records: place, resize, move, cancel."""

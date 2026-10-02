@@ -526,7 +526,10 @@ The app is built to be left running:
   minute or two) and reconnects once the Gateway has logged back in. A Gateway that takes connections
   before it has loaded the account isn't trusted - the app tries again - and for a minute after any
   reconnect, positions aren't compared with the trade records and working orders aren't given up on,
-  so nothing is deleted because an answer came back half-loaded.
+  so nothing is deleted because an answer came back half-loaded. An order that finished while the
+  connection was down comes back from IBKR without its order id; the app finds it by IBKR's permId or
+  its executions and books it as if it had heard it live. An entry, stop or target IBKR no longer knows
+  at all is looked for in IBKR's executions before it is given up, so what it filled is booked.
 * **IBKR's nightly maintenance** (about 11:45 PM-12:45 AM ET). When the Gateway stays up but loses
   IBKR's servers, the app waits on the same connection for IBKR's all-clear; if that hasn't come after
   10 minutes it starts the connection afresh.
@@ -552,7 +555,9 @@ The app is built to be left running:
   and no price is restored: the first cycle reads fresh candles within seconds, and an entry still
   needs a current quote. With today's watchlist on disk the full scan isn't repeated either; open
   positions and their resting stop and target orders are found again from the trade records and the
-  order tags. A replay the restart cut short resumes from its last finished job (see *The replay*).
+  order tags. An entry sent before the restart that filled while the app was off (its play still
+  *sent*, with no trade and no order working) is booked from IBKR's executions tagged with the play, and
+  gets its stop. A replay the restart cut short resumes from its last finished job (see *The replay*).
 * **An open dashboard tab updates itself.** After the app is updated and restarted, a tab that was already
   open reconnects - and would go on running the scripts it loaded before. The server stamps the dashboard's
   files in its first message; a tab that started on another stamp reloads (or, with a dialog open, asks you to).
