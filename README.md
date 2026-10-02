@@ -1540,6 +1540,11 @@ scales confidence by Aziz's session clock. **Every play's stop is floored**: a
 stop closer than ~0.6 % of price (or ~0.9 intraday ATRs) is widened, *then*
 reward:risk is re-checked. Indicators the setups share (ATRs, VWAP, relative
 volume, the S/R map, the daily trend) are computed once per stock per scan.
+Relative volume leaves out the 5-minute candle still printing: today's closed
+candles against earlier sessions' up to the same time. The swing setups read
+their signals on **completed daily candles** (during the session today's candle
+is still forming and is left out), the ones the replay signals on at each
+session's close, and enter at the price now.
 
 | key | timeframe | idea |
 |---|---|---|

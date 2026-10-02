@@ -261,43 +261,80 @@ def test_stops_are_floored_at_a_slice_of_the_stocks_daily_range():
 
 
 # --------------------------------------------------------------------------- #
-#  the odds a play states lean on the setup's record (Douglas, Chan)
+#  the swing setups signal on completed daily candles and enter at the price now
 # --------------------------------------------------------------------------- #
-def test_the_52_week_setup_projects_todays_volume_during_the_session(monkeypatch):
+def _daily_through_today(closes, today):
+    """Daily candles ending in today's, one per close given, each half a point beyond its body."""
+    days = pd.bdate_range(end=pd.Timestamp(today) - pd.Timedelta(days=1), periods=len(closes) - 1)
+    c = np.asarray(closes, float)
+    o = np.concatenate([[c[0]], c[:-1]])
+    return pd.DataFrame({"open": o, "high": np.maximum(o, c) + 0.5, "low": np.minimum(o, c) - 0.5, "close": c,
+                         "volume": np.full(len(c), 2e6)},
+                        index=pd.DatetimeIndex([*days, pd.Timestamp(today)]).tz_localize("America/New_York"))
+
+
+def _live_context(monkeypatch, symbol, daily, minutes=30.0):
+    """A context ``minutes`` into today's session - today's daily candle, last, is still forming - priced
+    at that candle's close so far."""
     import datetime as dt
 
+    monkeypatch.setattr(clock, "minutes_since_open", lambda ts=None: minutes)
+    ctx = build_context(symbol, fakes.intraday_bars(symbol), daily,
+                        fakes.quote_from_price(symbol, float(daily["close"].iloc[-1])))
+    ctx.now = dt.datetime.combine(daily.index[-1].date(), dt.time(10, 0), tzinfo=clock.NY)
+    return ctx
+
+
+def test_swing_setups_signal_on_the_last_completed_daily_candle(monkeypatch):
+    from autotradebot.indicators import ta
+    from autotradebot.strategies.technical import Rsi2MeanReversion
+
+    today = clock.session_date(clock.now_ny())
+    climb = list(np.linspace(50.0, 100.0, 230))                                      # well above its 200-day
+    # today's candle, still forming, has dropped five points: RSI(2) reads a washout on it, but no session
+    # has closed on one - until the close, when the same candle is complete
+    daily = _daily_through_today(climb + [95.0], today)
+    ctx = _live_context(monkeypatch, "RSI", daily)
+    assert Rsi2MeanReversion().generate(ctx) == []
+    pd.testing.assert_frame_equal(ctx.daily_adx, ta.adx(daily.iloc[:-1], 14))        # the shared ADX too
+    plays = Rsi2MeanReversion().generate(_live_context(monkeypatch, "RSI", daily, minutes=390.0))
+    assert len(plays) == 1 and plays[0].side is Side.LONG
+
+    # yesterday closed on the washout and today bounces a little: the signal stands, entered at the price now
+    plays = Rsi2MeanReversion().generate(_live_context(monkeypatch, "RSI", _daily_through_today(climb + [95.0, 95.5],
+                                                                                              today)))
+    assert len(plays) == 1 and plays[0].side is Side.LONG
+    assert plays[0].entry == pytest.approx(95.5) and plays[0].evidence["rsi2"] < 10
+
+
+def test_the_52_week_setup_reads_the_push_and_its_volume_off_the_last_completed_session(monkeypatch):
     from autotradebot.strategies.technical import Week52Breakout
 
     symbol = "W52"
-    daily = fakes.daily_bars(symbol)
-    intraday = fakes.intraday_bars(symbol)
     today = clock.session_date(clock.now_ny())
-    # a stock at its 52-week high, whose twenty prior sessions averaged 1M shares
-    daily = daily.copy()
+    daily = fakes.daily_bars(symbol)
+    daily = daily[daily.index.date < today].copy()
+    # a stock in a tight base just under its 52-week high, 1M shares every session
     daily.loc[:, "volume"] = 1_000_000.0
     hi = float(daily["high"].max())
-    tail = daily.index[-20:]                                                         # a tight base under the high
+    tail = daily.index[-20:]
     daily.loc[tail, "open"], daily.loc[tail, "close"] = hi * 0.99, hi * 0.992
     daily.loc[tail, "high"], daily.loc[tail, "low"] = hi * 0.998, hi * 0.985
-    partial = pd.DataFrame({"open": [hi * 1.001], "high": [hi * 1.02], "low": [hi * 0.999], "close": [hi * 1.015],
-                            "volume": [400_000.0]},                                  # 40% of a session's, early on
+    forming = pd.DataFrame({"open": [hi * 1.001], "high": [hi * 1.02], "low": [hi * 0.999], "close": [hi * 1.015],
+                            "volume": [900_000.0]},                                  # most of a session's, 30 minutes in
                            index=pd.DatetimeIndex([pd.Timestamp(today).tz_localize("America/New_York")]))
-    with_today = pd.concat([daily[daily.index.date < today], partial])
-    quote = fakes.quote_from_price(symbol, float(partial["close"].iloc[0]))
-    ny = dt.datetime.combine(today, dt.time(10, 0), tzinfo=clock.NY)                 # 30 minutes in
+    # today's candle pushes through the high on heavy volume so far, but no session has closed on it
+    assert Week52Breakout().generate(_live_context(monkeypatch, symbol, pd.concat([daily, forming]))) == []
 
-    ctx = build_context(symbol, intraday, with_today, quote)
-    ctx.now = ny
-    monkeypatch.setattr(clock, "minutes_since_open", lambda ts=None: 30.0)
-    plays = Week52Breakout().generate(ctx)
-    assert plays and plays[0].evidence["vol_mult"] == pytest.approx(400_000 * 13 / 1_000_000, rel=1e-3)   # projected x13
-
-    monkeypatch.setattr(clock, "minutes_since_open", lambda ts=None: 390.0)         # after the close: as printed
-    ctx2 = build_context(symbol, intraday, with_today, quote)
-    ctx2.now = ny
-    assert Week52Breakout().generate(ctx2) == []                                    # 0.4x average volume: no breakout
+    daily.iloc[-1, daily.columns.get_loc("volume")] = 2_600_000.0                   # yesterday's session was heavy
+    plays = Week52Breakout().generate(_live_context(monkeypatch, symbol, pd.concat([daily, forming])))
+    assert plays and plays[0].side is Side.LONG and plays[0].entry == pytest.approx(hi * 1.015, rel=1e-4)
+    assert plays[0].evidence["vol_mult"] == pytest.approx(2.6 / 1.08, rel=1e-2)     # its volume, against 20 sessions
 
 
+# --------------------------------------------------------------------------- #
+#  the odds a play states lean on the setup's record (Douglas, Chan)
+# --------------------------------------------------------------------------- #
 def test_calibrated_probability_shrinks_toward_the_record_as_it_grows():
     from autotradebot.strategies.base import calibrated_probability
 
