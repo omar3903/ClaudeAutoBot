@@ -986,8 +986,8 @@ def _moved_silently(broker, orders):
 
 def _a_minute_on(broker, order_id):
     """As if the move noted for ``order_id`` had gone out a minute ago."""
-    status, at, sent = broker._modifying[order_id]
-    broker._modifying[order_id] = (status, at, sent - 60.0)
+    status, at, sent, before = broker._modifying[order_id]
+    broker._modifying[order_id] = (status, at, sent - 60.0, before)
 
 
 @pytest.mark.parametrize("a_minute_on,reads", [(False, "SUBMITTED"), (True, "CANCELED")])
@@ -1015,6 +1015,39 @@ def test_an_error_long_after_a_refused_stop_move_ends_the_stop(broker):
     _a_minute_on(broker, res.order_id)
     orders.error(1, 201, "Order rejected - reason: the stop could not be routed")     # ib_async logs nothing: "done"
     assert broker.get_order(res.order_id).status == "CANCELED"
+
+
+def test_a_stop_move_ibkr_refuses_after_its_silence_reads_back_where_ibkr_still_holds_the_stop(broker):
+    orders = IbOrders(broker._session.ib)
+    res = _moved_silently(broker, orders)                                      # 98.5 -> 99, and no word from IBKR
+    orders.error(1, 201, "Order rejected - reason: the order can't be changed")   # its no, a moment late
+    got = broker.get_order(res.order_id)
+    assert (got.status, got.stop_price, got.submitted_qty) == ("SUBMITTED", 98.5, 10.0)
+
+
+def test_ibkrs_full_list_of_its_orders_settles_a_stop_move_it_answered_with_an_error(broker):
+    orders = IbOrders(broker._session.ib)
+    broker.MODIFY_ANSWER_S = 0.05
+    for oid, price in ((1, 98.5), (2, 97.5)):
+        _resting_stop(broker, price=price)
+        orders.book[oid].orderStatus.status = "PreSubmitted"
+        broker.modify_stop(str(oid), stop_price=99.0)                         # IBKR says nothing...
+        orders.error(oid, 201, "Order rejected - reason: the stop could not be routed")   # ...then: a no, or its end?
+    assert [broker.get_order(o).status for o in ("1", "2")] == ["SUBMITTED", "SUBMITTED"]
+    orders.closed.add(1)                                                       # IBKR no longer works the first
+    broker.list_orders("WORKING")
+    assert [broker.get_order(o).status for o in ("1", "2")] == ["CANCELED", "SUBMITTED"]   # ended, and working
+
+
+def test_moving_a_stop_ibkr_holds_until_its_trigger_waits_only_a_moment_for_a_word_that_never_comes(broker):
+    orders = IbOrders(broker._session.ib)
+    res = _resting_stop(broker, price=98.5)
+    orders.book[1].orderStatus.status = "PreSubmitted"                         # IBKR takes a change to it silently
+    broker.MODIFY_ANSWER_S, broker.MODIFY_QUIET_S = 5.0, 0.05
+    began = time.monotonic()
+    assert broker.modify_stop(res.order_id, stop_price=99.0).stop_price == 99.0
+    assert time.monotonic() - began < 2.0                                      # the order sync isn't held up
+    assert res.order_id in broker._modifying                                   # a refusal may yet come
 
 
 def _rebuilt(orders, contract, perm, status, fills=(), **order):

@@ -269,9 +269,10 @@ class IbkrBroker(BrokerAdapter):
         self._orders_lock = threading.Lock()
         self._orders_asked: Optional[Future] = None
         #: the orders IBKR has said are cancelled (its 202), and the orders a modify was sent for, with the status
-        #: each had then, where the modify sits in its log and when it was sent - see _true_status. Order id -> ...
+        #: each had then, where the modify sits in its log, when it was sent and the trigger and shares it held
+        #: before - see _true_status. Order id -> ...
         self._cancels_confirmed: Dict[str, float] = {}
-        self._modifying: Dict[str, Tuple[str, int, float]] = {}
+        self._modifying: Dict[str, Tuple[str, int, float, Tuple[Any, Any]]] = {}
         #: order id -> IBKR's permId, noted when an order is placed or read. An order that finishes while the
         #: connection is down comes back from IBKR's list of finished orders with no order id, only the permId
         self._perm_ids: Dict[str, int] = {}
@@ -632,13 +633,24 @@ class IbkrBroker(BrokerAdapter):
 
     def _modify_heard(self, order_id: int) -> None:
         """An error on an order a modify was sent for. Within MODIFY_REFUSED_WITHIN_S of the modify it is IBKR's
-        answer to it - the order works on as it was (_true_status). Later, it is IBKR's word on the order itself (a
-        stop rejected as it triggers, say), and the note goes: what ends the order then must read as its end, not as
-        a refused move. (ib_async logs no error on an order it already has down as finished - after a refused
-        move, say - so it is only heard here.) Runs on the loop thread, from _on_error."""
+        answer to it - the order works on as it was (_true_status), its trigger and shares put back to what IBKR
+        still holds, so a move refused after modify_stop took IBKR's silence for a yes reads as not made. Later, it
+        is IBKR's word on the order itself (a stop rejected as it triggers, say), and the note goes: what ends the
+        order then must read as its end, not as a refused move. (ib_async logs no error on an order it already has
+        down as finished - after a refused move, say - so it is only heard here.) Runs on the loop thread, from
+        _on_error."""
         note = self._modifying.get(str(order_id))
-        if note is not None and time.monotonic() - note[2] > self.MODIFY_REFUSED_WITHIN_S:
+        if note is None:
+            return
+        if time.monotonic() - note[2] > self.MODIFY_REFUSED_WITHIN_S:
             self._modifying.pop(str(order_id), None)
+            return
+        try:
+            trade = next((t for t in self._ib.trades() if str(getattr(t.order, "orderId", "")) == str(order_id)), None)
+            if trade is not None:
+                trade.order.auxPrice, trade.order.totalQuantity = note[3]
+        except Exception:  # noqa: BLE001 - IBKR's own list puts the order right when it is next read
+            log.debug("could not put order %s back as IBKR holds it", order_id, exc_info=True)
 
     def _servers_back(self, code: int) -> None:
         """IB Gateway reached IBKR's servers again. Runs on the loop thread, so it calls ib_async directly."""
@@ -1203,9 +1215,11 @@ class IbkrBroker(BrokerAdapter):
 
     #: how long a stop's move waits for IBKR's answer. A refusal comes back as an error on the order, which
     #: ib_async takes for the order's end; one later than this, but within MODIFY_REFUSED_WITHIN_S of the move,
-    #: still never makes the order read as cancelled - an error after that is IBKR's word on the order itself.
-    #: (A change IBKR takes on an order not yet live - PreSubmitted - leaves no word in the log: it waits it out)
-    MODIFY_ANSWER_S, MODIFY_REFUSED_WITHIN_S = 1.0, 10.0
+    #: still never makes the order read as cancelled, and puts its trigger and shares back as IBKR holds them - an
+    #: error after that is IBKR's word on the order itself. A change IBKR takes on an order it holds until its
+    #: trigger (PreSubmitted, as it holds most stops on stocks) leaves no word in the log, so the wait for one is
+    #: only MODIFY_QUIET_S: every such move would otherwise hold the order sync for the whole wait
+    MODIFY_ANSWER_S, MODIFY_QUIET_S, MODIFY_REFUSED_WITHIN_S = 1.0, 0.25, 10.0
 
     def modify_stop(self, order_id: str, stop_price: Optional[float] = None,
                     quantity: Optional[float] = None) -> OrderResult:
@@ -1242,27 +1256,29 @@ class IbkrBroker(BrokerAdapter):
             at = len(entries) if entries is not None else None
             if at is not None:
                 _remember(self._modifying, str(order_id),
-                          (getattr(trade.orderStatus, "status", "") or "", at, time.monotonic()))
+                          (getattr(trade.orderStatus, "status", "") or "", at, time.monotonic(), before))
             try:
                 return ib.placeOrder(trade.contract, order), at
             except Exception:
                 self._modifying.pop(str(order_id), None)      # never sent: a later error isn't its answer
                 raise
 
+        quiet = getattr(trade.orderStatus, "status", "") == "PreSubmitted"     # IBKR takes a change to it silently
+        wait = min(self.MODIFY_QUIET_S, self.MODIFY_ANSWER_S) if quiet else self.MODIFY_ANSWER_S
         changed, at = self._session.call(_send, timeout=10)
         if at is not None:
-            refused = self._modify_answer(changed, str(order_id), at)
+            refused = self._modify_answer(changed, str(order_id), at, wait)
             if refused:
                 order.auxPrice, order.totalQuantity = before        # what IBKR still holds
                 raise OrderRejected(f"IBKR refused to change order {order_id}: {refused}")
         return self._result(changed)
 
-    def _modify_answer(self, trade, order_id: str, at: int) -> str:
-        """Wait a moment for IBKR's word on the modify noted at ``at`` in the order's log: its reason when it
-        refused the change, "" when it took it - or said nothing in time, when the modify stays noted, so a
-        refusal that comes later, within MODIFY_REFUSED_WITHIN_S, still reads as one (_true_status)."""
+    def _modify_answer(self, trade, order_id: str, at: int, wait: float) -> str:
+        """Wait up to ``wait`` seconds for IBKR's word on the modify noted at ``at`` in the order's log: its reason
+        when it refused the change, "" when it took it - or said nothing in time, when the modify stays noted, so a
+        refusal that comes later, within MODIFY_REFUSED_WITHIN_S, still reads as one (_true_status, _modify_heard)."""
         async def _wait(ib):
-            end = time.monotonic() + self.MODIFY_ANSWER_S
+            end = time.monotonic() + wait
             while True:
                 for entry in list(getattr(trade, "log", None) or [])[at + 1:]:
                     code = int(getattr(entry, "errorCode", 0) or 0)
@@ -1275,7 +1291,7 @@ class IbkrBroker(BrokerAdapter):
                 await _sleep(0.05)
 
         try:
-            verdict, why = self._session.run_coro(_wait, timeout=self.MODIFY_ANSWER_S + 5)
+            verdict, why = self._session.run_coro(_wait, timeout=wait + 5)
         except Exception:  # noqa: BLE001 - the answer is read off the order later all the same
             return ""
         if verdict == "taken":
@@ -1341,7 +1357,9 @@ class IbkrBroker(BrokerAdapter):
         if lead:
             try:
                 # a few seconds past the request's own limit: time for a busy loop to get to it
+                started = time.monotonic()
                 answer = self._session.run_coro(self._ask_open_orders, timeout=self.OPEN_ORDERS_TIMEOUT_S + 5)
+                self._settle_modifies(answer or [], started)
                 asked.set_result(answer)
             except BaseException as e:  # noqa: BLE001 - whatever ended it, every caller waiting hears the same
                 asked.set_exception(e)
@@ -1352,6 +1370,16 @@ class IbkrBroker(BrokerAdapter):
             return asked.result(timeout=self.OPEN_ORDERS_TIMEOUT_S + 10) or []
         except (FutureTimeout, asyncio.TimeoutError) as e:     # asyncio's timeout, or what it becomes crossing threads
             raise BrokerError(f"IBKR's open orders didn't arrive within {self.OPEN_ORDERS_TIMEOUT_S:.0f} s") from e
+
+    def _settle_modifies(self, listed, asked_at: float) -> None:
+        """IBKR's full list of the orders it works settles the moves noted before it was asked for (_modifying): an
+        order it doesn't list isn't working, so an error that ended it is its end, not a refused move - the note
+        goes and the order reads as the cancelled one it is. (One it lists, ib_async has put right from IBKR's own
+        order status and prices.)"""
+        live = {str(getattr(getattr(t, "order", None), "orderId", "")) for t in listed}
+        for oid, note in list(self._modifying.items()):
+            if oid not in live and note[2] <= asked_at:    # (the clock moves in steps of a few ms)
+                self._modifying.pop(oid, None)
 
     async def _ask_open_orders(self, ib):
         # reqAllOpenOrdersAsync hands back a future, not a coroutine, so it is awaited in one. Timing out

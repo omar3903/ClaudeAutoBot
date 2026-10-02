@@ -305,3 +305,14 @@ def test_a_plain_stop_from_before_the_update_is_replaced_by_the_pair():
     assert stop.oca_group == target.oca_group != "" and ex.protective_stops()[0]["order_id"] != "70"
     ex.sync_open_orders()
     assert len(broker.orders) == 2                                             # settled: nothing more is sent
+
+
+def test_a_rebuild_leaves_the_pair_alone_while_an_exit_is_standing_it_down():
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()
+    repo.update_trade_risk("t1", target_price=106.0)                          # the pair has the wrong shape now
+    assert ex._claim_resting("t1")                                             # a close on another thread holds it
+    assert ex._rebuild(repo.get_trade("t1")) is False
+    assert broker.cancelled == [] and len(broker.orders) == 2                  # nothing stood down, nothing placed
+    ex._release_resting("t1")
+    assert ex._rebuild(repo.get_trade("t1")) is True and sorted(broker.cancelled) == ["1", "2"]
