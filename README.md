@@ -149,7 +149,12 @@ Settings so it's done before the bell):
    session such a stock's candle for yesterday is built from its 5-minute bars,
    so its gap, its prior close and its intraday heat start from yesterday's
    close and never an older one. When the 5-minute bars don't hold yesterday
-   either, its day-trade setups are skipped; the swing setups still run.
+   either, its day-trade setups are skipped; the swing setups still run (the
+   first such stock each session is logged at INFO). Yesterday is the last
+   session the stock's 5-minute bars or the S&P 500 ETF's candles hold, so a
+   weekday the market was shut that the holiday calendar doesn't list isn't
+   taken for a missed session; the calendar decides only when no candles reach
+   today.
 4. **Daily heat** — no requests: relative volume in the last session, the size of
    its move against its ATR, a close near a 20-day high or low, volatility and
    dollar volume, each turned into a percentile across every **liquid** stock

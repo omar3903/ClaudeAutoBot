@@ -594,6 +594,20 @@ def test_a_live_name_whose_daily_candles_stop_short_of_yesterday_waits_for_candl
     assert live._live_scan_once() == ["T20", "T26", "T21"]
 
 
+def test_a_weekday_the_market_was_shut_that_the_calendar_doesnt_list_keeps_no_live_name_out(live, monkeypatch):
+    yesterday = clock.prev_trading_day(DAY)
+    full = live.md.daily_frame("T20")
+    short = full[full.index.date < yesterday]                        # current if the market was shut yesterday
+    daily_frame, cached = live.md.daily_frame, live.md.cached_intraday
+    monkeypatch.setattr(live.md, "daily_frame", lambda s: short if s == "T20" else daily_frame(s))
+    assert live._live_scan_once() == ["T26", "T21", "T27"]           # by the calendar it is a session short
+    # the S&P 500 ETF's 5-minute candles have none on yesterday - a closure the holiday calendar doesn't list
+    spy = live.md.intraday([BENCHMARK])[BENCHMARK]
+    shut = spy[spy.index.date != yesterday]
+    monkeypatch.setattr(live.md, "cached_intraday", lambda s: shut if s == BENCHMARK else cached(s))
+    assert cached("T20") is None and live._live_scan_once() == ["T20", "T26", "T21"]
+
+
 def test_the_live_scan_slots_default_to_10_within_0_to_20():
     from autotradebot.config import ScannerCfg
 

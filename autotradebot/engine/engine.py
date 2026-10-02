@@ -89,7 +89,7 @@ from ..scanner.noise import LABELS as NOISE_LABELS
 from ..scanner import schedule
 from ..scanner.evaluator import prev_close_known
 from ..scanner.filters import TradeFilters
-from ..scanner.scanner import Scanner, ScanResult
+from ..scanner.scanner import BENCHMARK, Scanner, ScanResult
 from ..scanner.schedule import ScanSettings
 from ..strategies.registry import REGISTRY, build_strategies, strategy_catalog
 from ..util import clock
@@ -1143,7 +1143,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         each scan's first, then each one's second... - that SymbolMaster calls ordinary tradable shares, in a sector
         the filters allow, with daily candles (the morning's download covers every tradable listing) that reach the
         last session - or 5-minute candles in hand that do, as the setups would take yesterday's close from them
-        (scanner/evaluator.py prev_close_known) - not on the hot list already and not found too thin today
+        (scanner/evaluator.py prev_close_known; the last session is the latest the stock's or the S&P 500 ETF's
+        cached 5-minute candles hold before today, the calendar's without them) - not on the hot list already and not found too thin today
         (_thin_live_names). The first scanner.live_scan of them take watch-tier slots right after the hot list
         (Scanner.set_live_names), so a stock too quiet for the morning's ranking is streamed and checked once it
         moves. Names never seen before are looked up first, LIVE_LOOKUPS a round, and kept in symbols.json. Only in
@@ -1179,13 +1180,14 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             except Exception as e:  # noqa: BLE001 - the names already known still count; the rest wait a round
                 log.debug("live scan: contract details unavailable: %s", e)
         hot, thin, sectors = set(wl.hot_symbols()), set(self._live_thin), self.scanner.filters.sectors
+        market = self.md.cached_intraday(BENCHMARK)   # its sessions are the market's: a closure leaves no bars
         names: List[str] = []
         for symbol in master.tradable(found):
             if len(names) >= n:
                 break
             if (symbol not in hot and symbol not in thin and sector_allowed(master.sector(symbol), sectors)
                     and (daily := self.md.daily_frame(symbol)) is not None
-                    and prev_close_known(daily, self.md.cached_intraday(symbol), now.date())):
+                    and prev_close_known(daily, self.md.cached_intraday(symbol), now.date(), market)):
                 names.append(symbol)
         before = list(self.scanner.live_names)
         if names != before:

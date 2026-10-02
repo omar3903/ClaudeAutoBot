@@ -440,6 +440,8 @@ class Scanner:
                     if activity is not None:
                         heat[symbol] = activity.heat + (_PLAY_BONUS if plays else 0.0)
                         seen[symbol] = activity
+        # the sweep's own time: the checks it stepped aside for are timed apart, under between_chunks
+        result.timings["setups"] -= result.timings.get("between_chunks", 0.0)
         result.symbols, result.scanned = [s for s in scanned if s not in fresher], len(scanned)
         result.plays = [p for p in result.plays if p.symbol not in fresher]
         with self._watchlist_lock:

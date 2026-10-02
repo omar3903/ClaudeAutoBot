@@ -7,6 +7,8 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import math
+import time
+import types
 
 import numpy as np
 import pandas as pd
@@ -23,7 +25,8 @@ from autotradebot.data.sec_edgar import SecEdgarFundamentals, annual_series, fin
 from autotradebot.data.sectors import SECTORS, sector_from_ibkr
 from autotradebot.data.symbols import SymbolMaster
 from autotradebot.scanner import evaluator, schedule
-from autotradebot.scanner.evaluator import evaluate, median_volume, prev_close_known, stale_daily, with_today
+from autotradebot.scanner.evaluator import (evaluate, last_session, median_volume, prev_close_known, stale_daily,
+                                            with_today)
 from autotradebot.scanner.heat import daily_metrics, intraday_metrics, liquid, rank_by_daily_heat
 from autotradebot.scanner.scanner import BENCHMARK, Scanner
 from autotradebot.scanner.schedule import ScanSettings
@@ -139,9 +142,14 @@ def test_the_wide_scan_hands_the_thread_over_between_its_chunks_and_leaves_newer
     scanner.set_strategies([_EveryStock()])
     asked = len(scanner.md.source.requests)
     pauses = []
+    skew = {"s": 0.0}
+    monotonic = time.monotonic
+    monkeypatch.setattr("autotradebot.scanner.scanner.time",
+                        types.SimpleNamespace(monotonic=lambda: monotonic() + skew["s"]))
 
     def between():
         pauses.append({r[0] for r in scanner.md.source.requests[asked:] if r[0] != BENCHMARK})
+        skew["s"] += 100.0                                         # each check stepped aside for takes 100 s
         # the first pause's check reads the first stock, which the sweep has read, and the last, which it hasn't yet
         return [ranked[0], ranked[-1]] if len(pauses) == 1 else []
 
@@ -150,7 +158,9 @@ def test_the_wide_scan_hands_the_thread_over_between_its_chunks_and_leaves_newer
     assert chunks >= 3 and pauses == [set(ranked[:10 * n]) for n in range(1, chunks)]     # between chunks only
     assert result.scanned == len(ranked) and set(result.symbols) == set(ranked) - {ranked[0]}
     assert {p.symbol for p in result.plays} == set(ranked) - {ranked[0]}           # the check's play on it stands
-    assert "between_chunks" in result.timings
+    # the checks are timed apart from the sweep's own setups, not in them as well
+    assert result.timings["between_chunks"] == pytest.approx(100.0 * (chunks - 1), abs=1.0)
+    assert 0 < result.timings["setups"] < 100.0
 
 
 def test_the_gap_check_adopts_the_gappers_into_the_hot_list(scanner, monkeypatch):
@@ -295,25 +305,61 @@ class _Only:
                      entry=ctx.price, stop=ctx.price * 0.99, targets=[ctx.price * 1.03])]
 
 
-def test_no_day_setups_run_when_neither_the_store_nor_the_bars_reach_the_last_session():
+def test_no_day_setups_run_when_neither_the_store_nor_the_bars_reach_the_last_session(monkeypatch, caplog):
+    monkeypatch.setattr(evaluator, "_failed_in", {})
     intraday = fakes.intraday_bars("AAA")
     day = intraday.index[-1].date()
     prev = clock.prev_trading_day(day)
     holey = intraday[intraday.index.date != prev]                   # the bars miss yesterday too
     daily = fakes.daily_bars("AAA")
     stale, current = daily[daily.index.date < prev], daily[daily.index.date < day]
+    # the S&P 500 ETF's closes as the scans pass them, today's included: the market traded yesterday
+    market = with_today(fakes.daily_bars(BENCHMARK), fakes.intraday_bars(BENCHMARK))["close"]
     both = [_Only(Timeframe.INTRADAY), _Only(Timeframe.SWING)]
 
     def timeframes(daily, intraday):
-        return [p.timeframe for p in evaluate("AAA", both, daily, intraday, run_id="r", equity=0.0, params={})]
+        return [p.timeframe for p in evaluate("AAA", both, daily, intraday, run_id="r", equity=0.0, params={},
+                                              benchmark=market)]
 
-    assert timeframes(stale, holey) == [Timeframe.SWING]          # a gap read off an older close would be made up
-    assert not prev_close_known(stale, holey, day) and stale_daily(stale, day)
-    # either one reaching yesterday is enough
-    assert timeframes(stale, intraday) == timeframes(current, holey) == [Timeframe.INTRADAY, Timeframe.SWING]
-    assert prev_close_known(stale, intraday, day) and prev_close_known(current, None, day)
-    assert timeframes(with_today(stale, holey), holey) == [Timeframe.SWING]   # the joined frame says the same
-    assert not stale_daily(with_today(stale, intraday), day)
+    with caplog.at_level(logging.DEBUG, logger="autotradebot.scanner.evaluator"):
+        assert timeframes(stale, holey) == [Timeframe.SWING]      # a gap read off an older close would be made up
+        assert not prev_close_known(stale, holey, day, market) and stale_daily(stale, day, holey, market)
+        assert stale_daily(stale, day)                            # the calendar says so too
+        # either one reaching yesterday is enough
+        assert timeframes(stale, intraday) == timeframes(current, holey) == [Timeframe.INTRADAY, Timeframe.SWING]
+        assert prev_close_known(stale, intraday, day, market) and prev_close_known(current, None, day, market)
+        assert timeframes(with_today(stale, holey), holey) == [Timeframe.SWING]   # the joined frame says the same
+        assert not stale_daily(with_today(stale, intraday), day)
+    # the session's first stock without them is an INFO line, so a session where none has them is seen
+    skipped = [r.levelno for r in caplog.records if "no day setups" in r.getMessage()]
+    assert skipped == [logging.INFO, logging.DEBUG]
+
+
+def test_a_weekday_the_market_was_shut_that_the_calendar_doesnt_list_isnt_taken_for_a_missed_session():
+    # the session after a closure the holiday calendar doesn't hold, as for a national day of mourning
+    day, shut, last = dt.date(2025, 1, 10), dt.date(2025, 1, 9), dt.date(2025, 1, 8)
+    assert clock.prev_trading_day(day) == shut
+    sessions = [dt.date(2025, 1, 6), dt.date(2025, 1, 7), last, day]                 # no bars on the day it was shut
+    index = pd.DatetimeIndex([t for d in sessions
+                              for t in pd.date_range(pd.Timestamp(f"{d} 09:30", tz=fakes.NY), periods=78, freq="5min")])
+    close = np.repeat([50.0, 51.0, 52.0, 53.0], 78)
+    intraday = pd.DataFrame({"open": close, "high": close + 0.1, "low": close - 0.1, "close": close,
+                             "volume": 1e4}, index=index)
+    daily = fakes.daily_bars("AAA", through=last)                   # current: it ends on the last session
+    spy = fakes.daily_bars(BENCHMARK, through=last)["close"]        # the S&P 500 ETF's closes, today's on the end
+    market = pd.concat([spy, pd.Series([spy.iloc[-1]], index=pd.DatetimeIndex([pd.Timestamp(day, tz=fakes.NY)]))])
+
+    assert stale_daily(daily, day)                                  # by the calendar alone it looks a session short
+    assert last_session(day, intraday) == last_session(day, intraday, market) == last_session(day, market) == last
+    assert not stale_daily(daily, day, intraday, market) and prev_close_known(daily, intraday, day, market)
+    assert prev_close_known(daily, None, day, market)               # the live scan's case: the market's candles only
+    full = with_today(daily, intraday)
+    assert [d.date() for d in full.index[-2:]] == [last, day] and full["close"].iloc[-2] == daily["close"].iloc[-1]
+    both = [_Only(Timeframe.INTRADAY), _Only(Timeframe.SWING)]
+    plays = evaluate("AAA", both, full, intraday, run_id="r", equity=0.0, params={}, benchmark=market)
+    assert [p.timeframe for p in plays] == [Timeframe.INTRADAY, Timeframe.SWING]
+    # candles that don't reach the day can't say: the calendar's yesterday stands
+    assert last_session(day, intraday[intraday.index.date < day]) == last_session(day) == shut
 
 
 def test_a_play_carries_the_stocks_median_volume_over_its_last_20_completed_sessions():
