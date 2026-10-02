@@ -49,13 +49,17 @@ day. IBC makes that hands-off.
 
 3. IB GATEWAY  (lighter than TWS - install this)
    https://www.interactivebrokers.com/en/trading/ibgateway-stable.php
-   Launch it, log in with your PAPER user first.
+   Launch it and log the paper Gateway in with your PAPER username (DU...),
+   not the live one - the app refuses a live account on the paper port.
    Configure -> Settings -> API -> Settings:
      [x] Enable ActiveX and Socket Clients   (older versions only - newer
                                               ones have the API on already)
-     [ ] Read-Only API           (untick so the bot can place orders;
-                                  leave ticked + set IBKR_READONLY=1 for
-                                  data-only)
+     [ ] Read-Only API           (PAPER login only: untick so the bot can
+                                  place paper orders. LIVE login: keep it
+                                  ticked until you deliberately trade live -
+                                  the app still reads prices and the
+                                  account. Ticked on both + IBKR_READONLY=1
+                                  for data-only)
      Socket port:  4002  (paper)   /  4001  (live)
      Trusted IPs:  127.0.0.1
    Configure -> Settings -> Lock and Exit -> "Auto restart" (NOT auto

@@ -295,13 +295,17 @@ re-enters your login automatically, and the app reconnects on its own.
 2. Optional: **Settings → Market Data Subscriptions** (e.g. *US Securities
    Snapshot Bundle*, ~$10/mo). Without it quotes are delayed and labelled
    `delayed`.
-3. **IB Gateway → Configure → Settings → API → Settings**: socket port **4002**
+3. Log the paper Gateway in with the **paper username** (`DU…`), not your live
+   one - the app refuses a live account on the paper port. **IB Gateway →
+   Configure → Settings → API → Settings**: socket port **4002**
    (paper) / **4001** (live), *Allow connections from localhost only* with
-   Trusted IP `127.0.0.1`, and untick *Read-Only API*. (Older versions also have
-   an *Enable ActiveX and Socket Clients* box to tick; newer ones have the API
-   on already.) Then *Lock and Exit → Auto restart* (not *Auto logoff*) at
-   **9:00 PM New York time**: after-hours trading has ended at 8:00 PM, IBKR's
-   nightly maintenance (about 11:45 PM–12:45 AM ET) hasn't started, and
+   Trusted IP `127.0.0.1`. Untick *Read-Only API* on the **paper** login only;
+   on the **live** login keep it ticked until you deliberately trade live (the
+   app still reads prices and the account; IBKR refuses its orders). (Older
+   versions also have an *Enable ActiveX and Socket Clients* box to tick; newer
+   ones have the API on already.) Then *Lock and Exit → Auto restart* (not
+   *Auto logoff*) at **9:00 PM New York time**: after-hours trading has ended
+   at 8:00 PM, IBKR's nightly maintenance (about 11:45 PM–12:45 AM ET) hasn't started, and
    pre-market (4:00 AM) and the pre-market scan are hours away. The app
    reconnects on its own; IBKR still asks for a full login about once a week.
 4. For a hands-off daily login, set `IbLoginId` / `IbPassword` /
@@ -388,8 +392,8 @@ account and place orders, with no login. Two locks keep that port to this comput
 
 1. **In IB Gateway** (*Configure → Settings → API → Settings*): tick *Allow connections from localhost only*,
    keep `127.0.0.1` as the **only** entry under *Trusted IPs* (remove anything else), and use the standard
-   ports (4002 paper, 4001 live). If you only want to watch, leave *Read-Only API* ticked - the app then can't
-   trade. Leave *Master API client ID* empty.
+   ports (4002 paper, 4001 live). Untick *Read-Only API* on the paper login only (see below). Leave *Master
+   API client ID* empty.
 2. **In the operating system's firewall**, block those ports from the network, so even a Gateway setting
    changed by mistake can't expose them. On Windows, in PowerShell run as administrator:
 
@@ -402,6 +406,31 @@ account and place orders, with no login. Two locks keep that port to this comput
    Gateway's installer added. Check it with `Get-NetFirewallRule -DisplayName "IBKR API - block from network"`.
    On Linux: `sudo ufw deny 4001:4002/tcp` and `sudo ufw deny 7496:7497/tcp`.
 
+The **live** account needs more than a closed port, since this app - or anything else running on this
+computer - can still reach it:
+
+- **Keep the live login read-only until you deliberately trade live.** *Read-Only API* is set per Gateway
+  login: untick it on the paper login only. With it ticked on the live login the app still reads prices and
+  the account, but IBKR refuses every order sent through the API.
+- **Live mode is switched off in the file.** The dashboard's Live switch is refused until you set
+  `account.allow_live_mode: true` in `config/config.yaml` - nothing in the dashboard can set it - and a Live
+  choice saved in `data/runtime.json` starts in Paper without it. Autopilot also needs `autopilot.allow_live`
+  before it routes a real order. Leave both off until you mean to trade real money.
+- **The app checks which account is behind each port**, on every connection and reconnect: the paper route
+  refuses a live login and the live route a paper one (see *Where orders go*). A live login on the paper
+  port, or a paper port set to 4001, is never traded as paper, out of reach of `allow_live`, the $2,000 floor
+  and the day-trade cap.
+- **Turn on IB Key two-factor login for the live username** (*IBKR Mobile* → *Secure Login System*), so
+  nobody can log the live Gateway in without your phone. Keep IBC's automatic login to the paper username.
+- **Set IBKR's order precautions on the live login**, so IBKR itself rejects an order bigger than you would
+  ever place, whatever sent it: in TWS logged in with the live username, *Global Configuration → Presets →
+  Stocks → Precautionary Settings*, a *Size Limit* (shares per order) and a *Total Value Limit* (money per
+  order) a little above the biggest order the app's sizing places (see *Trading capital*), or IBKR refuses
+  its normal orders too. In the Gateway's *Configure → Settings → API → Precautions*, leave *Bypass Order
+  Precautions for API Orders* unticked so they apply to the app's orders.
+- **Log the live Gateway out when you're not trading live.** With nothing logged in behind port 4001, no
+  program can reach the live account through the API at all.
+
 And around it:
 
 - Keep `IBKR_HOST=127.0.0.1`. The API connection isn't encrypted, so never point the app at a Gateway on
@@ -409,11 +438,16 @@ And around it:
 - The app never stores your IBKR username or password - the Gateway holds the login. If you use IBC for the
   daily login, its `config.ini` holds your password in plain text: keep it in IBC's own folder (not in this
   repository), readable only by your Windows user, and never commit it.
-- Turn on two-factor login for IBKR (*IBKR Mobile* → *Secure Login System*) and for GitHub.
+- Turn on two-factor login for GitHub too.
 - Your keys live in `.env`, which is git-ignored - never commit it. On a public GitHub repository, turn on
   *secret scanning* and *push protection* (Settings → Code security) so a key pushed by mistake is blocked.
 - Keep `WEB_HOST=127.0.0.1` so the dashboard is only served to this computer (see below). `run.py`
   refuses to start on any other host (`0.0.0.0`, a network address) unless you pass `--allow-network`.
+- Never expose port 8787 through a tunnel or port forwarder (ngrok, Cloudflare Tunnel, Tailscale Funnel, VS
+  Code or `ssh` port forwarding, a router's port forward). One running on this computer hands outside
+  requests to the app from this computer itself, and whoever is at the other end can send the headers the
+  dashboard sends, so the same-machine check would let them in - and the dashboard has no password and can
+  place orders.
 
 ### Security of settings
 

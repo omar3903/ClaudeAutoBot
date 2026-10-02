@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from autotradebot.brokers.venues import PAPER_PLATFORMS, VenuePlan, normalize_platform, plan_venue, venue_id, venue_label
+from autotradebot.brokers.venues import (IBKR_STEPS, PAPER_PLATFORMS, VenuePlan, normalize_platform, plan_venue,
+                                         venue_id, venue_label)
 
 
 def test_live_always_trades_on_the_live_account():
@@ -34,3 +35,11 @@ def test_unknown_platforms_fall_back_to_ibkr():
 def test_labels():
     assert "simulator" in venue_label("paper")
     assert "IBKR paper" in venue_label("ibkr-paper")
+
+
+def test_the_setup_steps_keep_the_live_login_read_only():
+    # the Connections panel shows these: only the paper login drops Read-Only API, and the paper Gateway
+    # takes the paper username (the live one on the paper port is refused)
+    step = next(s for s in IBKR_STEPS if "Read-Only API" in s)
+    assert "PAPER login only" in step and "LIVE login keep it ticked" in step
+    assert any("paper username (DU...)" in s for s in IBKR_STEPS)
