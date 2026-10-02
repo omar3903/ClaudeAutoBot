@@ -795,7 +795,10 @@ shown so you can see where live would stop you.
 (full-day holidays **and** 1:00 pm half-days) through 2028.
 
 * **Regular hours** → the order type from `execution.default_order_type`
-  (`LIMIT` / `MARKET` / `STOP_LIMIT`).
+  (`LIMIT` / `MARKET` / `STOP_LIMIT`). A `STOP_LIMIT` entry rests at IBKR as a
+  real stop-limit: it waits for the price to reach the entry, then pays no more
+  than its limit. An order type the IBKR adapter can't send is refused, never
+  sent as some other order.
 * **Pre-market / after-hours** → **limit only**, and only for setups flagged
   extended-hours-eligible (all swing/valuation setups, plus `gap_and_go`).
 * **Closed** (overnight / weekend / holiday) → execution is blocked; the

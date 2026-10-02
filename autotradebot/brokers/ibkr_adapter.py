@@ -1149,7 +1149,7 @@ class IbkrBroker(BrokerAdapter):
 
     def place_order(self, req: OrderRequest) -> OrderResult:
         self._guard_orders()
-        from ib_async import LimitOrder, MarketOrder, StopOrder
+        from ib_async import LimitOrder, MarketOrder, StopLimitOrder, StopOrder
 
         contract = self._contract(req.symbol)
         action = "BUY" if req.side is Side.LONG else "SELL"      # the side is the order's direction, exits too
@@ -1158,9 +1158,18 @@ class IbkrBroker(BrokerAdapter):
             if not req.stop_price:
                 raise OrderRejected("a stop order needs its trigger price")
             order = StopOrder(action, qty, float(req.stop_price))   # a market order once the price trades through it
-        else:
+        elif req.order_type is OrderType.STOP_LIMIT:
+            # a breakout entry: it waits for the price to reach the trigger, then pays no more than the limit - sent
+            # as a plain limit it would fill at once, before the breakout it waits for
+            if not req.stop_price or not req.limit_price:
+                raise OrderRejected("a stop-limit order needs its trigger and limit prices")
+            order = StopLimitOrder(action, qty, float(req.limit_price), float(req.stop_price))
+        elif req.order_type is OrderType.MARKET or req.order_type is OrderType.LIMIT:
             order = (MarketOrder(action, qty) if req.order_type is OrderType.MARKET or not req.limit_price
                      else LimitOrder(action, qty, float(req.limit_price)))
+        else:
+            # never sent as some other order than the one asked for
+            raise OrderRejected(f"IBKR adapter can't send a {getattr(req.order_type, 'value', req.order_type)} order")
         order.tif = _tif(req.tif)
         order.outsideRth = req.session in ("EXTENDED", "SEAMLESS")
         order.orderRef = req.client_tag            # lets a restarted app recognise its own working orders

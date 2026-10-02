@@ -513,6 +513,27 @@ def test_limit_order_carries_price_and_tif(broker):
     assert order.outsideRth is True
 
 
+def test_a_stop_limit_entry_rests_as_a_stop_limit_and_an_unknown_order_type_is_refused(broker):
+    # a breakout entry waits for its trigger - sent as a plain limit it would have filled at once
+    broker.place_order(OrderRequest(symbol="AAA", side=Side.LONG, quantity=10, order_type=OrderType.STOP_LIMIT,
+                                    stop_price=50.0, limit_price=50.1, client_tag="play_1"))
+    _, order = broker._session.ib.placed[-1]
+    assert (order.orderType, order.action, order.auxPrice, order.lmtPrice, order.totalQuantity, order.orderRef) == \
+        ("STP LMT", "BUY", 50.0, 50.1, 10, "play_1")
+    [working] = broker.list_orders("WORKING")
+    assert (working.order_type, working.stop_price, working.limit_price) == ("STOP_LIMIT", 50.0, 50.1)
+
+    sent = len(broker._session.ib.placed)
+    for missing in ({"stop_price": 50.0}, {"limit_price": 50.1}):
+        with pytest.raises(OrderRejected, match="stop-limit"):
+            broker.place_order(OrderRequest(symbol="AAA", side=Side.LONG, quantity=10,
+                                            order_type=OrderType.STOP_LIMIT, **missing))
+    with pytest.raises(OrderRejected, match="TRAILING_STOP"):
+        broker.place_order(OrderRequest(symbol="AAA", side=Side.SHORT, quantity=10, order_type="TRAILING_STOP",
+                                        limit_price=49.0, stop_price=49.5))
+    assert len(broker._session.ib.placed) == sent              # nothing went to IBKR in place of them
+
+
 def test_readonly_blocks_orders(monkeypatch):
     monkeypatch.setattr(mod, "port_is_open", lambda *a, **k: True)
 
