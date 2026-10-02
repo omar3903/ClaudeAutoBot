@@ -556,8 +556,9 @@ The app is built to be left running:
   needs a current quote. With today's watchlist on disk the full scan isn't repeated either; open
   positions and their resting stop and target orders are found again from the trade records and the
   order tags. An entry sent before the restart that filled while the app was off (its play still
-  *sent*, with no trade and no order working) is booked from IBKR's executions tagged with the play, and
-  gets its stop. A replay the restart cut short resumes from its last finished job (see *The replay*).
+  *sent*, with no trade and no order working) is booked from IBKR's executions tagged with the play (a
+  read of them that fails is tried again), and gets its stop. A replay the restart cut short resumes
+  from its last finished job (see *The replay*).
 * **An open dashboard tab updates itself.** After the app is updated and restarted, a tab that was already
   open reconnects - and would go on running the scripts it loaded before. The server stamps the dashboard's
   files in its first message; a tab that started on another stamp reloads (or, with a dialog open, asks you to).
@@ -872,11 +873,13 @@ Two rules keep it safe:
   confirmation - ib_async would report that stop as cancelled, the app keeps it as
   working until IBKR says it filled or is cancelled - and a stop that read cancelled is
   read once more, for a fill landing just behind the cancel, before the exit goes out.
-  A stop move IBKR refuses leaves the stop as it was, and it is replaced.
+  A cancel IBKR answers with neither its confirmation nor a fill holds the exit back
+  for half a minute. A stop move IBKR refuses leaves the stop as it was, and it is replaced.
   An exit right after a start stands down the stop and target an earlier run left
   too, before the app has taken them over; while IBKR's order list can't be read, or
-  is still reloading after a connect, the exit waits rather than go out beside one.
-  A partial exit first shrinks the stop to the shares that remain.
+  is still reloading after a connect, the exit waits rather than go out beside one -
+  and goes within seconds once it may. A partial exit first shrinks the stop to the
+  shares that remain, and is never sent while a target rests at IBKR.
 * **Never a stop without a position.** A stop is placed only while the account shows
   the shares and the broker's orders could be read; a stop whose trade is no longer
   open is cancelled; a stop an earlier run left is followed, never doubled. If it (or

@@ -269,9 +269,9 @@ class IbkrBroker(BrokerAdapter):
         self._orders_lock = threading.Lock()
         self._orders_asked: Optional[Future] = None
         #: the orders IBKR has said are cancelled (its 202), and the orders a modify was sent for, with the status
-        #: each had then and where the modify sits in its log - see _true_status. Order id -> ...
+        #: each had then, where the modify sits in its log and when it was sent - see _true_status. Order id -> ...
         self._cancels_confirmed: Dict[str, float] = {}
-        self._modifying: Dict[str, Tuple[str, int]] = {}
+        self._modifying: Dict[str, Tuple[str, int, float]] = {}
         #: order id -> IBKR's permId, noted when an order is placed or read. An order that finishes while the
         #: connection is down comes back from IBKR's list of finished orders with no order id, only the permId
         self._perm_ids: Dict[str, int] = {}
@@ -568,6 +568,8 @@ class IbkrBroker(BrokerAdapter):
             self._cancel_answer(reqId, errorCode, errorString)
             if errorCode in _CANCEL_REFUSED:
                 return
+        else:
+            self._modify_heard(reqId)
         if errorCode in _SERVERS_BACK or (errorCode in _FARMS_OK and self._servers_lost_code == 2110):
             self._servers_back(errorCode)
             return
@@ -627,6 +629,16 @@ class IbkrBroker(BrokerAdapter):
             return
         log.warning("IBKR refused to cancel order %s (%s, state: %s) - it may still fill, so it reads as working "
                     "until IBKR says it filled or is cancelled", order_id, code, state or "not given")
+
+    def _modify_heard(self, order_id: int) -> None:
+        """An error on an order a modify was sent for. Within MODIFY_REFUSED_WITHIN_S of the modify it is IBKR's
+        answer to it - the order works on as it was (_true_status). Later, it is IBKR's word on the order itself (a
+        stop rejected as it triggers, say), and the note goes: what ends the order then must read as its end, not as
+        a refused move. (ib_async logs no error on an order it already has down as finished - after a refused
+        move, say - so it is only heard here.) Runs on the loop thread, from _on_error."""
+        note = self._modifying.get(str(order_id))
+        if note is not None and time.monotonic() - note[2] > self.MODIFY_REFUSED_WITHIN_S:
+            self._modifying.pop(str(order_id), None)
 
     def _servers_back(self, code: int) -> None:
         """IB Gateway reached IBKR's servers again. Runs on the loop thread, so it calls ib_async directly."""
@@ -1038,11 +1050,14 @@ class IbkrBroker(BrokerAdapter):
         got = self._session.run_coro(run, timeout=budget)
         return Candles({s: f for s, f in got if f is not None and len(f)}, failed=failed)
 
-    def get_fills(self, symbol: Optional[str] = None, timeout: float = 15.0) -> List[Fill]:
+    def get_fills(self, symbol: Optional[str] = None, timeout: float = 15.0, strict: bool = False) -> List[Fill]:
         """This session's executions on the account (IBKR keeps the current day's), oldest first.
         They book a record whose position was closed in TWS, or by an exit that filled while the
-        app was down."""
+        app was down. A read that fails (not connected, an error, no answer in time) answers [] -
+        or, with ``strict``, raises BrokerError, for a caller that must tell "none" from "not known"."""
         if not self.is_connected:
+            if strict:
+                raise BrokerError("IBKR is not connected - its executions can't be read")
             return []
         from ib_async import ExecutionFilter
 
@@ -1055,6 +1070,8 @@ class IbkrBroker(BrokerAdapter):
             reported = self._session.run_coro(run, timeout=timeout) or []
         except Exception as e:  # noqa: BLE001
             log.debug("executions for %s unavailable: %s", symbol or "the account", e)
+            if strict:
+                raise BrokerError(f"IBKR's executions for {symbol or 'the account'} couldn't be read: {e}") from e
             return []
         out: List[Fill] = []
         for item in reported:
@@ -1185,9 +1202,10 @@ class IbkrBroker(BrokerAdapter):
                            submitted_qty=req.quantity, raw={"tif": order.tif}, side=req.side, tag=req.client_tag)
 
     #: how long a stop's move waits for IBKR's answer. A refusal comes back as an error on the order, which
-    #: ib_async takes for the order's end; one later than this still never makes the order read as cancelled.
+    #: ib_async takes for the order's end; one later than this, but within MODIFY_REFUSED_WITHIN_S of the move,
+    #: still never makes the order read as cancelled - an error after that is IBKR's word on the order itself.
     #: (A change IBKR takes on an order not yet live - PreSubmitted - leaves no word in the log: it waits it out)
-    MODIFY_ANSWER_S = 1.0
+    MODIFY_ANSWER_S, MODIFY_REFUSED_WITHIN_S = 1.0, 10.0
 
     def modify_stop(self, order_id: str, stop_price: Optional[float] = None,
                     quantity: Optional[float] = None) -> OrderResult:
@@ -1223,7 +1241,8 @@ class IbkrBroker(BrokerAdapter):
             entries = getattr(trade, "log", None)
             at = len(entries) if entries is not None else None
             if at is not None:
-                _remember(self._modifying, str(order_id), (getattr(trade.orderStatus, "status", "") or "", at))
+                _remember(self._modifying, str(order_id),
+                          (getattr(trade.orderStatus, "status", "") or "", at, time.monotonic()))
             try:
                 return ib.placeOrder(trade.contract, order), at
             except Exception:
@@ -1241,7 +1260,7 @@ class IbkrBroker(BrokerAdapter):
     def _modify_answer(self, trade, order_id: str, at: int) -> str:
         """Wait a moment for IBKR's word on the modify noted at ``at`` in the order's log: its reason when it
         refused the change, "" when it took it - or said nothing in time, when the modify stays noted, so a
-        refusal that comes later still reads as one (_true_status)."""
+        refusal that comes later, within MODIFY_REFUSED_WITHIN_S, still reads as one (_true_status)."""
         async def _wait(ib):
             end = time.monotonic() + self.MODIFY_ANSWER_S
             while True:

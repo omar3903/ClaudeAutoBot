@@ -21,7 +21,9 @@ For each OPEN trade it:
 
 A trade whose close order is still working is left alone. An exit that can't
 be sent, or that the broker rejects or cancels, is sent again - waiting a
-little longer after each try (``RETRY_DELAYS_S``).
+little longer after each try (``RETRY_DELAYS_S``). One that only had to wait on
+the broker (a stop's cancel to confirm, its orders reloading after a connect) is
+no failed try: it goes again in ``WAIT_RETRY_S``.
 
 Between full passes, a streamed tick on a stock held runs a tick pass on just that
 stock (``run_once(only=...)``, engine._sync_loop): steps 1, 2 and 5 on the fresh
@@ -84,6 +86,8 @@ def stop_locked(side: str, stop: Any, entry: float) -> bool:
 class ExitManager:
     #: seconds to wait before the next exit for a trade, after its 1st, 2nd, ... one
     RETRY_DELAYS_S = (5.0, 15.0, 30.0, 60.0, 120.0, 300.0)
+    #: seconds before an exit that waited on the broker is tried again - no longer after each wait
+    WAIT_RETRY_S = 5.0
 
     def __init__(self, repo, executor, quote_fn: Callable[[str], Any], cfg, bus=BUS,
                  venue: Optional[str] = None) -> None:
@@ -191,6 +195,15 @@ class ExitManager:
                 self._not_held.add(tid)
                 log.warning("AUTO-EXIT %s skipped: %s", tid, out.get("reason"))
                 self.bus.publish("exit.not_held", trade_id=tid, reason=out.get("reason"))
+            return None
+        if out.get("wait"):
+            # the broker has yet to answer (Executor.close_trade): no failed exit - tried again shortly, the
+            # back-off untouched, so it goes out within seconds of the answer, not minutes
+            self._tries[tid] = (tries, now + self.WAIT_RETRY_S)
+            why = out.get("reason") or "waiting on the broker"
+            if self._last_failure.get(tid) != why:
+                self._last_failure[tid] = why
+                log.info("AUTO-EXIT %s (%s) waits - next try in %.0fs: %s", tid, reason, self.WAIT_RETRY_S, why)
             return None
         tries += 1
         wait = self.RETRY_DELAYS_S[min(tries, len(self.RETRY_DELAYS_S)) - 1]

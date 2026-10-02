@@ -168,14 +168,28 @@ def test_moving_the_stop_while_the_target_fills_in_part_keeps_the_size_the_group
     assert (stop.quantity, stop.stop_price, target.quantity, target.limit_price) == (5, 100.05, 5, 110.0)
 
 
-def test_a_part_the_app_takes_off_beside_a_target_that_filled_in_part_leaves_the_stop_what_will_be_left():
-    broker, _, ex, _ = _setup()
-    ex.sync_open_orders()
-    broker.fill("2", 3, 104.0, working=True)                                   # the group cuts the stop to seven
-    broker.positions["AAA"] = 7
-    out = ex.close_trade("t1", reason="manual", qty=4)
-    assert out["ok"] and broker.exits()[0].quantity == 4
-    assert broker.modified == [("1", 98.0, 3.0)]                               # ten on record, less the target's three and these four
+@pytest.mark.parametrize("left_by_an_earlier_run", [False, True])
+def test_a_part_the_app_would_take_off_beside_a_resting_target_is_left_to_the_target(left_by_an_earlier_run):
+    broker, repo, ex, _ = _setup()
+    if left_by_an_earlier_run:
+        # the minute after a start: the earlier run's pair rests, not taken over yet - the exit manager, seeing no
+        # target resting, takes the first target's part itself
+        broker.live.update({o.order_id: o for o in (
+            OrderResult(order_id="70", status="SUBMITTED", symbol="AAA", submitted_qty=10, side=Side.SHORT,
+                        tag="stop:t1", order_type="STOP", stop_price=98.0),
+            OrderResult(order_id="71", status="SUBMITTED", symbol="AAA", submitted_qty=5, side=Side.SHORT,
+                        tag="tgt:t1", order_type="LIMIT", limit_price=104.0))})
+        broker.connected_since = time.monotonic()
+        assert not ex.target_resting("t1")
+    else:
+        ex.sync_open_orders()
+        broker.fill("2", 3, 104.0, working=True)                               # this run's, three of its five filled
+        broker.positions["AAA"] = 7
+    cancelled = list(broker.cancelled)
+    out = ex.close_trade("t1", reason="target-1", qty=5, after_fill={"stop_price": 100.05, "target_price": 110.0})
+    assert not out["ok"] and out["wait"] and "left to the target" in out["reason"]
+    assert broker.exits() == [] and broker.modified == [] and broker.cancelled == cancelled
+    assert ex.target_resting("t1") and repo.get_trade("t1")["quantity"] == 10  # the exit manager leaves it be now
 
 
 def test_while_a_target_rests_at_the_broker_the_exit_manager_leaves_the_target_to_it():

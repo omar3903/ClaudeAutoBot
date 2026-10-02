@@ -199,6 +199,54 @@ def test_a_stop_found_cancelled_is_read_once_more_and_a_fill_landing_behind_the_
     assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
 
 
+def test_a_cancel_the_broker_never_confirmed_holds_back_every_exit_until_a_fill_would_have_been_heard():
+    broker, _, ex, _ = _setup()
+    ex.sync_open_orders()
+    broker.unconfirmed = True                                                  # it reads cancelled: an error, no 202
+    for _ in range(3):                                                         # the exit manager's next tries too
+        out = ex.close_trade("t1", reason="stop")
+        assert not out["ok"] and out["wait"] and broker.exits() == []
+    ex._cancels_sent["1"] -= ex.CANCEL_UNCONFIRMED_S                           # half a minute on, and no fill came
+    assert ex.close_trade("t1", reason="stop")["ok"] and [o.quantity for o in broker.exits()] == [10]
+
+
+def test_a_stop_dropped_from_the_books_while_an_exit_stands_it_down_is_still_waited_for(monkeypatch):
+    from autotradebot.execution import protective_stops as module
+
+    broker, _, ex, _ = _setup()
+    ex.sync_open_orders()                                                      # stop 1 rests for the 10 shares
+    broker.slow_cancel = True                                                  # IBKR hasn't confirmed the cancel
+    ex.STAND_DOWN_POLL_S = 0.25
+
+    def refused(order_id, stop_price=None, quantity=None):
+        raise BrokerError("IBKR refused to change the order")
+
+    def meanwhile(seconds):                                                    # another thread, while it waits:
+        st = ex._stops.get("t1")
+        if st is not None:
+            ex._move_stop(st, 98.5)                                            # a move refused drops the stop
+    broker.modify_stop = refused
+    monkeypatch.setattr(module.time, "sleep", meanwhile)
+    out = ex.close_trade("t1", reason="stop")
+    assert not out["ok"] and out["wait"] and broker.exits() == []
+    assert ex.protective_stops()[0]["order_id"] == "1"                         # still working: followed again
+
+
+def test_the_order_sync_leaves_a_trades_orders_alone_while_an_exit_stands_them_down(monkeypatch):
+    from autotradebot.execution import protective_stops as module
+
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()
+    broker.slow_cancel = True
+    ex.STAND_DOWN_POLL_S, ex.STOP_MOVE_S = 0.25, 0.0
+    repo.update_trade_risk("t1", stop_price=99.0)                              # the ratchet moved the record's stop
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: ex.sync_open_orders())   # a pass on the sync thread
+    out = ex.close_trade("t1", reason="stop")
+    assert not out["ok"] and out["wait"] and broker.exits() == [] and broker.modified == []
+    ex.sync_open_orders()                                                      # the exit has let go: the move goes
+    assert broker.modified == [("1", 99.0, None)]
+
+
 def _ibkr_broker(monkeypatch):
     """The real IBKR adapter around the adapter tests' fake ib_async, its orders kept as ib_async keeps them,
     and past the re-sync after connecting."""
@@ -238,6 +286,18 @@ def test_a_stop_whose_cancel_ibkr_refuses_is_never_taken_for_cancelled_and_no_ex
     closed = repo.get_trade("t1")
     assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
     assert [t.order.orderType for t in orders.book.values()] == ["STP"]       # no market exit ever went out
+
+
+def test_a_cancel_ibkr_answers_with_some_other_error_holds_the_exit_back_on_the_next_pass_too(monkeypatch):
+    broker, orders = _ibkr_broker(monkeypatch)
+    ex = _executor(broker, _Repo([_trade()]))
+    ex.STAND_DOWN_S = ex.STAND_DOWN_POLL_S = 0.0
+    ex.sync_open_orders()
+    orders.answer_cancel = (10147, "OrderId 1 that needs to be cancelled is not found.")   # no 202: may still fill
+    for _ in range(2):
+        out = ex.close_trade("t1", reason="stop")
+        assert not out["ok"] and out["wait"]
+    assert [t.order.orderType for t in orders.book.values()] == ["STP"]       # no market exit beside it
 
 
 def test_a_stop_that_filled_first_is_booked_and_no_second_exit_is_sent():
@@ -432,6 +492,27 @@ def test_no_exit_goes_out_while_the_order_list_is_reloading_or_unreadable_and_no
     broker.list_orders = listed
     assert ex.close_trade("t1", reason="stop")["ok"]                           # read, and nothing rests: it goes
     assert [(o.symbol, o.quantity) for o in broker.exits()] == [("BBB", 10), ("AAA", 10)]
+
+
+def test_an_exit_held_back_while_the_order_list_reloads_goes_out_within_seconds_of_the_reload(monkeypatch):
+    from test_order_follow_up import CFG
+    from autotradebot.core.models import Quote
+    from autotradebot.execution import exit_manager as module
+    from autotradebot.execution.exit_manager import ExitManager
+
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    events = []
+    broker, repo, ex, _ = _setup()
+    broker.connected_since = clock[0]                                          # just connected: nothing listed yet
+    em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=97, ask=97, last=97), cfg=CFG,
+                     bus=SimpleNamespace(publish=lambda topic, **p: events.append(topic)), venue=VENUE)
+    while not broker.exits() and clock[0] < 1000.0 + 3 * ex.RESYNC_GRACE_S:
+        em.run_once()                                                          # under the 98 stop, pass after pass
+        clock[0] += 1.0
+    assert [o.quantity for o in broker.exits()] == [10]
+    assert clock[0] <= 1000.0 + ex.RESYNC_GRACE_S + em.WAIT_RETRY_S + 1.0      # not a stretched back-off later
+    assert "exit.failed" not in events                                         # a wait is no failed exit
 
 
 def test_an_exit_beside_an_earlier_runs_stop_that_filled_in_part_while_the_app_was_off_books_it_and_waits():
@@ -663,6 +744,33 @@ def test_an_entry_an_earlier_run_sent_that_filled_while_the_app_was_off_is_booke
     assert len(repo.open_trades()) == 2 and len(asked) == 1                    # once
     since, until = asked[0]
     assert until - since == dt.timedelta(hours=ex.ENTRY_LOOKBACK_H)
+
+
+def test_an_executions_read_that_fails_at_the_start_is_tried_again_and_the_entry_still_booked():
+    broker = _StopBroker({"AAA": 10})
+    repo, asked = _Repo([]), []
+    repo.submitted_plays = lambda since, until: [_sent("play_off", "AAA")]
+
+    def get_fills(symbol=None, strict=False):                                  # IBKR's, asked strictly
+        asked.append(strict)
+        if len(asked) == 1:
+            raise BrokerError("IBKR's executions for the account couldn't be read: no answer in time")
+        return [Fill(order_id="11", symbol="AAA", side=Side.LONG, quantity=10, price=100.0, tag="play_off")]
+
+    broker.get_fills = get_fills
+    broker.connected_since = time.monotonic()                                  # just connected: its lists reload
+    ex = _executor(broker, repo)
+    ex.sync_open_orders()
+    assert asked == []                                                         # not looked for until they have
+    broker.connected_since -= ex.RESYNC_GRACE_S + 1
+    ex.sync_open_orders()
+    ex.sync_open_orders()
+    assert repo.open_trades() == [] and asked == [True]                        # failed - tried again in a while
+    ex._entries_retry_at -= ex.ENTRY_LOOK_RETRY_S
+    ex.sync_open_orders()
+    [t] = repo.open_trades()
+    assert (t["symbol"], t["quantity"], asked) == ("AAA", 10, [True, True])
+    assert [(s.symbol, s.quantity) for s in broker.stops()] == [("AAA", 10)]
 
 
 def test_a_stop_the_broker_no_longer_knows_is_booked_from_its_executions_before_it_is_given_up():

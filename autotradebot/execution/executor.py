@@ -70,6 +70,8 @@ class Executor(ProtectiveStops):
     #: hours before the start that an earlier run's entry may have gone out and still be looked for in the
     #: broker's executions (IBKR reports the current day's)
     ENTRY_LOOKBACK_H = 24.0
+    #: seconds before that look is tried again, when the broker's orders, executions or account couldn't be read
+    ENTRY_LOOK_RETRY_S = 30.0
 
     def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS,
                  venue: Optional[str] = None) -> None:
@@ -96,6 +98,7 @@ class Executor(ProtectiveStops):
         #: the entries sent before ``_bound_at`` that may have filled while the app was off are still to be
         #: looked for in the broker's executions (_book_entries_filled_while_off)
         self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
+        self._entries_retry_at = 0.0
         self._init_stops()
 
     def rebind(self, broker: BrokerAdapter, venue: Optional[str] = None) -> None:
@@ -107,6 +110,7 @@ class Executor(ProtectiveStops):
         self._pending.clear()
         self._open_by_symbol.clear()
         self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
+        self._entries_retry_at = 0.0
         self._init_stops()              # the other venue's stops stay where they are; they are found again by their tags
 
     def cancel_pending_entries(self) -> int:
@@ -312,10 +316,13 @@ class Executor(ProtectiveStops):
         in the play log, with no trade record, no order working for them and none followed here: what the broker's
         executions tagged with a play's id show it bought, up to what the account holds beyond the records, becomes
         its trade through the same booking as a fill heard live, so the position gets its stop on the next pass.
-        Looked for once, when the broker is connected and its orders, executions and account could be read. Pair
-        legs are left to the desk: the play log doesn't keep their pair. Returns the trades booked."""
-        if getattr(self.broker, "is_connected", True) is False:
-            return []                                   # looked for once it is connected
+        Looked for once, when the broker is connected, past its re-sync after the connect, and its orders,
+        executions and account could be read - a read that failed is no "none": the look is tried again every
+        ENTRY_LOOK_RETRY_S. Pair legs are left to the desk: the play log doesn't keep their pair. Returns the trades
+        booked."""
+        if (getattr(self.broker, "is_connected", True) is False or self._broker_resyncing()
+                or time.monotonic() < self._entries_retry_at):
+            return []                                   # looked for once it is connected and its lists have reloaded
         find = getattr(self.repo, "submitted_plays", None)
         if not callable(find):
             self._entries_due = False
@@ -324,13 +331,17 @@ class Executor(ProtectiveStops):
             rows = find(self._bound_at - dt.timedelta(hours=self.ENTRY_LOOKBACK_H), self._bound_at)
         except Exception:  # noqa: BLE001
             log.debug("could not read the plays sent before the start", exc_info=True)
+            self._entries_retry_at = time.monotonic() + self.ENTRY_LOOK_RETRY_S
             return []
         followed = {p.play.id for p in list(self._pending.values()) if p.kind == "entry"}
         rows = [r for r in rows if r["id"] not in followed and "pair-leg" not in (r.get("tags") or [])]
         working = self._working_or_none() if rows else []
         fills = self._executions(None) if rows else []
         if working is None or fills is None:
-            return []                                   # not known: looked for again at the next sync
+            # not known: looked for again shortly (IBKR's executions are read strictly - a request that failed or
+            # timed out is no "none", or the entry would never be looked for again)
+            self._entries_retry_at = time.monotonic() + self.ENTRY_LOOK_RETRY_S
+            return []
         working_for, found = {o.tag for o in working}, []
         for row in rows:
             if row["id"] in working_for:
@@ -341,8 +352,6 @@ class Executor(ProtectiveStops):
             qty, price = shares_and_price(mine)
             if qty > 1e-9:
                 found.append((row, side, qty, price, str(mine[-1].order_id)))
-        if found and self._broker_resyncing():
-            return []                                   # the account is still loading after a connect
         self._entries_due = False
         booked: List[str] = []
         for row, side, qty, price, order_id in found:
@@ -351,6 +360,7 @@ class Executor(ProtectiveStops):
             held = self._held_quantity(row["symbol"])
             if held is None:
                 self._entries_due = True                # the account couldn't be read: looked for again
+                self._entries_retry_at = time.monotonic() + self.ENTRY_LOOK_RETRY_S
                 continue
             recorded = sum(abs(float(t.get("quantity") or 0.0)) for t in self.repo.open_trades()
                            if t["symbol"] == row["symbol"] and t["side"] == side.value
@@ -449,7 +459,9 @@ class Executor(ProtectiveStops):
         part of it the exit manager takes off at the first target; ``after_fill`` is the stop and
         target the rest gets once that part has gone (see Repository.reduce_trade). The stop and target
         resting at the broker are stood down first - one an earlier run left too, before this run's first
-        pass has taken it over (_take_over_for_exit)."""
+        pass has taken it over (_take_over_for_exit). An exit that must wait on the broker for that (a cancel
+        to confirm, its orders reloading after a connect) comes back ``wait``: not a failed exit, one to try
+        again in seconds."""
         t = self.repo.get_trade(trade_id)
         if not t or t["status"] == "CLOSED":
             return {"ok": False, "reason": "trade not open"}
@@ -465,6 +477,20 @@ class Executor(ProtectiveStops):
             # a market exit would be rejected, and standing the stop down for it would leave the position
             # with nothing at the broker - so nothing is touched until the session opens
             return {"ok": False, "market_closed": True, "reason": closed}
+        # one caller at a time stands the trade's resting orders down - a manual close or a quit can come from
+        # another thread - and the order sync leaves them alone until the exit is placed or refused
+        if not self._claim_resting(trade_id):
+            return {"ok": False, "wait": True,
+                    "reason": f"An exit for this {t['symbol']} position is already being sent."}
+        try:
+            return self._send_exit(t, reason, limit_price, qty, after_fill, decision_price)
+        finally:
+            self._release_resting(trade_id)
+
+    def _send_exit(self, t: Dict[str, Any], reason: str, limit_price: Optional[float], qty: Optional[float],
+                   after_fill: Optional[Dict[str, float]], decision_price: Optional[float]) -> Dict[str, Any]:
+        """close_trade's work once it holds the trade's resting orders: stand them down, then send the exit."""
+        trade_id, held_on = t["id"], t.get("broker") or "paper"
         working = self._working_or_none()
         # a stop or target an earlier run left, not taken over yet (just after a start), is stood down like this run's
         wait = self._take_over_for_exit(t, working)
@@ -472,7 +498,7 @@ class Executor(ProtectiveStops):
             fresh = self.repo.get_trade(trade_id)
             if not fresh or fresh["status"] == "CLOSED":     # one filled while the app was off, for all of it
                 return {"ok": True, "status": "FILLED", "trade": fresh or t, "by": "broker-stop"}
-            return {"ok": False, "reason": wait}
+            return {"ok": False, "wait": True, "reason": wait}
         if working is None:
             # not known is not "none working": an exit an earlier run left, or one placed by hand, can't be
             # seen - the exits this run is following and the shares the broker holds still cap this one
@@ -488,16 +514,23 @@ class Executor(ProtectiveStops):
             return {"ok": True, "status": order.status, "order_id": order.order_id, "adopted": True}
         wanted = abs(float(t["quantity"]))
         partial = qty is not None and 0 < float(qty) < wanted - 1e-9
+        if partial and trade_id in self._targets:
+            # the target resting at the broker takes this part off at that price - one an earlier run left, just
+            # taken over, too: an exit of the app's own beside it would sell the same shares twice
+            return {"ok": False, "wait": True,
+                    "reason": "The target resting at the broker takes this part off - it is left to the target."}
         # the stop resting at the broker first: two exits on one position must never both fill
         if partial:
             if not self._shrink_stop(trade_id, wanted - float(qty)):
-                return {"ok": False, "reason": "The stop at the broker couldn't be resized for the part coming off - "
-                                               "trying again shortly."}
+                return {"ok": False, "wait": True,
+                        "reason": "The stop at the broker couldn't be resized for the part coming off - "
+                                  "trying again shortly."}
         else:
             stood = self._stand_down(trade_id)
             if stood == "busy":
-                return {"ok": False, "reason": "Waiting for the broker to confirm the protective stop is cancelled "
-                                               "before sending the exit."}
+                return {"ok": False, "wait": True,
+                        "reason": "Waiting for the broker to confirm the protective stop is cancelled "
+                                  "before sending the exit."}
             if stood in ("filled", "cancelled"):
                 t = self.repo.get_trade(trade_id) or t      # the stop, or part of it, may have filled first
                 if stood == "filled" or t["status"] == "CLOSED":
