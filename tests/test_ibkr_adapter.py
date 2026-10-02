@@ -3,9 +3,9 @@
 Covers the translation layer: interval -> barSize, order action (an order's
 side is its direction, exits included), order states and IBKR's rejection
 reasons, account parsing, quote NaN fallback, the delayed-data downgrade,
-bar-frame shaping, connection state, real-time streams (the lines held,
-when a stream's quote can be trusted, and IBKR's refusals) and the live market
-scans (always cancelled). The real Gateway path is not tested
+bar-frame shaping, connection state, the account behind the port, real-time
+streams (the lines held, when a stream's quote can be trusted, and IBKR's
+refusals) and the live market scans (always cancelled). The real Gateway path is not tested
 here (it needs a running IB Gateway). Where the app's threads overlap, the real
 session's loop runs around the fake (ThreadedSession).
 """
@@ -24,8 +24,11 @@ import pytest
 from ib_async.order import OrderStatus
 
 from autotradebot.brokers import ibkr_adapter as mod
-from autotradebot.brokers.base import DONE_STATUSES, AuthError, BrokerError, OrderRejected
+from autotradebot.brokers.base import DONE_STATUSES, AuthError, BrokerError, OrderRejected, WrongAccount
 from autotradebot.brokers.paper_adapter import PaperBroker
+from autotradebot.brokers.venues import VenuePlan
+from autotradebot.config import Secrets
+from autotradebot.engine.connections import Connections
 from autotradebot.core.enums import OrderType, Side, TimeInForce
 from autotradebot.core.models import OrderRequest, Quote
 from autotradebot.execution.order_builder import build_exit_order
@@ -134,8 +137,11 @@ class FakeIB:
     def reqMarketDataType(self, t):
         self.market_data_type = t
 
+    # the accounts the Gateway is logged in to: a paper login's ids start with D
+    accounts = ["DU111111"]
+
     def managedAccounts(self):
-        return ["DU111111"]
+        return list(self.accounts)
 
     # account - what reqAccountUpdates streams (tag, currency, value); a USD account by default
     account_values = [
@@ -377,6 +383,100 @@ def test_connect_requires_a_listening_port(monkeypatch):
     b = mod.IbkrBroker(port=4002, mode="paper", session_factory=FakeSession)
     with pytest.raises(AuthError):
         b.connect()
+
+
+def _logged_in(accounts):
+    """A Gateway session logged in to ``accounts``."""
+    session = FakeSession()
+    session.ib.accounts = list(accounts)
+    return session
+
+
+@pytest.fixture
+def quick(monkeypatch):
+    """A Gateway on every port, and no waiting for the first portfolio updates."""
+    monkeypatch.setattr(mod, "port_is_open", lambda *a, **k: True)
+
+    async def _fast(*_a):
+        return None
+
+    monkeypatch.setattr(mod, "_sleep", _fast)
+
+
+@pytest.mark.parametrize("mode,port,wrong,right,refusal", [
+    ("paper", 4002, ["U1234567"], ["DU111111"],
+     r"port 4002 is logged in to a LIVE account \(…4567\) - the paper route refuses it"),
+    ("paper", 7497, ["DU111111", "U1234567"], ["DF111111"], "LIVE account"),    # an advisor's paper ids start DF
+    ("live", 4001, ["DU111111"], ["U1234567"],
+     r"port 4001 is logged in to a paper account \(…1111\) - the live route refuses it"),
+])
+def test_the_account_behind_the_port_must_be_the_kind_the_route_is_for(quick, mode, port, wrong, right, refusal):
+    session = _logged_in(wrong)
+    b = mod.IbkrBroker(port=port, mode=mode, session_factory=lambda: session)
+    with pytest.raises(WrongAccount, match=refusal) as refused:
+        b.connect()
+    assert not b.is_connected and not session.ib.isConnected()          # the socket was dropped
+    assert "U1234567" not in str(refused.value) and "DU111111" not in str(refused.value)   # ids masked
+    session.ib.accounts = right                                          # the Gateway logged in to the right one
+    b.connect()
+    assert b.is_connected and b.account_id == right[0]
+
+
+def test_an_account_id_the_login_doesnt_have_is_refused(quick):
+    session = _logged_in(["DU111111"])
+    b = mod.IbkrBroker(port=4002, mode="paper", account_id="DU999999", session_factory=lambda: session)
+    with pytest.raises(WrongAccount, match=r"account …9999 isn't on the login at port 4002 \(it has …1111\)"):
+        b.connect()
+    assert not session.ib.isConnected()
+    session.ib.accounts = ["DU111111", "DU999999"]
+    b.connect()
+    assert b.is_connected and b.account_id == "DU999999"
+
+
+def test_every_reconnect_checks_the_account_again(broker, monkeypatch, caplog):
+    ib = broker._session.ib
+    broker._connected, broker._reconnecting = False, True
+    ib.disconnect()                                                      # the nightly restart...
+    ib.accounts = ["U1234567"]                                           # ...logged in to the live account
+    naps = []
+
+    def nap(seconds):
+        naps.append(seconds)
+        if len(naps) == 3:
+            ib.accounts = ["DU111111"]                                   # the paper login is back
+    monkeypatch.setattr(mod.time, "sleep", nap)
+    with caplog.at_level("WARNING", logger=mod.__name__):
+        broker._reconnect_loop()
+    assert len(naps) == 3 and broker.is_connected
+    assert [r.getMessage() for r in caplog.records if "LIVE account" in r.getMessage()] == [
+        "IBKR: port 4002 is logged in to a LIVE account (…4567) - the paper route refuses it. Log the paper "
+        "Gateway in with your paper username (DU...), or point IBKR_PAPER_PORT at the Gateway that is."]  # once
+
+
+def _connections(session, **secrets):
+    settings = SimpleNamespace(secrets=Secrets(_env_file=None, **secrets))
+    return Connections(settings, None, port_check=lambda host, port: True,
+                       broker_factory=lambda name, **kw: mod.IbkrBroker(session_factory=lambda: session, **kw))
+
+
+def test_the_test_buttons_show_the_wrong_account_warning(quick):
+    out = _connections(_logged_in(["U1234567"])).probe("paper")
+    assert not out["ok"] and out["reason"].startswith(
+        "Port 4002 is logged in to a LIVE account (…4567) - the paper route refuses it.")
+    out = _connections(_logged_in(["DU111111"])).probe("live")
+    assert not out["ok"] and out["reason"].startswith("Port 4001 is logged in to a paper account (…1111)")
+
+
+def test_one_port_for_both_accounts_is_refused_unless_read_only(quick):
+    conn = _connections(_logged_in(["DU111111"]), ibkr_port=4002)
+    sec = conn.settings.secrets
+    assert "IBKR_READONLY=1" in sec.ibkr_port_problem()
+    assert (sec.ibkr_port_for("paper"), sec.ibkr_port_for("live")) == (4002, 4001)   # never dialled for both
+    assert conn.prereqs(VenuePlan("paper", True)) == [sec.ibkr_port_problem()]
+    out = conn.probe("paper")
+    assert not out["ok"] and out["reason"] == sec.ibkr_port_problem()
+    sec = Secrets(_env_file=None, ibkr_port=4002, ibkr_readonly=True)                  # data only: allowed
+    assert not sec.ibkr_port_problem() and (sec.ibkr_port_for("paper"), sec.ibkr_port_for("live")) == (4002, 4002)
 
 
 def test_connected_and_account(broker):

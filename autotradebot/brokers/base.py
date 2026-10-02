@@ -32,6 +32,11 @@ class AuthError(BrokerError):
     pass
 
 
+class WrongAccount(AuthError):
+    """The login behind the port is the wrong kind of account for the route - a live account on the paper
+    port, a paper one on the live port, or not the account IBKR_ACCOUNT_ID names."""
+
+
 class BrokerAdapter(abc.ABC):
     name: str = "base"
     #: can the venue hold the stop and target itself as a one-cancels-other bracket?

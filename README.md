@@ -253,6 +253,15 @@ Two switches, both in the dashboard and remembered in `data/runtime.json`
   (off by default; read at start, and never set from the dashboard). With it off
   the Live switch is refused and says why, and a Live choice saved in
   `data/runtime.json` starts in Paper with a warning in the log.
+- The port is all that tells paper from live, so every connection (each nightly
+  reconnect too) checks the account behind it: the paper route only takes a paper
+  login (account ids starting with `D` - `DU…`, or `DF…` for an advisor) and the
+  live route only a live one. A live login on the paper port is refused with
+  `port 4002 is logged in to a LIVE account (…1234) - the paper route refuses it`,
+  and so is an `IBKR_ACCOUNT_ID` the login doesn't have; **Test paper** / **Test
+  live** show the same warning. The two ports must differ, 4001 / 7496 (IBKR's
+  live ports) can't be the paper port, and `IBKR_PORT` (one port for both) is
+  only accepted with `IBKR_READONLY=1`.
 - If the Gateway isn't reachable, paper orders fall back to the simulator (which
   has no prices until the Gateway answers) and the header pill turns red with the
   fix. **Live** is never faked: if your live account isn't reachable, the switch

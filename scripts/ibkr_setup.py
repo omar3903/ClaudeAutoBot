@@ -110,6 +110,9 @@ def main() -> None:
     from autotradebot.util.net import port_is_open
 
     s = get_settings().secrets
+    if s.ibkr_port_problem():
+        print(f"\n{s.ibkr_port_problem()}\n")
+        sys.exit(1)
     host = s.ibkr_host or "127.0.0.1"
     ports = {account: s.ibkr_port_for(account) for account in ("paper", "live")}
     print(f"probing {host} ...")

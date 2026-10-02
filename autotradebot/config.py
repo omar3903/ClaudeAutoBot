@@ -47,7 +47,7 @@ class Secrets(BaseSettings):
     ibkr_host: str = "127.0.0.1"
     ibkr_paper_port: int = 4002       # IB Gateway paper  (TWS paper = 7497)
     ibkr_live_port: int = 4001        # IB Gateway live   (TWS live  = 7496)
-    ibkr_port: int = 0               # non-zero = force this port for both accounts
+    ibkr_port: int = 0               # non-zero = force this port for both accounts (only with ibkr_readonly)
     ibkr_client_id: int = 11         # any int unique to this app on the Gateway
     ibkr_account_id: str = ""        # DUxxxxxxx (paper) / Uxxxxxxx (live); blank = first
     ibkr_market_data: str = "auto"   # auto | live | delayed | delayed-frozen
@@ -71,7 +71,19 @@ class Secrets(BaseSettings):
     open_browser_on_start: bool = True
 
     def ibkr_port_for(self, account: str) -> int:
-        return int(self.ibkr_port or (self.ibkr_live_port if account == "live" else self.ibkr_paper_port))
+        # a refused IBKR_PORT is never dialled; the places that connect say why (ibkr_port_problem)
+        forced = 0 if self.ibkr_port_problem() else self.ibkr_port
+        return int(forced or (self.ibkr_live_port if account == "live" else self.ibkr_paper_port))
+
+    def ibkr_port_problem(self) -> str:
+        """Why IBKR_PORT is refused, or "" when it isn't set or may be used. The app tells the paper account
+        from the live one by the port it dials, so one port for both is only allowed when it never sends an
+        order (IBKR_READONLY on)."""
+        if self.ibkr_port and not self.ibkr_readonly:
+            return (f"IBKR_PORT={self.ibkr_port} in .env forces one port for both your paper and live accounts, "
+                    "so the app couldn't tell which one it trades - it is only allowed with IBKR_READONLY=1 "
+                    "(data only). Remove IBKR_PORT and set IBKR_PAPER_PORT / IBKR_LIVE_PORT instead.")
+        return ""
 
     def resolved_database_url(self) -> str:
         if self.database_url:
