@@ -22,7 +22,7 @@ from autotradebot.data.sec_edgar import SecEdgarFundamentals, annual_series, fin
 from autotradebot.data.sectors import SECTORS, sector_from_ibkr
 from autotradebot.data.symbols import SymbolMaster
 from autotradebot.scanner import schedule
-from autotradebot.scanner.evaluator import evaluate, median_volume, with_today
+from autotradebot.scanner.evaluator import evaluate, median_volume, prev_close_known, stale_daily, with_today
 from autotradebot.scanner.heat import daily_metrics, intraday_metrics, liquid, rank_by_daily_heat
 from autotradebot.scanner.scanner import BENCHMARK, Scanner
 from autotradebot.scanner.schedule import ScanSettings
@@ -237,13 +237,82 @@ def test_the_watch_tier_is_the_hot_list_then_kept_then_the_next_picks(scanner, m
 
 
 def test_todays_candle_is_built_from_the_intraday_bars():
-    daily = fakes.daily_bars("AAA").iloc[:-1]
     intraday = fakes.intraday_bars("AAA")
     today = intraday[intraday.index.date == intraday.index[-1].date()]
+    daily = fakes.daily_bars("AAA")
+    daily = daily[daily.index.date < today.index[0].date()]           # through the session before today's
     full = with_today(daily, intraday)
     assert len(full) == len(daily) + 1 and full.index[-1].date() == intraday.index[-1].date()
     assert full["high"].iloc[-1] == today["high"].max() and full["volume"].iloc[-1] == today["volume"].sum()
     assert with_today(full, intraday) is full and with_today(daily, None) is daily
+
+
+class _PriorClose:
+    """A swing play on every stock it is shown, carrying the close its setup read as the previous session's."""
+    key, style, weight = "prior_close", "momentum", 1.0
+    kind, timeframe = StrategyKind.TECHNICAL, Timeframe.SWING
+
+    def generate(self, ctx):
+        return [Play(symbol=ctx.symbol, side=Side.LONG, strategy=self.key, kind=self.kind, timeframe=self.timeframe,
+                     entry=ctx.price, stop=ctx.price * 0.99, targets=[ctx.price * 1.03],
+                     evidence={"prior_close": ctx.prev_close()})]
+
+
+def test_a_store_a_session_short_takes_yesterdays_candle_from_the_intraday_bars(scanner):
+    intraday = fakes.intraday_bars("T01")
+    day = intraday.index[-1].date()
+    prev = clock.prev_trading_day(day)
+    yesterday = intraday[intraday.index.date == prev]
+    stale = fakes.daily_bars("T01")
+    stale = stale[stale.index.date < prev]                          # the store ends the session before yesterday
+    full = with_today(stale, intraday)
+    assert [d.date() for d in full.index[-3:]] == [stale.index[-1].date(), prev, day]
+    assert full.iloc[-2].to_dict() == {"open": yesterday["open"].iloc[0], "high": yesterday["high"].max(),
+                                       "low": yesterday["low"].min(), "close": yesterday["close"].iloc[-1],
+                                       "volume": yesterday["volume"].sum()}
+    # bars that don't reach yesterday either: today's candle follows the store's last, as before
+    assert with_today(stale, intraday[intraday.index.date == day]).index[-2] == stale.index[-1]
+
+    # the scans read it so: the setups' prior close and the stock's move today are from yesterday's close
+    scanner.md.update_daily(["T01"], stale.index[-1].date())
+    scanner.set_strategies([_PriorClose()])
+    (play,) = scanner.run_close(["T01"], intraday.index[-1].to_pydatetime()).plays
+    assert play.evidence["prior_close"] == pytest.approx(yesterday["close"].iloc[-1])
+    moved = intraday_metrics("T01", intraday, full).change_pct
+    assert play.evidence["activity"]["change_pct"] == moved != intraday_metrics("T01", intraday, stale).change_pct
+
+
+class _Only:
+    """One play of ``timeframe`` on every stock it is shown."""
+    style, weight, kind = "momentum", 1.0, StrategyKind.TECHNICAL
+
+    def __init__(self, timeframe):
+        self.key, self.timeframe = f"only_{timeframe.value.lower()}", timeframe
+
+    def generate(self, ctx):
+        return [Play(symbol=ctx.symbol, side=Side.LONG, strategy=self.key, kind=self.kind, timeframe=self.timeframe,
+                     entry=ctx.price, stop=ctx.price * 0.99, targets=[ctx.price * 1.03])]
+
+
+def test_no_day_setups_run_when_neither_the_store_nor_the_bars_reach_the_last_session():
+    intraday = fakes.intraday_bars("AAA")
+    day = intraday.index[-1].date()
+    prev = clock.prev_trading_day(day)
+    holey = intraday[intraday.index.date != prev]                   # the bars miss yesterday too
+    daily = fakes.daily_bars("AAA")
+    stale, current = daily[daily.index.date < prev], daily[daily.index.date < day]
+    both = [_Only(Timeframe.INTRADAY), _Only(Timeframe.SWING)]
+
+    def timeframes(daily, intraday):
+        return [p.timeframe for p in evaluate("AAA", both, daily, intraday, run_id="r", equity=0.0, params={})]
+
+    assert timeframes(stale, holey) == [Timeframe.SWING]          # a gap read off an older close would be made up
+    assert not prev_close_known(stale, holey, day) and stale_daily(stale, day)
+    # either one reaching yesterday is enough
+    assert timeframes(stale, intraday) == timeframes(current, holey) == [Timeframe.INTRADAY, Timeframe.SWING]
+    assert prev_close_known(stale, intraday, day) and prev_close_known(current, None, day)
+    assert timeframes(with_today(stale, holey), holey) == [Timeframe.SWING]   # the joined frame says the same
+    assert not stale_daily(with_today(stale, intraday), day)
 
 
 def test_a_play_carries_the_stocks_median_volume_over_its_last_20_completed_sessions():

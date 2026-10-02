@@ -10,6 +10,7 @@ quantitative readings behind them and its rank.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -38,19 +39,60 @@ SESSION_MINUTES = 390.0
 
 
 def with_today(daily: pd.DataFrame, intraday: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """The stored daily candles plus today's candle built from the intraday bars."""
+    """The stored daily candles plus today's candle built from the intraday bars. When the store stops short of
+    the session before today's (stale_daily), that session's candle is built from the intraday bars too, so the
+    candle before today's - the close the setups read as yesterday's - is never an older one. When the bars don't
+    hold that session either, today's candle follows the store's last as before, and evaluate() runs no day
+    setups on the stock (prev_close_known)."""
     if intraday is None or not len(intraday):
         return daily
     day = intraday.index[-1].date()
     if len(daily) and daily.index[-1].date() >= day:
         return daily
-    today = intraday[intraday.index.date == day]
-    bar = pd.DataFrame(
-        {"open": [today["open"].iloc[0]], "high": [today["high"].max()], "low": [today["low"].min()],
-         "close": [today["close"].iloc[-1]], "volume": [today["volume"].sum()]},
-        index=pd.DatetimeIndex([pd.Timestamp(day).tz_localize(daily.index.tz or "America/New_York")]),
+    tz = daily.index.tz or "America/New_York"
+    candles = [daily]
+    if stale_daily(daily, day):
+        candles.append(_session_candle(intraday, clock.prev_trading_day(day), tz))
+    candles.append(_session_candle(intraday, day, tz))
+    return pd.concat([c for c in candles if c is not None])
+
+
+def _session_candle(intraday: pd.DataFrame, day: dt.date, tz: Any) -> Optional[pd.DataFrame]:
+    """``day``'s daily candle built from its 5-minute bars in ``intraday`` - None when they hold none of it."""
+    bars = intraday[intraday.index.date == day]
+    if not len(bars):
+        return None
+    return pd.DataFrame(
+        {"open": [bars["open"].iloc[0]], "high": [bars["high"].max()], "low": [bars["low"].min()],
+         "close": [bars["close"].iloc[-1]], "volume": [bars["volume"].sum()]},
+        index=pd.DatetimeIndex([pd.Timestamp(day).tz_localize(tz)]),
     )
-    return pd.concat([daily, bar])
+
+
+def stale_daily(daily: Optional[pd.DataFrame], day: dt.date) -> bool:
+    """Whether ``daily``'s candles before ``day`` stop short of the session before it. The morning's ranking lets
+    a stock's store miss a session (scanner.py _rank) and a download can fail, so during the session a store can
+    end two sessions back or more - and its last close isn't yesterday's."""
+    if daily is None or not len(daily):
+        return True
+    last = daily.index[-1].date()
+    if last >= day:                                 # the store holds ``day`` already: the candle before it counts
+        before = daily.index[daily.index.date < day]
+        if not len(before):
+            return True
+        last = before[-1].date()
+    return last < clock.prev_trading_day(day)
+
+
+def prev_close_known(daily: Optional[pd.DataFrame], intraday: Optional[pd.DataFrame], day: dt.date) -> bool:
+    """Whether the close of the session before ``day`` is at hand: in the daily store, or in the 5-minute bars that
+    with_today builds the store's missing session from. evaluate() runs no day setups on a stock without it - a
+    gap or a prior close read off an older session would be made up - and the live scan admits no such stock
+    (engine/engine.py _live_scan_once)."""
+    if not stale_daily(daily, day):
+        return True
+    prev = clock.prev_trading_day(day)
+    return intraday is not None and bool(len(intraday)) and bool((intraday.index.date == prev).any())
 
 
 def closed_bar_at(intraday: Optional[pd.DataFrame]) -> Optional[str]:
@@ -93,6 +135,9 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
     ``premarket``: what the gap check saw for the stock today (scanner/heat.py GapperMetrics)."""
     noise = noise or NoiseSettings()
     full_daily = with_today(daily, intraday)
+    if intraday is not None and len(intraday) and not prev_close_known(daily, intraday, intraday.index[-1].date()):
+        log.debug("%s: neither its daily candles nor its 5-minute bars reach the last session - no day setups", symbol)
+        strategies = [s for s in strategies if s.timeframe is not Timeframe.INTRADAY]
     latest = intraday if intraday is not None and len(intraday) else full_daily
     ctx = StrategyContext(
         symbol=symbol, intraday=intraday, daily=full_daily,

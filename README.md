@@ -144,7 +144,12 @@ Settings so it's done before the bell):
    stock type (common stock, ADR, REIT…) and IBKR's industry, which maps onto the
    11 sectors. Kept in `data/symbols.json`, so only new listings cost a request.
 3. **Daily candles.** Each stock's daily candles live on disk (`data/bars/`); a
-   stock is downloaded in full once, then only the sessions it's missing.
+   stock is downloaded in full once, then only the sessions it's missing. The
+   ranking lets a stock miss one session, and a download can fail: during the
+   session such a stock's candle for yesterday is built from its 5-minute bars,
+   so its gap, its prior close and its intraday heat start from yesterday's
+   close and never an older one. When the 5-minute bars don't hold yesterday
+   either, its day-trade setups are skipped; the swing setups still run.
 4. **Daily heat** — no requests: relative volume in the last session, the size of
    its move against its ATR, a close near a 20-day high or low, volatility and
    dollar volume, each turned into a percentile across every **liquid** stock
@@ -366,7 +371,8 @@ live market scans - the biggest % gainers, the biggest % losers and the
 stocks hottest by volume (US stocks and ADRs at $3-600), one open at a time
 and each cancelled once it answers. The first `scanner.live_scan` (10; 0 =
 off) of their names that are ordinary shares in the sectors the filters
-allow, with daily candles and not on the hot list already, take watch-tier
+allow, with daily candles through yesterday (or 5-minute candles in hand that
+hold yesterday's session) and not on the hot list already, take watch-tier
 slots right after the hot list - so a stock that was quiet until today is
 streamed and checked at each close like the rest. Liquidity is judged on
 today's volume: after a candle-close check, a live name whose dollar volume

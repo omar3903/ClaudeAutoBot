@@ -87,6 +87,7 @@ from .chart import (INTRADAY_MAX_SESSIONS, TRADE_CANDLES_TTL_S, candle_request, 
 from .market_regime import MarketRegime
 from ..scanner.noise import LABELS as NOISE_LABELS
 from ..scanner import schedule
+from ..scanner.evaluator import prev_close_known
 from ..scanner.filters import TradeFilters
 from ..scanner.scanner import Scanner, ScanResult
 from ..scanner.schedule import ScanSettings
@@ -1140,13 +1141,14 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def _live_scan_once(self, now: Optional[dt.datetime] = None) -> List[str]:
         """One round of IBKR's live scans (LIVE_SCAN_CODES, one after another): their names interleaved by rank -
         each scan's first, then each one's second... - that SymbolMaster calls ordinary tradable shares, in a sector
-        the filters allow, with daily candles (the morning's download covers every tradable listing), not on the
-        hot list already and not found too thin today (_thin_live_names). The first scanner.live_scan of them take
-        watch-tier slots right after the hot list (Scanner.set_live_names), so a stock too quiet for the morning's
-        ranking is streamed and checked once it moves. Names never seen before are looked up first, LIVE_LOOKUPS a
-        round, and kept in symbols.json. Only in regular hours on real-time data, with today's watchlist and the
-        watch tier on, and not while quitting - otherwise nothing is asked and the names held are let go. Returns
-        the names held now."""
+        the filters allow, with daily candles (the morning's download covers every tradable listing) that reach the
+        last session - or 5-minute candles in hand that do, as the setups would take yesterday's close from them
+        (scanner/evaluator.py prev_close_known) - not on the hot list already and not found too thin today
+        (_thin_live_names). The first scanner.live_scan of them take watch-tier slots right after the hot list
+        (Scanner.set_live_names), so a stock too quiet for the morning's ranking is streamed and checked once it
+        moves. Names never seen before are looked up first, LIVE_LOOKUPS a round, and kept in symbols.json. Only in
+        regular hours on real-time data, with today's watchlist and the watch tier on, and not while quitting -
+        otherwise nothing is asked and the names held are let go. Returns the names held now."""
         cfg = self.settings.config
         now = (now or clock.now_ny()).astimezone(clock.NY)
         n, wl = int(cfg.scanner.live_scan or 0), self.scanner.watchlist
@@ -1182,7 +1184,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             if len(names) >= n:
                 break
             if (symbol not in hot and symbol not in thin and sector_allowed(master.sector(symbol), sectors)
-                    and self.md.daily_frame(symbol) is not None):
+                    and (daily := self.md.daily_frame(symbol)) is not None
+                    and prev_close_known(daily, self.md.cached_intraday(symbol), now.date())):
                 names.append(symbol)
         before = list(self.scanner.live_names)
         if names != before:

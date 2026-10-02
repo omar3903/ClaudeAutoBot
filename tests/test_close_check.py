@@ -581,6 +581,19 @@ def test_the_live_scans_put_the_first_passing_names_right_after_the_hot_list(liv
     assert live._live_scan_once() == ["T20", "T26", "T21"] and len(gateway.scan_calls) == 9
 
 
+def test_a_live_name_whose_daily_candles_stop_short_of_yesterday_waits_for_candles_that_reach_it(live, monkeypatch):
+    before_yesterday = clock.prev_trading_day(clock.prev_trading_day(DAY))
+    full = live.md.daily_frame("T20")
+    short = full[full.index.date <= before_yesterday]                # yesterday's download didn't come for it
+    daily_frame = live.md.daily_frame
+    monkeypatch.setattr(live.md, "daily_frame", lambda s: short if s == "T20" else daily_frame(s))
+    assert live._live_scan_once() == ["T26", "T21", "T27"]           # its setups would read an older close
+    # 5-minute candles in hand that hold yesterday's session give the setups yesterday's close: it is admitted
+    live.md.intraday(["T20"])
+    assert clock.prev_trading_day(DAY) in set(live.md.cached_intraday("T20").index.date)
+    assert live._live_scan_once() == ["T20", "T26", "T21"]
+
+
 def test_the_live_scan_slots_default_to_10_within_0_to_20():
     from autotradebot.config import ScannerCfg
 

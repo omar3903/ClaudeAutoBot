@@ -345,8 +345,9 @@ class Scanner:
             for symbol in symbols:
                 if symbol not in intraday or symbol not in daily:
                     continue
-                activity = intraday_metrics(symbol, intraday[symbol], daily[symbol])
-                plays = evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
+                candles = with_today(daily[symbol], intraday[symbol])   # yesterday's too if the store lacks it
+                activity = intraday_metrics(symbol, intraday[symbol], candles)
+                plays = evaluate(symbol, active, candles, intraday[symbol], run_id=result.run_id,
                                  equity=self._equity, params=self._params, activity=activity, noise=self._noise,
                                  signals=self.signals, market=self.market,
                                  evidence_weights=self.evidence_weights,
@@ -420,8 +421,9 @@ class Scanner:
                     if symbol not in intraday or symbol not in daily:
                         continue
                     scanned.append(symbol)
-                    activity = intraday_metrics(symbol, intraday[symbol], daily[symbol])
-                    plays = evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
+                    candles = with_today(daily[symbol], intraday[symbol])
+                    activity = intraday_metrics(symbol, intraday[symbol], candles)
+                    plays = evaluate(symbol, active, candles, intraday[symbol], run_id=result.run_id,
                                      equity=self._equity, params=self._params, activity=activity, noise=self._noise,
                                      signals=self.signals, market=self.market,
                                      evidence_weights=self.evidence_weights,
@@ -556,8 +558,9 @@ class Scanner:
         seen: Dict[str, Optional[IntradayMetrics]] = {}
         with self._timed(result, "setups"):
             for symbol in symbols:
-                activity = seen[symbol] = intraday_metrics(symbol, intraday[symbol], daily[symbol])
-                result.plays += evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
+                candles = with_today(daily[symbol], intraday[symbol])
+                activity = seen[symbol] = intraday_metrics(symbol, intraday[symbol], candles)
+                result.plays += evaluate(symbol, active, candles, intraday[symbol], run_id=result.run_id,
                                          equity=self._equity, params=self._params, activity=activity,
                                          noise=self._noise, signals=self.signals, market=self.market,
                                          evidence_weights=self.evidence_weights,
