@@ -5,6 +5,7 @@ them: heat, today's candle, the listings directory and SEC financials."""
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import math
 
 import numpy as np
@@ -21,7 +22,7 @@ from autotradebot.data.market_data import MarketData
 from autotradebot.data.sec_edgar import SecEdgarFundamentals, annual_series, financials_from_facts, sec_ticker
 from autotradebot.data.sectors import SECTORS, sector_from_ibkr
 from autotradebot.data.symbols import SymbolMaster
-from autotradebot.scanner import schedule
+from autotradebot.scanner import evaluator, schedule
 from autotradebot.scanner.evaluator import evaluate, median_volume, prev_close_known, stale_daily, with_today
 from autotradebot.scanner.heat import daily_metrics, intraday_metrics, liquid, rank_by_daily_heat
 from autotradebot.scanner.scanner import BENCHMARK, Scanner
@@ -353,6 +354,54 @@ def test_a_day_play_carries_the_last_closed_candle_it_was_seen_on():
     assert "bar_at" not in swing.evidence                                 # swing plays count scans, as before
     no_candles, _ = evaluate("AAA", [_DayAndSwing()], daily, None, run_id="r", equity=0.0, params={})
     assert no_candles.is_day_trade and "bar_at" not in no_candles.evidence   # no candles, nothing to count by
+
+
+class _Broken:
+    """A setup with a bug: it raises on every stock it is shown."""
+    key, style, weight, kind = "broken", "momentum", 1.0, StrategyKind.TECHNICAL
+
+    def __init__(self, timeframe=Timeframe.INTRADAY):
+        self.timeframe = timeframe
+
+    def generate(self, ctx):
+        raise ZeroDivisionError("a bug in the setup")
+
+
+def test_a_setups_first_failure_in_a_session_is_a_warning_with_its_traceback_and_each_one_is_counted(monkeypatch,
+                                                                                                   caplog):
+    monkeypatch.setattr(evaluator, "_failed_in", {})
+    daily, intraday = fakes.daily_bars("AAA").iloc[:-1], fakes.intraday_bars("AAA")
+    failures = {}
+
+    def run(symbol, strategies):
+        return evaluate(symbol, strategies, daily, intraday, run_id="r", equity=0.0, params={}, failures=failures)
+
+    def logged():
+        return [(r.levelno, r.exc_info is not None) for r in caplog.records if "broken failed" in r.getMessage()]
+
+    with caplog.at_level(logging.DEBUG, logger="autotradebot.scanner.evaluator"):
+        plays = run("AAA", [_Broken(), _Only(Timeframe.INTRADAY)])
+        run("BBB", [_Broken()])
+        assert [p.strategy for p in plays] == ["only_intraday"]            # the other setups still run
+        assert failures == {"broken": 2}
+        assert logged() == [(logging.WARNING, True), (logging.DEBUG, False)]   # repeats stay quiet
+
+        caplog.clear()
+        tomorrow = clock.now_ny() + dt.timedelta(days=1)
+        monkeypatch.setattr(clock, "now_ny", lambda *a, **k: tomorrow)
+        run("AAA", [_Broken()])
+        assert logged() == [(logging.WARNING, True)] and failures == {"broken": 3}   # a new session warns afresh
+
+
+def test_a_scan_counts_each_setups_failures_in_its_summary(scanner, monkeypatch):
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: True)
+    monkeypatch.setattr(evaluator, "_failed_in", {})
+    scanner.set_strategies([_Broken(Timeframe.SWING)])
+    full = scanner.run_full(ScanSettings(hot_list_size=6, sector_queue_size=10))
+    assert full.symbols and full.strategy_errors == {"broken": len(full.symbols)} and not full.plays
+    cycle = scanner.run_cycle(fast=True)
+    assert cycle.scanned == 6 and cycle.summary()["strategy_errors"] == {"broken": 6}
+    assert scanner.run_cycle(fast=True).strategy_errors == {"broken": 6}          # counted per scan, not summed
 
 
 # ---------------------------------------------------------------- heat

@@ -124,6 +124,16 @@ def test_a_cycle_adopts_keeps_or_drops_each_buffer_name(watchlist):
     assert {d.symbol: d.action for d in decisions} == {"T3": "dropped", "E2": "kept", "E3": "dropped"}
 
 
+def test_a_hot_name_keeps_its_heat_when_a_cycle_missed_its_candles(watchlist):
+    watchlist.apply_cycle({"T0": 0.8, "T1": 0.5, "E0": 0.6, "E1": 0.7}, {}, kept_per_sector=1)
+    picks = watchlist.next_picks(per_sector=1)                                   # T2 and E2
+    decisions = watchlist.apply_cycle({"T0": 0.8, "T1": 0.5, "E0": 0.6, "T2": 0.45, "E2": 0.3},   # no E1 this time
+                                      picks, kept_per_sector=1)
+    assert {d.symbol: d.action for d in decisions} == {"T2": "kept", "E2": "kept"}   # not hotter than E1's last 0.7
+    assert watchlist.hot_symbols() == ["T0", "T1", "E0", "E1"]
+    assert next(c.heat for c in watchlist.hot if c.symbol == "E1") == 0.7
+
+
 def test_a_watchlist_survives_a_restart_and_old_ones_are_pruned(watchlist, tmp_path):
     watchlist.apply_cycle({"T2": 0.9}, watchlist.next_picks(1), kept_per_sector=1)
     watchlist.save(tmp_path)

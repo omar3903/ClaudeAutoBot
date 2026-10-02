@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import threading
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -36,6 +37,11 @@ log = logging.getLogger(__name__)
 HOLD_MINUTES = (10.0, 180.0)
 HOLD_DAYS = (1.0, 15.0)
 SESSION_MINUTES = 390.0
+
+#: the session each setup last failed in: its first failure of a session is a warning with the traceback, the
+#: rest are DEBUG lines - a broken setup is seen without a traceback for every stock it runs on
+_failed_in: Dict[str, dt.date] = {}
+_failed_lock = threading.Lock()
 
 
 def with_today(daily: pd.DataFrame, intraday: Optional[pd.DataFrame]) -> pd.DataFrame:
@@ -128,11 +134,14 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
              evidence_weights: Optional[Mapping[str, float]] = None,
              benchmark: Optional[pd.Series] = None,
              records: Optional[Mapping[str, Mapping[str, Any]]] = None,
-             premarket: Optional[Mapping[str, Any]] = None) -> List[Play]:
+             premarket: Optional[Mapping[str, Any]] = None,
+             failures: Optional[Dict[str, int]] = None) -> List[Play]:
     """``evidence_weights``: each strategy's evidence multiplier (see research/weights.py). ``benchmark``:
     the S&P 500 ETF's closes, for the market model. ``records``: each strategy's pooled win rate and
     trade count (research/weights.py pooled_odds), which calibrate the odds its plays state.
-    ``premarket``: what the gap check saw for the stock today (scanner/heat.py GapperMetrics)."""
+    ``premarket``: what the gap check saw for the stock today (scanner/heat.py GapperMetrics).
+    ``failures``: a strategy that raises adds one to its count here (the scan's ScanResult.strategy_errors);
+    the other strategies still run."""
     noise = noise or NoiseSettings()
     full_daily = with_today(daily, intraday)
     if intraday is not None and len(intraday) and not prev_close_known(daily, intraday, intraday.index[-1].date()):
@@ -175,8 +184,18 @@ def evaluate(symbol: str, strategies: Sequence[Strategy], daily: pd.DataFrame,
                 if activity is not None:
                     p.evidence.setdefault("activity", activity_summary(activity))
                 plays.append(p)
-        except Exception as e:  # noqa: BLE001
-            log.debug("%s %s failed: %s", symbol, strategy.key, e)
+        except Exception as e:  # noqa: BLE001 - one setup's bug, not the scan
+            if failures is not None:
+                failures[strategy.key] = failures.get(strategy.key, 0) + 1
+            session = clock.now_ny().date()
+            with _failed_lock:
+                first = _failed_in.get(strategy.key) != session
+                _failed_in[strategy.key] = session
+            if first:
+                log.warning("%s %s failed: %s - its further failures today are logged at DEBUG", symbol,
+                            strategy.key, e, exc_info=True)
+            else:
+                log.debug("%s %s failed: %s", symbol, strategy.key, e)
     return plays
 
 

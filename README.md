@@ -182,6 +182,9 @@ buffer name looked at is:
 - **kept** — among the two best seen so far in its sector, waiting for a slot;
 - **dropped** — of less use than what's already hot or kept.
 
+A hot-list stock whose candles didn't come this cycle keeps the heat it had, so
+a missed request doesn't make it the coolest and cost it its slot.
+
 So each sector's buffer is worked through over the day for a handful of requests
 per cycle — about 60 every 15 minutes. While **Autopilot** is day-trading an
 open session, the hot list alone is also rescanned every minute.
@@ -1175,13 +1178,17 @@ A background service (`autotradebot/signals/`) watches what happens off the pric
 * **Connections** — paper platform, IB Gateway settings, **Test paper / Test
   live**, **Reconnect**.
 * **Settings** — the scan schedule and list sizes, the scan status, **Run full
-  scan now** and **Rescan hot list now**.
+  scan now** and **Rescan hot list now**. A setup that raised an error in a scan is
+  named in its status line with how many stocks it failed on (it found nothing on
+  them); its first failure each day is logged as a warning with the traceback, the
+  rest at DEBUG.
 * **Signals** — insider trades and company news, their sources and what they do to plays (see [Signals](#signals--insider-trades-and-company-news)).
 * **Reports** — each session's report (see [Reports](#reports--every-session-the-market-and-the-bot));
   a dot marks one you haven't opened.
 * **Scan now** — rescan the hot list and the next buffer names. The plays header
-  shows the last scan, a progress bar while one runs, when the next full
-  scan is due, and "replay running" while a replay runs in the background.
+  shows the last scan (and any setup that failed in it), a progress bar while one
+  runs, when the next full scan is due, and "replay running" while a replay runs in
+  the background.
 * **Long / Short / Intraday / Swing** and **Sectors** — what the bot scans for
   and may trade.
 * **Strategies** — switch setups on or off and weight them.
