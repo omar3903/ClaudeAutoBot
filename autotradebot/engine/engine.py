@@ -1234,15 +1234,11 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return "gappers"
         if wl is None or not clock.is_market_open(now):
             return None
-        with self._close_lock:
-            close_due, movers = self._close_due, bool(self._movers_due)
-        # the early movers wait for a 5-minute close queued behind them: it covers them, and run now it would read
-        # IBKR's bars before scanner.close_grace_s has let IBKR finish them (a close's second ask takes them along)
-        if (close_due is not None and mono >= close_due[1]) or (close_due is None and movers):
+        due, waiting = self._close_check_due(mono)
+        if due:
             return "close"
-        # a candle-close check (or its second ask) starts within seconds: it stands in for the fast cycle, and the
-        # quick re-check waits for it rather than hold it up
-        waiting = close_due is not None
+        # a candle-close check (or its second ask) starts within seconds (waiting): it stands in for the fast cycle,
+        # and the quick re-check waits for it rather than hold it up
         if mono - self._last_cycle_at >= self.scan_settings.cycle_minutes * 60:
             return "cycle"
         if self.scan_settings.wide_on and mono - self._last_wide_at >= self.scan_settings.wide_minutes * 60:
@@ -1250,10 +1246,45 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if (not waiting and self._autopilot_day_active()
                 and mono - self._last_fast_at >= self.settings.config.scanner.fast_cycle_seconds):
             return "fast"
-        refresh = self.settings.config.scanner.plays_refresh_seconds
-        if not waiting and refresh and mono - self._last_plays_at >= refresh and self._board_symbols():
+        if not waiting and self._plays_due(mono):
             return "plays"
         return None
+
+    def _close_check_due(self, mono: float) -> Tuple[bool, bool]:
+        """(the candle-close or early-mover check _on_minute queued is due now, a 5-minute close's check is queued
+        at all) - for _due_scan and the wide scan's pauses (_between_wide_chunks)."""
+        with self._close_lock:
+            close_due, movers = self._close_due, bool(self._movers_due)
+        # the early movers wait for a 5-minute close queued behind them: it covers them, and run now it would read
+        # IBKR's bars before scanner.close_grace_s has let IBKR finish them (a close's second ask takes them along)
+        due = (close_due is not None and mono >= close_due[1]) or (close_due is None and movers)
+        return due, close_due is not None
+
+    def _plays_due(self, mono: float) -> bool:
+        """The quick re-check of the plays on the board is due (scanner.plays_refresh_seconds, 0 = off)."""
+        refresh = self.settings.config.scanner.plays_refresh_seconds
+        return bool(refresh and mono - self._last_plays_at >= refresh and self._board_symbols())
+
+    def _between_wide_chunks(self) -> List[str]:
+        """Scanner.run_wide's pause between two chunks, on the scan thread the wide scan holds: a candle-close or
+        early-mover check that came due runs now, else the quick re-check of the plays if it is due - each ends in
+        Autopilot's pass, so a sweep of minutes holds up neither the check (CLOSE_STALE_S would drop it) nor an
+        entry. Only those light checks run here: never a cycle, a full scan or another wide scan, and a scan asked
+        for waits for the sweep to end. A failure is logged and the sweep goes on. Returns the stocks it read."""
+        if self.quit_state or not clock.is_market_open():
+            return []
+        mono = time.monotonic()
+        due, waiting = self._close_check_due(mono)
+        kind = "close" if due else "plays" if not waiting and self._plays_due(mono) else None
+        if kind is None:
+            return []
+        try:
+            result = self._run_scan(kind)
+        except Exception:  # noqa: BLE001 - the check's failure, not the sweep's
+            log.exception("the %s between the wide scan's chunks failed",
+                          "candle-close check" if kind == "close" else "quick re-check")
+            return []
+        return list(result.symbols) if result is not None else []
 
     def _settings_changed(self) -> None:
         """Called by everything that changes a setting while the app runs - the day/swing split, the
@@ -1278,7 +1309,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self._scan_request = kind
         self._scan_wake.set()
 
-    def _run_scan(self, kind: str) -> None:
+    def _run_scan(self, kind: str) -> Optional[ScanResult]:
+        """Run the ``kind`` of scan and put what it found on the board, then Autopilot's pass. Returns the result -
+        None when it ran nothing or failed, or for the gap check."""
         quick = kind == "plays"                         # the quick re-check of the plays on the board
         # ...and the candle-close check are light: seconds matter, so no lead-in, and a failure is only logged
         light = quick or kind == "close"
@@ -1303,7 +1336,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             elif kind == "gappers":
                 result = self.scanner.run_gappers()
             elif kind == "wide":
-                result = self.scanner.run_wide(self.scan_settings.wide_stocks, self.scan_settings.movers)
+                result = self.scanner.run_wide(self.scan_settings.wide_stocks, self.scan_settings.movers,
+                                               between=self._between_wide_chunks)
             elif kind == "close":
                 result = self._close_check(queued)
                 if result is None:
@@ -1395,6 +1429,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._log_close_check(result, changes)
             self._thin_live_names(result)
         self._note_changes(changes)
+        return result
 
     def _take_close_queue(self) -> Tuple[Optional[dt.datetime], Dict[str, dt.datetime], Dict[str, str],
                                          Optional[List[str]]]:

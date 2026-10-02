@@ -118,6 +118,40 @@ def test_todays_movers_get_hot_list_slots_from_the_wide_scan(scanner, monkeypatc
     assert all(d.note for d in result.decisions if d.symbol in movers and d.action == "adopted")
 
 
+class _EveryStock:
+    """One day play on every stock it is shown, at its latest price."""
+    key, style, weight = "vwap_reclaim", "reversal", 1.0
+    kind, timeframe = StrategyKind.TECHNICAL, Timeframe.INTRADAY
+
+    def generate(self, ctx):
+        return [Play(symbol=ctx.symbol, side=Side.LONG, strategy=self.key, kind=StrategyKind.TECHNICAL,
+                     timeframe=Timeframe.INTRADAY, entry=ctx.price, stop=ctx.price * 0.99,
+                     targets=[ctx.price * 1.03])]
+
+
+def test_the_wide_scan_hands_the_thread_over_between_its_chunks_and_leaves_newer_reads_to_the_check(scanner,
+                                                                                                    monkeypatch):
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: True)
+    scanner.run_full(ScanSettings(hot_list_size=6, sector_queue_size=10))
+    ranked = scanner.watchlist.ranked
+    monkeypatch.setattr(scanner, "WIDE_CHUNK", 10)
+    scanner.set_strategies([_EveryStock()])
+    asked = len(scanner.md.source.requests)
+    pauses = []
+
+    def between():
+        pauses.append({r[0] for r in scanner.md.source.requests[asked:] if r[0] != BENCHMARK})
+        # the first pause's check reads the first stock, which the sweep has read, and the last, which it hasn't yet
+        return [ranked[0], ranked[-1]] if len(pauses) == 1 else []
+
+    result = scanner.run_wide(between=between)
+    chunks = math.ceil(len(ranked) / 10)
+    assert chunks >= 3 and pauses == [set(ranked[:10 * n]) for n in range(1, chunks)]     # between chunks only
+    assert result.scanned == len(ranked) and set(result.symbols) == set(ranked) - {ranked[0]}
+    assert {p.symbol for p in result.plays} == set(ranked) - {ranked[0]}           # the check's play on it stands
+    assert "between_chunks" in result.timings
+
+
 def test_the_gap_check_adopts_the_gappers_into_the_hot_list(scanner, monkeypatch):
     from autotradebot.analysis.levels import find_levels
     from autotradebot.scanner.heat import GapperMetrics, rank_gappers

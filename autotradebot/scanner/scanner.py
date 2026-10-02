@@ -29,7 +29,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Collection, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Collection, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -367,12 +367,17 @@ class Scanner:
         return self._finish(result, filters)
 
     # ---- the wide scan: every liquid stock ------------------------------- #
-    def run_wide(self, stocks: int = 0, movers: int = 0) -> ScanResult:
+    def run_wide(self, stocks: int = 0, movers: int = 0,
+                 between: Optional[Callable[[], Collection[str]]] = None) -> ScanResult:
         """Every liquid stock the full scan ranked - or the hottest ``stocks`` of them - on its
         5-minute candles: the day-trade and swing setups the filters allow run on all of them, with
         today's partial candle, and the hot list is refreshed from what has heated up since the
         morning; today's ``movers`` biggest movers on volume hold slots outright. One request per
-        stock, in chunks; a chunk that fails is noted and skipped."""
+        stock, in chunks; a chunk that fails is noted and skipped. Between two chunks ``between``
+        has the thread - the engine's light checks that came due, so a sweep of minutes holds none of
+        them up - and returns the stocks it read: one this sweep had read before is left out of its
+        plays and the stocks it says it looked at, so the check's plays on the newer candles stand.
+        Its heat still counts for the hot list."""
         cfg = self.settings.config.scanner
         filters, strategies = self.filters, list(self.strategies)
         result = ScanResult("wide")
@@ -392,8 +397,14 @@ class Scanner:
         heat: Dict[str, float] = {}
         seen: Dict[str, Any] = {}                       # each stock's intraday metrics, for the movers
         scanned: List[str] = []
+        fresher: set = set()                            # stocks a check between the chunks read after this sweep
         with self._timed(result, "setups"):
             for start in range(0, len(symbols), self.WIDE_CHUNK):
+                if start and between is not None:
+                    paused = time.monotonic()
+                    fresher.update(set(between()) & set(scanned))
+                    result.timings["between_chunks"] = (result.timings.get("between_chunks", 0.0)
+                                                        + time.monotonic() - paused)
                 chunk = symbols[start:start + self.WIDE_CHUNK]
                 self._progress(result, "wide scan", start, len(symbols))
                 try:
@@ -420,7 +431,8 @@ class Scanner:
                     if activity is not None:
                         heat[symbol] = activity.heat + (_PLAY_BONUS if plays else 0.0)
                         seen[symbol] = activity
-        result.symbols, result.scanned = scanned, len(scanned)
+        result.symbols, result.scanned = [s for s in scanned if s not in fresher], len(scanned)
+        result.plays = [p for p in result.plays if p.symbol not in fresher]
         with self._watchlist_lock:
             result.decisions = wl.apply_wide(heat, self.symbols.sector, cfg.kept_per_sector)
             if movers:

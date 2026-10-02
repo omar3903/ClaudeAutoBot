@@ -191,7 +191,11 @@ the board within the half hour. Its intraday heat refreshes the hot list: a
 stock hotter than the coolest hot-list name by 10 % takes its slot (within the
 cap of a third per sector), and the best of the rest per sector are kept
 waiting. It takes two to three minutes of Gateway time and the 5-minute cycle
-waits for it. (The Gateway takes about half a second over a candle request
+waits for it. Between its chunks it steps aside for a candle-close check that
+has come due and for the 15-second re-check of the plays, each followed by
+Autopilot's pass, so neither waits out the sweep; a stock such a check read
+after the sweep did keeps the check's plays, which are on the newer candle.
+(The Gateway takes about half a second over a candle request
 whether it asks for an hour or a week, so the rate is set by how many are in
 flight: twelve at once read about 17 stocks a second, none refused in a test of
 700; thirty-two timed out.) The plays it finds stay on the board and are

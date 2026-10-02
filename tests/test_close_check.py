@@ -332,6 +332,77 @@ def test_a_newer_close_or_a_late_start_drops_a_second_ask(engine, gateway, now, 
     assert _asked(gateway, asked) == [] and engine._close_due is None and "check's second ask is dropped" in caplog.text
 
 
+# ---------------------------------------------------------------- the wide scan steps aside
+def test_a_close_check_due_during_the_wide_scan_runs_between_its_chunks_and_its_plays_stand(engine, gateway, now,
+                                                                                             monkeypatch, caplog):
+    limits = _bars_until(gateway, monkeypatch, _at(10, 0))       # the 10:05 candle hasn't closed yet
+    now["t"] = _at(10, 4, 30)
+    monkeypatch.setattr(engine.scanner, "WIDE_CHUNK", 2)
+    engine._last_plays_at = time.monotonic() + 60               # no quick re-check comes due in the sweep
+    intraday = engine.md.intraday
+
+    def first_chunk_then_the_close(symbols, con_ids=None):
+        got = intraday(symbols, con_ids)
+        if list(symbols) == WATCH[:2]:                           # the sweep has read T01 and T02; the candle closes
+            limits["at"], now["t"] = _at(10, 5), _at(10, 5, 8.5)
+            engine._close_due = (_at(10, 5), time.monotonic())
+        return got
+
+    monkeypatch.setattr(engine.md, "intraday", first_chunk_then_the_close)
+    checks, passes = _spy_run_close(engine, monkeypatch), []
+    monkeypatch.setattr(engine.autopilot, "consider", lambda plays: passes.append(
+        ((engine._scan_running or {}).get("kind"), sorted(p.symbol for p in plays.values()))) or [])
+    with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
+        engine._run_scan("wide")
+
+    # the check ran in the sweep's first pause, on the whole tier, and Autopilot had its plays then
+    [check] = checks
+    assert check.symbols == WATCH and engine._close_due is None
+    assert passes == [("wide", WATCH), (None, WATCH)]
+    assert "close check 10:05 ET: 6 of 6 stocks read, 6 plays (6 new)" in caplog.text
+    # the sweep's older read of T01 and T02 doesn't undo the check's plays on the candle that closed at 10:05
+    assert engine._last_scans["wide"]["scanned"] == len(WATCH)
+    assert sorted(p.symbol for p in engine.board.plays.values()) == WATCH
+    assert {pd.Timestamp(p.evidence["bar_at"]) for p in engine.board.plays.values()} == {pd.Timestamp(_at(10, 0))}
+
+
+def test_between_the_wide_scans_chunks_only_a_due_quick_recheck_or_close_check_runs(engine, gateway, now,
+                                                                                   monkeypatch, caplog):
+    _bars_until(gateway, monkeypatch, _at(10, 5))
+    monkeypatch.setattr(engine.scanner, "WIDE_CHUNK", 2)
+    engine.board.replace([_play("T06")], None)
+    rechecks = []
+    run_plays = engine.scanner.run_plays
+    monkeypatch.setattr(engine.scanner, "run_plays", lambda symbols: rechecks.append(list(symbols))
+                        or run_plays(symbols))
+    for scan in ("run_full", "run_cycle", "run_gappers"):
+        monkeypatch.setattr(engine.scanner, scan, lambda *a, **k: pytest.fail("a scan ran between the chunks"))
+    engine._queue_scan("full")
+    engine._last_cycle_at = float("-inf")                        # a cycle is due too
+    engine._run_scan("wide")
+    # the quick re-check was due at the first pause and not again 2 stocks later; the scan asked for still waits
+    assert rechecks == [["T06"]] and engine._scan_request == "full"
+
+    # a pause while quitting, with the market shut, or with nothing due runs nothing
+    engine._close_due, engine._last_plays_at = (_at(10, 5), time.monotonic()), float("-inf")
+    engine.quit_state = {"by": "operator"}
+    assert engine._between_wide_chunks() == [] and engine._close_due is not None
+    engine.quit_state, now["t"] = None, _at(16, 5)
+    assert engine._between_wide_chunks() == [] and engine._close_due is not None
+    now["t"], engine._close_due, engine._last_plays_at = _at(10, 5, 9), None, time.monotonic()
+    assert engine._between_wide_chunks() == [] and rechecks == [["T06"]]
+
+    # a check that fails between the chunks is logged, and the sweep goes on
+    def broken(kind):
+        raise RuntimeError("the board is locked")
+
+    monkeypatch.setattr(engine, "_run_scan", broken)
+    engine._close_due = (_at(10, 5), time.monotonic())
+    with caplog.at_level(logging.ERROR, logger="autotradebot.engine.engine"):
+        assert engine._between_wide_chunks() == []
+    assert "the candle-close check between the wide scan's chunks failed" in caplog.text
+
+
 # ---------------------------------------------------------------- early movers
 def _atr5(engine, symbol) -> float:
     return float(ta.atr(engine.md.cached_intraday(symbol).tail(30), 14).iloc[-1])
