@@ -230,6 +230,8 @@ class IbkrBroker(BrokerAdapter):
         self.port = int(port or s.ibkr_port_for(mode))
         self.client_id = int(client_id if client_id is not None else s.ibkr_client_id)
         self.account_id = (account_id if account_id is not None else s.ibkr_account_id) or ""
+        #: the account was named (IBKR_ACCOUNT_ID) rather than taken from the first login (_do_connect)
+        self._account_named = bool(self.account_id)
         self.readonly = bool(s.ibkr_readonly if readonly is None else readonly)
         self._md_pref = (market_data or s.ibkr_market_data or "auto").lower()
         self._data_type = _MARKET_DATA_TYPES.get(self._md_pref, 1)
@@ -476,10 +478,17 @@ class IbkrBroker(BrokerAdapter):
             problem = (f"port {self.port} is logged in to a paper account ({mask(paper[0])}) - the live route "
                        "refuses it. Log the live Gateway in with your live username, or point IBKR_LIVE_PORT "
                        "at the Gateway that is.")
-        elif self.account_id and self.account_id not in accounts:
+        elif self.account_id and self.account_id not in accounts and self._account_named:
             problem = (f"account {mask(self.account_id)} isn't on the login at port {self.port} (it has "
                        f"{', '.join(mask(a) for a in accounts)}) - set IBKR_ACCOUNT_ID to one of those, or log "
                        "IB Gateway in to that account.")
+        elif self.account_id and self.account_id not in accounts:
+            # taken from the first login, and the Gateway has been logged in to another account since: the open
+            # positions, their stops and the orders are the first one's, so the app keeps to it rather than send
+            # their exits to an account that doesn't hold them
+            problem = (f"the login at port {self.port} changed account since the app connected (it was "
+                       f"{mask(self.account_id)}, now {', '.join(mask(a) for a in accounts)}) - log IB Gateway back "
+                       "in to the first, or restart the app to trade the new one.")
         if problem:
             self._drop_socket()
             raise WrongAccount(problem)

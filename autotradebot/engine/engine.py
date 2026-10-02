@@ -174,8 +174,19 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             log.warning("starting in PAPER: Live was saved in %s, but account.allow_live_mode is off in "
                         "config/config.yaml", self.runtime.path.name)
             self.mode = "paper"
+            saved = {**saved, "mode": "paper"}
+            held = sorted(t["symbol"] for t in self._open_trades() if t.get("broker") == "ibkr-live")
+            unfinished = saved.get("quit")
+            if isinstance(unfinished, dict) and (unfinished.get("mode") == "live"
+                                                 or unfinished.get("venue") == "ibkr-live"):
+                # a quit of the live account, resumed from Paper, would close the paper positions and shut down
+                del saved["quit"]
+                log.warning("dropped the unfinished quit of your live account - it can't run from Paper")
+            if held:
+                log.warning("%d live position(s) stay open with only their stop orders at the broker - nothing here "
+                            "manages them until Live is allowed again: %s", len(held), ", ".join(held))
             # saved at once, so turning the switch on later doesn't reopen Live by itself
-            self.runtime.write({**saved, "mode": "paper"})
+            self.runtime.write(saved)
         self.paper_platform = normalize_platform(saved.get("paper_platform") or self.settings.secrets.paper_platform)
         self.filters = load_filters(saved.get("filters"), cfg.scanner.sectors)
         self.strategy_overrides = load_strategy_overrides(saved.get("strategies"))

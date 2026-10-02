@@ -433,6 +433,28 @@ def test_an_account_id_the_login_doesnt_have_is_refused(quick):
     assert b.is_connected and b.account_id == "DU999999"
 
 
+def test_with_no_account_named_a_reconnect_keeps_to_the_account_first_found(quick):
+    session = _logged_in(["DU111111"])
+    b = mod.IbkrBroker(port=4002, mode="paper", account_id="", session_factory=lambda: session)
+    b.connect()
+    assert b.account_id == "DU111111"                                    # taken from the login
+    session.ib.disconnect()                                              # the Gateway restarted...
+    session.ib.accounts = ["DU222222"]                                   # ...logged in to another paper user
+    with pytest.raises(WrongAccount) as refused:
+        b._do_connect()
+    # it wasn't set, so the refusal doesn't ask to fix IBKR_ACCOUNT_ID: it says what changed and what to do
+    assert str(refused.value) == ("the login at port 4002 changed account since the app connected (it was …1111, "
+                                  "now …2222) - log IB Gateway back in to the first, or restart the app to trade "
+                                  "the new one.")
+    assert not session.ib.isConnected() and b.account_id == "DU111111"  # its positions' exits never go elsewhere
+    session.ib.accounts = ["DU111111"]
+    b._do_connect()
+    assert b.is_connected
+    restarted = mod.IbkrBroker(port=4002, mode="paper", account_id="", session_factory=lambda: _logged_in(["DU222222"]))
+    restarted.connect()                                                  # a restart takes the login as it is now
+    assert restarted.is_connected and restarted.account_id == "DU222222"
+
+
 def test_the_connect_line_logs_the_account_masked(quick, caplog):
     b = mod.IbkrBroker(port=4002, mode="paper", session_factory=lambda: _logged_in(["DU111111"]))
     with caplog.at_level("INFO", logger=mod.__name__):

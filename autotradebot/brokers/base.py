@@ -34,7 +34,8 @@ class AuthError(BrokerError):
 
 class WrongAccount(AuthError):
     """The login behind the port is the wrong kind of account for the route - a live account on the paper
-    port, a paper one on the live port, or not the account IBKR_ACCOUNT_ID names."""
+    port, a paper one on the live port, or not the account IBKR_ACCOUNT_ID names (with none named: not the
+    account the connection first found there)."""
 
 
 class BrokerAdapter(abc.ABC):

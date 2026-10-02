@@ -176,7 +176,7 @@ def fig_components() -> str:
     srv = s.box(20, 100, 680, 58, "FastAPI app  (autotradebot/server/app.py  +  security.py)",
                 ["GET/POST /api/*  ->  engine methods           /ws  ->  EventBus queue  ->  JSON events        "
                  "/static  ->  the dashboard files",
-                 "same-machine check on every request and on /ws (client, Host, Origin, cross-site /api/, "
+                 "same-machine check on every request and on /ws (client, Host, exact Origin, Sec-Fetch-Site, "
                  "X-ATB-Request on writes)"],
                 fill="#f5f9ff", title_fill="#dbe7fb")
     connect(s, ui, srv, "HTTP + WebSocket", start=None, end="arr", offset=-120)
@@ -912,9 +912,11 @@ def build() -> str:
          "<code>scripts/run_24_7.bat</code> keeps it up"),
         ("Web server", "FastAPI + uvicorn, WebSocket", "REST routes call the engine in a thread pool; "
          "<code>security.py</code> refuses every request, and the WebSocket, that isn't the dashboard on "
-         "this machine"),
-        ("Broker / prices", "ib_async against IB Gateway", "Paper on port 4002, live on 4001. The only price "
-         "source; delayed data is accepted"),
+         "this machine; <code>run.py</code> listens on this computer only (unless <code>--allow-network</code>) "
+         "and trusts no proxy headers"),
+        ("Broker / prices", "ib_async against IB Gateway", "Paper on port 4002, live on 4001; every connection "
+         "checks the account behind the port (paper ids start with D). The only price source; delayed data is "
+         "accepted"),
         ("Simulator", "<code>brokers/paper_adapter.py</code>", "Fills on IBKR prices; its state is in "
          "<code>data/paper_state.json</code>"),
         ("Database", "SQLAlchemy 2 ORM; SQLite by default", "MySQL/PyMySQL if <code>DATABASE_URL</code> is set; "
@@ -922,7 +924,8 @@ def build() -> str:
         ("Numerics", "pandas, numpy", "No TA-Lib, no SciPy: <code>indicators/ta.py</code> and "
          "<code>quant/</code> are vectorised by hand"),
         ("Config", "pydantic-settings", "<code>.env</code> for secrets, <code>config/config.yaml</code> for "
-         "defaults, <code>data/runtime.json</code> for dashboard choices (it wins)"),
+         "defaults, <code>data/runtime.json</code> for dashboard choices (it wins - but Live also needs "
+         "<code>account.allow_live_mode</code>)"),
         ("Dashboard", "Vanilla JS ES modules", "No bundler, no framework; <code>state.js</code> is a small "
          "pub/sub store"),
         ("Tests", "pytest, 474 tests in 52 files", "<code>tests/fakes.py</code> fakes the Gateway; "
@@ -1210,7 +1213,8 @@ def build() -> str:
         ("symbols.json", "JSON", "IBKR contract ids, stock types, sectors (the SymbolMaster)"),
         ("watchlists/watchlist_&lt;date&gt;.json", "JSON", "the day's hot list, buffers and decisions (5 days kept)"),
         ("runtime.json", "JSON", "every dashboard choice: mode, filters, strategies, capital, scan settings, "
-         "Autopilot settings - wins over config.yaml"),
+         "Autopilot settings - wins over config.yaml, except a saved Live, which starts in Paper unless "
+         "account.allow_live_mode is on"),
         ("day_state.bin", "compressed pickle", "the current session so far: the board's plays, the setups settled, "
          "the gap check's pre-market levels, the last wide scan's time, the last scans' summaries - a restart "
          "picks the day up from it (engine/day_state.py)"),
@@ -1232,7 +1236,9 @@ def build() -> str:
       'risk, scanner, strategies, valuation, execution, exit_manager, autopilot, noise, replay, journal, pairs, '
       'signals, database, app).</li>'
       '<li><code>data/runtime.json</code>: what you set in the dashboard. Loaded at start and applied over the '
-      'YAML, so a slider you moved survives a restart and beats the file.</li></ol>')
+      'YAML, so a slider you moved survives a restart and beats the file. The one exception is Live: it needs '
+      '<code>account.allow_live_mode: true</code>, which only the file can set - without it the dashboard refuses '
+      'Live, and a saved Live starts in Paper (saved as Paper, with a quit of the live account dropped).</li></ol>')
 
     # ---- 7 research -----------------------------------------------------------------------------
     A('<h2>7. The research loop: replay, records, journal</h2>')
@@ -1341,13 +1347,19 @@ def build() -> str:
         ("/api/setup[/secrets|/reconnect|/ibkr/test|/paper-platform], /api/quit", "GET/POST",
          "the dashboard's header even on a read: setup_state(), save_secrets(), reconnect(), probe_ibkr(), "
          "begin_quit()"),
-        ("/ws", "WebSocket", "closed with 1008 before accept when the client, Host or Origin is foreign; otherwise "
+        ("/ws", "WebSocket", "closed with 1008 before accept when the client, Host, Origin or Sec-Fetch-Site "
+         "fails the check below; otherwise "
          "a queue on the EventBus; first message is a full snapshot (the account id shows only its end), then "
          "the plays as slim rows, like every later plays push"),
     ]))
     A('<p>Answers over 2 KB go gzipped (FastAPI\'s <code>GZipMiddleware</code>); the WebSocket does not pass '
       'through it.</p>')
-    A('<p>Every request passes <code>security.py</code>\'s check first (a refusal is a 403), and every answer '
+    A('<p>Every request passes <code>security.py</code>\'s check first (a refusal is a 403): the client must be '
+      'this computer and the <code>Host</code> a name for it; an <code>Origin</code> must be the dashboard\'s '
+      'own - http, the same port, 127.0.0.1, localhost or [::1] - so a page another program serves on another '
+      'port is refused; on '
+      '<code>/api/</code> and <code>/ws</code> a <code>Sec-Fetch-Site</code> other than same-origin or none is '
+      'refused; and a write needs <code>X-ATB-Request: 1</code>. There are no generated API docs. Every answer '
       'carries <code>X-Frame-Options: DENY</code>, <code>X-Content-Type-Options: nosniff</code> and a '
       '<code>Content-Security-Policy</code> that runs only the dashboard\'s own script files (no inline script '
       'or <code>onclick=</code>; inline styles are allowed) and lets no other site frame the page.</p>')

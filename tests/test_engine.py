@@ -176,6 +176,40 @@ def test_a_saved_live_choice_starts_in_paper_without_the_switch(tmp_path, gatewa
     assert _new_engine(tmp_path, gateway, port).mode == "live"            # with the switch on, Live is restored
 
 
+def test_a_quit_of_the_live_account_isnt_resumed_on_paper_without_the_switch(tmp_path, gateway, port, caplog):
+    import json
+    import logging
+    from autotradebot.persistence.db import DB
+    from autotradebot.persistence.repository import Repository
+
+    DB.init(url=f"sqlite:///{(tmp_path / 'engine.sqlite').as_posix()}")
+    DB.create_all()
+    e = None
+    try:
+        held = SimpleNamespace(repo=Repository())
+        paper, live = _open(held, "T01", venue="ibkr-paper"), _open(held, "T02", venue="ibkr-live")
+        port["open"] = True                                               # both Gateways answer
+        (tmp_path / "runtime.json").write_text(json.dumps({"mode": "live", "paper_platform": "ibkr", "quit": {
+            "started_at": "2026-10-01T15:00:00+00:00", "mode": "live", "venue": "ibkr-live", "by": "operator",
+            "reset_sim": False, "keeping": []}}), encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger="autotradebot.engine.engine"):
+            e = _new_engine(tmp_path, gateway, port)
+        assert e.mode == "paper" and e.quit_state is None and "quit" not in e.runtime.read()
+        assert "1 live position(s) stay open" in caplog.text and "T02" in caplog.text
+        e._bind()
+        closed = _closes_fill(e)
+        e._quit_retry_at = 0
+        e._check_quit_progress()
+        # the paper account's positions aren't closed in its place, and nothing shuts down
+        assert closed == [] and e.quit_state is None and e._venue == "ibkr-paper"
+        assert {e.repo.get_trade(t)["status"] for t in (paper, live)} == {"OPEN"}
+    finally:
+        if e is not None:
+            e.stop()
+        DB.engine.dispose()
+        DB.init(url=os.environ["DATABASE_URL"])
+
+
 def test_live_is_refused_when_the_live_gateway_is_unreachable(engine, monkeypatch):
     _allow_live(engine, monkeypatch)
     r = engine.set_mode("live")
