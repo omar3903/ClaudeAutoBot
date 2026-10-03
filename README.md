@@ -551,7 +551,10 @@ The app is built to be left running:
   minute or two) and reconnects once the Gateway has logged back in. A Gateway that takes connections
   before it has loaded the account isn't trusted - the app tries again - and for a minute after any
   reconnect, positions aren't compared with the trade records and working orders aren't given up on,
-  so nothing is deleted because an answer came back half-loaded.
+  so nothing is deleted because an answer came back half-loaded. An order that finished while the
+  connection was down comes back from IBKR without its order id; the app finds it by IBKR's permId or
+  its executions and books it as if it had heard it live. An entry, stop or target IBKR no longer knows
+  at all is looked for in IBKR's executions before it is given up, so what it filled is booked.
 * **IBKR's nightly maintenance** (about 11:45 PM-12:45 AM ET). When the Gateway stays up but loses
   IBKR's servers, the app waits on the same connection for IBKR's all-clear; if that hasn't come after
   10 minutes it starts the connection afresh.
@@ -577,7 +580,10 @@ The app is built to be left running:
   and no price is restored: the first cycle reads fresh candles within seconds, and an entry still
   needs a current quote. With today's watchlist on disk the full scan isn't repeated either; open
   positions and their resting stop and target orders are found again from the trade records and the
-  order tags. A replay the restart cut short resumes from its last finished job (see *The replay*).
+  order tags. An entry sent before the restart that filled while the app was off (its play still
+  *sent*, with no trade and no order working) is booked from IBKR's executions tagged with the play (a
+  read of them that fails is tried again), and gets its stop. A replay the restart cut short resumes
+  from its last finished job (see *The replay*).
 * **An open dashboard tab updates itself.** After the app is updated and restarted, a tab that was already
   open reconnects - and would go on running the scripts it loaded before. The server stamps the dashboard's
   files in its first message; a tab that started on another stamp reloads (or, with a dialog open, asks you to).
@@ -815,7 +821,10 @@ shown so you can see where live would stop you.
 (full-day holidays **and** 1:00 pm half-days) through 2028.
 
 * **Regular hours** → the order type from `execution.default_order_type`
-  (`LIMIT` / `MARKET` / `STOP_LIMIT`).
+  (`LIMIT` / `MARKET` / `STOP_LIMIT`). A `STOP_LIMIT` entry rests at IBKR as a
+  real stop-limit: it waits for the price to reach the entry, then pays no more
+  than its limit. An order type the IBKR adapter can't send is refused, never
+  sent as some other order.
 * **Pre-market / after-hours** → **limit only**, and only for setups flagged
   extended-hours-eligible (all swing/valuation setups, plus `gap_and_go`).
 * **Closed** (overnight / weekend / holiday) → execution is blocked; the
@@ -887,7 +896,28 @@ Two rules keep it safe:
 * **Never two exits on one position.** Before the app sends an exit of its own it
   cancels the stop and waits for IBKR to confirm; if the stop filled first, that
   fill is booked and nothing else is sent; if IBKR hasn't confirmed, the exit waits
-  for the next pass. A partial exit first shrinks the stop to the shares that remain.
+  for the next pass. A cancel IBKR refuses (the stop is already filling) is no
+  confirmation - ib_async would report that stop as cancelled, the app keeps it as
+  working until IBKR says it filled or is cancelled - and a stop that read cancelled is
+  read once more, for a fill landing just behind the cancel, before the exit goes out.
+  A cancel IBKR answers with neither its confirmation nor a fill holds the exit back
+  for half a minute, and the order sync leaves that stop alone meanwhile. A stop move IBKR
+  refuses leaves the stop as it was, and it is replaced; one refused a few seconds after the
+  move seemed taken reads where IBKR still holds it and rests on there - never cancelled for
+  the next move - which goes once IBKR's list of its orders shows the stop still working.
+  A close that waited while another (a second click, a quit, the order sync booking the
+  stop's fill) had the position's orders looks again: if that one sent its exit or closed
+  the record, nothing more goes out. A stop IBKR no longer knows at all is looked for in its
+  executions before an exit stands it down; while they can't be read the exit waits.
+  An exit right after a start stands down the stop and target an earlier run left
+  too, before the app has taken them over; while IBKR's order list can't be read (the
+  connection down too: no list is no empty list), or is still reloading after a connect,
+  the exit waits rather than go out beside one - and goes within seconds once it may.
+  Once a full list has shown nothing of an earlier run's for a position (or the app
+  opened it itself), a list that can't be read no longer holds its exit back. An exit still
+  waiting after a minute and a half - however far apart its tries - is reported on the
+  dashboard like a failed one. A partial exit first shrinks the stop to the
+  shares that remain, and is never sent while a target rests at IBKR.
 * **Never a stop without a position.** A stop is placed only while the account shows
   the shares and the broker's orders could be read; a stop whose trade is no longer
   open is cancelled; a stop an earlier run left is followed, never doubled. If it (or
@@ -901,19 +931,25 @@ that comes off at the first target when the position scales out, for all of it
 otherwise. The two share a **one-cancels-all group** at IBKR (type 3: when one fills,
 the other is reduced by the shares filled) - the target taking half off shrinks the
 stop to the other half, the stop filling cancels the target, and the two can never
-both fill for the whole position. IBKR works them on real prices, so profit is taken
-at the target even on delayed quotes, and while the app is off. When the first
+both fill for the whole position. Moving the stop's price leaves its size as IBKR holds
+it, so a target that has filled in part keeps the stop cut to what is left, and a resize
+never asks for more than the record holds less what the target has filled. IBKR works
+them on real prices, so profit is taken at the target even on delayed quotes, and while
+the app is off. When the first
 target fills, the app books the scale-out (stop to break-even, second target) and
 rests a fresh pair for what is left; while a target rests the exit manager leaves
 the target to the broker. A plain stop left by an earlier version is stood down and
-replaced by the pair. If IBKR refuses the pair, the trade gets a stop alone and the
-app works its target itself, as before.
+replaced by the pair. A pair is only stood down to be placed afresh once IBKR's orders
+have been read, so a stop is never cancelled that can't be replaced. If IBKR refuses the
+pair, the trade gets a stop alone and the app works its target itself, as before.
 
 **A position without a stop at the broker is never silent.** A stop is only ever rested for shares
 the broker shows - triggered, one for shares it doesn't hold would open a position the other way - so
 during a fill landing in pieces it waits a few seconds, and if the broker's count and the record
 disagree (part sold by hand in TWS, say) it waits for them to agree. Meanwhile the app's exit
-manager still watches the price and sends the exit itself; what nothing covers is the app being off.
+manager still watches the price and sends the exit itself - unless IBKR's orders can't be read for a
+position never looked for in a full list, when its exit waits too (and the report says so); what
+nothing covers is the app being off.
 So a position with no stop at the broker is marked **no stop at the broker yet** in red in the Open
 positions tab's **Protection** column, and once that has lasted 90 seconds the log and the dashboard say
 so, with the reason, and again every five minutes until it's fixed.

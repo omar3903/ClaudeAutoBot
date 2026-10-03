@@ -10,7 +10,9 @@ broker's reason, and whatever part of the order did fill is booked.
 
 Orders outlive the app: after a restart, the orders an earlier run left working
 at the broker are taken over (see :meth:`Executor.adopt_working_orders`), so an
-exit is never sent twice.
+exit is never sent twice. An entry that finished while the app was off, or that
+the broker no longer knows (the connection was down when it filled), is booked
+from the broker's executions, so its shares get their record and their stop.
 """
 
 from __future__ import annotations
@@ -18,8 +20,8 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..brokers.base import DONE_STATUSES, BrokerAdapter, BrokerError
 from ..brokers.venues import venue_label
@@ -28,7 +30,7 @@ from ..core.eventbus import BUS
 from ..core.models import Account, OrderRequest, OrderResult, Play
 from ..util import clock
 from .order_builder import build_entry_order, build_exit_order, plan_order
-from .protective_stops import TAG as STOP_TAG, TARGET_TAG, ProtectiveStops
+from .protective_stops import TAG as STOP_TAG, TARGET_TAG, ProtectiveStops, shares_and_price
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +67,11 @@ class Executor(ProtectiveStops):
     RESYNC_GRACE_S = 60.0
     #: seconds after which a cancel the app sent for an entry that is still working is sent again
     CANCEL_AGAIN_S = 30.0
+    #: hours before the start that an earlier run's entry may have gone out and still be looked for in the
+    #: broker's executions (IBKR reports the current day's)
+    ENTRY_LOOKBACK_H = 24.0
+    #: seconds before that look is tried again, when the broker's orders, executions or account couldn't be read
+    ENTRY_LOOK_RETRY_S = 30.0
 
     def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS,
                  venue: Optional[str] = None) -> None:
@@ -88,6 +95,10 @@ class Executor(ProtectiveStops):
         self.on_entries_adopted: Optional[Callable[[List[str]], Any]] = None
         #: the broker's orders couldn't be listed when they were to be taken over: each order sync tries again
         self._adopt_due = False
+        #: the entries sent before ``_bound_at`` that may have filled while the app was off are still to be
+        #: looked for in the broker's executions (_book_entries_filled_while_off)
+        self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
+        self._entries_retry_at = 0.0
         self._init_stops()
 
     def rebind(self, broker: BrokerAdapter, venue: Optional[str] = None) -> None:
@@ -98,6 +109,8 @@ class Executor(ProtectiveStops):
         self.venue = venue or broker.name
         self._pending.clear()
         self._open_by_symbol.clear()
+        self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
+        self._entries_retry_at = 0.0
         self._init_stops()              # the other venue's stops stay where they are; they are found again by their tags
 
     def cancel_pending_entries(self) -> int:
@@ -275,7 +288,10 @@ class Executor(ProtectiveStops):
 
     def _working_or_none(self) -> Optional[List[OrderResult]]:
         """The orders working at the broker, or None when it couldn't be asked - for the callers that
-        must tell "nothing is working" from "not known"."""
+        must tell "nothing is working" from "not known". A broker that isn't connected isn't asked:
+        it can say nothing of its orders then."""
+        if getattr(self.broker, "is_connected", True) is False:
+            return None
         try:
             return [o for o in self.broker.list_orders("WORKING")
                     if o.status not in DONE_STATUSES and o.side is not None]
@@ -297,6 +313,87 @@ class Executor(ProtectiveStops):
         if row is None or Side(row["side"]) is not order.side:
             return None
         return _play_from_row(row)
+
+    def _book_entries_filled_while_off(self) -> List[str]:
+        """Book the entries an earlier run sent that finished while the app was off - their plays still SUBMITTED
+        in the play log, with no trade record, no order working for them and none followed here: what the broker's
+        executions tagged with a play's id show it bought, up to what the account holds beyond the records, becomes
+        its trade through the same booking as a fill heard live, so the position gets its stop on the next pass.
+        Looked for once, when the broker is connected, past its re-sync after the connect, and its orders,
+        executions and account could be read - a read that failed is no "none": the look is tried again every
+        ENTRY_LOOK_RETRY_S. Pair legs are left to the desk: the play log doesn't keep their pair. Returns the trades
+        booked."""
+        if (getattr(self.broker, "is_connected", True) is False or self._broker_resyncing()
+                or time.monotonic() < self._entries_retry_at):
+            return []                                   # looked for once it is connected and its lists have reloaded
+        find = getattr(self.repo, "submitted_plays", None)
+        if not callable(find):
+            self._entries_due = False
+            return []
+        try:
+            rows = find(self._bound_at - dt.timedelta(hours=self.ENTRY_LOOKBACK_H), self._bound_at)
+        except Exception:  # noqa: BLE001
+            log.debug("could not read the plays sent before the start", exc_info=True)
+            self._entries_retry_at = time.monotonic() + self.ENTRY_LOOK_RETRY_S
+            return []
+        followed = {p.play.id for p in list(self._pending.values()) if p.kind == "entry"}
+        rows = [r for r in rows if r["id"] not in followed and "pair-leg" not in (r.get("tags") or [])]
+        working = self._working_or_none() if rows else []
+        fills = self._executions(None) if rows else []
+        if working is None or fills is None:
+            # not known: looked for again shortly (IBKR's executions are read strictly - a request that failed or
+            # timed out is no "none", or the entry would never be looked for again)
+            self._entries_retry_at = time.monotonic() + self.ENTRY_LOOK_RETRY_S
+            return []
+        working_for, found = {o.tag for o in working}, []
+        for row in rows:
+            if row["id"] in working_for:
+                continue                                # still working: followed once it is taken over
+            side = Side(row["side"])
+            mine = [f for f in fills if (getattr(f, "tag", "") or "") == row["id"] and f.side is side
+                    and f.symbol == row["symbol"]]
+            qty, price = shares_and_price(mine)
+            if qty > 1e-9:
+                found.append((row, side, qty, price, str(mine[-1].order_id)))
+        self._entries_due = False
+        booked: List[str] = []
+        for row, side, qty, price, order_id in found:
+            try:
+                tid = self._book_entry_filled_while_off(row, side, qty, price, order_id)
+            except Exception:  # noqa: BLE001 - the database busy, say: this one is looked for again, the rest go on
+                log.exception("booking the entry for %s (play %s) that filled while the app was off failed - looked "
+                              "for again shortly", row["symbol"], row["id"])
+                tid = None
+            if tid is None:
+                # the account couldn't be read, or the booking failed: looked for again (one booked by then has its
+                # trade, and is no longer among the plays looked for)
+                self._entries_due = True
+                self._entries_retry_at = time.monotonic() + self.ENTRY_LOOK_RETRY_S
+            elif tid:
+                booked.append(tid)
+        return booked
+
+    def _book_entry_filled_while_off(self, row: Dict[str, Any], side: Side, qty: float, price: float,
+                                     order_id: str) -> Optional[str]:
+        """Book one entry found filled while the app was off. Returns its trade id, "" when the account holds none
+        of its shares beyond the records (nothing booked), None when the account couldn't be read."""
+        # never more than the account holds beyond the records: shares sold by hand meanwhile get no record,
+        # and the record that is booked matches the account, so its stop can go on
+        held = self._held_quantity(row["symbol"])
+        if held is None:
+            return None
+        recorded = sum(abs(float(t.get("quantity") or 0.0)) for t in self.repo.open_trades()
+                       if t["symbol"] == row["symbol"] and t["side"] == side.value
+                       and (t.get("broker") or "paper") == self.venue)
+        take = min(qty, (held if side is Side.LONG else -held) - recorded)
+        if take <= 1e-9:
+            log.warning("an entry for %s (play %s) filled while the app was off, but the account holds none of "
+                        "its shares beyond the records - not booked", row["symbol"], row["id"])
+            return ""
+        tid = self._open_trade(_play_from_row(row), price, take, order_id)
+        log.warning("ENTRY FILLED WHILE THE APP WAS OFF  %s %s x%s @ %.4f (play %s) - booked from the broker's "
+                    "executions", row["symbol"], side.value, take, price, row["id"])
+        return tid
 
     def _cancel_extra_exits(self, working: List[OrderResult], trades: List[Dict[str, Any]]) -> List[OrderResult]:
         recorded: Dict[str, float] = {}
@@ -379,7 +476,11 @@ class Executor(ProtectiveStops):
                     decision_price: Optional[float] = None) -> Dict[str, Any]:
         """Send the order that closes a position - or, with ``qty`` short of the whole position, the
         part of it the exit manager takes off at the first target; ``after_fill`` is the stop and
-        target the rest gets once that part has gone (see Repository.reduce_trade)."""
+        target the rest gets once that part has gone (see Repository.reduce_trade). The stop and target
+        resting at the broker are stood down first - one an earlier run left too, before this run's first
+        pass has taken it over (_take_over_for_exit). An exit that must wait on the broker for that (a cancel
+        to confirm, its orders reloading after a connect) comes back ``wait``: not a failed exit, one to try
+        again in seconds."""
         t = self.repo.get_trade(trade_id)
         if not t or t["status"] == "CLOSED":
             return {"ok": False, "reason": "trade not open"}
@@ -395,7 +496,40 @@ class Executor(ProtectiveStops):
             # a market exit would be rejected, and standing the stop down for it would leave the position
             # with nothing at the broker - so nothing is touched until the session opens
             return {"ok": False, "market_closed": True, "reason": closed}
+        # one caller at a time stands the trade's resting orders down - a manual close or a quit can come from
+        # another thread - and the order sync leaves them alone until the exit is placed or refused (and holds them
+        # itself for the moment it places, moves or books one: a close waits a moment for that)
+        if not self._claim_resting(trade_id, wait_s=self.STAND_DOWN_S):
+            return {"ok": False, "wait": True,
+                    "reason": f"An exit for this {t['symbol']} position is already being sent, or its orders at the "
+                              f"broker are being changed this moment - try again in a few seconds."}
+        try:
+            # whoever held the trade's orders while this close waited for them may have sent its exit, or booked the
+            # stop's fill: the record and the exits working are read again before anything goes to the broker
+            fresh = self.repo.get_trade(trade_id)
+            if not fresh:
+                return {"ok": False, "reason": "trade not open"}
+            if fresh["status"] == "CLOSED":
+                return {"ok": True, "status": "FILLED", "trade": fresh}
+            if trade_id in self.pending_exit_trade_ids():
+                return {"ok": False,
+                        "reason": f"An exit order for this {t['symbol']} position is already working."}
+            return self._send_exit(fresh, reason, limit_price, qty, after_fill, decision_price)
+        finally:
+            self._release_resting(trade_id)
+
+    def _send_exit(self, t: Dict[str, Any], reason: str, limit_price: Optional[float], qty: Optional[float],
+                   after_fill: Optional[Dict[str, float]], decision_price: Optional[float]) -> Dict[str, Any]:
+        """close_trade's work once it holds the trade's resting orders: stand them down, then send the exit."""
+        trade_id, held_on = t["id"], t.get("broker") or "paper"
         working = self._working_or_none()
+        # a stop or target an earlier run left, not taken over yet (just after a start), is stood down like this run's
+        wait = self._take_over_for_exit(t, working)
+        if wait:
+            fresh = self.repo.get_trade(trade_id)
+            if not fresh or fresh["status"] == "CLOSED":     # one filled while the app was off, for all of it
+                return {"ok": True, "status": "FILLED", "trade": fresh or t, "by": "broker-stop"}
+            return {"ok": False, "wait": True, "reason": wait}
         if working is None:
             # not known is not "none working": an exit an earlier run left, or one placed by hand, can't be
             # seen - the exits this run is following and the shares the broker holds still cap this one
@@ -411,16 +545,23 @@ class Executor(ProtectiveStops):
             return {"ok": True, "status": order.status, "order_id": order.order_id, "adopted": True}
         wanted = abs(float(t["quantity"]))
         partial = qty is not None and 0 < float(qty) < wanted - 1e-9
+        if partial and trade_id in self._targets:
+            # the target resting at the broker takes this part off at that price - one an earlier run left, just
+            # taken over, too: an exit of the app's own beside it would sell the same shares twice
+            return {"ok": False, "wait": True,
+                    "reason": "The target resting at the broker takes this part off - it is left to the target."}
         # the stop resting at the broker first: two exits on one position must never both fill
         if partial:
             if not self._shrink_stop(trade_id, wanted - float(qty)):
-                return {"ok": False, "reason": "The stop at the broker couldn't be resized for the part coming off - "
-                                               "trying again shortly."}
+                return {"ok": False, "wait": True,
+                        "reason": "The stop at the broker couldn't be resized for the part coming off - "
+                                  "trying again shortly."}
         else:
             stood = self._stand_down(trade_id)
             if stood == "busy":
-                return {"ok": False, "reason": "Waiting for the broker to confirm the protective stop is cancelled "
-                                               "before sending the exit."}
+                return {"ok": False, "wait": True,
+                        "reason": "Waiting for the broker to confirm the protective stop is cancelled "
+                                  "before sending the exit."}
             if stood in ("filled", "cancelled"):
                 t = self.repo.get_trade(trade_id) or t      # the stop, or part of it, may have filled first
                 if stood == "filled" or t["status"] == "CLOSED":
@@ -551,6 +692,12 @@ class Executor(ProtectiveStops):
                 self.adopt_working_orders()
             except Exception:  # noqa: BLE001
                 log.exception("taking over the orders already working failed")
+        # ...and, once they are, book the entries it sent that filled while the app was off
+        if self._entries_due and not self._adopt_due:
+            try:
+                self._book_entries_filled_while_off()
+            except Exception:  # noqa: BLE001
+                log.exception("looking for the entries that filled while the app was off failed")
 
         # 1) advance the simulator
         if hasattr(self.broker, "poll"):
@@ -648,13 +795,54 @@ class Executor(ProtectiveStops):
             return
         if self._pending.pop(res.order_id, None) is None:
             return                                      # another pass (the Refresh button's) has just handled it
+        if res.status == "UNKNOWN" and p.kind == "entry":
+            found = self._found_in_executions(p, res)
+            if found is None:
+                # the executions couldn't be read: not known is no "none bought" - followed on, and looked for again
+                # once the broker has gone another few polls without knowing it
+                p.unseen = 0
+                self._pending.setdefault(res.order_id, p)
+                return
+            res = found
         if res.status == "FILLED":
             self._on_filled(p, res)
         else:
             self._on_unfilled(p, res)
 
+    def _found_in_executions(self, p: _Pending, res: OrderResult) -> Optional[OrderResult]:
+        """An entry the broker no longer knows, before it is given up: what the broker's executions show it bought
+        - it may have filled while the app wasn't following it (the connection was down when it finished, say).
+        All of it reads as filled, part of it as the order ended with that part filled. None when the executions
+        couldn't be read: the entry isn't given up on that."""
+        executed = self._executed(p, res.order_id)
+        if executed is None:
+            return None
+        got, price = executed
+        if got <= float(res.filled_qty or 0.0) + 1e-9:
+            return res
+        log.warning("ENTRY FOUND IN THE EXECUTIONS  %s order %s is no longer known to the broker, but its executions "
+                    "show %s of %s shares bought @ %.4f - booked", p.play.symbol, res.order_id, got, p.qty, price)
+        return replace(res, symbol=p.play.symbol, filled_qty=got, avg_fill_price=price,
+                       status="FILLED" if got >= p.qty - 1e-9 else res.status)
+
+    def _executed(self, p: _Pending, order_id: str) -> Optional[Tuple[float, float]]:
+        """The shares, and their average price, the broker's executions show for order ``order_id`` - and, for an
+        entry, for any order tagged with its play's id (an entry's tag; an exit's is shared by every exit its trade
+        has had). (0, 0) when they show none; None when they can't be read."""
+        fills = self._executions(p.play.symbol)
+        if fills is None:
+            return None
+        side = p.play.side if p.kind == "entry" else _exit_side(p.play.side.value)
+        tag = p.play.id if p.kind == "entry" else ""
+        return shares_and_price([f for f in fills if f.side is side
+                                 and (str(f.order_id) == str(order_id) or (tag and getattr(f, "tag", "") == tag))])
+
     def _on_filled(self, p: _Pending, res) -> None:
         px = res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0)
+        if not px:
+            # finished with no price on the report - an order rebuilt after a reconnect with no executions on it
+            px = (self._executed(p, res.order_id) or (0.0, 0.0))[1] or (
+                (p.avg_seen or p.play.entry) if p.kind == "entry" else (p.decision_price or 0.0))
         if p.kind == "entry":
             # an adopted entry's clock restarted at the restart (for its time-out) - it isn't when it went out
             self._open_trade(p.play, px, res.filled_qty or p.qty, res.order_id,
@@ -752,6 +940,7 @@ class Executor(ProtectiveStops):
                                    order_type=order_type, order_session=order_session,
                                    entry_context=context, submitted_at=submitted_at, **seen)
         self._open_by_symbol[play.symbol] = tid
+        self._left_looked.add(tid)                      # a record this run made: no earlier run left orders for it
         play.status = PlayStatus.FILLED
         play.trade_id = tid
         self.bus.publish("order.filled", kind="entry", trade_id=tid, symbol=play.symbol,

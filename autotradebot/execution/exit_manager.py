@@ -21,7 +21,10 @@ For each OPEN trade it:
 
 A trade whose close order is still working is left alone. An exit that can't
 be sent, or that the broker rejects or cancels, is sent again - waiting a
-little longer after each try (``RETRY_DELAYS_S``).
+little longer after each try (``RETRY_DELAYS_S``). One that only had to wait on
+the broker (a stop's cancel to confirm, its orders reloading after a connect) is
+no failed try: it goes again in ``WAIT_RETRY_S`` - and a wait that goes on past
+``WAIT_WARN_S`` is reported like a failed exit.
 
 Between full passes, a streamed tick on a stock held runs a tick pass on just that
 stock (``run_once(only=...)``, engine._sync_loop): steps 1, 2 and 5 on the fresh
@@ -84,6 +87,11 @@ def stop_locked(side: str, stop: Any, entry: float) -> bool:
 class ExitManager:
     #: seconds to wait before the next exit for a trade, after its 1st, 2nd, ... one
     RETRY_DELAYS_S = (5.0, 15.0, 30.0, 60.0, 120.0, 300.0)
+    #: seconds before an exit that waited on the broker is tried again - no longer after each wait
+    WAIT_RETRY_S = 5.0
+    #: an exit still waiting on the broker after this long - past the minute its orders take to reload after a
+    #: connect - is reported, and again every WAIT_REPEAT_S while it waits
+    WAIT_WARN_S, WAIT_REPEAT_S = 90.0, 300.0
 
     def __init__(self, repo, executor, quote_fn: Callable[[str], Any], cfg, bus=BUS,
                  venue: Optional[str] = None) -> None:
@@ -95,6 +103,8 @@ class ExitManager:
         self.bus = bus
         self._tries: Dict[str, Tuple[int, float]] = {}  # trade id -> (exits sent, monotonic time the next may go)
         self._last_failure: Dict[str, str] = {}         # trade id -> the failure last published
+        self._waiting: Dict[str, float] = {}                 # trade id -> when its exit began waiting on the broker
+        self._wait_warned: Dict[str, float] = {}             # trade id -> when that wait was last reported
         self._overdue_seen: set = set()     # trade ids we've already flagged as overdue
         self._not_held: set = set()         # trade ids whose position the broker doesn't show
         # this pass's quotes: each stock's price, and when the quote was printed
@@ -192,6 +202,15 @@ class ExitManager:
                 log.warning("AUTO-EXIT %s skipped: %s", tid, out.get("reason"))
                 self.bus.publish("exit.not_held", trade_id=tid, reason=out.get("reason"))
             return None
+        if out.get("wait"):
+            # the broker has yet to answer (Executor.close_trade): no failed exit - tried again shortly, the
+            # back-off untouched, so it goes out within seconds of the answer, not minutes
+            self._tries[tid] = (tries, now + self.WAIT_RETRY_S)
+            why = out.get("reason") or "waiting on the broker"
+            self._note_wait(tid, reason, why, tries, now)
+            return None
+        self._waiting.pop(tid, None)
+        self._wait_warned.pop(tid, None)
         tries += 1
         wait = self.RETRY_DELAYS_S[min(tries, len(self.RETRY_DELAYS_S)) - 1]
         self._tries[tid] = (tries, now + wait)
@@ -214,6 +233,24 @@ class ExitManager:
             self.bus.publish("exit.failed", trade_id=tid, reason=why, attempt=tries, retry_in_s=round(wait))
         return None
 
+    def _note_wait(self, tid: str, reason: str, why: str, tries: int, now: float) -> None:
+        """Log an exit's wait on the broker - and once it has gone on past WAIT_WARN_S, report it like a failed exit,
+        again every WAIT_REPEAT_S: a wait is no failed try, but one that doesn't end leaves the position without its
+        exit, and that must not go unseen. It ends when a full pass wants no exit for the trade (the price came back:
+        _manage) - never for the time between tries, which one waiting out an order list that times out stretches."""
+        since = self._waiting.setdefault(tid, now)
+        if self._last_failure.get(tid) != why:
+            self._last_failure[tid] = why
+            log.info("AUTO-EXIT %s (%s) waits - next try in %.0fs: %s", tid, reason, self.WAIT_RETRY_S, why)
+        waited = now - since
+        if waited < self.WAIT_WARN_S or now - self._wait_warned.get(tid, float("-inf")) < self.WAIT_REPEAT_S:
+            return
+        self._wait_warned[tid] = now
+        log.warning("AUTO-EXIT %s (%s) has waited on the broker for %.0fs and is still not sent: %s", tid, reason,
+                    waited, why)
+        self.bus.publish("exit.failed", trade_id=tid, reason=f"waiting on the broker for {waited:.0f}s - {why}",
+                         attempt=tries + 1, retry_in_s=round(self.WAIT_RETRY_S))
+
     def _scale_out(self, t: Dict[str, Any], managed: bool, entry: float, sign: float,
                    risk_ps: float) -> Optional[Tuple[float, Dict[str, float]]]:
         """At the first target of a play that has a second: the shares to take off and the stop
@@ -224,7 +261,8 @@ class ExitManager:
 
     def _forget_all_but(self, open_ids: set) -> None:
         """Drop what's remembered about trades that are no longer open."""
-        for book in (self._tries, self._last_failure, self._extreme, self._unannounced):
+        for book in (self._tries, self._last_failure, self._extreme, self._unannounced, self._waiting,
+                     self._wait_warned):
             for tid in [k for k in book if k not in open_ids]:
                 del book[tid]
         self._not_held &= open_ids
@@ -367,6 +405,11 @@ class ExitManager:
                     return close("time-stop")
             except Exception:  # noqa: BLE001
                 pass
+
+        if full:
+            # no exit wanted on a full pass: a wait its exit had on the broker is over - wanted again, it starts afresh
+            self._waiting.pop(t["id"], None)
+            self._wait_warned.pop(t["id"], None)
 
         # --- 3. move the protective stop in our favour ------------ #
         if not managed or risk_ps <= 0:

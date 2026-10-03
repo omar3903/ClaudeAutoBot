@@ -555,6 +555,63 @@ def test_a_part_filled_entry_the_broker_loses_track_of_books_what_it_was_seen_to
     assert [(t["quantity"], t["entry_price"]) for t in repo.open_trades()] == [(4.0, 100.03)]   # so they get a stop
 
 
+def test_an_entry_the_broker_loses_track_of_books_what_its_executions_show_it_bought():
+    from autotradebot.core.models import Fill
+
+    broker, repo, heard = _Broker(), _Repo([]), []
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    play = _entry(ex)
+    broker.reports["1"] = OrderResult(order_id="1", status="UNKNOWN", symbol="?", submitted_qty=0)
+    broker.get_fills = lambda symbol=None: [                           # known by the play's tag on IBKR's executions
+        Fill(order_id="7", symbol="AAA", side=Side.LONG, quantity=4, price=100.02, tag=play.id),
+        Fill(order_id="8", symbol="AAA", side=Side.SHORT, quantity=4, price=101.0, tag="exit:t9")]
+    for _ in range(ex.LOST_AFTER_POLLS):
+        ex.sync_open_orders()
+    assert [(t["quantity"], t["entry_price"]) for t in repo.open_trades()] == [(4.0, 100.02)]
+    [failed] = [p for topic, p in heard if topic == "order.failed"]
+    assert failed["filled_qty"] == 4.0 and "after 4 of 10 shares filled" in failed["msg"]   # it ended with part bought
+
+
+def test_an_entry_the_broker_loses_track_of_is_not_given_up_while_its_executions_cant_be_read():
+    from autotradebot.core.models import Fill
+
+    broker, repo, heard = _Broker(), _Repo([]), []
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    play = _entry(ex)
+    broker.reports["1"] = OrderResult(order_id="1", status="UNKNOWN", symbol="?", submitted_qty=0)
+    readable = []
+
+    def get_fills(symbol=None, strict=False):                          # IBKR's, asked strictly
+        if not readable:
+            raise BrokerError("IBKR's executions for AAA couldn't be read: no answer in time")
+        return [Fill(order_id="1", symbol="AAA", side=Side.LONG, quantity=10, price=100.01, tag=play.id)]
+
+    broker.get_fills = get_fills
+    for _ in range(2 * ex.LOST_AFTER_POLLS):
+        ex.sync_open_orders()
+    assert repo.open_trades() == [] and "order.failed" not in [topic for topic, _ in heard]
+    assert [e["play_id"] for e in ex.working_entries()] == [play.id]     # not known is no "none bought": followed on
+    readable.append(True)
+    for _ in range(ex.LOST_AFTER_POLLS):
+        ex.sync_open_orders()
+    assert [(t["quantity"], t["entry_price"]) for t in repo.open_trades()] == [(10.0, 100.01)]
+    assert ex.working_entries() == []
+
+
+def test_an_entry_reported_filled_without_a_price_is_booked_at_its_executions_price_never_at_zero():
+    from autotradebot.core.models import Fill
+
+    broker, repo = _Broker(), _Repo([])
+    ex = _executor(broker, repo)
+    first, _ = _entry(ex), _entry(ex, "BBB")
+    for oid, symbol in (("1", "AAA"), ("2", "BBB")):                   # rebuilt after a reconnect, no price on it
+        broker.reports[oid] = OrderResult(order_id=oid, status="FILLED", symbol=symbol, submitted_qty=10, filled_qty=10)
+    executions = [Fill(order_id="1", symbol="AAA", side=Side.LONG, quantity=10, price=99.98, tag=first.id)]
+    broker.get_fills = lambda symbol=None: [f for f in executions if symbol in (None, f.symbol)]
+    ex.sync_open_orders()
+    assert sorted((t["symbol"], t["entry_price"]) for t in repo.open_trades()) == [("AAA", 99.98), ("BBB", 100.0)]
+
+
 # ---------------------------------------------------------------- the dashboard's countdowns on a working entry
 def _at_broker(order_id, play, filled=0.0):
     """The entry the app sent, as the broker lists it while it works."""
