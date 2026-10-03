@@ -579,9 +579,9 @@ def test_autopilot_can_be_told_to_take_pairs_only():
 # --------------------------------------------------------------------------- #
 #  the daily loss stop (Aziz: a daily maximum loss - live to trade another day)
 # --------------------------------------------------------------------------- #
-def _closed(symbol, pl, broker="paper"):
+def _closed(symbol, pl, broker="paper", timeframe="INTRADAY"):
     return {"id": f"t_{symbol}", "symbol": symbol, "status": "CLOSED", "realized_pl": pl, "broker": broker,
-            "session_date": "2000-01-01"}
+            "session_date": "2000-01-01", "timeframe": timeframe}
 
 
 def test_the_daily_loss_limit_stops_new_entries_for_the_session():
@@ -646,6 +646,86 @@ def test_the_daily_loss_limit_is_tunable_and_remembered():
     other = AutoPilot(FakeEngine(), _cfg(), bus=SILENT)
     other.load_runtime(ap.to_runtime())
     assert other.max_daily_loss_pct == 3.5 and other.max_giveback_pct == 40.0
+
+
+def test_a_daily_stop_holds_for_the_rest_of_the_day_when_the_pl_recovers(monkeypatch):
+    import datetime as dt
+
+    from autotradebot.execution import autopilot as module
+
+    eng = FakeEngine(equity=10_000.0)                      # 2% of equity = $200
+    eng.repo._closed = [_closed("AAA", -250.0)]
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    assert _run(ap, mkplay(sym="BBB")) == [] and ap.status()["daily_loss_stop"]
+    ap._realized = (float("-inf"), 0.0)
+    eng.repo._closed = [_closed("AAA", -250.0), _closed("SWG", 400.0, timeframe="SWING")]   # back above the limit
+    p = mkplay(sym="CCC")
+    assert _run(ap, p) == [] and eng.approved == []
+    st = ap.status()
+    assert st["daily_loss_stop"] and "past the daily limit" in st["daily_loss_reason"]
+    assert "past the daily limit" in ap.verdict(p)
+
+    ap.configure(max_giveback_pct=40.0)                    # moving a limit judges the day afresh: the gain lifts it
+    assert not ap.status()["daily_loss_stop"]
+    assert len(_run(ap, mkplay(sym="DDD"))) == 1
+
+    eng.repo._closed = [_closed("AAA", -250.0)]
+    ap._realized = (float("-inf"), 0.0)
+    assert _run(ap, mkplay(sym="EEE")) == [] and ap.stopped_for_the_day
+    tomorrow = module.clock.session_date() + dt.timedelta(days=1)
+    monkeypatch.setattr(module.clock, "session_date", lambda ts=None: tomorrow)
+    eng.repo._closed = []                                  # a new session starts unstopped
+    ap._realized = (float("-inf"), 0.0)
+    assert not ap.status()["daily_loss_stop"] and ap._loss_stop_reason == "" and ap._day == tomorrow.isoformat()
+    assert len(_run(ap, mkplay(sym="FFF"))) == 1
+
+
+def test_a_daily_stop_survives_a_restart_the_same_day_only():
+    import datetime as dt
+
+    from autotradebot.util import clock
+
+    eng = FakeEngine(equity=10_000.0)
+    eng.repo._closed = [_closed("AAA", -250.0)]
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    _run(ap, mkplay(sym="BBB"))
+    saved = ap.to_runtime()
+    assert saved["loss_stop_day"] == clock.session_date().isoformat()
+
+    eng2 = FakeEngine(equity=10_000.0)                     # the restarted app reads no loss (the record isn't back yet)
+    again = AutoPilot(eng2, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    again.load_runtime(saved)
+    assert _run(again, mkplay(sym="CCC")) == [] and eng2.approved == []
+    assert again.status()["daily_loss_stop"] and "past the daily limit" in again.status()["headline"]["text"]
+
+    yesterday = (clock.session_date() - dt.timedelta(days=1)).isoformat()
+    fresh = AutoPilot(eng2, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    fresh.load_runtime({**saved, "day": yesterday, "loss_stop_day": yesterday})
+    assert len(_run(fresh, mkplay(sym="DDD"))) == 1 and not fresh.status()["daily_loss_stop"]
+
+
+def test_the_give_back_peak_counts_day_trades_only_and_the_loss_limit_counts_everything():
+    eng = FakeEngine(equity=10_000.0)                      # give-back floor $25; daily limit $200
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0, max_giveback_pct=30.0, giveback_floor_pct=0.25), bus=SILENT)
+    eng.repo._closed = [_closed("SWG", 500.0, timeframe="SWING")]                   # a swing closed at a profit
+    assert len(_run(ap, mkplay(sym="AAA"))) == 1 and ap.status()["peak_realized"] == 0.0
+    ap._realized = (float("-inf"), 0.0)
+    eng.repo._closed += [_closed("AAA", -180.0)]           # an ordinary day-trade loss isn't giving back the swing's gain
+    assert len(_run(ap, mkplay(sym="BBB"))) == 1 and not ap.status()["daily_loss_stop"]
+
+    eng2 = FakeEngine(equity=10_000.0)
+    ap2 = AutoPilot(eng2, _cfg(max_daily_loss_pct=2.0, max_giveback_pct=30.0, giveback_floor_pct=0.25), bus=SILENT)
+    eng2.repo._closed = [_closed("SWG", 500.0, timeframe="SWING"), _closed("AAA", 200.0)]
+    assert len(_run(ap2, mkplay(sym="BBB"))) == 1 and ap2.status()["peak_realized"] == 200.0
+    ap2._realized = (float("-inf"), 0.0)
+    eng2.repo._closed += [_closed("BBB", -70.0)]           # the day trades kept 130 of 200, whatever the swing made
+    p = mkplay(sym="CCC")
+    assert _run(ap2, p) == [] and "day trades' realized gain has fallen from 200 to 130" in ap2.verdict(p)
+
+    eng3 = FakeEngine(equity=10_000.0)                     # the loss limit still counts a swing trade's loss
+    eng3.repo._closed = [_closed("SWG", -250.0, timeframe="SWING")]
+    ap3 = AutoPilot(eng3, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    assert _run(ap3, mkplay(sym="AAA")) == [] and ap3.status()["daily_loss_stop"]
 
 
 def test_proof_also_asks_whether_the_edge_is_luck_drift_or_eaten_by_costs():

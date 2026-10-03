@@ -1048,8 +1048,8 @@ def build() -> str:
     A('<h3>The Autopilot gates, in order (execution/autopilot.py)</h3>')
     A(table(["Gate", "Rule", "Setting"], [
         ("switched on, venue ok", "Autopilot on; live trading only when the live checks pass", "enabled"),
-        ("daily stop", "no entries once today's closed trades lost 2% of equity, or gave back 30% of the day's "
-         "peak gain (after +0.25%)", "max_daily_loss_pct, max_giveback_pct"),
+        ("daily stop", "no entries for the rest of the day once today's closed trades lost 2% of equity, or the "
+         "day trades gave back 30% of their peak gain (after +0.25%)", "max_daily_loss_pct, max_giveback_pct"),
         ("per-cycle / per-day / concurrent caps", "1 new entry per pass, 5 per day, 10 open, 2 per strategy",
          "max_new_per_cycle, max_auto_trades_per_day, max_auto_positions, max_per_strategy"),
         ("trade type", "day and swing follow the filter bar; pairs separately", "trade_types"),

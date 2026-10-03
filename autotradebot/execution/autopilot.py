@@ -137,8 +137,9 @@ class AutoPilot:
         self._blocked_note: str = ""
         self._loss_stop_day: str = ""           # the session the daily loss limit was reached on
         self._loss_stop_reason: str = ""        # ...and why, in the words of daily_loss_reason, for the status strip
-        self._peak_realized: float = 0.0        # the best the day's realized P/L has been
+        self._peak_realized: float = 0.0        # the best the day trades' realized P/L has been today
         self._realized: tuple = (float("-inf"), 0.0)   # (monotonic time read, realized P/L today)
+        self._realized_day: float = 0.0         # ...the day trades' part of it, read with it (the give-back rule's)
         #: today's closed trades by setup, read with the realized P/L above (_realized_today)
         self._tally: List[Dict[str, Any]] = []
         self._entries_at: List[float] = []      # monotonic times of the latest entries, for the per-cycle cap
@@ -165,7 +166,10 @@ class AutoPilot:
             "cooldown_after_loss": self.cooldown_after_loss,
             "max_daily_loss_pct": self.max_daily_loss_pct,
             "max_giveback_pct": self.max_giveback_pct,
-            "peak_realized": self._peak_realized,
+            # the day trades' peak - under a key of its own: a peak saved as "peak_realized" counted swing trades too
+            "peak_day_realized": self._peak_realized,
+            "loss_stop_day": self._loss_stop_day,
+            "loss_stop_reason": self._loss_stop_reason,
             "max_gross_exposure_pct": self.max_gross_exposure_pct,
             "min_confirmations": self.min_confirmations,
             "confirm_on_new_candle": self.confirm_on_new_candle,
@@ -234,7 +238,11 @@ class AutoPilot:
                              if isinstance(counted, dict) else {})
             sent = d.get("sent_today")
             self._sent_today = int(sent) if isinstance(sent, int) else self._count_today
-            self._peak_realized = float(d.get("peak_realized", 0.0) or 0.0)
+            self._peak_realized = float(d.get("peak_day_realized", 0.0) or 0.0)
+            # stopped for the day stays stopped through a restart
+            if d.get("loss_stop_day") == self._day:
+                self._loss_stop_day = self._day
+                self._loss_stop_reason = str(d.get("loss_stop_reason") or "")
 
     # ------------------------------------------------------------------ #
     def configure(self, **kw: Any) -> Dict[str, Any]:
@@ -270,10 +278,15 @@ class AutoPilot:
             self.require_proven = bool(kw["require_proven"])
         if isinstance(kw.get("max_gross_exposure_pct"), (int, float)):
             self.max_gross_exposure_pct = _exposure_pct(kw["max_gross_exposure_pct"])
+        limits = (self.max_daily_loss_pct, self.max_giveback_pct)
         if isinstance(kw.get("max_daily_loss_pct"), (int, float)):
             self.max_daily_loss_pct = max(0.0, min(50.0, float(kw["max_daily_loss_pct"])))
         if isinstance(kw.get("max_giveback_pct"), (int, float)):
             self.max_giveback_pct = max(0.0, min(100.0, float(kw["max_giveback_pct"])))
+        if (self.max_daily_loss_pct, self.max_giveback_pct) != limits:
+            # the one thing that lifts a stop before the next session: the owner moving a limit. The next pass
+            # judges the day by the limits as they are now, and stops it again if they still hold
+            self._loss_stop_day = self._loss_stop_reason = ""
         if isinstance(kw.get("min_confirmations"), int):
             self.min_confirmations = max(1, min(10, int(kw["min_confirmations"])))
         if "confirm_on_new_candle" in kw:
@@ -309,6 +322,7 @@ class AutoPilot:
                 self._counted = {}
                 self._sent_today = 0
             self._peak_realized = 0.0
+            self._loss_stop_day = self._loss_stop_reason = ""   # a new session starts unstopped
             self._acted.clear()
             self._refused.clear()
             self._last_reason.clear()
@@ -436,8 +450,10 @@ class AutoPilot:
             "max_daily_loss_pct": round(self.max_daily_loss_pct, 2),
             "max_giveback_pct": round(self.max_giveback_pct, 1),
             "realized_today": round(self._realized_today(), 2),
-            "peak_realized": round(self._peak_realized, 2),
+            "realized_day_trades": round(self._realized_day, 2),      # read by the line above
+            "peak_realized": round(self._peak_realized, 2),           # the day trades' best today
             "daily_loss_stop": self.stopped_for_the_day,
+            "daily_loss_reason": self._loss_stop_reason if self.stopped_for_the_day else "",
             "max_gross_exposure_pct": round(self.max_gross_exposure_pct, 1),
             "min_confirmations": self.min_confirmations,
             "confirm_on_new_candle": self.confirm_on_new_candle,
@@ -669,15 +685,19 @@ class AutoPilot:
         actions: List[Dict[str, Any]] = []
         taken = 0                              # new entries opened this cycle
 
-        stopped = self.daily_loss_reason(equity)
-        if not stopped:
-            self._loss_stop_day = ""               # the limit was raised or switched off: it isn't stopped any more
-        if stopped:
-            self._loss_stop_reason = stopped
-            if self._loss_stop_day != self._day:
+        # once stopped, stopped until the next session: a later win - a swing closed at a profit, a trade booked
+        # late - doesn't reopen the day. Only moving a limit (configure) lifts it
+        if self.stopped_for_the_day:
+            stopped = self._loss_stop_reason or "the daily loss limit or the give-back rule was reached"
+        else:
+            stopped = self.daily_loss_reason(equity)
+            if stopped:
+                self._loss_stop_reason = stopped    # the reason first: the strip, on a web thread, reads the day
                 self._loss_stop_day = self._day
+                self._persist()                    # a restart keeps it
                 log.warning("autopilot stopped for the day: %s", stopped)
                 self.bus.publish("autopilot.daily_loss", reason=stopped, day=self._day)
+        if stopped:
             for p in plays.values():
                 if p.id not in self._acted:
                     self._last_reason[p.id] = stopped
@@ -865,12 +885,13 @@ class AutoPilot:
         """Realized P/L of the trades closed this session on the venue Autopilot trades on, by
         hand or by Autopilot - they drain the same account. The same read tallies them by setup for
         the status strip (_today_by_setup); a pair's legs count in the P/L but not in the tally, where
-        two legs with no stop of their own would read as two trades without an R."""
+        two legs with no stop of their own would read as two trades without an R. The day trades' part
+        of the P/L is kept beside it (_realized_day), for the give-back rule."""
         mono = time.monotonic()
         if mono - self._realized[0] < self.REALIZED_CACHE_S:
             return self._realized[1]
         venue = getattr(self.engine, "_venue", None)
-        total, by_setup = 0.0, {}
+        total, day, by_setup = 0.0, 0.0, {}
         try:
             for t in self.engine.repo.trades_on(clock.session_date()):
                 if t.get("status") == "CLOSED" and (not venue or (t.get("broker") or "paper") == venue):
@@ -878,6 +899,8 @@ class AutoPilot:
                     total += pl
                     if t.get("pair_id"):
                         continue
+                    if t.get("timeframe") == "INTRADAY":
+                        day += pl
                     row = by_setup.setdefault(t.get("strategy") or "?", {"closed": 0, "wins": 0, "r": 0.0, "pl": 0.0})
                     row["closed"] += 1
                     row["wins"] += int(pl > 0)
@@ -889,6 +912,7 @@ class AutoPilot:
         self._tally = [{"strategy": key, "closed": row["closed"], "wins": row["wins"], "r": round(row["r"], 2),
                         "pl": round(row["pl"], 2)}
                        for key, row in sorted(by_setup.items(), key=lambda kv: (-kv[1]["closed"], kv[0]))]
+        self._realized_day = day
         self._realized = (mono, total)
         return total
 
@@ -899,11 +923,15 @@ class AutoPilot:
     def daily_loss_reason(self, equity: float) -> Optional[str]:
         """Why today's results stop new entries, if they do. Aziz's daily maximum loss - "live to
         trade another day" - and his give-back rule: he stops once he has lost 30% of what the
-        morning made. Chan's version: cut exposure after losses, never add."""
+        morning made. Chan's version: cut exposure after losses, never add. The loss limit counts
+        every trade closed today; the give-back rule only the day trades - the morning's trading it
+        is about. A swing position closed at a profit, by hand or at its target, would otherwise make
+        most of the peak, and one ordinary day-trade loss would read as giving it back."""
         if equity <= 0:
             return None
         realized = self._realized_today()
-        self._peak_realized = max(self._peak_realized, realized)
+        day = self._realized_day                   # read with it
+        self._peak_realized = max(self._peak_realized, day)
         if self.max_daily_loss_pct > 0:
             limit = equity * self.max_daily_loss_pct / 100.0
             if realized <= -limit:
@@ -911,10 +939,11 @@ class AutoPilot:
                         f"{self.max_daily_loss_pct:g}% of equity ({limit:,.0f}) - no more entries this session")
         peak = self._peak_realized
         if self.max_giveback_pct > 0 and peak >= equity * self.giveback_floor_pct / 100.0:
-            kept = realized / peak if peak else 1.0
+            kept = day / peak if peak else 1.0
             if kept <= 1.0 - self.max_giveback_pct / 100.0:
-                return (f"today's realized gain has fallen from {peak:,.0f} to {realized:,.0f}, giving back more "
-                        f"than {self.max_giveback_pct:g}% of it - no more entries this session (Aziz's give-back rule)")
+                return (f"today's day trades' realized gain has fallen from {peak:,.0f} to {day:,.0f}, giving back "
+                        f"more than {self.max_giveback_pct:g}% of it - no more entries this session "
+                        "(Aziz's give-back rule)")
         return None
 
     def _play_check(self, tf: str, confidence: float, reward_risk: float, kind: str, status: str,

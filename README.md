@@ -1096,8 +1096,8 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | **cool off** a ticker after it stops out today | on | `cooldown_after_loss` |
 | **proof is not luck**: the replayed edge, net of the stocks' own drift, survives a reality check across every setup tried, and costs take no more than a third of it | p ≤ 0.10 | `proof_p_value` (Aronson; Carver's speed limit; 0 = the luck test off) |
 | **the learned model** | shadow | `model_mode`: `shadow` logs its odds, `gate` refuses plays under `model_min_p`, `size` also scales the risk - only while the model is usable |
-| **stop for the day** once today's closed trades have lost this % of equity | 2 % | `max_daily_loss_pct` (Aziz's daily maximum loss; 0 = off) |
-| **stop for the day** once the day's realized gain has given back this % of its best | 30 % | `max_giveback_pct` (Aziz: never lose more than 30 % of what the morning made; `giveback_floor_pct` 0.25 % of equity is the smallest gain that counts; 0 = off) |
+| **stop for the day** once today's closed trades have lost this % of equity | 2 % | `max_daily_loss_pct` (Aziz's daily maximum loss; every trade closed today counts, swing trades too; 0 = off) |
+| **stop for the day** once the day trades' realized gain has given back this % of its best | 30 % | `max_giveback_pct` (Aziz: never lose more than 30 % of what the morning made; only day trades count, so a swing closed at a profit doesn't make a peak one day-trade loss gives back; `giveback_floor_pct` 0.25 % of equity is the smallest gain that counts; 0 = off). Either stop holds for the rest of the session, even if a later trade brings the P/L back, and through a restart; only changing one of the two limits lifts it |
 | **no new day trades** in the last minutes of the session | 30 | `min_minutes_to_close` (Aziz keeps the last half hour for closing; the exit manager flattens day trades 10 minutes before the bell; 0 = off) |
 | require a catalyst / dry-run | off | `require_catalyst`, `dry_run` |
 
