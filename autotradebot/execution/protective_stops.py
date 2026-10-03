@@ -33,7 +33,8 @@ Resting orders bring two dangers, and the rules here exist for them:
   nothing of an earlier run's for the trade (or this run opened it). A close that waited for a trade's
   orders while another caller had them reads the record and the exits working again first. While a
   target rests at the broker the exit manager leaves the target to it, and a part it would take off
-  beside one is never sent.
+  beside one is never sent; a stop crossed while it rests (``stop_resting``) gets
+  ``broker_stop_grace_s`` to fill before the exit manager sends an exit of its own.
 * **An order that outlives its position** would open a position the other way when it triggers.
   Orders are only placed while the broker shows the shares and its order list could be read for
   certain; every pass cancels a tracked order whose trade record is no longer open; and a sweep
@@ -242,6 +243,13 @@ class ProtectiveStops:
     def target_resting(self, trade_id: str) -> bool:
         """Whether the broker is working this trade's target - the exit manager then leaves it to it."""
         return trade_id in self._targets
+
+    def stop_resting(self, trade_id: str) -> bool:
+        """Whether a stop rests at the broker for this trade, with the broker there to fill it: stops kept at the
+        broker, the broker connected, and a stop followed for the trade. On a stop cross the exit manager then gives
+        that stop a moment to fill before it sends an exit of its own (``broker_stop_grace_s``)."""
+        return (self.native_stops_on() and getattr(self.broker, "is_connected", True) is not False
+                and trade_id in self._stops)
 
     def fill_unbooked(self, trade_id: str) -> bool:
         """Whether this trade's stop or target filled and the database refused the booking: it is followed again until

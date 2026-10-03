@@ -878,7 +878,13 @@ truth: every few seconds the order is made to match it - the break-even and
 trailing ratchets move it (at most once every 15 s), the scale-out resizes it.
 Two rules keep it safe:
 
-* **Never two exits on one position.** Before the app sends an exit of its own it
+* **Never two exits on one position.** When the price crosses the stop while it rests at
+  IBKR, the app first gives that stop `broker_stop_grace_s` (10 s from the first cross) to
+  fill: IBKR fills it on real prices and the order sync books it, where cancelling it for a
+  market order of the app's own costs a round trip and a worse fill, and may find it already
+  filling. Back inside the stop, the next cross gets its 10 s afresh; past them, with no
+  stop resting or with IBKR disconnected, the app's exit goes as below (`0` = at once).
+  Before the app sends an exit of its own it
   cancels the stop and waits for IBKR to confirm; if the stop filled first, that
   fill is booked and nothing else is sent; if IBKR hasn't confirmed, the exit waits
   for the next pass. A cancel IBKR refuses (the stop is already filling) is no
@@ -978,7 +984,7 @@ held on the active platform — **entries need your click, exits never do**:
 
 | rule | default | config key |
 |---|---|---|
-| cut losses at the working stop | on | — |
+| cut losses at the working stop - one resting at IBKR gets a moment to fill first | on, 10 s grace | `broker_stop_grace_s` |
 | take profit at the target | on | — |
 | **take half off at the first target**, stop to break-even, the rest runs to the second target (Aziz) | 50 % | `scale_out_pct`, `scale_out_lock_r` (plays with one target exit whole) |
 | tighten the stop to **lock a small profit** once green | at +1.3 R, lock +0.3 R | `breakeven_at_r`, `breakeven_lock_r` |

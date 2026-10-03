@@ -192,6 +192,60 @@ def test_the_stop_stands_down_before_the_apps_own_exit_goes_out():
     assert len(broker.stops()) == 1                                            # no new stop while the exit is working
 
 
+def test_a_stop_counts_as_resting_only_while_followed_kept_at_the_broker_and_the_broker_connected():
+    broker, _, ex, _ = _setup()
+    assert not ex.stop_resting("t1")                                           # none placed yet
+    ex.sync_open_orders()
+    assert ex.stop_resting("t1") and not ex.stop_resting("t2")
+    broker.is_connected = False                                                # nobody there to fill it
+    assert not ex.stop_resting("t1")
+    broker.is_connected = True
+    broker.supports_native_stop = False
+    assert not ex.stop_resting("t1")
+
+
+def _crossing_stop(monkeypatch):
+    """The exit manager over a trade whose stop rests at the broker, the price under that 98 stop, on a clock of its
+    own: (broker, repo, executor, exit manager, clock)."""
+    from test_order_follow_up import CFG, SILENT
+    from autotradebot.core.models import Quote
+    from autotradebot.execution import exit_manager as module
+    from autotradebot.execution.exit_manager import ExitManager
+
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()
+    em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=97, ask=97, last=97),
+                     cfg=SimpleNamespace(**vars(CFG), broker_stop_grace_s=10), bus=SILENT, venue=VENUE)
+    return broker, repo, ex, em, clock
+
+
+def test_a_stop_crossed_while_it_rests_is_left_to_fill_and_the_apps_exit_goes_only_after_the_grace(monkeypatch):
+    broker, _, _, em, clock = _crossing_stop(monkeypatch)
+    for _ in range(10):                                                        # a pass a second, 0 to 9 s after the cross
+        em.run_once()
+        clock[0] += 1.0
+    assert broker.exits() == [] and broker.cancelled == []                     # the broker's stop left to fill
+    em.run_once()                                                              # 10 s after the first cross
+    assert broker.cancelled == ["1"]                                           # stood down, then the app's own exit
+    assert [(o.quantity, o.client_tag) for o in broker.exits()] == [(10, "exit:t1")]
+
+
+def test_a_stop_that_fills_within_its_grace_is_booked_and_the_app_sends_no_exit(monkeypatch):
+    broker, repo, ex, em, clock = _crossing_stop(monkeypatch)
+    em.run_once()
+    clock[0] += 2.0
+    broker.live["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                   avg_fill_price=97.9)
+    ex.sync_open_orders()                                                      # the order sync books the stop's fill
+    clock[0] += 20.0
+    em.run_once()
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
+    assert broker.exits() == [] and broker.cancelled == []
+
+
 def test_no_exit_goes_out_until_the_broker_confirms_the_stop_is_cancelled():
     broker, _, ex, _ = _setup()
     ex.sync_open_orders()

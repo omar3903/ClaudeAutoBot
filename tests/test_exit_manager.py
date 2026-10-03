@@ -505,3 +505,68 @@ def test_a_trade_the_broker_doesnt_hold_waits_for_the_full_pass():
     assert ex.asked == 1
     em.run_once()                                                        # the full pass tries as before
     assert ex.asked == 2
+
+
+# ---------------------------------------------------------------- a stop resting at the broker gets a moment to fill
+class _StopRests(FakeExecutor):
+    """A stop rests at the broker for each trade in ``resting``."""
+
+    def __init__(self, repo):
+        super().__init__(repo)
+        self.resting = {"t1"}
+
+    def stop_resting(self, tid):
+        return tid in self.resting
+
+
+_SHORT = dict(side="SHORT", stop_price=102.0, initial_stop_price=102.0, target_price=90.0, initial_target_price=90.0)
+
+
+@pytest.mark.parametrize("trade, crossed", [({}, 97.5), (_SHORT, 102.5)])
+def test_a_stop_crossed_while_it_rests_at_the_broker_gets_its_grace_before_the_apps_own_exit(monkeypatch, trade,
+                                                                                             crossed):
+    from autotradebot.execution import exit_manager as module
+
+    now = [1_000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    em, repo, ex, _, _ = _ticking([_trade(**trade)], {"AAA": crossed}, executor=_StopRests, broker_stop_grace_s=10)
+    em.run_once()                                                        # past the stop: the broker's to fill
+    now[0] += 6.0
+    em.run_once(only={"AAA"})
+    now[0] += 3.9
+    em.run_once()
+    assert ex.closed == []
+    assert repo._t["t1"]["stop_price"] == _trade(**trade)["stop_price"]  # nor is the stop moved past the price
+    now[0] += 0.1                                                        # ten seconds after the first cross
+    em.run_once()
+    assert ex.closed == [("t1", "stop")]
+
+
+def test_a_price_back_inside_the_stop_gives_the_next_cross_its_grace_afresh(monkeypatch):
+    from autotradebot.execution import exit_manager as module
+
+    now = [1_000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    prices = {"AAA": 97.5}
+    em, _, ex, _, _ = _ticking([_trade()], prices, executor=_StopRests, broker_stop_grace_s=10)
+    em.run_once()
+    now[0] += 8.0
+    prices["AAA"] = 98.5                                                 # back over the 98 stop
+    em.run_once()
+    now[0] += 4.0
+    prices["AAA"] = 97.5                                                 # under it again, 12 s after the first cross
+    em.run_once()
+    assert ex.closed == []
+    now[0] += 10.0
+    em.run_once()
+    assert ex.closed == [("t1", "stop")]
+
+
+def test_with_no_stop_resting_at_the_broker_or_the_grace_off_a_stop_cross_exits_at_once():
+    trades = [_trade(), _trade(id="t2", symbol="BBB")]                   # both under their 98 stops
+    em, _, ex, _, _ = _ticking(trades, {"AAA": 97.5, "BBB": 97.5}, executor=_StopRests, broker_stop_grace_s=10)
+    em.run_once()
+    assert ex.closed == [("t2", "stop")]                                 # only t1's stop rests at the broker
+    em.cfg.broker_stop_grace_s = 0                                       # 0: the app's exit at once, as before
+    em.run_once()
+    assert ex.closed == [("t2", "stop"), ("t1", "stop")]

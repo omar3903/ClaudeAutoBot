@@ -223,6 +223,10 @@ class ExecutionCfg(_Model):
 
 class ExitManagerCfg(_Model):
     enabled: bool = True
+    broker_stop_grace_s: float = 10.0     # a stop cross while the trade's stop rests at the broker: that stop gets this
+                                          # many seconds to fill before the app stands it down and sends its own exit
+                                          # - the broker fills it on real prices, a cancel and a market order cost a
+                                          # round trip and a worse fill (0 = the app's exit at once)
     breakeven_at_r: float = 1.3           # tighten the stop once the trade is +this R  (0 = off)
     breakeven_lock_r: float = 0.3         # ...to lock +this R of profit, not a pure scratch
     breakeven_buffer_bps: float = 5.0
