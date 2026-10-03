@@ -322,6 +322,11 @@ class AutoPilot:
                 self._counted = {}
                 self._sent_today = 0
             self._peak_realized = 0.0
+            # yesterday's figures aren't today's: a read of today's trades that fails keeps the last figures read
+            # (_realized_today), and yesterday's loss would stop the new session. The time first: a reader on
+            # another thread that finds it reads afresh
+            self._realized = (float("-inf"), 0.0)
+            self._realized_day, self._tally = 0.0, []
             self._loss_stop_day = self._loss_stop_reason = ""   # a new session starts unstopped
             self._acted.clear()
             self._refused.clear()
@@ -406,7 +411,7 @@ class AutoPilot:
 
     def _held_by_kind(self, opens: Optional[List[Dict[str, Any]]] = None) -> Dict[str, int]:
         """Autopilot's open positions and working entries, day trades and swing trades apart."""
-        rows = self._open_auto_trades() + self._working_auto_entries() if opens is None else opens
+        rows = (self._open_auto_trades() or []) + self._working_auto_entries() if opens is None else opens
         held = {DAY: 0, SWING: 0}
         for t in rows:
             held[kind_of(t.get("timeframe"))] += 1
@@ -426,7 +431,7 @@ class AutoPilot:
     # ------------------------------------------------------------------ #
     def status(self) -> Dict[str, Any]:
         self._roll_day()
-        opens = self._open_auto_trades() + self._working_auto_entries()
+        opens = (self._open_auto_trades() or []) + self._working_auto_entries()
         losers = self.replay_losers()
         blocked = ""
         if self.enabled and not self._live_ok():
@@ -566,15 +571,17 @@ class AutoPilot:
         return list(self._tally)
 
     # ------------------------------------------------------------------ #
-    def _open_auto_trades(self) -> List[Dict[str, Any]]:
+    def _open_auto_trades(self) -> Optional[List[Dict[str, Any]]]:
         """The open trades Autopilot entered, on the account orders go to. The ids it remembers cover
         this run; after a restart the trade's own record says who took it (``entry_context.by``) -
         otherwise every cap would start from nothing with its positions still open. Pair legs are the
-        pair desk's."""
+        pair desk's. None when the trades can't be read: an empty list would count no positions and let
+        every cap through, so consider() skips the pass instead (the status strip shows none)."""
         try:
             opens = self.engine.repo.open_trades()
         except Exception:  # noqa: BLE001
-            return []
+            log.debug("could not read the open trades", exc_info=True)
+            return None
         venue = getattr(self.engine, "_venue", None)
         mine = []
         for t in opens:
@@ -642,15 +649,28 @@ class AutoPilot:
         """Auto entries sent but not filled yet - they count against every cap."""
         return [w for w in self.engine.working_entries() if w["play_id"] in self._auto_play_ids]
 
-    def _open_risk_dollars(self) -> float:
+    def _open_risk_dollars(self, trades: List[Dict[str, Any]]) -> float:
+        """What Autopilot's working entries and open ``trades`` (read by the caller, which skips the pass when
+        they can't be) stand to lose at the stops they opened with."""
         total = sum(w["risk"] for w in self._working_auto_entries())
-        for t in self._open_auto_trades():
+        for t in trades:
             entry = t.get("entry_price") or 0.0
             stp = t.get("initial_stop_price") or t.get("stop_price") or 0.0
             qty = t.get("quantity") or 0.0
             if entry and stp and qty:
                 total += abs(entry - stp) * qty
         return total
+
+    #: why a pass took nothing when Autopilot's open trades couldn't be read
+    UNREAD_POSITIONS = "positions could not be read - no entries until they can"
+
+    def _skip_pass(self, plays: Iterable[Any], why: str) -> None:
+        """Autopilot's own state couldn't be read: the rest of the pass is skipped rather than judged on
+        nothing, and the plays not yet handled say why. Nothing is marked handled - the next pass tries again."""
+        log.warning("autopilot skipped the pass: %s", why)
+        for p in plays:
+            if p.id not in self._acted:
+                self._last_reason[p.id] = why
 
     # ------------------------------------------------------------------ #
     def consider(self, plays: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -702,11 +722,16 @@ class AutoPilot:
                 if p.id not in self._acted:
                     self._last_reason[p.id] = stopped
             return []
+        # the caps count what Autopilot holds: with its open trades unreadable they would count nothing and let
+        # every entry through, so the pass is skipped - the next one reads them again
+        if self._open_auto_trades() is None:
+            self._skip_pass(plays.values(), self.UNREAD_POSITIONS)
+            return []
 
         # highest-conviction first; the records the checks read are read once for the pass
         self._pass_cache = (time.monotonic(), {}, [])
         ordered = sorted(plays.values(), key=lambda p: getattr(p, "score", 0.0), reverse=True)
-        for p in ordered:
+        for i, p in enumerate(ordered):
             if p.id in self._acted:
                 continue
             wait = self._pace_wait(p.timeframe.value, taken)
@@ -727,7 +752,11 @@ class AutoPilot:
                 self._last_reason[p.id] = (f"{self._sent_today} entry orders sent today - {self.SENT_CEILING} times "
                                            "the daily cap, counting the ones that bought nothing; no more today")
                 continue
-            opens = self._open_auto_trades() + self._working_auto_entries()   # orders still working count too
+            mine = self._open_auto_trades()
+            if mine is None:                          # the read failed part-way through the pass
+                self._skip_pass(ordered[i:], self.UNREAD_POSITIONS)
+                break
+            opens = mine + self._working_auto_entries()   # orders still working count too
             if len(opens) >= self.max_auto_positions:
                 self._last_reason[p.id] = f"max concurrent auto positions ({self.max_auto_positions}) reached"
                 continue
@@ -757,7 +786,7 @@ class AutoPilot:
                 continue
 
             est_risk = float(pre["order_preview"].get("est_risk", 0.0) or 0.0)
-            if equity and (self._open_risk_dollars() + est_risk) > equity * float(self.cfg.max_open_risk_pct) / 100.0:
+            if equity and self._open_risk_dollars(mine) + est_risk > equity * float(self.cfg.max_open_risk_pct) / 100.0:
                 self._last_reason[p.id] = (f"would exceed {self.cfg.max_open_risk_pct:.0f}% aggregate open "
                                            f"auto-risk")
                 continue
@@ -909,7 +938,10 @@ class AutoPilot:
                     row["r"] += float(t.get("r_multiple") or 0.0)
                     row["pl"] += pl
         except Exception:  # noqa: BLE001
+            # the figures read last stand, and their time isn't refreshed, so the next call reads again: a zero or
+            # a part-sum would read as a day without its losses, and the daily stop is judged on these
             log.debug("could not read today's closed trades", exc_info=True)
+            return self._realized[1]
         # the tally first: a reader on another thread that finds the fresh time finds the fresh tally too
         self._tally = [{"strategy": key, "closed": row["closed"], "wins": row["wins"], "r": round(row["r"], 2),
                         "pl": round(row["pl"], 2)}
@@ -1008,11 +1040,13 @@ class AutoPilot:
             return doubted
         if self.cfg.require_catalyst and not any(t in ("catalyst", "gap") for t in (p.tags or [])):
             return "no catalyst tag (autopilot.require_catalyst is on)"
+        # a check whose read fails refuses: passing it would take the play on a guess
         try:
             if self.engine.repo.get_open_trade_for_symbol(p.symbol):
                 return f"already holding {p.symbol}"
         except Exception:  # noqa: BLE001
-            pass
+            log.debug("could not read the open trade for %s", p.symbol, exc_info=True)
+            return f"could not check whether {p.symbol} is already held - the open trades could not be read"
         if any(w["symbol"] == p.symbol for w in self.engine.working_entries()):
             return f"an entry order for {p.symbol} is still working"
         account = getattr(self.engine, "_account", None)
@@ -1030,7 +1064,9 @@ class AutoPilot:
                             and float(t.get("realized_pl") or 0.0) < 0):
                         return f"{p.symbol} already stopped out today - cooling off"
             except Exception:  # noqa: BLE001
-                pass
+                log.debug("could not read today's trades for the cooling off", exc_info=True)
+                return (f"could not check whether {p.symbol} already stopped out today - today's trades could "
+                        "not be read")
         return None
 
     def exposure_ceiling(self, equity: float) -> float:
@@ -1274,7 +1310,7 @@ class AutoPilot:
         now = time.monotonic()
         cached = getattr(self, "_room_cache", None)
         if cached is None or now - cached[0] > self.ROOM_CACHE_S:
-            opens = self._open_auto_trades() + self._working_auto_entries()
+            opens = (self._open_auto_trades() or []) + self._working_auto_entries()
             cached = (now, opens)
             self._room_cache = cached
         opens = cached[1]

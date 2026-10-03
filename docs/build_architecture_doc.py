@@ -1051,7 +1051,8 @@ def build() -> str:
         ("switched on, venue ok", "Autopilot on; live trading only when the live checks pass", "enabled"),
         ("daily stop", "no entries for the rest of the day once today's closed trades lost 2% of equity, or the "
          "day trades gave back 30% of their peak gain (after +0.25%)", "max_daily_loss_pct, max_giveback_pct"),
-        ("per-cycle / per-day / concurrent caps", "1 new entry per pass, 5 per day, 10 open, 2 per strategy",
+        ("per-cycle / per-day / concurrent caps", "1 new entry per pass, 5 per day, 10 open, 2 per strategy; a "
+         "pass that can't read Autopilot's open trades takes nothing",
          "max_new_per_cycle, max_auto_trades_per_day, max_auto_positions, max_per_strategy"),
         ("trade type", "day and swing follow the filter bar; pairs separately", "trade_types"),
         ("confidence", "the setup's own conviction >= the floor (0.62 default; PR #22 adds a swing floor of 0.5)",
@@ -1064,7 +1065,8 @@ def build() -> str:
          "between sightings starts again (setting off: 2 scans in a row, as before)",
          "min_confirmations, confirm_on_new_candle"),
         ("catalyst", "optional: a news or earnings tag", "require_catalyst"),
-        ("already in it", "not holding the symbol, no entry working, not stopped out today (cooldown)", "-"),
+        ("already in it", "not holding the symbol, no entry working, not stopped out today (cooldown); a check whose "
+         "read fails refuses the play", "-"),
         ("late in the day", "no new day trade with fewer than 30 minutes to the close", "min_minutes_to_close"),
         ("<b>proof</b>", "the strategy's replay record: >= 30 trades at >= +0.05R (also net of the stocks' own "
          "drift), a positive held-out sample of >= 10 trades, a reality-check p-value <= 0.10 across every setup "
