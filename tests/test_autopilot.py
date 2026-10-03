@@ -293,6 +293,30 @@ def test_open_risk_cap():
     assert len(eng.approved) == 2              # 200 + 200 == 400 ok; 3rd would be 600 > 400
 
 
+def test_an_entry_booked_while_a_play_is_assessed_still_counts_against_the_open_risk_cap():
+    """The order sync books one of Autopilot's working entries while the engine assesses the next play: the
+    entries are read before the trades, so it counts - working, or in the records - and never as neither."""
+    eng = FakeEngine(equity=10_000.0)          # 4% => $400 of open auto-risk; the new play risks $200
+    ap = AutoPilot(eng, _cfg(max_open_risk_pct=4.0, max_auto_positions=9), bus=SILENT)
+    eng.working = [{"order_id": "o1", "play_id": "play_w", "symbol": "T09", "strategy": "opening_range_breakout",
+                    "timeframe": "INTRADAY", "qty": 10, "risk": 300.0}]
+    ap._auto_play_ids.add("play_w")
+    assess = eng.assess_play
+
+    def booked_meanwhile(pid):
+        if eng.working:                        # its fill is booked as the play is assessed: $300 at its stop
+            eng.working = []
+            eng.repo._open.append({"id": "t_w", "play_id": "play_w", "symbol": "T09",
+                                   "strategy": "opening_range_breakout", "timeframe": "INTRADAY",
+                                   "entry_price": 100.0, "initial_stop_price": 70.0, "quantity": 10})
+        return assess(pid)
+
+    eng.assess_play = booked_meanwhile
+    p = mkplay(sym="AAA")
+    _run(ap, p)
+    assert eng.approved == [] and "aggregate open auto-risk" in ap._last_reason[p.id]   # 300 + 200 > 400
+
+
 def test_max_new_per_cycle_prevents_bursts():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(max_new_per_cycle=1, max_auto_positions=9,

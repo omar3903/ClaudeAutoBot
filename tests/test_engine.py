@@ -1470,6 +1470,30 @@ def test_the_open_risk_counts_this_venues_trades_at_their_opening_stop_and_the_e
     assert engine.open_risk_usd() == pytest.approx(50.0 + 40.0 + 15.0)
 
 
+def test_an_entry_booked_while_the_open_risk_is_read_counts_twice_never_not_at_all(engine, monkeypatch):
+    play, booked = _wide_play("AAA", stop=95.0), []                          # 10 shares, $50 at its stop
+    working = {"symbol": "AAA", "timeframe": "SWING", "qty": 10, "notional": 1000.0, "risk": 50.0, "pair_leg": False}
+    real = engine.repo.open_trades
+
+    def book():                                 # the order sync saves its record the moment after the first read
+        if not booked:
+            booked.append(_hold(engine, play, 10))
+
+    def trades():
+        out = real()
+        book()
+        return out
+
+    def entries():
+        out = [] if booked else [dict(working)]
+        book()
+        return out
+
+    monkeypatch.setattr(engine.repo, "open_trades", trades)
+    monkeypatch.setattr(engine, "working_entries", entries)
+    assert engine.open_risk_usd() == pytest.approx(100.0)                     # working, then in the records
+
+
 def test_a_new_play_is_sized_down_then_refused_as_the_open_risk_nears_its_ceiling(engine, monkeypatch):
     engine._refresh_account()
     risk = engine.settings.config.risk
@@ -1904,6 +1928,30 @@ def test_a_re_priced_entry_still_working_counts_its_risk_and_cost_at_its_limit(e
     assert working["risk"] == pytest.approx(713.9) and working["notional"] == pytest.approx(11923.9)
     assert engine.open_risk_usd() == pytest.approx(p.dollar_risk)
     assert engine.exposure_by_symbol()["T07"] == pytest.approx(11923.9)
+
+
+def test_assessing_a_sent_play_again_leaves_the_size_it_went_out_at(engine, monkeypatch):
+    """The dashboard assesses the play it shows again after an approval: a play already sent keeps its size - for
+    one the last look re-priced, the size at its limit, which its working entry's risk and cost are read off."""
+    from autotradebot.core.enums import PlayStatus
+    from autotradebot.execution.executor import _Pending
+
+    _plain_sizing(engine, monkeypatch)
+    p = _play("T07")
+    p.targets = [112.0]
+    engine.board.replace([p])
+    engine.assess_play(p.id)
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    _live_tape(engine, monkeypatch, 101.0)
+    assert engine._chase_check(p, plan) is None
+    p.status = PlayStatus.SUBMITTED
+    engine.executor._pending["o1"] = _Pending("o1", p, "entry", qty=p.suggested_qty)   # sent, and working
+    pre = engine.assess_play(p.id)
+    assert pre["already_executed"] and not pre["can_execute"]
+    assert (p.suggested_qty, p.dollar_risk, p.notional, p.risk_per_share) == (118, 713.9, 11923.9, 6.05)
+    assert (pre["order_preview"]["qty"], pre["order_preview"]["est_risk"]) == (118, 713.9)   # what went out
+    assert engine.working_entries()[0]["risk"] == pytest.approx(713.9)       # not 590, from the play's entry
+    assert engine.open_risk_usd() == pytest.approx(713.9)
 
 
 def test_open_trades_that_cant_be_read_size_nothing_rather_than_everything(engine, monkeypatch):

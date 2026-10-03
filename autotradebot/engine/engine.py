@@ -626,7 +626,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         out: their stops are placeholders, the desk closes the legs together. A trade's prices are dollars and so
         is the account sizing sees (Account: US stocks are sized in dollars), so nothing needs converting.
         None when the open trades can't be read: no trades read would hand a new trade the whole ceiling, so the
-        callers size nothing instead (_risk_used)."""
+        callers size nothing instead (_risk_used). The working entries are read first: one whose fill the order sync
+        books in between is then counted twice - working, and in the records - rather than not at all."""
+        working = sum(float(w.get("risk") or 0.0) for w in self.working_entries() if not w.get("pair_leg"))
         try:
             opens = self.repo.open_trades()
         except Exception:  # noqa: BLE001
@@ -640,7 +642,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             stop = float(t.get("initial_stop_price") or t.get("stop_price") or 0.0)
             if entry and stop:
                 total += abs(entry - stop) * abs(float(t.get("quantity") or 0.0))
-        return total + sum(float(w.get("risk") or 0.0) for w in self.working_entries() if not w.get("pair_leg"))
+        return total + working
 
     def _risk_used(self, open_risk: Optional[float], sized_on: Account) -> float:
         """open_risk_usd() as sizing takes it: when the open trades couldn't be read (None), the whole open-risk
@@ -2294,14 +2296,17 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if acc is None:
             return {"ok": False, "reason": "no account data"}
         cfg = self.settings.config
+        acted_on = p.status in _ACTED_ON
         # sized against the trading capital, less the risk already at work (all of it, when that can't be read);
-        # the PDT rule and the floor see the real account
+        # the PDT rule and the floor see the real account. A play already sent keeps the size it went out at - the
+        # last look may have re-sized it at a re-priced limit, and the dashboard assesses the play it shows again
+        # after an approval - so it is sized on a copy
         sized_on, open_risk = self.sizing_account(p.timeframe) or acc, self.open_risk_usd()
-        sizing = self._size_entry(p, sized_on, self._risk_used(open_risk, sized_on))
+        sizing = self._size_entry(dataclasses.replace(p) if acted_on else p, sized_on,
+                                  self._risk_used(open_risk, sized_on))
         decision = self.pdt.assess(acc, p)
         session = clock.current_session()
         plan = plan_order(p, session, cfg.execution)
-        acted_on = p.status in _ACTED_ON
 
         reasons: List[str] = []
         # a refusal that clears by itself - room under the open-risk ceiling frees as trades close, a read that

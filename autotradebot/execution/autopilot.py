@@ -650,10 +650,10 @@ class AutoPilot:
         """Auto entries sent but not filled yet - they count against every cap."""
         return [w for w in self.engine.working_entries() if w["play_id"] in self._auto_play_ids]
 
-    def _open_risk_dollars(self, trades: List[Dict[str, Any]]) -> float:
-        """What Autopilot's working entries and open ``trades`` (read by the caller, which skips the pass when
-        they can't be) stand to lose at the stops they opened with."""
-        total = sum(w["risk"] for w in self._working_auto_entries())
+    def _open_risk_dollars(self, trades: List[Dict[str, Any]], working: List[Dict[str, Any]]) -> float:
+        """What Autopilot's ``working`` entries and open ``trades`` (both read by the caller - the entries first, and
+        it skips the pass when the trades can't be read) stand to lose at the stops they opened with."""
+        total = sum(w["risk"] for w in working)
         for t in trades:
             entry = t.get("entry_price") or 0.0
             stp = t.get("initial_stop_price") or t.get("stop_price") or 0.0
@@ -775,11 +775,14 @@ class AutoPilot:
                 self._last_reason[p.id] = (f"{self._sent_today} entry orders sent today - {self.SENT_CEILING} times "
                                            "the daily cap, counting the ones that bought nothing; no more today")
                 continue
+            # orders still working count too - read before the trades, so an entry the order sync books in between
+            # counts twice rather than not at all
+            working = self._working_auto_entries()
             mine = self._open_auto_trades()
             if mine is None:                          # the read failed part-way through the pass
                 self._skip_pass(ordered[i:], self.UNREAD_POSITIONS)
                 break
-            opens = mine + self._working_auto_entries()   # orders still working count too
+            opens = mine + working
             if len(opens) >= self.max_auto_positions:
                 self._last_reason[p.id] = f"max concurrent auto positions ({self.max_auto_positions}) reached"
                 continue
@@ -814,7 +817,8 @@ class AutoPilot:
                 continue
 
             est_risk = float(pre["order_preview"].get("est_risk", 0.0) or 0.0)
-            if equity and self._open_risk_dollars(mine) + est_risk > equity * float(self.cfg.max_open_risk_pct) / 100.0:
+            if equity and self._open_risk_dollars(mine, working) + est_risk > \
+                    equity * float(self.cfg.max_open_risk_pct) / 100.0:
                 self._last_reason[p.id] = (f"would exceed {self.cfg.max_open_risk_pct:.0f}% aggregate open "
                                            f"auto-risk")
                 continue
