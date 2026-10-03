@@ -25,6 +25,11 @@ the broker by its tag (:meth:`Executor._look_for_unknown`) - it is followed if i
 works, booked if it filled, and taken as never sent only once the broker shows it
 neither working nor filled. Nothing is sent in its place meanwhile: an entry's play
 stays sent (Autopilot keeps its slot) and the position's exit waits.
+
+A fill whose booking the database refuses (busy with another writer, say) is never lost: the booking raises
+BookingFailed once it has been logged and the dashboard told (order.unbooked), and the order stays followed - in
+``_pending``, ``_unknown`` or its stop's book - so the next order sync books it. Meanwhile it counts as working: an
+entry keeps Autopilot's slot, and no second exit goes out for the position.
 """
 
 from __future__ import annotations
@@ -43,7 +48,7 @@ from ..core.eventbus import BUS
 from ..core.models import Account, OrderRequest, OrderResult, Play
 from ..util import clock
 from .order_builder import build_entry_order, build_exit_order, plan_order
-from .protective_stops import TAG as STOP_TAG, TARGET_TAG, ProtectiveStops, shares_and_price
+from .protective_stops import TAG as STOP_TAG, TARGET_TAG, BookingFailed, ProtectiveStops, shares_and_price
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +121,9 @@ class Executor(ProtectiveStops):
         #: were sent for (no order id yet) and when (monotonic) the call gave up: looked for at the broker by the order
         #: syncs (_look_for_unknown), and nothing is sent in their place meanwhile
         self._unknown: Dict[str, Tuple[_Pending, float]] = {}
+        #: fills the database refused to book, by what they were for ("entry:<play id>", "exit:<trade id>") -> the
+        #: tries that failed so far: the dashboard hears of the first, the log of each, till one takes (_booking_failed)
+        self._unbooked: Dict[str, int] = {}
         self._open_by_symbol: Dict[str, str] = {}   # symbol -> trade_id
         #: the exit manager takes part of a position off at the first target, so a native bracket
         #: (the simulator's) carries the stop only - a take-profit child would close all of it there
@@ -145,6 +153,7 @@ class Executor(ProtectiveStops):
             self.venue = venue or broker.name
             self._pending.clear()
             self._unknown.clear()       # an entry's play stays sent: the look for entries sent before finds it
+            self._unbooked.clear()
             self._open_by_symbol.clear()
             self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
             self._entries_retry_at = 0.0
@@ -434,6 +443,8 @@ class Executor(ProtectiveStops):
         for row, side, qty, price, order_id in found:
             try:
                 tid = self._book_entry_filled_while_off(row, side, qty, price, order_id)
+            except BookingFailed:
+                tid = None                              # (said as it failed) looked for again shortly
             except Exception:  # noqa: BLE001 - the database busy, say: this one is looked for again, the rest go on
                 log.exception("booking the entry for %s (play %s) that filled while the app was off failed - looked "
                               "for again shortly", row["symbol"], row["id"])
@@ -532,12 +543,16 @@ class Executor(ProtectiveStops):
             # immediate fill (paper / marketable) -> open the trade now
             if res.status in ("FILLED",) or res.filled_qty >= qty > 0:
                 fill_price = res.avg_fill_price or (res.fills[-1].price if res.fills else play.entry)
-                tid = self._open_trade(play, fill_price, res.filled_qty or qty, res.order_id, ot, osess,
-                                       context=context, submitted_at=submitted_at, decision=decision)
-                return {"ok": True, "status": "FILLED", "trade_id": tid,
-                        "fill_price": round(fill_price, 4), "qty": res.filled_qty or qty,
-                        "order_id": res.order_id, "order_type": ot, "order_session": osess,
-                        "bracket_mode": plan.get("bracket_mode")}
+                try:
+                    tid = self._open_trade(play, fill_price, res.filled_qty or qty, res.order_id, ot, osess,
+                                           context=context, submitted_at=submitted_at, decision=decision)
+                except BookingFailed:
+                    pass        # followed below instead: the next order sync reads the fill and books it then
+                else:
+                    return {"ok": True, "status": "FILLED", "trade_id": tid,
+                            "fill_price": round(fill_price, 4), "qty": res.filled_qty or qty,
+                            "order_id": res.order_id, "order_type": ot, "order_session": osess,
+                            "bracket_mode": plan.get("bracket_mode")}
 
             # otherwise track it; sync_open_orders() will pick up the fill. The play log says it went out
             # before the sync loop can hear how it ended, so the ending is never overwritten by this
@@ -619,6 +634,8 @@ class Executor(ProtectiveStops):
                               f"it is being looked for there before another is sent."}
         if trade_id in self.pending_exit_trade_ids():
             return {"ok": False, "reason": f"An exit order for this {t['symbol']} position is already working."}
+        if self.fill_unbooked(trade_id):
+            return self._wait_for_booking(t["symbol"])
         closed = self._exchange_closed()
         if closed:
             # a market exit would be rejected, and standing the stop down for it would leave the position
@@ -642,9 +659,21 @@ class Executor(ProtectiveStops):
             if trade_id in self.pending_exit_trade_ids():
                 return {"ok": False,
                         "reason": f"An exit order for this {t['symbol']} position is already working."}
-            return self._send_exit(fresh, reason, limit_price, qty, after_fill, decision_price)
+            try:
+                return self._send_exit(fresh, reason, limit_price, qty, after_fill, decision_price)
+            except BookingFailed:
+                # what one of its resting orders filled couldn't be saved: followed again and booked on the next pass,
+                # when the record says what is left to sell - the exit waits (a wait, not a failed try)
+                return self._wait_for_booking(t["symbol"])
         finally:
             self._release_resting(trade_id)
+
+    @staticmethod
+    def _wait_for_booking(symbol: str) -> Dict[str, Any]:
+        """close_trade's answer while a fill of the trade's resting orders waits to be saved (fill_unbooked)."""
+        return {"ok": False, "wait": True,
+                "reason": f"A fill at the broker for this {symbol} position couldn't be saved yet - it is booked on "
+                          f"the next order sync, before any exit goes out."}
 
     def _send_exit(self, t: Dict[str, Any], reason: str, limit_price: Optional[float], qty: Optional[float],
                    after_fill: Optional[Dict[str, float]], decision_price: Optional[float]) -> Dict[str, Any]:
@@ -738,9 +767,13 @@ class Executor(ProtectiveStops):
 
         if res.status == "FILLED" or res.filled_qty > 0:
             px = res.avg_fill_price or (res.fills[-1].price if res.fills else limit_price)
-            out, closed = self._book_exit(t["symbol"], trade_id, float(px), res.filled_qty or qty, reason,
-                                          partial, after_fill, decision_price, submitted_at=sent_at)
-            return {"ok": True, "status": "FILLED", "trade": out, "reduced": not closed}
+            try:
+                out, closed = self._book_exit(t["symbol"], trade_id, float(px), res.filled_qty or qty, reason,
+                                              partial, after_fill, decision_price, submitted_at=sent_at)
+            except BookingFailed:
+                pass            # followed below instead: the next order sync reads the fill and books it then
+            else:
+                return {"ok": True, "status": "FILLED", "trade": out, "reduced": not closed}
 
         self._pending[res.order_id] = _Pending(res.order_id, Play(**_min_play(t)), "exit",
                                                trade_id=trade_id, qty=qty, reason=reason,
@@ -752,18 +785,24 @@ class Executor(ProtectiveStops):
                    partial: bool = False, after_fill: Optional[Dict[str, float]] = None,
                    decision_price: Optional[float] = None, submitted_at: Optional[dt.datetime] = None):
         """Book an exit fill: the whole position closes the record, part of it (the scale-out)
-        reduces it. Returns (the record, whether it is now closed)."""
-        if partial:
-            out = self.repo.reduce_trade(trade_id, float(qty), float(price), exit_reason=reason,
-                                         **(after_fill or {}))
-            if out and out.get("status") == "OPEN":
-                self.bus.publish("trade.reduced", trade=out, reason=reason, qty=qty, price=round(price, 4))
-                return out, False
-        else:
-            seen = {"decision_price": float(decision_price)} if decision_price else {}
-            if submitted_at is not None:
-                seen["submitted_at"] = submitted_at          # an exit the app sent: how long it took to fill
-            out = self.repo.close_trade(trade_id, float(price), exit_reason=reason, **seen)
+        reduces it. Returns (the record, whether it is now closed). Raises BookingFailed when the
+        database refuses it - the caller keeps the order followed, and books it again on the next pass."""
+        key = f"exit:{trade_id}"
+        try:
+            if partial:
+                out = self.repo.reduce_trade(trade_id, float(qty), float(price), exit_reason=reason,
+                                             **(after_fill or {}))
+            else:
+                seen = {"decision_price": float(decision_price)} if decision_price else {}
+                if submitted_at is not None:
+                    seen["submitted_at"] = submitted_at          # an exit the app sent: how long it took to fill
+                out = self.repo.close_trade(trade_id, float(price), exit_reason=reason, **seen)
+        except Exception as e:  # noqa: BLE001 - the database busy, say
+            raise self._booking_failed(key, symbol, "exit", e) from e
+        self._booked(key, symbol, "exit")
+        if partial and out and out.get("status") == "OPEN":
+            self.bus.publish("trade.reduced", trade=out, reason=reason, qty=qty, price=round(price, 4))
+            return out, False
         self._open_by_symbol.pop(symbol, None)
         self.bus.publish("trade.closed", trade=out, reason=reason)
         return out, True
@@ -879,17 +918,25 @@ class Executor(ProtectiveStops):
         except Exception:  # noqa: BLE001
             log.exception("entry time-out check failed")
 
-        # 3) reconcile tracked live orders
+        # 3) reconcile tracked live orders. Only the broker not answering is skipped quietly (asked again next pass): a
+        # booking the database refused has said so and keeps the order followed, and anything else is a fault to log
         for oid in list(self._pending):
             try:
-                self._on_order_update(self.broker.get_order(oid))
+                res = self.broker.get_order(oid)
             except Exception:  # noqa: BLE001
+                log.debug("could not read order %s - asked again on the next pass", oid, exc_info=True)
                 continue
+            try:
+                self._on_order_update(res)
+            except Exception:  # noqa: BLE001 - one order's fault never stops the rest
+                log.exception("following order %s failed", oid)
 
         # 4) the stops resting at the broker: book the ones that filled, keep the rest in step with the records
         try:
             self._watch_stops()
             self._protect_positions()
+        except BookingFailed:
+            pass                                        # said as it failed: booked again on the next pass
         except Exception:  # noqa: BLE001
             log.exception("protective stops check failed")
 
@@ -903,7 +950,8 @@ class Executor(ProtectiveStops):
     def _look_for_unknown(self) -> List[str]:
         """Look for the orders whose send got no answer in time (OrderOutcomeUnknown) at the broker, by their tag. One
         working is followed from here like any other (one called off meanwhile - a quit, the pairs desk - is cancelled
-        as it is found); one whose executions show it filled is booked as that fill; one the broker shows neither
+        as it is found); one whose executions show it filled is booked as that fill (one the database refuses to book
+        stays looked for, and is booked on the next pass); one the broker shows neither
         working nor filled UNKNOWN_GIVE_UP_S after the call is taken as never sent: an entry's play is marked ERROR and
         Autopilot's slot handed back, and the trade's exit may go out again. Nothing is decided while the broker's
         orders or executions can't be read, nor while it is still reloading its orders after a connect. Under the
@@ -944,15 +992,22 @@ class Executor(ProtectiveStops):
                 continue
             p.order_id = str(mine[-1].order_id)
             done = got >= p.qty - 1e-9
-            self._found_unknown(p, f"filled at {venue_label(self.venue)} after all (order {p.order_id}): {got:,.0f} "
-                                   f"of {p.qty:,.0f} shares @ {price:.4f} - booked")
             res = OrderResult(order_id=p.order_id, status="FILLED" if done else "CANCELED", symbol=p.play.symbol,
                               submitted_qty=p.qty, filled_qty=got, avg_fill_price=price,
                               message="" if done else "it ended with only part of it filled")
-            if done:
-                self._on_filled(p, res)
-            else:
-                self._on_unfilled(p, res)
+            try:
+                if done:
+                    self._on_filled(p, res)
+                else:
+                    self._on_unfilled(p, res)
+            except BookingFailed:
+                # the database refused it: looked for again on the next pass and booked then - and until it is, it
+                # still counts as sent, so nothing goes out in its place
+                self._unknown[ref] = (p, at)
+                settled.remove(ref)
+                continue
+            self._found_unknown(p, f"filled at {venue_label(self.venue)} after all (order {p.order_id}): {got:,.0f} "
+                                   f"of {p.qty:,.0f} shares @ {price:.4f} - booked")
         return settled
 
     def _filled_since(self, f: Any, sent_at: Optional[dt.datetime]) -> bool:
@@ -1031,6 +1086,8 @@ class Executor(ProtectiveStops):
         return out
 
     def _on_order_update(self, res) -> None:
+        """What the broker says of a followed order. One that is done is let go once what it filled is booked: a booking
+        the database refuses (BookingFailed) puts it back, so the next pass reads it again and books it then."""
         p = self._pending.get(res.order_id)
         if p is None:
             return
@@ -1058,10 +1115,13 @@ class Executor(ProtectiveStops):
                 self._pending.setdefault(res.order_id, p)
                 return
             res = found
-        if res.status == "FILLED":
-            self._on_filled(p, res)
-        else:
-            self._on_unfilled(p, res)
+        try:
+            if res.status == "FILLED":
+                self._on_filled(p, res)
+            else:
+                self._on_unfilled(p, res)
+        except BookingFailed:
+            self._pending.setdefault(res.order_id, p)  # still followed: booked on the next pass, never lost
 
     def _found_in_executions(self, p: _Pending, res: OrderResult) -> Optional[OrderResult]:
         """An entry the broker no longer knows, before it is given up: what the broker's executions show it bought
@@ -1189,10 +1249,17 @@ class Executor(ProtectiveStops):
                     context: Optional[Dict[str, Any]] = None,
                     submitted_at: Optional[dt.datetime] = None,
                     decision: Optional[Dict[str, Any]] = None) -> str:
+        """Book an entry fill as an open trade. Raises BookingFailed when the database refuses it - the caller
+        keeps the order followed, and books it again on the next pass."""
         seen = {"decision": decision} if decision else {}
-        tid = self.repo.open_trade(play, float(price), float(qty), self.venue, order_id,
-                                   order_type=order_type, order_session=order_session,
-                                   entry_context=context, submitted_at=submitted_at, **seen)
+        key = f"entry:{play.id}"
+        try:
+            tid = self.repo.open_trade(play, float(price), float(qty), self.venue, order_id,
+                                       order_type=order_type, order_session=order_session,
+                                       entry_context=context, submitted_at=submitted_at, **seen)
+        except Exception as e:  # noqa: BLE001 - the database busy, say
+            raise self._booking_failed(key, play.symbol, "entry", e) from e
+        self._booked(key, play.symbol, "entry")
         self._open_by_symbol[play.symbol] = tid
         self._left_looked.add(tid)                      # a record this run made: no earlier run left orders for it
         play.status = PlayStatus.FILLED
@@ -1200,6 +1267,28 @@ class Executor(ProtectiveStops):
         self.bus.publish("order.filled", kind="entry", trade_id=tid, symbol=play.symbol,
                          price=round(price, 4), qty=qty, play=play.to_row())
         return tid
+
+    def _booking_failed(self, key: str, symbol: str, kind: str, e: BaseException) -> BookingFailed:
+        """A fill the database refused to book (busy with another writer, say), called from inside the ``except``:
+        logged with its traceback each time, and the dashboard told the first time (order.unbooked). Returns the
+        BookingFailed to raise - its caller keeps the order followed, so the next pass books the fill again."""
+        tries = self._unbooked[key] = self._unbooked.get(key, 0) + 1
+        why = (str(e).strip().splitlines() or [type(e).__name__])[0][:200]    # the database's first line, not its SQL
+        log.exception("BOOKING FAILED  the %s %s fill couldn't be saved (try %d) - its order stays followed and the "
+                      "booking is tried again shortly", symbol, kind, tries)
+        if tries == 1:
+            after = ("until then its shares have no trade record, nor a stop at the broker" if kind == "entry"
+                     else "no other exit goes out for the position meanwhile")
+            self.bus.publish("order.unbooked", kind=kind, symbol=symbol, reason=why,
+                             msg=f"The {symbol} {kind} fill couldn't be saved ({why}). The app keeps following the "
+                                 f"order and saves it shortly - {after}.")
+        return BookingFailed(f"the {symbol} {kind} fill couldn't be saved: {why}")
+
+    def _booked(self, key: str, symbol: str, kind: str) -> None:
+        """A fill booked: one whose booking failed before says so."""
+        tries = self._unbooked.pop(key, 0)
+        if tries:
+            log.warning("BOOKED  the %s %s fill, saved on try %d", symbol, kind, tries + 1)
 
     def _audit(self, action: str, req: OrderRequest, response: dict, ok: bool,
                play_id: str = "", trade_id: str = "", msg: str = "") -> None:

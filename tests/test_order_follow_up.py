@@ -890,3 +890,126 @@ def test_an_exit_the_broker_shows_neither_working_nor_filled_goes_out_again_once
     ex.sync_open_orders()
     assert ex.pending_exit_trade_ids() == set()
     assert ex.close_trade("t1", reason="stop")["ok"] and [o.quantity for o in broker.orders] == [10, 10]
+
+
+# ---------------------------------------------------------------- a fill the database refuses to book
+def _refuses_once(repo, method):
+    """``repo``'s ``method`` raises the first time it is called - another thread holds the database's write lock -
+    and works after. Returns the calls made."""
+    real, calls = getattr(repo, method), []
+
+    def once(*a, **k):
+        calls.append(a)
+        if len(calls) == 1:
+            raise RuntimeError("database is locked")
+        return real(*a, **k)
+
+    setattr(repo, method, once)
+    return calls
+
+
+def test_an_exit_fill_whose_booking_fails_is_booked_on_the_next_sync_and_no_second_exit_goes_out(caplog):
+    heard = []
+    broker, repo = _Broker({"AAA": 10}), _Repo([_trade()])
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    calls = _refuses_once(repo, "close_trade")
+    assert ex.close_trade("t1", reason="stop", decision_price=97.9)["ok"]
+    broker.reports["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                      avg_fill_price=97.8)
+    with caplog.at_level(logging.ERROR):
+        ex.sync_open_orders()
+    assert repo.get_trade("t1")["status"] == "OPEN" and ex.pending_exit_trade_ids() == {"t1"}   # still followed
+    assert "BOOKING FAILED" in caplog.text and "database is locked" in caplog.text
+    [alert] = [p for topic, p in heard if topic == "order.unbooked"]                # the dashboard is told, once
+    assert (alert["symbol"], alert["kind"]) == ("AAA", "exit") and "database is locked" in alert["msg"]
+    assert not ex.close_trade("t1", reason="manual")["ok"] and len(broker.orders) == 1    # no second exit meanwhile
+
+    ex.sync_open_orders()
+    t = repo.get_trade("t1")
+    assert (t["status"], t["exit_price"], t["exit_reason"], t["exit_decision_price"]) == ("CLOSED", 97.8, "stop", 97.9)
+    assert ex.pending_exit_trade_ids() == set() and len(calls) == 2 and len(broker.orders) == 1
+    topics = [topic for topic, _ in heard]
+    assert topics.count("order.unbooked") == 1 and topics.count("trade.closed") == 1
+
+
+def test_an_entry_fill_whose_booking_fails_keeps_counting_as_working_and_is_booked_once_on_the_next_sync():
+    broker, repo = _Broker(), _Repo([])
+    ex = _executor(broker, repo)
+    calls = _refuses_once(repo, "open_trade")
+    play = _day_play()
+    assert ex.execute_play(play, Account(account_id="DU"), plan=PLAN, context={"schema": 1})["ok"]
+    broker.reports["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                      avg_fill_price=100.02)
+    ex.sync_open_orders()
+    assert repo.open_trades() == [] and [w["order_id"] for w in ex.working_entries()] == ["1"]   # its slot stays taken
+    ex.sync_open_orders()
+    [t] = repo.open_trades()
+    assert (t["quantity"], t["entry_price"], t["entry_context"]) == (10, 100.02, {"schema": 1})
+    assert ex.working_entries() == [] and len(calls) == 2 and play.status is PlayStatus.FILLED
+
+
+def test_an_unanswered_entry_found_filled_whose_booking_fails_stays_looked_for_and_is_booked_on_the_next_sync():
+    broker, repo = _Unanswered(lands="filled"), _Repo([])
+    ex = _executor(broker, repo)
+    calls = _refuses_once(repo, "open_trade")
+    play = _day_play()
+    assert ex.execute_play(play, Account(account_id="DU"), plan=PLAN)["sent_unknown"]
+    ex.sync_open_orders()
+    assert repo.open_trades() == [] and len(ex._unknown) == 1                   # still looked for: nothing in its place
+    assert [w["play_id"] for w in ex.working_entries()] == [play.id]
+    ex.sync_open_orders()
+    [t] = repo.open_trades()
+    assert (t["quantity"], t["entry_price"]) == (10, 100.5) and ex._unknown == {} and len(calls) == 2
+    assert len(broker.orders) == 1
+
+
+def test_orders_that_fill_at_once_whose_booking_fails_are_followed_and_booked_on_the_next_sync():
+    class _FillsAtOnce(_Broker):
+        def place_order(self, req):
+            res = super().place_order(req)
+            self.reports[res.order_id] = filled = OrderResult(
+                order_id=res.order_id, status="FILLED", symbol=req.symbol, submitted_qty=req.quantity,
+                filled_qty=req.quantity, avg_fill_price=100.01)
+            return filled
+
+    broker, repo = _FillsAtOnce({"AAA": 10}), _Repo([])
+    ex = _executor(broker, repo)
+    opens = _refuses_once(repo, "open_trade")
+    out = ex.execute_play(_day_play(), Account(account_id="DU"), plan=PLAN)
+    assert out["ok"] and out["order_id"] == "1" and repo.open_trades() == []
+    assert [w["order_id"] for w in ex.working_entries()] == ["1"]               # followed instead
+    ex.sync_open_orders()
+    [t] = repo.open_trades()
+    assert (t["quantity"], t["entry_price"]) == (10, 100.01) and ex.working_entries() == [] and len(opens) == 2
+
+    closes = _refuses_once(repo, "close_trade")
+    assert ex.close_trade(t["id"], reason="manual")["ok"]
+    assert repo.get_trade(t["id"])["status"] == "OPEN" and ex.pending_exit_trade_ids() == {t["id"]}
+    ex.sync_open_orders()
+    assert repo.get_trade(t["id"])["status"] == "CLOSED" and ex.pending_exit_trade_ids() == set() and len(closes) == 2
+    assert len(broker.orders) == 2
+
+
+def test_the_order_sync_skips_an_order_the_broker_cant_read_but_logs_any_other_fault(caplog):
+    broker, repo = _Broker({"AAA": 10}), _Repo([_trade()])
+    ex = _executor(broker, repo)
+    assert ex.close_trade("t1")["ok"]
+
+    def unreadable(order_id):
+        raise BrokerError("IBKR is not connected")
+
+    broker.get_order = unreadable
+    with caplog.at_level(logging.WARNING):
+        ex.sync_open_orders()
+    assert "following order" not in caplog.text and ex.pending_exit_trade_ids() == {"t1"}   # asked again next pass
+    del broker.get_order
+    broker.reports["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                      avg_fill_price=97.8)
+
+    def garbled(p, res):
+        raise ValueError("a report the app can't read")
+
+    ex._on_filled = garbled
+    with caplog.at_level(logging.WARNING):
+        ex.sync_open_orders()
+    assert "following order 1 failed" in caplog.text and "a report the app can't read" in caplog.text

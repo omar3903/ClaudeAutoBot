@@ -551,6 +551,11 @@ The app is built to be left running:
   Nothing goes out in its place meanwhile: an entry's play stays sent and Autopilot keeps its slot
   (handed back if the order never went out), a position's exit waits, and a stop or target found resting
   is taken over rather than placed twice.
+* **A fill the trade log can't save is saved on the next pass, never lost.** When the database refuses
+  to book a fill (busy with another writer, say) - an entry, an exit, or a stop or target IBKR filled - the
+  app logs it, the dashboard says so once, and the order stays followed until the next order sync books
+  it. Meanwhile it still counts as working: an entry keeps Autopilot's slot, and nothing else is done for
+  the position - no second exit, and its stop is neither moved nor placed afresh.
 * **A restart picks the day up where it left off.** The plays on the board, the setups already traded
   or dismissed this session, the pre-market levels the gap check read and the time of the last wide
   scan are saved as the day goes (`data/day_state.bin`: after a scan at most every two minutes, at once
@@ -891,7 +896,8 @@ Two rules keep it safe:
   closes and Autopilot's entries take turns at the broker, one at a time: a second close
   for a position whose exit is being sent comes back at once, a Refresh while the sync is
   mid-pass doesn't start a second pass beside it, and a stop's fill is booked once, by
-  whichever of them takes it off the books first. A stop IBKR no longer knows at all is
+  whichever of them takes it off the books first - one the database couldn't save goes back on
+  them, and the exit waits until the next pass has booked it. A stop IBKR no longer knows at all is
   looked for in its executions before an exit stands it down; while they can't be read the
   exit waits.
   An exit right after a start stands down the stop and target an earlier run left

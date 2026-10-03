@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from test_order_follow_up import VENUE, _Broker, _executor, _Repo, _trade
+from test_order_follow_up import VENUE, _Broker, _executor, _refuses_once, _Repo, _trade
 from autotradebot.brokers.base import BrokerError
 from autotradebot.core.enums import OrderType, Side, TimeInForce
 from autotradebot.core.models import Fill, OrderResult
@@ -1301,6 +1301,43 @@ def test_an_exit_books_nothing_of_a_stop_fill_the_order_sync_took_and_booked_fir
     assert not out["ok"] and out["wait"] and broker.exits() == []              # the rest goes on its next try
     assert ex.close_trade("t1", reason="manual")["ok"] and [o.quantity for o in broker.exits()] == [6]
 
+
+
+def test_a_stop_fill_whose_booking_fails_is_booked_on_the_next_pass_and_nothing_else_is_done_meanwhile():
+    broker, repo, ex, heard = _setup()
+    ex.STOP_MOVE_S = 0.0
+    ex.sync_open_orders()                                                      # the stop rests: order 1
+    calls = _refuses_once(repo, "close_trade")
+    broker.live["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                   avg_fill_price=97.9)
+    repo.update_trade_risk("t1", stop_price=99.0)                              # the exit manager ratchets the record
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["status"] == "OPEN" and ex.fill_unbooked("t1")
+    assert len(broker.stops()) == 1 and broker.modified == []                  # never moved, nor placed afresh
+    out = ex.close_trade("t1", reason="stop")                                  # the exit manager sees the cross
+    assert not out["ok"] and out["wait"] and broker.exits() == []              # no exit of the app's own beside it
+    assert [t for t, _ in heard].count("order.unbooked") == 1
+
+    ex.sync_open_orders()
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
+    assert not ex.fill_unbooked("t1") and ex.protective_stops() == [] and len(calls) == 2
+    assert len(broker.orders) == 1 and broker.modified == []
+
+
+def test_a_stop_fill_an_exit_finds_whose_booking_fails_holds_the_exit_back_until_the_next_pass_books_it():
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()                                                      # the stop rests: order 1
+    calls = _refuses_once(repo, "close_trade")
+    broker.live["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                   avg_fill_price=97.9)
+    out = ex.close_trade("t1", reason="stop")                                  # its stand-down finds the stop filled
+    assert not out["ok"] and out["wait"] and broker.exits() == [] and ex.fill_unbooked("t1")
+    ex.sync_open_orders()
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
+    assert ex.close_trade("t1", reason="stop")["reason"] == "trade not open" and broker.exits() == []
+    assert len(calls) == 2
 
 def test_syncs_exits_entries_take_overs_and_cancels_from_many_threads_never_deadlock():
     from test_order_follow_up import PLAN

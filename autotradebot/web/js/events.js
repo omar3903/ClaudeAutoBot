@@ -227,6 +227,10 @@ function handle(topic, p) {
       toast("⚠ " + p.msg, "bad");
       loadOpen(); refreshState();
       break;
+    case "order.unbooked":
+      // a fill the trade log couldn't save yet: the order stays followed and the next pass saves it
+      toast("⚠ " + p.msg, "bad");
+      break;
     case "positions.mismatch":
       (p.mismatches || []).forEach(m => toast("⚠ " + m.note, "bad"));
       refreshState();
