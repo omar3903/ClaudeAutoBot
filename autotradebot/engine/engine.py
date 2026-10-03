@@ -37,6 +37,7 @@ record is deleted only when a connected broker confirms the position is gone
 """
 
 
+import dataclasses
 import datetime as dt
 import itertools
 import logging
@@ -72,7 +73,7 @@ from ..indicators import ta
 from ..persistence.db import init_db
 from ..persistence.repository import Repository
 from ..risk.pdt_guard import PdtGuard
-from ..risk.position_sizing import liquidity_cap, size_play
+from ..risk.position_sizing import SizingResult, liquidity_cap, size_play
 from ..research.features import play_features
 from ..research.model import Scorer, risk_factor
 from ..research.history import IntradayHistory
@@ -2279,10 +2280,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         # sized against the trading capital, less the risk already at work; the PDT rule and the floor see the
         # real account
         sized_on, open_risk = self.sizing_account(p.timeframe) or acc, self.open_risk_usd()
-        sizing = size_play(p, sized_on, cfg.risk, open_risk_used=open_risk,
-                           symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0),
-                           risk_pct=self._play_risk_pct(p), risk_why=self.strategy_risk_why(p.strategy),
-                           size_factor=self.size_factor)
+        sizing = self._size_entry(p, sized_on, open_risk)
         decision = self.pdt.assess(acc, p)
         session = clock.current_session()
         plan = plan_order(p, session, cfg.execution)
@@ -2339,6 +2337,16 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             },
         }
 
+    def _size_entry(self, p: Play, sized_on: Account, open_risk: float) -> SizingResult:
+        """size_play as an entry is sized: against ``sized_on`` (the trading capital) less ``open_risk`` (the risk
+        already at work), beside what the stock already holds, at the strategy's risk and the size factor. The
+        order preview (assess_play) and the last look at a re-priced limit (_repriced_check) both size here, so the
+        two never size by different rules."""
+        return size_play(p, sized_on, self.settings.config.risk, open_risk_used=open_risk,
+                         symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0),
+                         risk_pct=self._play_risk_pct(p), risk_why=self.strategy_risk_why(p.strategy),
+                         size_factor=self.size_factor)
+
     def approve_play(self, play_id: str, operator: str = "operator") -> Dict[str, Any]:
         with self._switch_lock:
             locked = self._locked()
@@ -2356,7 +2364,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             if not pre["can_execute"]:
                 return {"ok": False, "reason": "; ".join(pre["reasons"]) or "not executable"}
             seen: Dict[str, Any] = {}
-            chased = self._chase_check(p, pre["order_plan"], seen)
+            chased = self._chase_check(p, pre["order_plan"], seen, operator=operator)
             if chased:
                 return {"ok": False, "reason": chased}
 
@@ -2393,7 +2401,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 # runs alongside its own
                 self._snapshot_wake.set()
             self._day_changed(now=True)                   # a restart mustn't offer this setup again today
-            return {"ok": out.get("ok", False), **out}
+            # the shares sent and their risk - the last look may have re-sized them at a re-priced limit, so the
+            # preview's are not always what went out (a fill's own count, in ``out``, wins)
+            return {"ok": out.get("ok", False), "qty": p.suggested_qty, "est_risk": round(p.dollar_risk, 2), **out}
 
     @staticmethod
     def _too_thin_reason(p: Play, risk) -> str:
@@ -2454,19 +2464,23 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return round(base * risk_factor(float(score["p"])), 4)
         return pct
 
-    def _chase_check(self, p: Play, plan: Dict[str, Any], seen: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    def _chase_check(self, p: Play, plan: Dict[str, Any], seen: Optional[Dict[str, Any]] = None, *,
+                     operator: str = "operator") -> Optional[str]:
         """The last look before an order goes out, at the live quote. Returns why the entry is
         refused, if it is; ``seen`` is filled with the quote (mid, bid, ask, spread_bps, live), which
         the fill is later measured against - Harris's implementation shortfall.
 
+        * A price already at or through the play's stop: the setup is void - the move it was waiting
+          for has failed before the order is sent.
         * Harris: the spread is the price of immediacy, paid going in and again coming out. On live
           quotes an entry is refused when the spread is more than ``execution.max_spread_r`` of the
           distance to the stop.
         * Aziz: never chase. Once the price has run past the play's entry by more than
           ``execution.max_chase_r`` of the distance to the stop, the reward:risk the play was judged
           on is gone. Within that, a limit entry is priced off the quote so it fills now instead of
-          waiting for the price to come back through the entry, which is the move failing. A
-          pullback under the entry is not a chase.
+          waiting for the price to come back through the entry, which is the move failing - and is
+          judged again at that price (_repriced_check): its reward:risk to the first target, and its
+          size, which then replaces the play's. A pullback under the entry is not a chase.
 
         With no price source attached there is nothing to check (and no plays to take). With one
         attached, an entry whose price can't be read is refused - an order is never sent blind.
@@ -2500,6 +2514,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             seen.update(mid=round(mid, 4), bid=bid or None, ask=ask or None, live=live,
                         spread_bps=round(spread / mid * 1e4, 2) if spread and mid else None,
                         quote_source=source, quote_age_ms=age_ms)
+        sign = 1.0 if p.side is Side.LONG else -1.0
+        if (px - float(p.stop)) * sign <= 0:
+            return f"the price ({px:.2f}) is already through the stop {p.stop:.2f} - the setup is void"
         max_spread = float(getattr(cfg, "max_spread_r", 0.0) or 0.0)
         if live and max_spread > 0 and spread / risk > max_spread:
             return (f"the spread ({bid:.2f} x {ask:.2f}) is {spread / risk:.2f}R of this trade's risk - too dear to "
@@ -2507,14 +2524,49 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         max_r = float(getattr(cfg, "max_chase_r", 0.0) or 0.0)
         if max_r <= 0:
             return None
-        sign = 1.0 if p.side is Side.LONG else -1.0
         run = (px - float(p.entry)) * sign / risk
         if run > max_r:
             return (f"the price ({px:.2f}) has run {run:.2f}R past the entry {p.entry:.2f} - not chasing "
                     f"(execution.max_chase_r {max_r:g})")
         if run > 0 and plan.get("order_type") == "LIMIT" and plan.get("limit_price"):
             offset = float(getattr(cfg, "limit_offset_bps", 5.0)) / 1e4
-            plan["limit_price"] = round(px * (1 + sign * offset), 2)
+            limit = round(px * (1 + sign * offset), 2)
+            refused = self._repriced_check(p, limit, operator)
+            if refused:
+                return refused
+            plan["limit_price"] = limit
+        return None
+
+    def _repriced_check(self, p: Play, limit: float, operator: str) -> Optional[str]:
+        """A limit entry the last look re-priced off the quote, judged again at that price - where the order
+        fills, not the play's entry: the further it runs, the more the risk to the stop and the less the reward to
+        the target. Refused when the reward:risk to the first target falls below the floor the entry was judged by
+        (Autopilot's own for its entries, risk.min_reward_risk for a click), or when the size at that price - the
+        risk budget over the wider stop distance, the per-position cap at the dearer price - comes to nothing.
+        Otherwise the play takes that size, so the shares sent, and the risk and cost the trade records, are the
+        re-priced entry's. None when it passes."""
+        sign = 1.0 if p.side is Side.LONG else -1.0
+        risk = (limit - float(p.stop)) * sign
+        target = p.primary_target
+        if target is not None and p.kind.value != "FUNDAMENTAL":     # assess_play leaves a valuation play's alone too
+            auto = operator == "autopilot"
+            floor = float(self.autopilot.min_reward_risk if auto else self.settings.config.risk.min_reward_risk)
+            rr = (float(target) - limit) * sign / risk if risk > 0 else 0.0
+            if rr < floor:
+                whose = ("Autopilot's minimum of {:g} (autopilot.min_reward_risk)" if auto
+                         else "the minimum of {:g} (risk.min_reward_risk)").format(floor)
+                return (f"re-priced to {limit:.2f}, the entry's reward:risk to the first target {float(target):.2f} is "
+                        f"only {max(rr, 0.0):.2f} - below {whose}")
+        sized_on = self.sizing_account(p.timeframe) or self._account
+        if sized_on is None:
+            return f"no account data - the entry re-priced to {limit:.2f} can't be sized"
+        at_limit = dataclasses.replace(p, entry=limit)      # sized on a copy: a refusal leaves the play's size
+        sizing = self._size_entry(at_limit, sized_on, self.open_risk_usd())
+        if sizing.qty <= 0:
+            return (f"re-priced to {limit:.2f}, the position sizes to nothing ("
+                    f"{', '.join(sizing.caps_hit) or 'risk budget too small for one share'}) - not entering")
+        p.suggested_qty, p.risk_per_share = at_limit.suggested_qty, at_limit.risk_per_share
+        p.dollar_risk, p.notional = at_limit.dollar_risk, at_limit.notional
         return None
 
     def reject_play(self, play_id: str, operator: str = "operator") -> Dict[str, Any]:

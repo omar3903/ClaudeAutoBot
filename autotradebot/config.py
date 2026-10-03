@@ -211,7 +211,8 @@ class ExecutionCfg(_Model):
     max_chase_r: float = 0.25             # an entry is refused once the price has run past the play's entry by more
                                           # than this share of the distance to the stop - the reward:risk the play was
                                           # judged on is gone; within it a limit entry is priced off the live quote so
-                                          # it fills now (0 = off)
+                                          # it fills now, re-sized at that price and refused when its reward:risk to
+                                          # the first target falls under the floor (0 = off)
     stream_lines: int = 80                # on proven real-time data, hold IBKR streams for this many stocks - the
                                           # positions and working entries first, then the best plays, then the watch
                                           # tier - and price them off a stream that ticked in the last 2 s instead of

@@ -871,7 +871,14 @@ checked against the play: once the price has run past the entry by more than
 `execution.max_chase_r` (0.25) of the distance to the stop, the reward:risk the
 play was judged on is gone and the entry is refused. Within that, a limit entry
 is priced off the quote so it fills now instead of waiting for the price to come
-back through the entry — which is the move failing. A day-trade entry still
+back through the entry — which is the move failing — and is judged again at that
+price: it is re-sized there (the risk budget over the wider distance to the stop,
+the per-position cap at the price paid), so the shares that go out can differ
+from the order card's, and it is refused when that comes to nothing or when its
+reward:risk to the first target falls under the floor — Autopilot's
+`min_reward_risk` for its entries, `risk.min_reward_risk` for a click. A price
+already at or through the play's stop refuses the entry outright: the setup is
+void. A day-trade entry still
 working after `execution.entry_timeout_min` (10) minutes is cancelled for the
 same reason; swing entries keep their DAY life. The log says which quote each
 check read (a stream's, a snapshot or a candle) and how old it was.

@@ -1079,8 +1079,11 @@ def build() -> str:
         ("engine assessment", "session valid, PDT ok, size > 0, R:R ok, open-risk and gross-exposure ceilings",
          "risk.*, max_gross_exposure_pct"),
         ("the last look", "at the live quote (a stream's when it ticked in the last 2 s, else a snapshot - the log "
-         "says which, and how old): refused when the spread is over 0.10R of the risk or the price has "
-         "run 0.25R past the entry; within that the limit is priced off the quote; a day-trade entry unfilled "
+         "says which, and how old): refused when the price is already at or through the stop, the spread is "
+         "over 0.10R of the risk or the price has run 0.25R past the entry; within that the limit is priced off "
+         "the quote and judged again there - re-sized at that price, and refused when it sizes to nothing or its "
+         "reward:risk to the first target falls under the floor (Autopilot's, or risk.min_reward_risk for a "
+         "click); a day-trade entry unfilled "
          "after 10 minutes is cancelled; any entry filled in part 30 seconds ago and still working has the rest "
          "cancelled, so the shares bought get their record and stop", "execution.max_spread_r, max_chase_r, "
          "entry_timeout_min, partial_entry_wait_s"),

@@ -1638,6 +1638,7 @@ def test_an_entry_never_chases_the_price_past_the_play(engine, monkeypatch):
     p = _play("AAPL")                                                       # entry 100, stop 95: 1R is 5
     plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
     assert engine._chase_check(p, plan) is None                             # no price source: nothing to check
+    engine._refresh_account()                                               # read first, as approve_play does
     from types import SimpleNamespace
 
     engine.md.attach(SimpleNamespace(quotes_from_bars=False, name="fake"))   # a live quote source
@@ -1669,6 +1670,110 @@ def test_an_entry_never_chases_the_price_past_the_play(engine, monkeypatch):
     assert "not chasing" in engine._chase_check(short, plan)
     tape["px"] = 99.5
     assert engine._chase_check(short, plan) is None and plan["limit_price"] == 99.45
+
+
+def _live_tape(engine, monkeypatch, px):
+    """A live quote source whose price a test sets in ``tape["px"]``, a cent either side for the bid and ask."""
+    from autotradebot.core.models import Quote
+
+    engine.md.attach(SimpleNamespace(quotes_from_bars=False, name="fake"))
+    tape = {"px": px}
+    monkeypatch.setattr(engine.md, "quote",
+                        lambda s: Quote(symbol=s, bid=tape["px"] - 0.01, ask=tape["px"] + 0.01, last=tape["px"]))
+    return tape
+
+
+def _plain_sizing(engine, monkeypatch):
+    """Sizing at the configured 1% risk on the $100,000 simulator account, with no strategy record to lower it."""
+    engine._refresh_account()
+    monkeypatch.setattr(engine, "_play_risk_pct", lambda p: None)
+    monkeypatch.setattr(engine, "strategy_risk_why", lambda key: None)
+
+
+def test_the_last_look_refuses_a_setup_already_through_its_stop(engine, monkeypatch):
+    p = _play("T07")                                                        # long: entry 100, stop 95
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    tape, seen = _live_tape(engine, monkeypatch, 94.5), {}
+    assert "the setup is void" in engine._chase_check(p, plan, seen)       # a pullback this deep is the move failing
+    assert seen["mid"] == 94.5 and plan["limit_price"] == 100.05            # the quote is still kept; nothing re-priced
+    tape["px"] = 95.0
+    assert "already through the stop 95.00" in engine._chase_check(p, plan)   # at the stop is through it
+    tape["px"] = 95.5
+    assert engine._chase_check(p, plan) is None                             # above it: a pullback, still a setup
+    short = _play("T08", side=Side.SHORT)
+    short.stop = 105.0
+    tape["px"] = 105.2
+    assert "the setup is void" in engine._chase_check(short, plan)
+
+
+def test_a_re_priced_entry_is_sized_again_at_its_limit(engine, monkeypatch):
+    _plain_sizing(engine, monkeypatch)
+    p = _play("T07")
+    p.targets = [112.0]                                                     # entry 100, stop 95, target 112
+    engine.board.replace([p])
+    assert engine.assess_play(p.id)["order_preview"]["qty"] == 120          # the 12% per-position cap at 100
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    _live_tape(engine, monkeypatch, 101.0)                                  # 0.2R past the entry
+    assert engine._chase_check(p, plan) is None and plan["limit_price"] == 101.05
+    # at 101.05 the stop is 6.05 away and the cap buys fewer shares: 118, risking 713.90 for 11,923.90
+    assert (p.suggested_qty, p.dollar_risk, p.notional, p.risk_per_share) == (118, 713.9, 11923.9, 6.05)
+    assert p.entry == 100.0                                                 # the play's own levels stay
+
+
+def test_a_re_priced_entry_that_sizes_to_nothing_is_refused(engine, monkeypatch):
+    _plain_sizing(engine, monkeypatch)
+    monkeypatch.setattr(engine.settings.config.risk, "max_position_pct_of_equity", 0.1005)   # $100.50 a position
+    p = _play("T07")
+    p.targets = [112.0]
+    engine.board.replace([p])
+    assert engine.assess_play(p.id)["order_preview"]["qty"] == 1            # one share at 100
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    _live_tape(engine, monkeypatch, 101.0)
+    why = engine._chase_check(p, plan)
+    assert "re-priced to 101.05, the position sizes to nothing" in why and "max position % of equity" in why
+    assert p.suggested_qty == 1 and plan["limit_price"] == 100.05           # a refusal leaves the play and the plan
+
+
+def test_a_re_priced_entry_is_held_to_the_reward_risk_floor_it_was_judged_by(engine, monkeypatch):
+    _plain_sizing(engine, monkeypatch)
+    assert (engine.autopilot.min_reward_risk, engine.settings.config.risk.min_reward_risk) == (2.0, 1.5)
+    p = _play("T07")
+    p.targets = [112.0]                                                     # 2.4 from the entry
+    engine.board.replace([p])
+    engine.assess_play(p.id)
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    _live_tape(engine, monkeypatch, 101.0)                                  # 101.05: (112 - 101.05) / 6.05 = 1.81
+    why = engine._chase_check(p, plan, operator="autopilot")
+    assert why == ("re-priced to 101.05, the entry's reward:risk to the first target 112.00 is only 1.81 - below "
+                   "Autopilot's minimum of 2 (autopilot.min_reward_risk)")
+    assert p.suggested_qty == 120 and plan["limit_price"] == 100.05         # refused before anything changed
+    assert engine._chase_check(p, plan) is None                             # a click: risk.min_reward_risk, 1.5
+    p.targets = [110.0]                                                     # (110 - 101.05) / 6.05 = 1.48
+    plan["limit_price"] = 100.05
+    assert "below the minimum of 1.5 (risk.min_reward_risk)" in engine._chase_check(p, plan)
+
+
+def test_an_approval_sends_the_size_re_priced_at_the_last_look_and_says_so(engine, monkeypatch):
+    _plain_sizing(engine, monkeypatch)
+    p, auto = _play("T07"), _play("T08")
+    p.targets = auto.targets = [112.0]
+    engine.board.replace([p, auto])
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    monkeypatch.setattr(engine, "assess_play", lambda pid: {"ok": True, "can_execute": True, "reasons": [],
+                                                            "order_plan": dict(plan)})
+    sent = []
+
+    def execute(play, account, **kw):
+        sent.append((play.symbol, play.suggested_qty, kw["plan"]["limit_price"]))
+        return {"ok": True, "status": "SUBMITTED"}
+
+    monkeypatch.setattr(engine.executor, "execute_play", execute)
+    _live_tape(engine, monkeypatch, 101.0)
+    out = engine.approve_play(p.id)
+    assert out["ok"] and (out["qty"], out["est_risk"]) == (118, 713.9)
+    assert sent == [("T07", 118, 101.05)]
+    refused = engine.approve_play(auto.id, operator="autopilot")           # Autopilot's floor is 2: 1.81 is short of it
+    assert not refused["ok"] and "Autopilot's minimum of 2" in refused["reason"] and len(sent) == 1
 
 
 def test_autopilot_takes_only_what_the_filters_and_its_own_boxes_both_allow(engine):
@@ -1994,7 +2099,7 @@ def test_an_approval_the_broker_didnt_answer_in_time_stays_sent_and_is_never_sen
     engine.board.replace([p])
     monkeypatch.setattr(engine, "assess_play",
                         lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
-    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen: None)
+    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen, **kw: None)
 
     def unanswered(play, account, **kw):                                    # as the executor answers it
         engine.executor._note(play, PlayStatus.SUBMITTED)
@@ -2017,7 +2122,7 @@ def test_new_plays_and_an_approval_wake_the_stream_loop_and_stopping_ends_it(eng
     engine.board.replace([p])
     monkeypatch.setattr(engine, "assess_play",
                         lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
-    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen: None)
+    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen, **kw: None)
     monkeypatch.setattr(engine.executor, "execute_play", lambda p, account, **kw: {"ok": True, "status": "SUBMITTED"})
     engine._stream_wake.clear()
     assert engine.approve_play(p.id)["ok"] and engine._stream_wake.is_set()   # its stock streams from the next pass
@@ -2035,6 +2140,7 @@ def test_an_entry_is_priced_off_a_fresh_stream_else_a_snapshot_and_the_log_says_
     gateway = fakes.StreamingGateway(fakes.SYMBOLS, delayed=True)
     gateway.connect()
     engine.md.attach(gateway)
+    engine._refresh_account()                                               # a re-priced entry is sized again on it
     p = _play("T01")                                                        # entry 100, stop 95: 1R is 5
     plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
     seen = {}
@@ -2442,7 +2548,7 @@ def test_a_click_is_answered_once_the_order_is_out_and_autopilot_still_reads_the
     engine.board.replace([web, auto])
     monkeypatch.setattr(engine, "assess_play",
                         lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
-    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen: None)
+    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen, **kw: None)
     monkeypatch.setattr(engine.executor, "execute_play", lambda p, account, **kw: {"ok": True, "status": "SUBMITTED"})
     reads, read_now = [], threading.Event()
 

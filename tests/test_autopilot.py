@@ -144,6 +144,17 @@ def test_happy_path_enters_via_approve():
     assert ap.status()["auto_trades_today"] == 1
 
 
+def test_an_entry_is_reported_at_the_size_the_engine_sent_not_the_preview():
+    published = []
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(), bus=SimpleNamespace(publish=lambda topic, **k: published.append((topic, k))))
+    # the preview said 10 shares risking 200; the engine's last look re-priced the limit and re-sized it
+    eng.approve_play = lambda pid, operator="operator": {"ok": True, "status": "WORKING", "qty": 8, "est_risk": 190.0}
+    acts = _run(ap, mkplay())
+    assert (acts[0]["action"], acts[0]["qty"], acts[0]["risk"]) == ("entered", 8, 190.0)
+    assert [(k["qty"], k["est_risk"]) for t, k in published if t == "autopilot.entered"] == [(8, 190.0)]
+
+
 def test_disabled_is_a_noop():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(enabled=False), bus=SILENT)

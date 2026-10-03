@@ -804,17 +804,19 @@ class AutoPilot:
                 if tid:
                     self._auto_trade_ids.add(tid)
                 self._persist()
+                # what went out: the engine's last look re-sizes an entry it re-priced off the quote
+                qty = out.get("qty", pre["order_preview"]["qty"])
+                est_risk = float(out.get("est_risk", est_risk) or 0.0)
                 actions.append({"play_id": p.id, "symbol": p.symbol, "action": "entered",
-                                "trade_id": tid, "qty": pre["order_preview"]["qty"],
-                                "risk": est_risk})
+                                "trade_id": tid, "qty": qty, "risk": est_risk})
                 self.bus.publish("autopilot.entered", play_id=p.id, symbol=p.symbol,
                                  strategy=p.strategy, side=p.side.value, trade_id=tid,
-                                 qty=pre["order_preview"]["qty"], est_risk=est_risk,
+                                 qty=qty, est_risk=est_risk,
                                  confidence=round(p.confidence, 2),
                                  reward_risk=round(p.reward_risk, 2),
                                  count_today=self._count_today)
                 log.warning("autopilot ENTERED %s %s x%s -> trade %s (risk $%.0f, %d/%d today)",
-                            p.side.value, p.symbol, pre["order_preview"]["qty"], tid,
+                            p.side.value, p.symbol, qty, tid,
                             est_risk, self._count_today, self.max_auto_trades_per_day)
             else:
                 self._release(p.id)                   # nothing went out
