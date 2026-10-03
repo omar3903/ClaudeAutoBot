@@ -699,6 +699,34 @@ def test_an_entry_reported_filled_without_a_price_is_booked_at_its_executions_pr
     assert sorted((t["symbol"], t["entry_price"]) for t in repo.open_trades()) == [("AAA", 99.98), ("BBB", 100.0)]
 
 
+def test_an_exit_reported_filled_without_a_price_is_booked_at_its_executions_price_never_at_zero():
+    from autotradebot.core.models import Fill
+
+    broker, repo = _Broker({"AAA": 10, "BBB": 10}), _Repo([_trade(), _trade(id="t2", symbol="BBB")])
+    ex = _executor(broker, repo)
+    for tid in ("t1", "t2"):                            # sent by hand - or decided on delayed quotes: no deciding price
+        assert ex.close_trade(tid, reason="manual")["ok"]
+    for oid, symbol in (("1", "AAA"), ("2", "BBB")):   # rebuilt after a reconnect, no price on it
+        broker.reports[oid] = OrderResult(order_id=oid, status="FILLED", symbol=symbol, submitted_qty=10, filled_qty=10)
+    readable = []
+
+    def get_fills(symbol=None):                                        # IBKR's: raises when it can't say
+        if not readable:
+            raise BrokerError("IBKR's executions couldn't be read: no answer in time")
+        return [f for f in [Fill(order_id="1", symbol="AAA", side=Side.SHORT, quantity=10, price=97.5, tag="exit:t1")]
+                if symbol in (None, f.symbol)]
+
+    broker.get_fills = get_fills
+    ex.sync_open_orders()
+    assert [t["status"] for t in repo.t.values()] == ["OPEN", "OPEN"]      # not known: neither booked...
+    assert ex.pending_exit_trade_ids() == {"t1", "t2"}                     # ...and both followed on
+    readable.append(True)
+    ex.sync_open_orders()
+    assert (repo.t["t1"]["status"], repo.t["t1"]["exit_price"]) == ("CLOSED", 97.5)
+    # none in its executions: its record keeps its shares for the position check to book
+    assert repo.t["t2"]["status"] == "OPEN" and ex.pending_exit_trade_ids() == set()
+
+
 # ---------------------------------------------------------------- the dashboard's countdowns on a working entry
 def _at_broker(order_id, play, filled=0.0):
     """The entry the app sent, as the broker lists it while it works."""
@@ -1385,10 +1413,11 @@ class _Reporting(_Broker):
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
-        self.reported, self.asked = [], 0
+        self.reported, self.asked, self.waits = [], 0, []
 
-    def get_fills(self, symbol=None):
+    def get_fills(self, symbol=None, timeout=15.0):                         # IbkrBroker's, with its wait
         self.asked += 1
+        self.waits.append(timeout)
         return list(self.reported)
 
 
@@ -1440,3 +1469,17 @@ def test_a_fills_fee_is_settled_a_while_after_its_booking_and_the_simulator_is_n
     simulator = _Reporting()
     Executor(simulator, repo, cfg=get_settings().config.execution, bus=SILENT, venue="paper")._top_up_fees(now=1000.0)
     assert simulator.asked == 0
+
+
+def test_the_fee_look_waits_moments_for_ibkr_and_none_is_made_while_it_reloads_after_a_connect(repo):
+    import time
+
+    _booked_round_trip(repo, "FEE3", "701", "702")
+    broker = _Reporting()
+    ex = _executor(broker, repo)
+    broker.connected_since = time.monotonic()                                  # it has only just (re)connected
+    assert ex._top_up_fees(now=1000.0) == [] and broker.asked == 0
+    broker.connected_since = time.monotonic() - ex.RESYNC_GRACE_S - 1.0
+    ex._top_up_fees(now=1000.0)
+    # the look runs in the order sync, under the executor's lock: a Gateway slow to answer holds the exits up moments
+    assert broker.waits == [ex.FEES_READ_TIMEOUT_S] and ex.FEES_READ_TIMEOUT_S <= 5.0

@@ -144,6 +144,9 @@ class Executor(ProtectiveStops):
     #: seconds after its booking that a fill's fee is settled: every report is in by then, and the fill is looked up
     #: no more (an account charged nothing has none to send)
     FEES_WAIT_S = 900.0
+    #: seconds that look may wait for IBKR's executions: it runs in the order sync, under the executor's lock, and a
+    #: Gateway slow to answer must not hold the exits up for long - a look that runs out is tried again a minute on
+    FEES_READ_TIMEOUT_S = 3.0
 
     def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS,
                  venue: Optional[str] = None) -> None:
@@ -1452,11 +1455,26 @@ class Executor(ProtectiveStops):
                 and (str(f.order_id) == str(order_id) or (tag and getattr(f, "tag", "") == tag))]
 
     def _on_filled(self, p: _Pending, res) -> None:
+        """Book an order the broker reports filled. An exit is never booked at no price: one with none on the report,
+        in the broker's executions or as the quote it was decided on (an exit decided on delayed quotes keeps none, nor
+        does one sent by hand) stays followed while the executions can't be read - BookingFailed, as for a booking the
+        database refuses, so the next pass reads them again - and is left to the position check when they show none."""
         px = res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0)
         if not px:
             # finished with no price on the report - an order rebuilt after a reconnect with no executions on it
-            px = (self._executed(p, res.order_id) or (0.0, 0.0))[1] or (
+            executed = self._executed(p, res.order_id)
+            px = (executed or (0.0, 0.0))[1] or (
                 (p.avg_seen or p.play.entry) if p.kind == "entry" else (p.decision_price or 0.0))
+            if not px and p.kind == "exit" and executed is None:
+                log.debug("the %s exit order %s filled with no price on its report, and the broker's executions "
+                          "couldn't be read - followed on, and read again next pass", p.play.symbol, res.order_id)
+                raise BookingFailed(f"the {p.play.symbol} exit's price isn't known yet")
+            if not px and p.kind == "exit":
+                # booked at 0 it would look like the whole position lost: the record keeps its shares, and the position
+                # check books them from the broker's fills, or says what it can't
+                log.warning("the %s exit order %s filled with no price on its report or in the broker's executions - "
+                            "its record is left to the position check", p.play.symbol, res.order_id)
+                return
         if p.kind == "entry":
             # an adopted entry's clock restarted at the restart (for its time-out) - it isn't when it went out
             self._open_trade(p.play, px, res.filled_qty or p.qty, res.order_id,
@@ -1612,11 +1630,12 @@ class Executor(ProtectiveStops):
         that order - beyond what the fill was booked with goes on the record (add_fill_fees: the fill, the trade's
         fees, and a closed trade's P/L, % and R). Every FEES_CHECK_S on an IBKR venue, while the day has fills not yet
         settled: a fill is settled at the first look FEES_WAIT_S or more after its booking (every report is in by then;
-        an account charged nothing has none to send). A read that failed is tried again on the next look. Under the
+        an account charged nothing has none to send). A read that failed - or took more than FEES_READ_TIMEOUT_S - is
+        tried again on the next look, and none is made while the broker is still reloading after a connect. Under the
         executor's lock (the order sync), so nothing is booked meanwhile. Returns the trades whose fees changed."""
         now = time.monotonic() if now is None else now
         if (not str(self.venue).startswith("ibkr") or getattr(self.broker, "is_connected", True) is False
-                or now < self._fees_due_at):
+                or now < self._fees_due_at or self._broker_resyncing()):
             return []
         find, add = getattr(self.repo, "fills_on", None), getattr(self.repo, "add_fill_fees", None)
         if not (callable(find) and callable(add)):
@@ -1625,7 +1644,7 @@ class Executor(ProtectiveStops):
         rows = [r for r in find(self.venue, clock.now_ny().date()) if r["fill_id"] not in self._fees_settled]
         if not rows:
             return []
-        executions = self._executions(None)
+        executions = self._executions(None, timeout=self.FEES_READ_TIMEOUT_S)
         if executions is None:
             return []
         reported: Dict[Tuple[str, str], List[Any]] = {}

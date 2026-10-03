@@ -1867,44 +1867,101 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         with the reason the orders that sold them give (_gone_reason): "closed-outside" only when an order
         from outside the app sold some of them; one of its own exits - a quit's - is closed as what it was sent
         for, its stop as a stop. One whose fills couldn't be read is left for a later check - its exit may well
-        be there, and deleted the trade would be lost; only one whose fills, read fine, show no exit since the
-        entry it hasn't booked already (IBKR keeps only the current session's) is deleted, the last resort.
-        Returns (closed, removed)."""
+        be there, and deleted the trade would be lost. One whose fills, read fine, show no exit since the entry it
+        hasn't booked already (IBKR keeps only the current session's) is deleted, the last resort - only while it has
+        booked no exit at all: one with a part off already (an exit capped at the shares held, a target's part) keeps
+        that part's outcome, and the shares no execution accounts for are closed at the price of its last exit booked,
+        noted on the record as an estimate. Decided and booked under the executor's lock, as _settle_short's are, and
+        a trade the order sync is about to book - an exit still working, a fill of its stop or target waiting to be
+        saved, or one of a stop or target this run follows - is left to it. A booking the database refuses changes
+        nothing and is tried again on a later check (_booking_refused). Returns (closed, removed)."""
         closed: List[Dict[str, Any]] = []
         removed: List[Dict[str, Any]] = []
+        ex, get = self.executor, getattr(self._broker, "get_fills", None)
+        if ex is None:
+            return closed, removed
         for t in gone:
-            row = {"id": t["id"], "symbol": t["symbol"], "side": t["side"], "quantity": t["quantity"]}
+            tid, sym = t["id"], t["symbol"]
+            row = {"id": tid, "symbol": sym, "side": t["side"], "quantity": t["quantity"]}
             try:
-                fill = self._exit_fill(t)
+                fills = list(get(sym) or []) if callable(get) else []
             except Exception as e:  # noqa: BLE001 - the broker couldn't say what closed it: nothing is changed
                 # the position check hands it back after its next misses, and the fills are read again then
                 log.info("%s's position is gone from %s, but its fills couldn't be read (%s) - the record %s is "
-                         "kept and looked at again on a later check", t["symbol"], venue_label(self._venue), e, t["id"])
+                         "kept and looked at again on a later check", sym, venue_label(self._venue), e, tid)
                 continue
-            if fill is None:
-                fresh = self.repo.get_trade(t["id"])
-                if not fresh or fresh["status"] != "OPEN":
-                    continue            # booked closed meanwhile (the order sync heard its exit): nothing to remove
-                if self.repo.delete_trade(t["id"]):
-                    log.warning("TRADE RECORD DELETED  %s (%s): its position is gone from %s and the broker's fills, "
-                                "read fine, show no exit since the entry that the record hasn't booked already (IBKR "
-                                "keeps only the current session's)",
-                                t["symbol"], t["id"], venue_label(self._venue))
-                    removed.append(row)
-                continue
-            reason = fill["reason"]
-            out = self.repo.close_trade(t["id"], fill["price"], exit_reason=reason,
-                                        commission=fill["commission"], exit_time=fill["at"],
-                                        broker_order_id=fill["order_id"])
-            if out:
-                if self.executor is not None:
-                    self.executor.forget_open(t["symbol"], t["id"])
+            # decided and booked under the executor's lock: the order sync books its own orders' fills, and one of its
+            # bookings landing between the read of the record and the close would count those shares twice, or go
+            # with a deleted record
+            with ex.lock:
+                if tid in ex.pending_exit_trade_ids() or ex.fill_unbooked(tid):
+                    continue            # the order sync books it: an exit still working, or a fill waiting to be saved
+                rec = self.repo.trade_record(tid) or {}
+                now = rec.get("trade") or {}
+                if now.get("status") != "OPEN":
+                    continue            # booked closed meanwhile (the order sync heard its exit): nothing left
+                fill = self._exit_fill(now, fills, rec)
+                if fill is not None and fill["orders"] & ex.resting_order_ids(tid):
+                    continue            # its stop or target this run follows filled: the order sync books it when done
+                exits = [f for f in rec.get("fills") or [] if f.get("leg") == "EXIT"]
+                holds = abs(float(now.get("quantity") or 0.0))
+                untouched = (not exits and not float(now.get("banked_pl") or 0.0)
+                             and abs(abs(float(now.get("initial_quantity") or holds)) - holds) < 1e-9)
+                try:
+                    if fill is None and untouched:
+                        if self.repo.delete_trade(tid, open_only=True):
+                            log.warning("TRADE RECORD DELETED  %s (%s): its position is gone from %s and the broker's "
+                                        "fills, read fine, show no exit since the entry that the record hasn't booked "
+                                        "already (IBKR keeps only the current session's)",
+                                        sym, tid, venue_label(self._venue))
+                            removed.append(row)
+                        continue
+                    if fill is None:
+                        # a part is booked off already, and nothing the broker reports sold the rest: those shares went
+                        # on an earlier session (IBKR keeps only today's executions) - priced as its last exit booked
+                        price = round(float(exits[-1]["price"] if exits else now["entry_price"]), 4)
+                        fill = {"price": price, "quantity": 0.0, "fills": 0, "commission": 0.0, "at": None,
+                                "order_id": "", "reason": "closed-outside", "orders": set()}
+                    rest = holds - fill["quantity"]
+                    note = "" if rest <= 1e-9 else (
+                        f"{rest:,.0f} of the shares closed have no execution at the broker (IBKR keeps only today's) - "
+                        f"estimated at {fill['price']:.2f}, "
+                        + ("the price of its fills found" if fill["fills"] else "the price of its last exit booked"))
+                    reason = fill["reason"]
+                    out = self.repo.close_trade(tid, fill["price"], exit_reason=reason,
+                                                commission=fill["commission"], exit_time=fill["at"],
+                                                broker_order_id=fill["order_id"], note=note)
+                except Exception as e:  # noqa: BLE001 - the database busy, say: nothing is changed
+                    self._booking_refused(tid, sym, "the deletion" if fill is None else "the close", e)
+                    continue
+            if out and out.get("status") == "CLOSED":
+                ex.forget_open(sym, tid)
+                if note:
+                    log.warning("%s (%s) closed from the broker's fills: %s", sym, tid, note)
                 closed.append({**row, "exit_price": fill["price"], "fills": fill["fills"], "reason": reason,
-                               "realized_pl": out.get("realized_pl")})
+                               "estimated": bool(note), "realized_pl": out.get("realized_pl")})
                 self._publish("trade.closed", trade=out,
                               reason=("closed outside the app" if reason == "closed-outside" else reason)
-                              + ", booked from the broker's fills")
+                              + (", booked from the broker's fills" if fill["fills"] else "")
+                              + (f" ({note})" if note else ""))
         return closed, removed
+
+    #: seconds before a booking from the broker's fills that the database keeps refusing is said on the dashboard again
+    BOOKING_REPEAT_S = 300.0
+
+    def _booking_refused(self, tid: str, symbol: str, what: str, e: BaseException) -> None:
+        """A booking from the broker's fills the database refused (busy with another writer past its wait, say):
+        nothing was changed, and the next position check tries it again. Logged each time, and the dashboard told
+        (order.unbooked) the first time and again every BOOKING_REPEAT_S while it keeps failing."""
+        why = (str(e).strip().splitlines() or [type(e).__name__])[0][:200]     # the database's first line, not its SQL
+        log.warning("BOOKING FAILED  %s of %s (%s) couldn't be saved: %s - tried again on the next position check",
+                    what, symbol, tid, why)
+        said, now = self.__dict__.setdefault("_refused_said", {}), time.monotonic()
+        if now - said.get(tid, float("-inf")) >= self.BOOKING_REPEAT_S:
+            said[tid] = now
+            self._publish("order.unbooked", kind="exit", symbol=symbol, reason=why,
+                          msg=f"The {symbol} record couldn't be brought in line with the broker's fills ({why}). The "
+                              f"app tries again at its next position check.")
 
     #: what sold the shares _settle_short books, by the kind of the trade's own order, in its log's words
     SHORT_SOURCES = {"exit": "an exit the app sent that was called off after filling in part",
@@ -1920,8 +1977,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         already (_not_booked): each order's at its own price, with its own reason - "exit", the stop's (stop or
         trailing-stop) or "target-1" - and never more than the record is over by. Never while an exit for it is
         still working, nor from a stop or target this run follows (the order sync books those when they finish, and
-        what they have filled meanwhile comes off what is booked here), and only for a symbol with one record.
-        Returns what it booked, a row per order."""
+        what they have filled meanwhile comes off what is booked here), and only for a symbol with one record. A
+        booking the database refuses is tried again on the next check (_booking_refused). Returns what it booked, a
+        row per order."""
         get = getattr(self._broker, "get_fills", None)
         if not callable(get) or self.executor is None:
             return []
@@ -1989,8 +2047,15 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                         after = dict(plan[1]) if plan else {}
                     else:
                         reason = "exit"
-                    out = self.repo.reduce_trade(tid, qty, price, exit_reason=reason, commission=round(fees, 6),
-                                                 broker_order_id=oid, **after)
+                    try:
+                        out = self.repo.reduce_trade(tid, qty, price, exit_reason=reason, commission=round(fees, 6),
+                                                     broker_order_id=oid, **after)
+                    except Exception as e:  # noqa: BLE001 - the database busy, say: this part isn't booked
+                        # not taken as looked at: the next check books it (and the ones after it) - and the rest of
+                        # this one's checks of the share counts still run
+                        seen.pop(tid, None)
+                        self._booking_refused(tid, sym, f"the {reason} part of {qty:,.0f} shares", e)
+                        break
                     if not out:
                         break
                     fresh = out
@@ -2003,18 +2068,16 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                                   reason=f"{reason}: {self.SHORT_SOURCES[kind]}, booked from the broker's fills")
         return booked
 
-    def _exit_fill(self, t: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-        """What closed a position outside the app, from the broker's executions: the exit-side fills of the
-        symbol since the trade was entered - of its own orders, and of ones from outside the app, never another
-        trade's - oldest first, past the shares the record has booked already (_not_booked), averaged by size up
-        to the shares it still holds, with only those fills' fees. ``order_id`` is the order they came from when
-        there was one (a fee reported later goes on it), else ""; ``reason`` the exit reason those orders give
-        (_gone_reason). None when the broker reports none the record hasn't booked (IBKR keeps only the current
-        session's); a read that failed raises, as the broker's does - "not known" is no "none"."""
-        get = getattr(self._broker, "get_fills", None)
-        if not callable(get):
-            return None
-        fills = get(t["symbol"]) or []
+    def _exit_fill(self, t: Mapping[str, Any], fills: Sequence[Any],
+                   rec: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """What closed a position outside the app, from the broker's executions of its stock (``fills``): the
+        exit-side ones since the trade (``t``, OPEN, as just read) was entered - of its own orders, and of ones from
+        outside the app, never another trade's - oldest first, past the shares the record (``rec``: its
+        Repository.trade_record) has booked already (_not_booked), averaged by size up to the shares it still holds,
+        with only those fills' fees. ``order_id`` is the order they came from when there was one (a fee reported
+        later goes on it), else ""; ``orders`` every order they came from; ``reason`` the exit reason those orders
+        give (_gone_reason). None when the broker reports none the record hasn't booked (IBKR keeps only the
+        current session's)."""
         tid, entered = t["id"], _utc(t.get("entry_time"))
         exit_side = Side.SHORT if t["side"] == "LONG" else Side.LONG
         own = {f"{STOP_TAG}{tid}": "stop", f"{TARGET_TAG}{tid}": "target", f"exit:{tid}": "exit"}
@@ -2022,11 +2085,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                   and (entered is None or _utc(f.ts) >= entered - dt.timedelta(minutes=1))
                   and ((getattr(f, "tag", "") or "") in own
                        or not (getattr(f, "tag", "") or "").startswith((STOP_TAG, TARGET_TAG, "exit:", "unwind:")))]
-        rec = self.repo.trade_record(tid) or {}
-        now = rec.get("trade") or t
-        if now.get("status", "OPEN") != "OPEN":
-            return None                                 # closed meanwhile (the order sync heard its exit): nothing left
-        holds = abs(float(now.get("quantity") or 0.0))
+        holds = abs(float(t.get("quantity") or 0.0))
         qty = value = fees = 0.0
         used: List[Any] = []
         for f, part in _not_booked(rec.get("fills") or [], picked):
@@ -2041,7 +2100,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         orders = {str(f.order_id) for f in used}
         return {"price": round(value / qty, 4), "quantity": qty, "fills": len(used), "commission": round(fees, 2),
                 "at": max(_utc(f.ts) for f in used), "order_id": next(iter(orders)) if len(orders) == 1 else "",
-                "reason": self._gone_reason(now, rec, used, own)}
+                "orders": orders, "reason": self._gone_reason(t, rec, used, own)}
 
     def _gone_reason(self, t: Mapping[str, Any], rec: Mapping[str, Any], used: Sequence[Any],
                      own: Mapping[str, str]) -> str:

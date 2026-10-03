@@ -350,14 +350,15 @@ class Repository:
         self, trade_id: str, exit_price: float, exit_reason: str = "manual",
         commission: float = 0.0, exit_qty: Optional[float] = None,
         exit_time: Optional[dt.datetime] = None, decision_price: Optional[float] = None,
-        submitted_at: Optional[dt.datetime] = None, broker_order_id: str = "",
+        submitted_at: Optional[dt.datetime] = None, broker_order_id: str = "", note: str = "",
     ) -> Optional[Dict[str, Any]]:
         """``exit_time``: when the position actually closed, for a fill learned after the fact
         (default: now); ``decision_price``: the price that triggered the exit, which the fill is
         measured against; ``submitted_at``: when the app's exit order went out, so the seconds it
         took to fill are kept (a stop or target resting at the broker has none - it waits for the
         price, not for the broker); ``broker_order_id``: the order that filled, which a fee the broker
-        reports later is put down to (add_fill_fees). A record closed already is returned as it stands
+        reports later is put down to (add_fill_fees); ``note``: added to the record's notes (an exit
+        price that is an estimate says so). A record closed already is returned as it stands
         and nothing more is booked: the close takes it from OPEN in one conditional write, so two closes
         of the same record at once - the order sync's and the position check's, say - can't both book."""
         now = (exit_time.astimezone(dt.timezone.utc).replace(tzinfo=None) if exit_time and exit_time.tzinfo
@@ -365,7 +366,7 @@ class Repository:
         with session_scope() as s:
             out, closed = _close(s, trade_id, exit_price, exit_reason, now, commission=commission, exit_qty=exit_qty,
                                  decision_price=decision_price, submitted_at=submitted_at,
-                                 broker_order_id=broker_order_id)
+                                 broker_order_id=broker_order_id, note=note)
         if closed:
             log.info("trade closed %s: P/L %.2f (%s)", trade_id, out["realized_pl"], exit_reason)
         return out
@@ -451,22 +452,32 @@ class Repository:
         changed: List[str] = []
         with session_scope() as s:
             for fill_id, fee in fees.items():
-                f = s.get(Fill, fill_id)
-                if f is None or not fee:
-                    continue
-                t = s.get(Trade, f.trade_id)
-                if t is None:
+                if not fee:
                     continue
                 fee = float(fee)
-                closing = t.status == "CLOSED" and f.id == s.execute(
-                    select(func.max(Fill.id)).where(Fill.trade_id == t.id, Fill.leg == "EXIT")).scalar()
-                f.commission = float(f.commission or 0.0) + fee
-                t.fees = float(t.fees or 0.0) + fee
-                if f.leg == "EXIT" and not closing:
-                    t.banked_pl = float(t.banked_pl or 0.0) - fee
+                # the fee is added where it is stored, written before anything of the trade is read: values worked out
+                # from a read would write over a close or a part taken off of the same trade that committed meanwhile
+                # (the position check's, a share-count fix), and lose this fee or that booking's. The first write also
+                # locks the database (SQLite) until this commits, so what is read below stays as read
+                if s.execute(update(Fill).where(Fill.id == fill_id)
+                             .values(commission=func.coalesce(Fill.commission, 0.0) + fee)
+                             .execution_options(synchronize_session=False)).rowcount != 1:
+                    continue
+                tid, leg = s.execute(select(Fill.trade_id, Fill.leg).where(Fill.id == fill_id)).one()
+                s.execute(update(Trade).where(Trade.id == tid).values(fees=func.coalesce(Trade.fees, 0.0) + fee)
+                          .execution_options(synchronize_session=False))
+                t = s.get(Trade, tid)
+                if t is None:
+                    continue
+                closing = t.status == "CLOSED" and fill_id == s.execute(
+                    select(func.max(Fill.id)).where(Fill.trade_id == tid, Fill.leg == "EXIT")).scalar()
+                if leg == "EXIT" and not closing:
+                    s.execute(update(Trade).where(Trade.id == tid)
+                              .values(banked_pl=func.coalesce(Trade.banked_pl, 0.0) - fee)
+                              .execution_options(synchronize_session=False))
                 if t.status == "CLOSED" and t.realized_pl is not None:
                     _score(t, float(t.realized_pl) - fee, float(t.initial_quantity or t.quantity))
-                changed.append(t.id)
+                changed.append(tid)
         return changed
 
     def first_fee_day(self) -> Optional[dt.date]:
@@ -503,10 +514,17 @@ class Repository:
                           .order_by(Trade.entry_time.desc())).scalars().first()
             return trade_to_dict(t) if t else None
 
-    def delete_trade(self, trade_id: str) -> bool:
+    def delete_trade(self, trade_id: str, open_only: bool = False) -> bool:
         """Remove a trade and its fills. The order audit log is kept - it's the
-        record of what was actually sent to a broker."""
+        record of what was actually sent to a broker. ``open_only``: only while the record is still OPEN - one closed
+        meanwhile (its exit booked on another thread) keeps its outcome, and False is returned."""
         with session_scope() as s:
+            # the check is a conditional write that changes nothing: it locks the record (SQLite: the database) until
+            # this commits, so no close can land between it and the delete
+            if open_only and s.execute(update(Trade).where(Trade.id == trade_id, Trade.status == "OPEN")
+                                       .values(status="OPEN")
+                                       .execution_options(synchronize_session=False)).rowcount != 1:
+                return False
             t = s.get(Trade, trade_id)
             if t is None:
                 return False
@@ -949,7 +967,7 @@ def _keeping_refusal(row: Optional[PlayLog], new: PlayLog) -> PlayLog:
 
 def _close(s, trade_id: str, exit_price: float, exit_reason: str, now: dt.datetime, commission: float = 0.0,
            exit_qty: Optional[float] = None, decision_price: Optional[float] = None,
-           submitted_at: Optional[dt.datetime] = None, broker_order_id: str = ""):
+           submitted_at: Optional[dt.datetime] = None, broker_order_id: str = "", note: str = ""):
     """Repository.close_trade's booking, in the session ``s`` - reduce_trade's too, when the part it was given is the
     whole position. Returns (the record, whether this call closed it)."""
     # the record is taken from OPEN first, in one conditional write: a second close of it - one running at the same
@@ -983,6 +1001,8 @@ def _close(s, trade_id: str, exit_price: float, exit_reason: str, now: dt.dateti
         t.exit_decision_price = float(decision_price)
         t.exit_slippage_bps = round((float(decision_price) - exit_price) * sign / float(decision_price) * 1e4, 2)
     t.fees = fees
+    if note:
+        t.notes = ((t.notes + " | ") if t.notes else "") + note
     _score(t, pl, basis_qty)
     # day-trade if entry and exit fall on the same NY session - or a part was sold on the session it was entered,
     # which made it one then, whenever the rest went

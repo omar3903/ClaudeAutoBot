@@ -381,15 +381,16 @@ class ProtectiveStops:
                             filled_qty=qty, avg_fill_price=price, commission=fees_of(mine)))
         return True
 
-    def _executions(self, symbol: Optional[str]) -> Optional[List[Any]]:
+    def _executions(self, symbol: Optional[str], timeout: Optional[float] = None) -> Optional[List[Any]]:
         """The broker's executions this session - of ``symbol``, or the whole account's - oldest first; None when
         the read failed (IBKR's raises then: here "none" must mean none). One that keeps no executions at all
-        answers [], as the base adapter's does - it will never say more."""
+        answers [], as the base adapter's does - it will never say more. ``timeout``: how long IBKR's read may take,
+        when not its own default."""
         get = getattr(self.broker, "get_fills", None)
         if not callable(get):
             return []
         try:
-            return list(get(symbol) or [])
+            return list((get(symbol) if timeout is None else get(symbol, timeout=timeout)) or [])
         except Exception:  # noqa: BLE001
             log.debug("executions for %s unavailable", symbol or "the account", exc_info=True)
             return None

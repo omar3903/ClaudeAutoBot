@@ -375,11 +375,12 @@ def test_a_part_taken_off_marks_the_trades_best_and_worst_prices(repo):
     assert part["mae"] == pytest.approx(1.25) and part["hwm_price"] == 50.0 and not part["mfe"]
 
 
-def _race(monkeypatch, other):
-    """Runs ``other`` on a second thread the first time a trade is read, and gives it up to a second to finish before
-    the read returns. A booking that reads the record and writes it in two steps lets it in between them; one that
-    takes the record in a conditional write first holds the database's write lock, so ``other`` waits for its commit.
-    Returns (the thread, a list that gets what ``other`` returned)."""
+def _race(monkeypatch, other, entity=None):
+    """Runs ``other`` on a second thread the first time a trade is read (with ``entity``, the first time one of those
+    is read), and gives it up to a second to finish before the read returns. A booking that reads the record and
+    writes it in two steps lets it in between them; one that takes the record in a conditional write first holds the
+    database's write lock, so ``other`` waits for its commit. Returns (the thread, a list that gets what ``other``
+    returned)."""
     import threading
 
     from sqlalchemy.orm import Session
@@ -388,7 +389,7 @@ def _race(monkeypatch, other):
 
     def get(self, *args, **kwargs):
         found = real(self, *args, **kwargs)
-        if not runs:
+        if not runs and (entity is None or args[0] is entity):
             runs.append(threading.Thread(target=lambda: results.append(other()), daemon=True))
             runs[0].start()
             runs[0].join(timeout=1.0)
@@ -427,6 +428,32 @@ def test_two_parts_taken_off_one_record_at_once_never_take_off_more_than_it_hold
     t = repo.get_trade(tid)
     assert (t["status"], t["quantity"], t["realized_pl"]) == ("CLOSED", 4.0, 18.0 + 16.0)
     assert results == [t]
+
+
+def test_a_fee_added_while_another_thread_closes_the_trade_comes_off_its_pl_with_the_closes_fee(repo, monkeypatch):
+    from autotradebot.persistence.models_orm import Trade
+    from autotradebot.util import clock
+
+    p = _play(symbol="T92")
+    repo.record_play(p)
+    tid = repo.open_trade(p, 100.0, 10, "ibkr-paper", broker_order_id="921")    # booked before its fee was reported
+    [entry] = [r for r in repo.fills_on("ibkr-paper", clock.now_ny().date()) if r["trade_id"] == tid]
+    runs, _ = _race(monkeypatch, lambda: repo.close_trade(tid, 101.0, exit_reason="target", commission=0.5),
+                    entity=Trade)                                               # the position check's close, say
+    repo.add_fill_fees({entry["fill_id"]: 1.0})                                 # the entry's fee, reported now
+    runs[0].join(timeout=30)
+    t = repo.get_trade(tid)
+    assert (t["fees"], t["realized_pl"]) == (pytest.approx(1.5), pytest.approx(10.0 - 1.5))   # both fees, once each
+
+
+def test_a_record_deleted_only_while_open_keeps_one_closed_meanwhile(repo):
+    p, q = _play(symbol="T93"), _play(symbol="T94")
+    repo.record_play(p)
+    repo.record_play(q)
+    closed, still = repo.open_trade(p, 100.0, 10, "paper"), repo.open_trade(q, 100.0, 5, "paper")
+    repo.close_trade(closed, 101.0, exit_reason="target")                       # its exit booked on another thread
+    assert not repo.delete_trade(closed, open_only=True) and repo.get_trade(closed)["realized_pl"] == 10.0
+    assert repo.delete_trade(still, open_only=True) and repo.get_trade(still) is None
 
 
 def test_the_recent_trades_carry_each_trades_exit_average_however_many_are_read(repo, monkeypatch):

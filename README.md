@@ -692,11 +692,21 @@ was sent for, which the order audit keeps with each exit (a quit's exit that
 filled as the app stopped is `quit`, not a close outside the app). Fills the
 record has booked already — a part taken off earlier, known by its order id —
 are skipped, and only those
-fills' fees come off. When the broker reports no such fill (IBKR keeps only the
-current session's) the record is **deleted** instead, as after **Reset paper** —
-but only once the broker has answered: when its fills can't be read (the
-connection dropped, no answer in time) the record is kept and looked at again on
-a later check, never deleted for a fill the app couldn't see. A wrong deletion
+fills' fees come off. Shares no fill accounts for are priced as the fills found
+were, and the record's notes say they are an estimate. When the broker reports no
+such fill (IBKR keeps only the current session's) the record is **deleted**
+instead, as after **Reset paper** — but only once the broker has answered: when
+its fills can't be read (the connection dropped, no answer in time) the record is
+kept and looked at again on a later check, never deleted for a fill the app
+couldn't see. A record with a part already booked off (an exit capped at the
+shares held, a target's part) is never deleted: it keeps that part, and the rest
+is closed at the price of its last exit booked, noted as an estimate. The check
+decides and books under the order sync's lock, and leaves to the sync a trade
+whose exit is still working or whose stop or target fill it is about to book; a
+booking the database refuses is said on the dashboard and tried again on the next
+check. An exit IBKR reports filled with no price is never booked at zero: it stays
+followed until its executions can be read, and is left to this check when they
+show none. A wrong deletion
 would orphan a real position, so the check is strict: it only acts on a connected
 broker's fresh account snapshot, after the connection has been up a minute, for
 trades older than 90 s whose close isn't in flight, and after two misses in a
@@ -708,7 +718,8 @@ exit's — and a trade's realised P/L, % and R are after all of them (a part tak
 off banks what it made after its own fee). IBKR sends its commission report a
 moment after each execution, so a fill is mostly booked before its fee is known:
 about once a minute the order sync reads IBKR's executions for the day's recent
-fills and adds what IBKR has reported since to the fill, the trade's fees and a
+fills (waiting three seconds at most, so a slow Gateway never holds the exits up)
+and adds what IBKR has reported since to the fill, the trade's fees and a
 closed trade's P/L and R. Fifteen minutes after its booking a fill's fee is
 settled and no longer looked up. IBKR keeps only the current day's executions, so
 records booked before fees were recorded stay before commissions; the session
