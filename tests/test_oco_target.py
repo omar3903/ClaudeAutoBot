@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
+
+import pytest
 
 from test_native_stop import _StopBroker
 from test_order_follow_up import CFG, _executor, _Repo, _trade
@@ -33,14 +36,18 @@ class _OcaBroker(_StopBroker):
                 self.groups[res.order_id] = (req.oca_group, req.oca_type)
         return res
 
-    def fill(self, order_id, qty, price):
+    def fill(self, order_id, qty, price, working=False):
+        """The order has filled ``qty`` shares in all - with ``working`` only part of it, and it works on."""
         o = self.live[order_id]
-        o.status, o.filled_qty, o.avg_fill_price = "FILLED", qty, price
+        new = qty - float(o.filled_qty or 0.0)
+        o.filled_qty, o.avg_fill_price = qty, price
+        if not working:
+            o.status = "FILLED"
         group = self.groups.get(order_id, ("", 0))[0]
         for other_id, (g, _) in self.groups.items():
             other = self.live[other_id]
             if g and g == group and other_id != order_id and other.status not in ("FILLED", "CANCELED"):
-                other.submitted_qty -= qty
+                other.submitted_qty -= new
                 if other.submitted_qty <= 0:
                     other.status = "CANCELED"
 
@@ -73,6 +80,29 @@ def test_the_stop_and_the_first_targets_part_rest_together_in_one_reducing_group
     assert ex.resting_targets() == [{"trade_id": "t1", "symbol": "AAA", "order_id": "2", "qty": 5.0, "limit_price": 104.0}]
     ex.sync_open_orders()
     assert len(broker.orders) == 2                                             # once is enough
+
+
+def test_a_target_the_broker_didnt_answer_in_time_is_taken_over_when_found_never_placed_twice():
+    from autotradebot.brokers.base import OrderOutcomeUnknown
+
+    broker, _, ex, _ = _setup()
+    place = broker.place_order
+
+    def unanswered_target(req):                                                # the target reaches the broker all the same
+        res = place(req)
+        if req.client_tag.startswith("tgt:"):
+            raise OrderOutcomeUnknown("IBKR didn't answer the order within 10 s", order_ref=req.client_tag)
+        return res
+
+    broker.place_order = unanswered_target
+    ex.sync_open_orders()
+    assert len(broker.stops()) == len(broker.targets()) == 1 and not ex.target_resting("t1")
+    broker.place_order = place
+    ex._target_retry.clear()
+    ex.sync_open_orders()
+    assert ex.target_resting("t1") and ex.resting_targets()[0]["order_id"] == "2"
+    ex.sync_open_orders()
+    assert len(broker.orders) == 2 and broker.cancelled == [] and "t1" not in ex._plain   # nothing stood down or doubled
 
 
 def test_a_position_that_exits_whole_gets_a_target_for_all_of_it():
@@ -142,6 +172,49 @@ def test_an_exit_after_the_target_took_its_part_covers_only_what_is_left():
     assert broker.exits()[0].quantity == 5 and ex.protective_stops() == []
 
 
+def test_moving_the_stop_while_the_target_fills_in_part_keeps_the_size_the_group_cut_it_to():
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()
+    broker.fill("2", 3, 104.0, working=True)                                   # three of the target's five...
+    assert broker.live["1"].submitted_qty == 7                                 # ...and the group cuts the stop to seven
+    repo.update_trade_risk("t1", stop_price=100.35)                           # the record's stop moves meanwhile
+    ex.sync_open_orders()
+    assert broker.modified == [("1", 100.35, None)]                           # the price alone
+    assert broker.live["1"].submitted_qty == 7 and ex.protective_stops()[0]["qty"] == 7.0   # seven, not ten
+    assert repo.get_trade("t1")["quantity"] == 10                              # booked when the target finishes
+    ex.sync_open_orders()
+    assert len(broker.modified) == 1 and broker.exits() == []                  # nothing resent
+    broker.fill("2", 5, 104.0)                                                 # the target's last two
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["quantity"] == 5 and "1" in broker.cancelled
+    stop, target = broker.stops()[-1], broker.targets()[-1]
+    assert (stop.quantity, stop.stop_price, target.quantity, target.limit_price) == (5, 100.05, 5, 110.0)
+
+
+@pytest.mark.parametrize("left_by_an_earlier_run", [False, True])
+def test_a_part_the_app_would_take_off_beside_a_resting_target_is_left_to_the_target(left_by_an_earlier_run):
+    broker, repo, ex, _ = _setup()
+    if left_by_an_earlier_run:
+        # the minute after a start: the earlier run's pair rests, not taken over yet - the exit manager, seeing no
+        # target resting, takes the first target's part itself
+        broker.live.update({o.order_id: o for o in (
+            OrderResult(order_id="70", status="SUBMITTED", symbol="AAA", submitted_qty=10, side=Side.SHORT,
+                        tag="stop:t1", order_type="STOP", stop_price=98.0),
+            OrderResult(order_id="71", status="SUBMITTED", symbol="AAA", submitted_qty=5, side=Side.SHORT,
+                        tag="tgt:t1", order_type="LIMIT", limit_price=104.0))})
+        broker.connected_since = time.monotonic()
+        assert not ex.target_resting("t1")
+    else:
+        ex.sync_open_orders()
+        broker.fill("2", 3, 104.0, working=True)                               # this run's, three of its five filled
+        broker.positions["AAA"] = 7
+    cancelled = list(broker.cancelled)
+    out = ex.close_trade("t1", reason="target-1", qty=5, after_fill={"stop_price": 100.05, "target_price": 110.0})
+    assert not out["ok"] and out["wait"] and "left to the target" in out["reason"]
+    assert broker.exits() == [] and broker.modified == [] and broker.cancelled == cancelled
+    assert ex.target_resting("t1") and repo.get_trade("t1")["quantity"] == 10  # the exit manager leaves it be now
+
+
 def test_while_a_target_rests_at_the_broker_the_exit_manager_leaves_the_target_to_it():
     sent = []
     repo = _Repo([_trade(target_price=104.0, target2_price=110.0, initial_quantity=10)])
@@ -194,6 +267,21 @@ def test_orders_an_earlier_run_left_are_followed_and_a_stray_target_is_cancelled
     assert ex.cancel_working_orders()["stops_kept"] == 2 and broker.cancelled == ["90"]   # neither is touched
 
 
+@pytest.mark.parametrize("with_stop", [True, False])
+def test_an_exit_right_after_a_start_stands_down_the_target_an_earlier_run_left_with_or_without_its_stop(with_stop):
+    broker, _, ex, _ = _setup()
+    left = [OrderResult(order_id="71", status="SUBMITTED", symbol="AAA", submitted_qty=5, side=Side.SHORT,
+                        tag="tgt:t1", order_type="LIMIT", limit_price=104.0)]
+    if with_stop:
+        left.append(OrderResult(order_id="70", status="SUBMITTED", symbol="AAA", submitted_qty=10, side=Side.SHORT,
+                                tag="stop:t1", order_type="STOP", stop_price=98.0))
+    broker.live.update({o.order_id: o for o in left})                          # still working from an earlier run
+    broker.connected_since = time.monotonic()                                  # just connected: none taken over yet
+    out = ex.close_trade("t1", reason="manual")
+    assert out["ok"] and sorted(broker.cancelled) == sorted(o.order_id for o in left)
+    assert [o.quantity for o in broker.exits()] == [10] and not ex.target_resting("t1")
+
+
 def test_a_target_that_filled_in_part_while_the_app_was_off_is_booked_as_the_first_target():
     left = [OrderResult(order_id="70", status="SUBMITTED", symbol="AAA", submitted_qty=7, side=Side.SHORT,
                         tag="stop:t1", order_type="STOP", stop_price=98.0),              # the group shrank it by 3
@@ -240,3 +328,33 @@ def test_a_plain_stop_from_before_the_update_is_replaced_by_the_pair():
     assert stop.oca_group == target.oca_group != "" and ex.protective_stops()[0]["order_id"] != "70"
     ex.sync_open_orders()
     assert len(broker.orders) == 2                                             # settled: nothing more is sent
+
+
+def test_a_rebuild_leaves_the_pair_alone_while_an_exit_is_standing_it_down():
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()
+    repo.update_trade_risk("t1", target_price=106.0)                          # the pair has the wrong shape now
+    assert ex._claim_resting("t1")                                             # a close on another thread holds it
+    assert ex._rebuild(repo.get_trade("t1"), ex._orders_for_certain()) is False
+    assert broker.cancelled == [] and len(broker.orders) == 2                  # nothing stood down, nothing placed
+    ex._release_resting("t1")
+    assert ex._rebuild(repo.get_trade("t1"), ex._orders_for_certain()) is True
+    assert sorted(broker.cancelled) == ["1", "2"]
+
+
+def test_a_pair_is_never_stood_down_to_be_placed_afresh_while_the_order_list_cant_be_read():
+    from test_order_follow_up import _unanswered
+
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()                                                      # stop 1 and target 2 rest together
+    broker.live["2"].status, broker.live["2"].raw = "CANCELED", {"cancel_confirmed": True}   # the target is gone
+    ex.sync_open_orders()
+    assert ex.resting_targets() == [] and ex.protective_stops()[0]["order_id"] == "1"
+    ex._target_retry.clear()                                                   # a fresh pair is due...
+    listed, broker.list_orders = broker.list_orders, _unanswered               # ...but the broker's orders can't be read
+    ex.sync_open_orders()
+    assert broker.cancelled == [] and ex.protective_stops()[0]["order_id"] == "1"   # the stop rests on
+    broker.list_orders = listed
+    ex.sync_open_orders()                                                      # read: stood down and placed afresh
+    assert broker.cancelled == ["1"] and ex.protective_stops()[0]["order_id"] == "3"
+    assert broker.stops()[-1].oca_group == broker.targets()[-1].oca_group != broker.stops()[0].oca_group

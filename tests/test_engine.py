@@ -50,11 +50,14 @@ def _new_engine(tmp_path, gateway, port) -> TradingEngine:
 
 @pytest.fixture
 def engine(tmp_path, gateway, port):
+    """An engine whose paper orders go to the built-in simulator, with IB Gateway down until a test connects it
+    (_connect: prices only). A test of orders going to the IBKR paper account switches to it (_on_ibkr)."""
     from autotradebot.persistence.db import DB
 
     # a database of its own, so open trades left by other tests can't leak in
     DB.init(url=f"sqlite:///{(tmp_path / 'engine.sqlite').as_posix()}")
     DB.create_all()
+    (tmp_path / "runtime.json").write_text('{"paper_platform": "simulator"}', encoding="utf-8")
     e = _new_engine(tmp_path, gateway, port)
     e._bind()
     yield e
@@ -93,16 +96,78 @@ def _connect(engine, port):
     assert engine._retry_connection(force=True)
 
 
+def _on_ibkr(engine):
+    """Paper orders to the IBKR paper account, as the dashboard's switch sends them."""
+    assert engine.set_paper_platform("ibkr")["ok"]
+
+
 # ---------------------------------------------------------------- where orders go
-def test_orders_go_to_the_simulator_while_the_gateway_is_down(engine):
+def _refused_entry(engine):
+    """An entry sent the way an approval sends it: what came back, and whether anything was booked."""
+    from autotradebot.execution.order_builder import plan_order
+
+    p = _play("AAPL")
+    p.suggested_qty = 5
+    engine.repo.record_play(p)
+    out = engine.executor.execute_play(p, Account(account_id="X", equity=50_000.0, cash=50_000.0),
+                                       plan=plan_order(p, clock.Session.REGULAR, engine.settings.config.execution))
+    return out, engine.repo.open_trades()
+
+
+def test_a_gateway_that_is_down_never_sends_the_orders_to_the_simulator(engine, tmp_path, gateway, port):
+    _on_ibkr(engine)                                                      # IB Gateway is down
     snap = engine.snapshot()
-    assert engine.paper_platform == "ibkr" and snap["venue"]["trading_on"] == "paper"
-    assert engine.broker.name == "paper" and not snap["data"]["connected"]
+    assert engine.paper_platform == "ibkr" and snap["venue"]["trading_on"] == "ibkr-paper"
+    assert engine.broker.name == "ibkr" and not engine.broker.is_connected and not snap["data"]["connected"]
     assert snap["connection"]["cls"] == "bad" and snap["connection"]["action"] == "connections"
+    assert "none go to the simulator" in snap["connection"]["detail"]
     assert any("IB Gateway" in b for b in engine.connections.blockers)
+    out, booked = _refused_entry(engine)
+    assert not out["ok"] and "isn't connected" in out["reason"] and booked == []     # refused, not filled elsewhere
+    assert engine.exit_manager.venue == engine.executor.venue == "ibkr-paper"
+
+    r = engine.reconnect()                                                # still down: the button says so
+    assert not r["ok"] and "no order goes out until it's back" in r["reason"] and engine._venue == "ibkr-paper"
+    refresh = engine.refresh_account_now()
+    assert not refresh["ok"] and "isn't reachable yet" in refresh["reason"]
+
+    engine.stop()                                                         # a start with the Gateway down: the same
+    again = _started_again(tmp_path, gateway, port)
+    try:
+        assert again._venue == "ibkr-paper" and again.broker.name == "ibkr" and not again.broker.is_connected
+    finally:
+        again.stop()
+
+
+def test_orders_held_for_the_gateway_go_to_it_once_it_answers(engine, port, gateway, monkeypatch):
+    _on_ibkr(engine)
+    heard = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **p: heard.append(topic))
+    engine.quit_state = {"mode": "paper"}                                 # even while quitting: nothing moves
+    _connect(engine, port)
+    assert engine._venue == "ibkr-paper" and engine.broker is gateway and engine.executor.broker is gateway
+    assert engine._account is not None and "broker.connected" in heard
+
+
+def test_live_stays_on_the_live_account_while_its_gateway_is_down_and_reconnects_by_itself(
+        engine, tmp_path, gateway, port):
+    import json
+
+    engine.stop()
+    (tmp_path / "runtime.json").write_text(json.dumps({"mode": "live", "paper_platform": "simulator"}))
+    live = _started_again(tmp_path, gateway, port)                        # the app restarts with the Gateway down
+    try:
+        assert live.mode == "live" and live._venue == "ibkr-live" and not live.broker.is_connected
+        assert live._live_blockers and _refused_entry(live)[0]["reason"].startswith("Your IBKR live account")
+        _connect(live, port)
+        assert live.mode == "live" and live._venue == "ibkr-live" and live.broker is gateway
+        assert gateway.kw["mode"] == "live" and gateway.kw["readonly"] is False
+    finally:
+        live.stop()
 
 
 def test_the_chosen_account_connects_once_the_gateway_answers(engine, port, gateway):
+    _on_ibkr(engine)
     assert not engine._retry_connection(force=True)                   # still down
     _connect(engine, port)
     snap = engine.snapshot()
@@ -133,8 +198,26 @@ def test_the_simulator_takes_only_prices_from_the_gateway(engine, port, gateway)
     assert engine.snapshot()["connection"]["label"] == "Simulator"
 
 
+def test_the_day_trades_and_todays_pl_shown_are_the_account_orders_go_to(engine):
+    for symbol, venue, exit_price in (("T01", "ibkr-paper", 104.0), ("T02", "ibkr-paper", 101.0),
+                                      ("T03", "paper", 98.0)):
+        engine.repo.close_trade(_open(engine, symbol, venue), exit_price=exit_price, exit_reason="target")
+    held = SimpleNamespace(round_trips=0)
+
+    def shown():
+        snap = engine.snapshot()
+        return (snap["day_trades_5d"], snap["pnl"]["realized_today"], engine.pnl_summary()["realized_today"],
+                engine.pdt.day_trades_last_5_sessions(held))
+
+    assert shown() == (1, -10.0, -10.0, 1)                               # on the simulator: its trade only
+    _on_ibkr(engine)
+    assert shown() == (2, 25.0, 25.0, 2)                                 # the IBKR paper account's two
+    assert engine.pnl_summary()["realized_total"] == 15.0                # the history keeps every venue's
+
+
 def test_auto_connect_never_moves_orders_away_from_open_positions(engine, port):
     tid = _open(engine, "AAPL")                                          # on the simulator
+    engine.paper_platform = "ibkr"                                       # the switch says IBKR, the orders don't
     port["open"] = True
     assert not engine._retry_connection(force=True)
     assert engine._venue == "paper" and "AAPL" in engine.connections.blockers[0]
@@ -485,6 +568,7 @@ def test_a_replay_a_restart_interrupted_is_resumed_once_and_an_older_one_is_drop
 
 # ---------------------------------------------------------------- the position size factor
 def test_the_size_factor_resizes_the_plays_is_remembered_and_refuses_what_is_out_of_range(engine, port):
+    _on_ibkr(engine)                                                            # sized on the IBKR account
     _connect(engine, port)
     assert engine.size_factor == 1.0 and engine.capital_state()["size_factor"] == 1.0
     p = _play()                                                                 # entry 100, stop 95
@@ -514,6 +598,7 @@ def test_the_most_one_position_may_hold_resizes_the_plays_is_remembered_and_refu
         engine, port, monkeypatch):
     risk = engine.settings.config.risk
     monkeypatch.setattr(risk, "max_position_pct_of_equity", risk.max_position_pct_of_equity)  # put back afterwards
+    _on_ibkr(engine)                                                            # sized on the IBKR account
     _connect(engine, port)
     assert engine.position_pct is None
     assert engine.capital_state()["max_position_pct"] == risk.max_position_pct_of_equity    # config.yaml's, unset
@@ -550,6 +635,7 @@ def test_the_most_one_position_may_hold_on_disk_stands_in_for_the_config_and_abs
 
 # ---------------------------------------------------------------- the split, and changes made while it runs
 def test_entries_still_working_count_in_their_kinds_share_of_the_capital(engine, port):
+    _on_ibkr(engine)                                                            # sized on the IBKR account
     _connect(engine, port)
     engine.set_capital(None, mode="cash")          # the account's own value: the fake's buying power never moves
     engine.set_filters(timeframes=["INTRADAY", "SWING"])
@@ -565,6 +651,7 @@ def test_entries_still_working_count_in_their_kinds_share_of_the_capital(engine,
 
 
 def test_a_kind_over_its_share_says_so_and_takes_nothing_new(engine, port):
+    _on_ibkr(engine)                                                            # sized on the IBKR account
     _connect(engine, port)
     engine.set_filters(timeframes=["INTRADAY", "SWING"])
     engine.set_capital_split(50)
@@ -856,6 +943,71 @@ def test_a_paper_quit_never_gets_stuck_on_a_close_that_wont_fill(engine):
     assert done.wait(3)
 
 
+def test_a_quit_sends_one_round_of_closes_while_the_sync_loop_checks_on_it(engine):
+    tid = _open(engine, "AAPL")
+    sent = []
+
+    def close(trade_id, reason="manual"):
+        sent.append(trade_id)
+        if len(sent) == 1:
+            engine._check_quit_progress()                                    # the sync loop's pass, meanwhile
+        return {"ok": True, "status": "WORKING", "order_id": f"o{len(sent)}"}
+
+    engine.executor.close_trade = close
+    assert engine.begin_quit()["ok"] and engine.quit_state
+    assert sent == [tid]                                                    # no second round beside the first
+
+
+def test_a_quit_check_while_the_working_entries_are_cancelled_sends_no_round_of_its_own(engine):
+    tid = _open(engine, "BBB")
+    sent, working = [], set()
+
+    def close(trade_id, reason="manual"):
+        sent.append(trade_id)
+        if trade_id in working:                                             # what the executor says of a second one
+            return {"ok": False, "reason": "An exit order for this BBB position is already working."}
+        working.add(trade_id)
+        return {"ok": True, "status": "WORKING", "order_id": f"o{len(sent)}"}
+
+    def cancel_pending_entries():                   # waiting on the executor's lock behind the loop's sync pass...
+        engine._check_quit_progress()               # ...whose quit check runs meanwhile
+        return 0
+
+    engine.executor.close_trade = close
+    engine.executor.cancel_pending_entries = cancel_pending_entries
+    out = engine.begin_quit()
+    assert sent == [tid] and engine._quit_rounds == 1                       # one round, the quit's own
+    assert out["note"].startswith("Exit sent for 1 position")
+
+
+def test_a_quit_waits_for_the_record_of_an_entry_whose_fill_waits_to_be_saved_and_closes_it(engine):
+    from autotradebot.execution.executor import _Pending
+
+    engine._venue = "ibkr-paper"
+    play = _play("AAA")
+    engine.executor._pending["9"] = _Pending("9", play, "entry", qty=10)    # filled at the broker...
+    engine.executor._unbooked[f"entry:{play.id}"] = 2                       # ...and the database refuses to book it
+    closed = _closes_fill(engine)
+    done = threading.Event()
+    engine.on_shutdown = done.set
+
+    out = engine.begin_quit()
+    assert out["ok"] and "AAA entry fill couldn't be saved yet" in out["note"]
+    # its shares are held: the quit neither cancels it nor shuts down without them
+    assert "9" in engine.executor._pending and engine.quit_state is not None
+    status = engine.snapshot()["quit"]
+    assert (status["left"], status["symbols"]) == (1, ["AAA"]) and "couldn't be saved" in status["waiting"]
+    engine._quit_retry_at = 0.0
+    engine._check_quit_progress()
+    assert engine.quit_state is not None and not done.is_set() and closed == []
+
+    del engine.executor._pending["9"], engine.executor._unbooked[f"entry:{play.id}"]   # the booking takes...
+    _open(engine, "AAA", venue="ibkr-paper", qty=10)
+    engine._quit_retry_at = 0.0
+    engine._check_quit_progress()
+    assert closed == ["AAA"] and engine.quit_state is None and done.wait(3)   # ...and the quit closes it
+
+
 def test_live_quit_can_be_cancelled_and_leaves_positions_alone(engine):
     _open(engine, "AAPL")
     closed = _closes_fill(engine)
@@ -985,6 +1137,57 @@ def test_a_position_closed_outside_the_app_is_booked_from_the_brokers_fills(engi
     assert engine.snapshot()["mismatches"] == []
 
 
+def test_a_gone_position_whose_fills_cant_be_read_keeps_its_record_until_a_read_finds_no_exit(engine, caplog):
+    import logging
+
+    from autotradebot.brokers.base import BrokerError
+
+    tid = _open(engine, "AAA", qty=5)
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    readable = []
+
+    def fills(symbol=None):
+        if not readable:
+            raise BrokerError("IBKR's executions for AAA couldn't be read: no answer in time")
+        return []                                                           # read fine: nothing since the entry
+
+    engine._broker.get_fills = fills
+    with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
+        assert all(engine._reconcile_open_trades() == [] for _ in range(4))     # gone, check after check
+    assert engine.repo.get_trade(tid)["status"] == "OPEN"                   # "not known" is no "none": kept
+    assert "its fills couldn't be read" in caplog.text and "TRADE RECORD DELETED" not in caplog.text
+    readable.append(True)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="autotradebot.engine.engine"):
+        removed = [r for _ in range(2) for r in engine._reconcile_open_trades()]
+    assert [r["id"] for r in removed] == [tid] and engine.repo.get_trade(tid) is None   # the last resort, said
+    assert f"TRADE RECORD DELETED  AAA ({tid})" in caplog.text
+
+
+def test_an_exit_called_off_part_filled_is_booked_once_its_fills_can_be_read(engine):
+    from autotradebot.brokers.base import BrokerError
+
+    tid = _open(engine, "AAA", qty=10)                                      # entered at 100
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAA", quantity=6, avg_price=100.0, market_price=101.0)]
+    now, readable = dt.datetime.now(dt.timezone.utc), []
+
+    def fills(symbol=None):
+        if not readable:
+            raise BrokerError("IBKR's executions for AAA couldn't be read: no answer in time")
+        return [Fill(order_id="e1", symbol="AAA", side=Side.SHORT, quantity=4, price=104.0, ts=now, tag=f"exit:{tid}")]
+
+    engine._broker.get_fills = fills
+    engine._reconcile_open_trades()
+    assert engine.repo.get_trade(tid)["quantity"] == 10                     # not known: nothing booked...
+    readable.append(True)
+    engine._reconcile_open_trades()
+    t = engine.repo.get_trade(tid)                                          # ...and not taken as looked at already
+    assert (t["quantity"], t["banked_pl"]) == (6, pytest.approx(4 * 4.0))
+
+
 def test_an_exit_called_off_after_filling_in_part_is_booked_from_its_tagged_fills(engine):
     import datetime as dt
 
@@ -1011,6 +1214,241 @@ def test_an_exit_called_off_after_filling_in_part_is_booked_from_its_tagged_fill
     assert t["banked_pl"] == pytest.approx(3 * 4.0 + 1 * 6.0)                # its own exit's four shares, at their prices
     engine._reconcile_open_trades()
     assert engine.repo.get_trade(tid)["quantity"] == 6                      # booked once: the counts agree now
+
+
+@pytest.mark.parametrize("order_id", ["g1", ""])                            # the part booked with its order's id, or not
+def test_a_position_closed_outside_is_booked_at_its_own_fills_past_the_parts_already_booked(engine, order_id):
+    tid = _open(engine, "AAA", qty=10)                                      # entered at 100
+    engine.repo.reduce_trade(tid, 4, 110.0, exit_reason="target-1", broker_order_id=order_id)   # its target part
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="g1", symbol="AAA", side=Side.SHORT, quantity=4, price=110.0, ts=now, tag=f"tgt:{tid}"),
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=6, price=95.0, ts=now + dt.timedelta(seconds=1),
+             commission=0.6, tag=f"stop:{tid}"),
+        Fill(order_id="x9", symbol="AAA", side=Side.SHORT, quantity=3, price=80.0, ts=now + dt.timedelta(seconds=2),
+             tag="exit:trd_other"),                                         # another trade's exit
+        Fill(order_id="tws", symbol="AAA", side=Side.SHORT, quantity=5, price=90.0, ts=now + dt.timedelta(seconds=3))]
+    engine._reconcile_open_trades()
+    [settled] = engine._reconcile_open_trades()
+    t = engine.repo.get_trade(tid)                                          # the 6 it held, at the stop's own fill
+    assert (t["status"], t["exit_reason"], t["exit_price"], settled["fills"]) == ("CLOSED", "stop", 95.0, 1)
+    assert t["realized_pl"] == pytest.approx(4 * 10.0 + 6 * -5.0 - 0.6)
+    exits = [f for f in engine.repo.trade_record(tid)["fills"] if f["leg"] == "EXIT"]
+    assert [(f["quantity"], f["broker_order_id"], f["commission"]) for f in exits][-1] == (6, "s1", 0.6)
+
+
+def _gone(engine, symbol="AAA", qty=5):
+    """An open record whose position the account no longer holds (the simulator was never given its shares)."""
+    tid = _open(engine, symbol, qty=qty)                                    # entered at 100, stop 95
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    return tid
+
+
+def _exit_sent(engine, tid, at, reason="", order_id="", qty=5):
+    """The order audit's row for an exit the app sent (Executor._send_exit): its tag and why it was sent - before the
+    audit kept why, no reason - and the broker's id for it (none when the send got no answer in time)."""
+    request = {"symbol": "AAA", "side": "SHORT", "qty": qty, "type": "MARKET", "tag": f"exit:{tid}",
+               **({"reason": reason} if reason else {})}
+    answer = {"order_id": order_id, "status": "SUBMITTED"} if order_id else {"error": "no answer", "outcome": "unknown"}
+    engine.repo.record_order_audit("PLACE", request, answer, bool(order_id), "paper", trade_id=tid, ts=at)
+
+
+@pytest.mark.parametrize("reason, quitting, booked", [
+    ("quit", False, "quit"),                # the audit kept why the exit was sent
+    ("", True, "quit"),                     # sent before it kept why, while a quit closing the trade is under way
+    ("", False, "exit"),                    # ...and with none under way: an exit of the app's own, all the same
+])
+def test_a_gone_position_its_own_exit_sold_is_closed_as_what_the_exit_was_sent_for(engine, reason, quitting, booked):
+    tid = _gone(engine)
+    now = dt.datetime.now(dt.timezone.utc)
+    _exit_sent(engine, tid, now, reason="time-stop", order_id="e1")         # an earlier exit, called off unfilled
+    _exit_sent(engine, tid, now + dt.timedelta(minutes=1), reason=reason, order_id="q1")
+    engine.quit_state = {"keeping": []} if quitting else None
+    engine._broker.get_fills = lambda symbol=None: [                        # it filled as the app stopped: unheard
+        Fill(order_id="q1", symbol="AAA", side=Side.SHORT, quantity=5, price=101.0, ts=now + dt.timedelta(minutes=2),
+             tag=f"exit:{tid}")]
+    engine._reconcile_open_trades()
+    [settled] = engine._reconcile_open_trades()
+    engine.quit_state = None
+    t = engine.repo.get_trade(tid)
+    assert (t["status"], t["exit_reason"], t["exit_price"], settled["reason"]) == ("CLOSED", booked, 101.0, booked)
+
+
+def test_an_exit_whose_send_got_no_answer_is_known_by_the_last_exit_sent_before_it_filled(engine):
+    tid = _gone(engine)
+    now = dt.datetime.now(dt.timezone.utc)
+    _exit_sent(engine, tid, now, reason="time-stop", order_id="e1")         # called off unfilled
+    _exit_sent(engine, tid, now + dt.timedelta(minutes=1), reason="quit")   # no answer, so no order id on record
+    _exit_sent(engine, tid, now + dt.timedelta(minutes=5), reason="manual", order_id="m1")   # after it had filled
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="77", symbol="AAA", side=Side.SHORT, quantity=5, price=101.0, ts=now + dt.timedelta(minutes=2),
+             tag=f"exit:{tid}")]
+    engine._reconcile_open_trades()
+    engine._reconcile_open_trades()
+    assert engine.repo.get_trade(tid)["exit_reason"] == "quit"
+
+
+def test_only_a_gone_position_an_order_from_outside_the_app_sold_some_of_is_closed_outside(engine):
+    mixed, whole = _gone(engine, "AAA"), _gone(engine, "BBB")
+    now = dt.datetime.now(dt.timezone.utc)
+    _exit_sent(engine, mixed, now, reason="quit", order_id="q1")
+    _exit_sent(engine, whole, now, reason="quit", order_id="q2")
+    later = now + dt.timedelta(minutes=2)
+    fills = [Fill(order_id="tws", symbol="AAA", side=Side.SHORT, quantity=2, price=99.0, ts=later),     # sold in TWS
+             Fill(order_id="q1", symbol="AAA", side=Side.SHORT, quantity=3, price=101.0, ts=later, tag=f"exit:{mixed}"),
+             Fill(order_id="q2", symbol="BBB", side=Side.SHORT, quantity=5, price=102.0, ts=later, tag=f"exit:{whole}")]
+    engine._broker.get_fills = lambda symbol=None: [f for f in fills if f.symbol == symbol]
+    engine._reconcile_open_trades()
+    engine._reconcile_open_trades()
+    t, w = engine.repo.get_trade(mixed), engine.repo.get_trade(whole)
+    assert (t["exit_reason"], t["exit_price"]) == ("closed-outside", pytest.approx((2 * 99.0 + 3 * 101.0) / 5))
+    assert (w["exit_reason"], w["exit_price"]) == ("quit", 102.0)           # its quit's exit sold every share
+
+
+def test_a_record_over_the_account_books_its_own_stop_that_filled_unseen_never_past_what_it_is_over_by(engine):
+    tid = _open(engine, "AAA", qty=10)                                      # entered at 100, stop 95
+    engine.repo.reduce_trade(tid, 2, 110.0, exit_reason="target-1", broker_order_id="g1")   # booked when it filled
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAA", quantity=3, avg_price=100.0, market_price=96.0)]
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="g1", symbol="AAA", side=Side.SHORT, quantity=2, price=110.0, ts=now, tag=f"tgt:{tid}"),
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=6, price=95.0, ts=now + dt.timedelta(seconds=1),
+             commission=0.6, tag=f"stop:{tid}"),
+        Fill(order_id="e1", symbol="AAA", side=Side.SHORT, quantity=4, price=90.0, ts=now + dt.timedelta(seconds=2),
+             tag=f"exit:{tid}")]
+    booked = engine._settle_short(engine.repo.open_trades(), {"AAA": 3.0})
+    assert [(b["qty"], b["price"], b["reason"]) for b in booked] == [(5, 95.0, "stop")]   # over by 5, oldest first
+    t = engine.repo.get_trade(tid)
+    assert (t["status"], t["quantity"]) == ("OPEN", 3) and "took 5 off at 95.00 (stop)" in t["notes"]
+    assert t["banked_pl"] == pytest.approx(2 * 10.0 + 5 * -5.0 - 0.5)       # its own share of the stop's fee
+    engine._short_checked.clear()
+    assert engine._settle_short(engine.repo.open_trades(), {"AAA": 3.0}) == []   # booked once: the counts agree
+
+
+def test_a_record_over_the_account_books_its_target_that_filled_unseen_as_the_first_target(engine):
+    tid = _open(engine, "AAA", qty=10)
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="g1", symbol="AAA", side=Side.SHORT, quantity=4, price=110.0, ts=now, tag=f"tgt:{tid}")]
+    [b] = engine._settle_short(engine.repo.open_trades(), {"AAA": 6.0})
+    t = engine.repo.get_trade(tid)
+    assert (b["reason"], t["quantity"], t["banked_pl"]) == ("target-1", 6, pytest.approx(40.0))
+
+
+def test_a_stop_or_target_the_order_sync_follows_is_left_to_it_and_its_fills_are_no_room_for_others(engine):
+    from autotradebot.execution.protective_stops import _Stop
+
+    tid = _open(engine, "AAA", qty=10)
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=6, price=95.0, ts=now, tag=f"stop:{tid}"),
+        Fill(order_id="e1", symbol="AAA", side=Side.SHORT, quantity=4, price=90.0, ts=now + dt.timedelta(seconds=1),
+             tag=f"exit:{tid}")]
+    engine.executor._stops[tid] = _Stop("s1", tid, "AAA", 10, 95.0)         # still working: it books its fills itself
+    assert engine._settle_short(engine.repo.open_trades(), {"AAA": 4.0}) == []
+    assert engine.repo.get_trade(tid)["quantity"] == 10
+
+
+def test_a_part_the_database_refuses_to_book_off_a_record_over_the_account_is_booked_on_the_next_check(engine,
+                                                                                                         monkeypatch):
+    import sqlite3
+
+    from sqlalchemy.exc import OperationalError
+
+    tid = _open(engine, "AAA", qty=10)                                      # entered at 100
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAA", quantity=6, avg_price=100.0, market_price=96.0)]
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [                        # its stop filled while the app restarted
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=4, price=95.0, ts=now, tag=f"stop:{tid}")]
+    real, refused, heard = engine.repo.reduce_trade, [], []
+
+    def reduce_trade(*a, **kw):
+        if not refused:                                                     # busy past its wait and its retries
+            refused.append(True)
+            raise OperationalError("UPDATE", {}, sqlite3.OperationalError("database is locked"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(engine.repo, "reduce_trade", reduce_trade)
+    monkeypatch.setattr(engine, "_publish", lambda topic, **p: heard.append((topic, p)))
+    engine._reconcile_open_trades()                                         # the rest of the check still runs...
+    assert engine.repo.get_trade(tid)["quantity"] == 10
+    [said] = [p for topic, p in heard if topic == "order.unbooked"]
+    assert "database is locked" in said["msg"]
+    engine._reconcile_open_trades()                                         # ...and it isn't taken as looked at
+    t = engine.repo.get_trade(tid)
+    assert (t["quantity"], t["banked_pl"]) == (6, pytest.approx(4 * -5.0))
+
+
+def test_a_gone_position_with_a_part_booked_off_already_is_closed_on_an_estimate_never_deleted(engine):
+    tid = _gone(engine, qty=10)                                             # entered at 100
+    # an exit capped at the 6 shares the account held sold them, and was booked; the other 4 left on an earlier
+    # session, which the broker's executions no longer cover
+    engine.repo.reduce_trade(tid, 6, 104.0, exit_reason="exit", broker_order_id="q1")
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="q1", symbol="AAA", side=Side.SHORT, quantity=6, price=104.0, ts=now, tag=f"exit:{tid}")]
+    engine._reconcile_open_trades()
+    [settled] = engine._reconcile_open_trades()
+    t = engine.repo.get_trade(tid)
+    assert t is not None and (t["status"], t["exit_reason"], t["exit_price"]) == ("CLOSED", "closed-outside", 104.0)
+    assert settled["estimated"] and "4 of the shares closed have no execution at the broker" in t["notes"]
+    assert t["realized_pl"] == pytest.approx(6 * 4.0 + 4 * 4.0) and t["is_day_trade"]   # the part's outcome kept
+
+
+def test_a_fill_the_order_sync_books_while_a_gone_position_is_settled_waits_for_it_and_counts_once(engine,
+                                                                                                    monkeypatch):
+    tid = _gone(engine, qty=10)                                             # entered at 100
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="g1", symbol="AAA", side=Side.SHORT, quantity=4, price=110.0, ts=now, tag=f"tgt:{tid}"),
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=6, price=95.0, ts=now + dt.timedelta(seconds=1),
+             tag=f"stop:{tid}")]
+
+    def sync_books_the_target():                                            # the order sync, under the executor's lock
+        with engine.executor.lock:
+            engine.repo.reduce_trade(tid, 4, 110.0, exit_reason="target-1", broker_order_id="g1")
+
+    real, runs = engine.repo.trade_record, []
+
+    def trade_record(trade_id):                     # the sync's booking comes just after the position check's read
+        found = real(trade_id)
+        if not runs:
+            runs.append(threading.Thread(target=sync_books_the_target, daemon=True))
+            runs[0].start()
+            runs[0].join(timeout=1.0)
+        return found
+
+    engine._reconcile_open_trades()
+    monkeypatch.setattr(engine.repo, "trade_record", trade_record)
+    engine._reconcile_open_trades()
+    runs[0].join(timeout=30)
+    t = engine.repo.get_trade(tid)
+    assert (t["status"], t["realized_pl"]) == ("CLOSED", pytest.approx(4 * 10.0 + 6 * -5.0))   # each share once
+
+
+def test_a_gone_position_whose_stop_the_order_sync_books_is_left_to_it(engine):
+    from autotradebot.execution.protective_stops import _Stop
+
+    tid = _gone(engine, qty=10)
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=10, price=95.0, ts=now, tag=f"stop:{tid}")]
+    stop = engine.executor._stops[tid] = _Stop("s1", tid, "AAA", 10, 95.0, unbooked=True)
+    for why in ("its fill waits to be saved", "followed: booked when the sync sees it done"):
+        engine._reconcile_open_trades()
+        assert engine._reconcile_open_trades() == [] and engine.repo.get_trade(tid)["status"] == "OPEN", why
+        stop.unbooked = False
+    del engine.executor._stops[tid]                                         # not followed: the position check books it
+    engine._reconcile_open_trades()
+    [settled] = engine._reconcile_open_trades()
+    assert (settled["reason"], engine.repo.get_trade(tid)["status"]) == ("stop", "CLOSED")
 
 
 def test_a_record_over_the_broker_for_a_reason_its_own_fills_dont_explain_is_left_alone(engine):
@@ -1060,6 +1498,79 @@ def test_shares_without_a_record_are_listed_and_can_be_exited(engine):
 
     engine._account.positions = [Position(symbol="MSFT", quantity=3, avg_price=100.0)]
     assert engine.untracked_positions() == []                               # fewer than recorded: a mismatch, not untracked
+
+
+def test_shares_no_record_explains_are_said_once_after_two_minutes_of_the_regular_session():
+    check = PositionCheck()
+    trades = [{"symbol": "AAA", "side": "LONG", "quantity": 10}, {"symbol": "BBB", "side": "LONG", "quantity": 5},
+              {"symbol": "FFF", "side": "LONG", "quantity": 8}]
+    held = {"AAA": 10.0, "BBB": -5.0, "CCC": 20.0, "DDD": -3.0, "EEE": 7.0, "FFF": 4.0}
+
+    def check_at(t, regular=True, account_age_s=0.0):
+        return {d["symbol"]: d for d in check.drift("ibkr-paper", "your IBKR paper account", trades, held,
+                                                    in_flight={"EEE"}, regular=regular, account_age_s=account_age_s,
+                                                    connection_age_s=1e9, now=t)}
+
+    assert check_at(0.0) == {} and check_at(119.0) == {}                     # seen, but not two minutes yet
+    said = check_at(120.0)
+    # AAA agrees, EEE has an order working, FFF holds fewer the same way round (the share-count warning's)
+    assert set(said) == {"BBB", "CCC", "DDD"}
+    assert said["BBB"]["urgent"] and "the other way round" in said["BBB"]["note"]       # short where the record is long
+    assert said["DDD"]["urgent"] and said["DDD"]["note"].startswith("URGENT")           # short with no record
+    assert not said["CCC"]["urgent"] and "20 shares long for 2 min with no open record" in said["CCC"]["note"]
+    assert check_at(500.0) == {}                                             # said once
+    held["CCC"] = 25.0                                                       # more of them: timed and said afresh
+    assert check_at(510.0) == {} and set(check_at(630.0)) == {"CCC"}
+    assert check_at(700.0, account_age_s=60.0) == {}                         # a stale account changes nothing
+
+    assert check_at(800.0, regular=False) == {} and check_at(5000.0, regular=False) == {}   # after hours: not timed
+    assert check_at(6000.0) == {} and set(check_at(6120.0)) == {"BBB", "CCC", "DDD"}      # the next session's own
+
+
+def test_shares_the_records_dont_explain_are_logged_and_sent_to_the_dashboard_never_unwound(engine, monkeypatch,
+                                                                                            caplog):
+    import logging
+
+    _open(engine, "BBB", qty=5)
+    engine.position_check.SETTLE_S = engine.position_check.DRIFT_ALERT_S = 0.0
+    monkeypatch.setattr(clock, "current_session", lambda ts=None: clock.Session.REGULAR)
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="BBB", quantity=5, avg_price=100.0),
+                                 Position(symbol="AAPL", quantity=-7, avg_price=50.0)]
+    heard, unwound = [], []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **p: heard.append((topic, p)))
+    monkeypatch.setattr(engine.executor, "close_untracked", lambda *a, **k: unwound.append(a))
+    with caplog.at_level(logging.WARNING, logger="autotradebot.engine.engine"):
+        engine._reconcile_open_trades()
+        engine._reconcile_open_trades()
+    [alert] = [p for topic, p in heard if topic == "positions.drift"]        # once
+    assert alert["urgent"] and [a["symbol"] for a in alert["alerts"]] == ["AAPL"]
+    assert "URGENT - AAPL" in caplog.text and unwound == []
+
+
+def test_shares_of_an_entry_whose_booking_keeps_failing_are_listed_and_said_not_hidden_as_in_flight(engine,
+                                                                                                    monkeypatch):
+    from autotradebot.execution.executor import _Pending
+
+    play = _play("AAA")
+    engine.executor._pending["9"] = _Pending("9", play, "entry", qty=10)    # filled at the broker...
+    engine.executor._unbooked[f"entry:{play.id}"] = 3                       # ...and the database refused it three times
+    engine.position_check.SETTLE_S = engine.position_check.DRIFT_ALERT_S = 0.0
+    monkeypatch.setattr(clock, "current_session", lambda ts=None: clock.Session.REGULAR)
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAA", quantity=10, avg_price=100.0, market_price=101.0)]
+    heard = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **p: heard.append((topic, p)))
+    assert [w["symbol"] for w in engine.working_entries()] == ["AAA"]       # Autopilot's caps still count it
+    [row] = engine.untracked_positions()                                    # listed, with its own Exit
+    assert (row["symbol"], row["side"], row["qty"]) == ("AAA", "LONG", 10)
+    engine._reconcile_open_trades()
+    engine._reconcile_open_trades()
+    [alert] = [p for topic, p in heard if topic == "positions.drift"]
+    assert [a["symbol"] for a in alert["alerts"]] == ["AAA"]
+
+    del engine.executor._unbooked[f"entry:{play.id}"]                       # an entry still working: left alone
+    assert engine.untracked_positions() == []
 
 
 # ---------------------------------------------------------------- fixing a share count from its warning
@@ -1228,6 +1739,33 @@ def test_a_trade_record_can_be_pulled_up_and_deleted(engine):
     assert engine.trade_record(tid) is None
 
 
+def test_the_history_and_a_record_show_a_position_taken_off_in_parts_whole(engine, monkeypatch):
+    from fastapi.testclient import TestClient
+    from autotradebot.server import security
+    from autotradebot.server.app import create_app
+
+    parted = _open(engine, "T01", qty=10)
+    engine.repo.reduce_trade(parted, 4, 102.0)                              # 4 of the 10 off at the first target
+    engine.repo.close_trade(parted, exit_price=101.0, exit_reason="stop")   # the other 6 at the stop
+    whole = _open(engine, "T02", qty=5)
+    engine.repo.close_trade(whole, exit_price=104.0, exit_reason="target")
+    still = _open(engine, "T03", qty=8)
+
+    monkeypatch.setattr(security, "ALLOWED_CLIENTS", security.ALLOWED_CLIENTS | {"testclient"})
+    monkeypatch.setattr(security, "ALLOWED_HOSTS", security.ALLOWED_HOSTS | {"testserver"})
+    app = create_app(lambda settings: None)
+    app.state.engine = engine
+    client = TestClient(app, headers={"X-ATB-Request": "1"})
+    rows = {t["id"]: t for t in client.get("/api/trades?limit=10").json()["trades"]}
+    shown = lambda t: (t["initial_quantity"], t["exit_avg_price"], t["exit_parts"], t["exit_price"])  # noqa: E731
+    assert shown(rows[parted]) == (10, 101.4, 2, 101.0)          # the shares entered, the average, the last part's price
+    assert shown(rows[whole]) == (5, 104.0, 1, 104.0)
+    assert shown(rows[still]) == (8, None, 0, None)
+    record = client.get(f"/api/trades/{parted}/record").json()["trade"]
+    assert shown(record) == (10, 101.4, 2, 101.0)
+    assert shown(client.get(f"/api/trades/{still}/record").json()["trade"]) == (8, None, 0, None)
+
+
 # ---------------------------------------------------------------- trading capital
 def _tight_play(symbol="NVDA"):
     # 0.50 of risk per share, so the position limits bind rather than the risk budget
@@ -1259,6 +1797,35 @@ def test_trading_capital_shrinks_what_the_bot_uses_not_the_account(engine):
     assert engine.runtime.read()["capital"] == {}
 
 
+def test_a_set_amount_and_cash_only_count_shares_the_account_holds_without_a_record(engine, monkeypatch):
+    engine._refresh_account()
+    assert engine.set_filters(timeframes=["SWING"])["ok"]                  # one kind: no day / swing split here
+    held = [Position("AAA", 100, 95.0, market_price=100.0)]               # 10,000 the app has no record of
+    engine._account = dataclasses.replace(engine._account, positions=held)
+    monkeypatch.setattr(engine, "_refresh_account", lambda: True)          # keep this account
+    assert engine.set_capital(20_000)["ok"]
+    assert engine.sizing_account().raw["capital_room"] == pytest.approx(10_000)
+    state = engine.capital_state()
+    assert (state["invested"], state["available"], state["untracked"]) == (10_000, 10_000, 10_000)
+
+    _open(engine, "AAA", qty=100)                                          # now it has a record: counted once
+    _open(engine, "EEE", qty=50)                                           # booked before the next account read
+    assert engine.sizing_account().raw["capital_room"] == pytest.approx(5_000)
+    assert engine.capital_state()["untracked"] == 0
+
+    held.append(Position("BBB", -50, 100.0, market_price=100.0))          # a 5,000 short with no record fills it
+    play = _tight_play()
+    engine.board.replace([play], None)
+    pre = engine.assess_play(play.id)
+    assert not pre["can_execute"] and "trading capital" in pre["order_preview"]["caps"]
+    assert ("the trading capital is fully invested - no room for another position (that counts $5,000 in shares "
+            "the account holds without a trade record)") in pre["reasons"]
+
+    assert engine.set_capital(None, mode="cash")["ok"]                     # cash only: the account's value, less all of it
+    assert engine.sizing_account().raw["capital_room"] == pytest.approx(engine._account.equity - 20_000)
+    assert engine.set_capital(None, mode="margin")["ok"] and engine.sizing_account() is engine._account
+
+
 def test_an_order_is_capped_at_a_slice_of_the_stocks_usual_volume_and_a_too_thin_stock_is_refused(engine, monkeypatch):
     engine._refresh_account()
     monkeypatch.setattr(engine.settings.config.risk, "max_adv_pct", 1.0)
@@ -1274,6 +1841,82 @@ def test_an_order_is_capped_at_a_slice_of_the_stocks_usual_volume_and_a_too_thin
     assert not pre["can_execute"] and pre["order_preview"]["qty"] == 0
     assert any(r.startswith("BBB is too thin to trade: it usually trades 50 shares a day") for r in pre["reasons"])
     assert "risk budget too small for one share" not in pre["order_preview"]["caps"]   # the cap did it, not the budget
+
+
+# ---------------------------------------------------------------- the risk already open
+def _wide_play(symbol, stop=80.0, timeframe=Timeframe.SWING):
+    return Play(symbol=symbol, side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=timeframe, entry=100.0, stop=stop, targets=[140.0])
+
+
+def _hold(engine, play, qty, venue="paper"):
+    engine.repo.record_play(play)
+    return engine.repo.open_trade(play, 100.0, qty, venue)
+
+
+def test_the_open_risk_counts_this_venues_trades_at_their_opening_stop_and_the_entries_still_working(
+        engine, monkeypatch):
+    moved = _hold(engine, _wide_play("AAA", stop=95.0), 10)                    # $50 at risk when it opened
+    engine.repo.update_trade_risk(moved, stop_price=100.0)                     # trailed to break-even since
+    _hold(engine, _wide_play("BBB", stop=90.0), 4)                             # $40
+    _hold(engine, _wide_play("CCC", stop=90.0), 50, venue="ibkr-paper")        # parked on another venue
+    leg = _wide_play("DDD", stop=50.0)
+    leg.pair_id = "pair1"                                                      # a pair leg: no stop of its own
+    _hold(engine, leg, 30)
+    monkeypatch.setattr(engine, "working_entries", lambda: [
+        {"symbol": "EEE", "timeframe": "INTRADAY", "qty": 5, "notional": 500.0, "risk": 15.0, "pair_leg": False},
+        {"symbol": "FFF", "timeframe": "SWING", "qty": 9, "notional": 900.0, "risk": 450.0, "pair_leg": True}])
+    assert engine.open_risk_usd() == pytest.approx(50.0 + 40.0 + 15.0)
+
+
+def test_an_entry_booked_while_the_open_risk_is_read_counts_twice_never_not_at_all(engine, monkeypatch):
+    play, booked = _wide_play("AAA", stop=95.0), []                          # 10 shares, $50 at its stop
+    working = {"symbol": "AAA", "timeframe": "SWING", "qty": 10, "notional": 1000.0, "risk": 50.0, "pair_leg": False}
+    real = engine.repo.open_trades
+
+    def book():                                 # the order sync saves its record the moment after the first read
+        if not booked:
+            booked.append(_hold(engine, play, 10))
+
+    def trades():
+        out = real()
+        book()
+        return out
+
+    def entries():
+        out = [] if booked else [dict(working)]
+        book()
+        return out
+
+    monkeypatch.setattr(engine.repo, "open_trades", trades)
+    monkeypatch.setattr(engine, "working_entries", entries)
+    assert engine.open_risk_usd() == pytest.approx(100.0)                     # working, then in the records
+
+
+def test_a_new_play_is_sized_down_then_refused_as_the_open_risk_nears_its_ceiling(engine, monkeypatch):
+    engine._refresh_account()
+    risk = engine.settings.config.risk
+    for name, value in (("max_risk_per_trade_pct", 1.0), ("max_open_risk_pct", 4.0),
+                        ("max_position_pct_of_equity", 12.0)):
+        monkeypatch.setattr(risk, name, value)
+    monkeypatch.setattr(engine, "_play_risk_pct", lambda p: None)              # the configured 1%, not practice size
+    assert engine.set_capital(20_000)["ok"]                                    # $200 a trade, $800 open at most
+    play = _wide_play("AAA")                                                   # $20 a share at risk
+    engine.board.replace([play], None)
+    assert engine.assess_play(play.id)["order_preview"]["qty"] == 10           # nothing open: the risk budget decides
+
+    _hold(engine, _wide_play("BBB", stop=50.0), 15)                            # $750 at risk: $50 left
+    pre = engine.assess_play(play.id)
+    assert pre["order_preview"]["qty"] == 2 and pre["order_preview"]["est_risk"] == 40.0
+    assert "portfolio open-risk ceiling" in pre["order_preview"]["caps"]
+    engine._size_plays([play])
+    assert play.suggested_qty == 2                                             # the board's suggested size too
+
+    monkeypatch.setattr(engine, "working_entries", lambda: [                   # an entry sent a moment ago: $10 left
+        {"symbol": "CCC", "timeframe": "SWING", "qty": 2, "notional": 200.0, "risk": 40.0, "pair_leg": False}])
+    pre = engine.assess_play(play.id)
+    assert not pre["can_execute"] and pre["order_preview"]["qty"] == 0
+    assert any(r.startswith("the open trades and working entries already risk $790 of the $800") for r in pre["reasons"])
 
 
 def test_trading_capital_is_split_between_day_trades_and_swing_trades(engine):
@@ -1445,8 +2088,10 @@ def test_an_entry_never_chases_the_price_past_the_play(engine, monkeypatch):
     from autotradebot.core.models import Quote
 
     p = _play("AAPL")                                                       # entry 100, stop 95: 1R is 5
+    p.suggested_qty = 10                                                    # as the order preview sized it
     plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
     assert engine._chase_check(p, plan) is None                             # no price source: nothing to check
+    engine._refresh_account()                                               # read first, as approve_play does
     from types import SimpleNamespace
 
     engine.md.attach(SimpleNamespace(quotes_from_bars=False, name="fake"))   # a live quote source
@@ -1473,11 +2118,297 @@ def test_an_entry_never_chases_the_price_past_the_play(engine, monkeypatch):
     tape["px"], plan["limit_price"] = 99.0, 100.05                          # a pullback under the entry is no chase
     assert engine._chase_check(p, plan) is None and plan["limit_price"] == 100.05
     short = Play(symbol="MSFT", side=Side.SHORT, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
-                 timeframe=Timeframe.INTRADAY, entry=100.0, stop=105.0, targets=[90.0])
+                 timeframe=Timeframe.INTRADAY, entry=100.0, stop=105.0, targets=[90.0], suggested_qty=10)
     tape["px"] = 98.5                                                       # 0.3R below a short's entry
     assert "not chasing" in engine._chase_check(short, plan)
     tape["px"] = 99.5
     assert engine._chase_check(short, plan) is None and plan["limit_price"] == 99.45
+
+
+def _live_tape(engine, monkeypatch, px):
+    """A live quote source whose price a test sets in ``tape["px"]``, a cent either side for the bid and ask."""
+    from autotradebot.core.models import Quote
+
+    engine.md.attach(SimpleNamespace(quotes_from_bars=False, name="fake"))
+    tape = {"px": px}
+    monkeypatch.setattr(engine.md, "quote",
+                        lambda s: Quote(symbol=s, bid=tape["px"] - 0.01, ask=tape["px"] + 0.01, last=tape["px"]))
+    return tape
+
+
+def _plain_sizing(engine, monkeypatch):
+    """Sizing at the configured 1% risk on the $100,000 simulator account, with no strategy record to lower it."""
+    engine._refresh_account()
+    monkeypatch.setattr(engine, "_play_risk_pct", lambda p: None)
+    monkeypatch.setattr(engine, "strategy_risk_why", lambda key: None)
+
+
+def test_the_last_look_refuses_a_setup_already_through_its_stop(engine, monkeypatch):
+    p = _play("T07")                                                        # long: entry 100, stop 95
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    tape, seen = _live_tape(engine, monkeypatch, 94.5), {}
+    assert "the setup is void" in engine._chase_check(p, plan, seen)       # a pullback this deep is the move failing
+    assert seen["mid"] == 94.5 and plan["limit_price"] == 100.05            # the quote is still kept; nothing re-priced
+    tape["px"] = 95.0
+    assert "already through the stop 95.00" in engine._chase_check(p, plan)   # at the stop is through it
+    tape["px"] = 95.5
+    assert engine._chase_check(p, plan) is None                             # above it: a pullback, still a setup
+    short = _play("T08", side=Side.SHORT)
+    short.stop = 105.0
+    tape["px"] = 105.2
+    assert "the setup is void" in engine._chase_check(short, plan)
+
+
+def test_a_re_priced_entry_is_sized_again_at_its_limit(engine, monkeypatch):
+    _plain_sizing(engine, monkeypatch)
+    p = _play("T07")
+    p.targets = [112.0]                                                     # entry 100, stop 95, target 112
+    engine.board.replace([p])
+    assert engine.assess_play(p.id)["order_preview"]["qty"] == 120          # the 12% per-position cap at 100
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    _live_tape(engine, monkeypatch, 101.0)                                  # 0.2R past the entry
+    assert engine._chase_check(p, plan) is None and plan["limit_price"] == 101.05
+    # at 101.05 the stop is 6.05 away and the cap buys fewer shares: 118, risking 713.90 for 11,923.90
+    assert (p.suggested_qty, p.dollar_risk, p.notional, p.risk_per_share) == (118, 713.9, 11923.9, 6.05)
+    assert p.entry == 100.0                                                 # the play's own levels stay
+
+
+def test_a_re_priced_entry_that_sizes_to_nothing_is_refused(engine, monkeypatch):
+    _plain_sizing(engine, monkeypatch)
+    monkeypatch.setattr(engine.settings.config.risk, "max_position_pct_of_equity", 0.1005)   # $100.50 a position
+    p = _play("T07")
+    p.targets = [112.0]
+    engine.board.replace([p])
+    assert engine.assess_play(p.id)["order_preview"]["qty"] == 1            # one share at 100
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    _live_tape(engine, monkeypatch, 101.0)
+    why = engine._chase_check(p, plan)
+    assert "re-priced to 101.05, the position sizes to nothing" in why and "max position % of equity" in why
+    assert p.suggested_qty == 1 and plan["limit_price"] == 100.05           # a refusal leaves the play and the plan
+
+
+def test_a_re_priced_entry_is_held_to_the_reward_risk_floor_it_was_judged_by(engine, monkeypatch):
+    _plain_sizing(engine, monkeypatch)
+    assert (engine.autopilot.min_reward_risk, engine.settings.config.risk.min_reward_risk) == (2.0, 1.5)
+    p = _play("T07")
+    p.targets = [112.0]                                                     # 2.4 from the entry
+    engine.board.replace([p])
+    engine.assess_play(p.id)
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    _live_tape(engine, monkeypatch, 101.0)                                  # 101.05: (112 - 101.05) / 6.05 = 1.81
+    why = engine._chase_check(p, plan, operator="autopilot")
+    assert why == ("re-priced to 101.05, the entry's reward:risk to the first target 112.00 is only 1.81 - below "
+                   "Autopilot's minimum of 2 (autopilot.min_reward_risk)")
+    assert p.suggested_qty == 120 and plan["limit_price"] == 100.05         # refused before anything changed
+    assert engine._chase_check(p, plan) is None                             # a click: risk.min_reward_risk, 1.5
+    p.targets = [110.0]                                                     # (110 - 101.05) / 6.05 = 1.48
+    plan["limit_price"] = 100.05
+    assert "below the minimum of 1.5 (risk.min_reward_risk)" in engine._chase_check(p, plan)
+
+
+def test_an_approval_sends_the_size_re_priced_at_the_last_look_and_says_so(engine, monkeypatch):
+    _plain_sizing(engine, monkeypatch)
+    p, auto = _play("T07"), _play("T08")
+    p.targets = auto.targets = [112.0]
+    p.suggested_qty = auto.suggested_qty = 120                              # as the order preview sized them
+    engine.board.replace([p, auto])
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    monkeypatch.setattr(engine, "assess_play", lambda pid: {"ok": True, "can_execute": True, "reasons": [],
+                                                            "order_plan": dict(plan)})
+    sent = []
+
+    def execute(play, account, **kw):
+        sent.append((play.symbol, play.suggested_qty, kw["plan"]["limit_price"]))
+        return {"ok": True, "status": "SUBMITTED"}
+
+    monkeypatch.setattr(engine.executor, "execute_play", execute)
+    _live_tape(engine, monkeypatch, 101.0)
+    out = engine.approve_play(p.id)
+    assert out["ok"] and (out["qty"], out["est_risk"]) == (118, 713.9)
+    assert sent == [("T07", 118, 101.05)]
+    refused = engine.approve_play(auto.id, operator="autopilot")           # Autopilot's floor is 2: 1.81 is short of it
+    assert not refused["ok"] and "Autopilot's minimum of 2" in refused["reason"] and len(sent) == 1
+
+
+def test_an_entry_keeps_how_it_was_sized_and_which_limit_decided_it(engine, monkeypatch):
+    _plain_sizing(engine, monkeypatch)
+    assert engine.set_size_factor(1.5)["ok"]
+    p, repriced = _play("T07"), _play("T08")
+    p.targets = repriced.targets = [112.0]                                  # entry 100, stop 95, target 112
+    engine.board.replace([p, repriced])
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    assess = engine.assess_play                                             # its real sizing, whatever the clock says
+    monkeypatch.setattr(engine, "assess_play", lambda pid: {**assess(pid), "can_execute": True, "reasons": [],
+                                                            "order_plan": dict(plan)})
+    sent = {}
+
+    def execute(play, account, **kw):
+        sent[play.symbol] = kw["context"]
+        return {"ok": True, "status": "SUBMITTED"}
+
+    monkeypatch.setattr(engine.executor, "execute_play", execute)
+    assert engine.approve_play(p.id)["ok"]                                  # no price source: sent as previewed
+    sizing = p.evidence["at_entry"]["sizing"]
+    # 1.5% of $100,000 is $1,500 of risk, 300 shares at $5 a share; the 12% per-position cap allows 120 at 100
+    assert (sizing["qty"], sizing["est_risk"], sizing["size_factor"], sizing["decided_by"]) == (120, 600.0, 1.5,
+                                                                                               "per_position")
+    assert sizing["limits"]["risk_budget"] == {"pct": 1.5, "size_factor": 1.5, "usd": 1500.0, "shares": 300}
+    assert sizing["limits"]["per_position"] == {"pct": 12.0, "usd": 12000.0, "shares": 120}
+    assert "max position % of equity" in sizing["caps"] and "repriced_to" not in sizing
+    assert sent["T07"]["sizing"] == sizing                                  # the trade's own record
+    assert engine.repo.get_play(p.id)["evidence"]["at_entry"]["sizing"] == sizing
+
+    _live_tape(engine, monkeypatch, 101.0)                                  # re-priced to 101.05 and sized again there
+    assert engine.approve_play(repriced.id)["ok"]
+    again = repriced.evidence["at_entry"]["sizing"]
+    assert (again["qty"], again["est_risk"], again["repriced_to"], again["decided_by"]) == (118, 713.9, 101.05,
+                                                                                          "per_position")
+    assert again["limits"]["per_position"]["shares"] == 118 and sent["T08"]["sizing"] == again
+
+
+def test_a_re_priced_entry_never_sends_more_shares_than_the_preview_sized(engine, monkeypatch):
+    """A short re-priced under its entry: every dollar cap buys more at the lower price, but the order carries no
+    more shares than the preview showed - what a click confirmed and Autopilot's checks were made on."""
+    _plain_sizing(engine, monkeypatch)
+    short = _play("T09", side=Side.SHORT)
+    short.stop, short.targets = 105.0, [88.0]                               # entry 100, stop 105, target 88
+    engine.board.replace([short])
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 99.95, "order_session": "REGULAR"}
+    assess = engine.assess_play                                             # its real sizing, whatever the clock says
+    monkeypatch.setattr(engine, "assess_play", lambda pid: {**assess(pid), "can_execute": True, "reasons": [],
+                                                            "order_plan": dict(plan)})
+    sent = {}
+
+    def execute(play, account, **kw):
+        sent.update(qty=play.suggested_qty, limit=kw["plan"]["limit_price"], sizing=kw["context"]["sizing"])
+        return {"ok": True, "status": "SUBMITTED"}
+
+    monkeypatch.setattr(engine.executor, "execute_play", execute)
+    assert assess(short.id)["order_preview"]["qty"] == 120                  # the 12% per-position cap at 100
+    _live_tape(engine, monkeypatch, 99.0)                                   # 0.2R in the short's favour: 98.95
+    out = engine.approve_play(short.id)
+    # at 98.95 the cap would buy 121; the preview's 120 go, each risking the 6.05 to the stop
+    assert out["ok"] and (out["qty"], out["est_risk"]) == (120, 726.0)
+    assert (sent["qty"], sent["limit"]) == (120, 98.95) and (short.dollar_risk, short.notional) == (726.0, 11874.0)
+    sizing = sent["sizing"]
+    assert (sizing["qty"], sizing["est_risk"], sizing["est_cost"], sizing["decided_by"], sizing["repriced_to"]) == (
+        120, 726.0, 11874.0, "preview", 98.95)
+    assert sizing["limits"]["preview"] == {"shares": 120} and sizing["limits"]["per_position"]["shares"] == 121
+
+
+def test_a_re_priced_autopilot_entry_is_held_to_the_engines_floor_when_its_own_is_lower(engine, monkeypatch):
+    _plain_sizing(engine, monkeypatch)
+    monkeypatch.setattr(engine.autopilot, "min_reward_risk", 1.0)          # under risk.min_reward_risk, 1.5
+    p = _play("T07")                                                        # entry 100, stop 95, target 110: 2.0
+    engine.board.replace([p])
+    engine.assess_play(p.id)
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    _live_tape(engine, monkeypatch, 101.0)                                  # 101.05: (110 - 101.05) / 6.05 = 1.48
+    assert engine._chase_check(p, plan, operator="autopilot") == (
+        "re-priced to 101.05, the entry's reward:risk to the first target 110.00 is only 1.48 - below the minimum "
+        "of 1.5 (risk.min_reward_risk)")                                    # the floor assess_play held it to too
+    assert p.suggested_qty == 120 and plan["limit_price"] == 100.05
+
+
+def test_a_re_priced_entry_still_working_counts_its_risk_and_cost_at_its_limit(engine, monkeypatch):
+    from autotradebot.execution.executor import _Pending
+
+    _plain_sizing(engine, monkeypatch)
+    p = _play("T07")
+    p.targets = [112.0]
+    engine.board.replace([p])
+    engine.assess_play(p.id)
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    _live_tape(engine, monkeypatch, 101.0)
+    assert engine._chase_check(p, plan) is None and (p.suggested_qty, p.dollar_risk) == (118, 713.9)
+    engine.executor._pending["o1"] = _Pending("o1", p, "entry", qty=p.suggested_qty)   # sent, and working
+    working = engine.working_entries()[0]
+    # 118 shares from 101.05 to the stop at 95 - not from the play's entry at 100, which would read 590
+    assert working["risk"] == pytest.approx(713.9) and working["notional"] == pytest.approx(11923.9)
+    assert engine.open_risk_usd() == pytest.approx(p.dollar_risk)
+    assert engine.exposure_by_symbol()["T07"] == pytest.approx(11923.9)
+
+
+def test_assessing_a_sent_play_again_leaves_the_size_it_went_out_at(engine, monkeypatch):
+    """The dashboard assesses the play it shows again after an approval: a play already sent keeps its size - for
+    one the last look re-priced, the size at its limit, which its working entry's risk and cost are read off."""
+    from autotradebot.core.enums import PlayStatus
+    from autotradebot.execution.executor import _Pending
+
+    _plain_sizing(engine, monkeypatch)
+    p = _play("T07")
+    p.targets = [112.0]
+    engine.board.replace([p])
+    engine.assess_play(p.id)
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    _live_tape(engine, monkeypatch, 101.0)
+    assert engine._chase_check(p, plan) is None
+    p.status = PlayStatus.SUBMITTED
+    engine.executor._pending["o1"] = _Pending("o1", p, "entry", qty=p.suggested_qty)   # sent, and working
+    pre = engine.assess_play(p.id)
+    assert pre["already_executed"] and not pre["can_execute"]
+    assert (p.suggested_qty, p.dollar_risk, p.notional, p.risk_per_share) == (118, 713.9, 11923.9, 6.05)
+    assert (pre["order_preview"]["qty"], pre["order_preview"]["est_risk"]) == (118, 713.9)   # what went out
+    assert engine.working_entries()[0]["risk"] == pytest.approx(713.9)       # not 590, from the play's entry
+    assert engine.open_risk_usd() == pytest.approx(713.9)
+
+
+def test_open_trades_that_cant_be_read_size_nothing_rather_than_everything(engine, monkeypatch):
+    _plain_sizing(engine, monkeypatch)
+    p = _play("T07")
+    p.targets = [112.0]
+    engine.board.replace([p])
+    assert engine.assess_play(p.id)["order_preview"]["qty"] == 120
+
+    def locked():
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(engine.repo, "open_trades", locked)
+    assert engine.open_risk_usd() is None                                   # unknown, not nothing
+    pre = engine.assess_play(p.id)
+    assert not pre["can_execute"] and pre["order_preview"]["qty"] == 0
+    assert any(r.startswith("the open trades couldn't be read, so the risk already open is unknown")
+               for r in pre["reasons"])
+    engine._size_plays([p])
+    assert p.suggested_qty == 0                                             # the board suggests nothing either
+    p.suggested_qty = 120                                                   # as previewed before the reads failed
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    _live_tape(engine, monkeypatch, 101.0)
+    assert "can't be sized again: the open trades couldn't be read" in engine._chase_check(p, plan)
+    assert p.suggested_qty == 120 and plan["limit_price"] == 100.05
+
+
+def test_a_play_refused_only_for_want_of_room_under_the_open_risk_ceiling_is_transient(engine, monkeypatch):
+    """Room frees as trades close and a failed read is tried again: such a refusal, alone, says so - Autopilot
+    asks again on its next pass instead of dropping the play for the day. Any other reason beside it doesn't."""
+    engine._refresh_account()
+    engine._check_arm()                                                     # paper: armed, as the snapshot loop does
+    monkeypatch.setattr(clock, "current_session", lambda ts=None: clock.Session.REGULAR)   # a session to price in
+    risk = engine.settings.config.risk
+    for name, value in (("max_risk_per_trade_pct", 1.0), ("max_open_risk_pct", 4.0),
+                        ("max_position_pct_of_equity", 12.0)):
+        monkeypatch.setattr(risk, name, value)
+    monkeypatch.setattr(engine, "_play_risk_pct", lambda p: None)
+    assert engine.set_capital(20_000)["ok"]                                 # $200 a trade, $800 open at most
+    play = _wide_play("AAA")
+    engine.board.replace([play], None)
+    pre = engine.assess_play(play.id)
+    assert pre["can_execute"] and not pre["transient"]
+
+    _hold(engine, _wide_play("BBB", stop=50.0), 16)                         # $800 at risk: the ceiling is full
+    pre = engine.assess_play(play.id)
+    assert not pre["can_execute"] and pre["transient"] and len(pre["reasons"]) == 1
+    play.targets = [110.0]                                                  # and a reward:risk of 0.5 besides
+    pre = engine.assess_play(play.id)
+    assert not pre["can_execute"] and not pre["transient"]
+    play.targets = [140.0]
+
+    def locked():
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(engine.repo, "open_trades", locked)
+    pre = engine.assess_play(play.id)
+    assert not pre["can_execute"] and pre["transient"]
 
 
 def test_autopilot_takes_only_what_the_filters_and_its_own_boxes_both_allow(engine):
@@ -1796,6 +2727,27 @@ def test_the_streams_go_to_the_positions_first_then_the_plays_still_on_offer(eng
     assert engine._resync_streams() == [] and gateway.streams == []
 
 
+def test_an_approval_the_broker_didnt_answer_in_time_stays_sent_and_is_never_sent_again(engine, monkeypatch):
+    from autotradebot.core.enums import PlayStatus
+
+    p = _play("T06")
+    engine.board.replace([p])
+    monkeypatch.setattr(engine, "assess_play",
+                        lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
+    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen, **kw: None)
+
+    def unanswered(play, account, **kw):                                    # as the executor answers it
+        engine.executor._note(play, PlayStatus.SUBMITTED)
+        return {"ok": False, "sent_unknown": True, "reason": "IBKR didn't answer the order in time"}
+
+    monkeypatch.setattr(engine.executor, "execute_play", unanswered)
+    out = engine.approve_play(p.id)
+    assert not out["ok"] and out["sent_unknown"]
+    assert p.status is PlayStatus.SUBMITTED and engine.repo.get_play(p.id)["status"] == "SUBMITTED"   # not offered again
+    again = engine.approve_play(p.id)
+    assert not again["ok"] and again["already_executed"]
+
+
 def test_new_plays_and_an_approval_wake_the_stream_loop_and_stopping_ends_it(engine, monkeypatch):
     engine._stream_wake.clear()
     engine._publish_plays()
@@ -1805,7 +2757,7 @@ def test_new_plays_and_an_approval_wake_the_stream_loop_and_stopping_ends_it(eng
     engine.board.replace([p])
     monkeypatch.setattr(engine, "assess_play",
                         lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
-    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen: None)
+    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen, **kw: None)
     monkeypatch.setattr(engine.executor, "execute_play", lambda p, account, **kw: {"ok": True, "status": "SUBMITTED"})
     engine._stream_wake.clear()
     assert engine.approve_play(p.id)["ok"] and engine._stream_wake.is_set()   # its stock streams from the next pass
@@ -1823,7 +2775,9 @@ def test_an_entry_is_priced_off_a_fresh_stream_else_a_snapshot_and_the_log_says_
     gateway = fakes.StreamingGateway(fakes.SYMBOLS, delayed=True)
     gateway.connect()
     engine.md.attach(gateway)
+    engine._refresh_account()                                               # a re-priced entry is sized again on it
     p = _play("T01")                                                        # entry 100, stop 95: 1R is 5
+    p.suggested_qty = 10                                                    # as the order preview sized it
     plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
     seen = {}
     engine._chase_check(p, plan, seen)                                      # delayed data: a candle, as before
@@ -2122,6 +3076,24 @@ def test_each_open_position_says_what_rests_at_the_broker_to_close_it(engine):
     assert engine.snapshot()["exit_manager"]["intraday_time_stop"] is True     # the countdown shows only while it's on
 
 
+def test_a_swing_position_says_when_its_time_stop_closes_it_in_trading_days(engine, monkeypatch):
+    # the dashboard has no holiday calendar: the server counts the sessions, as the exit manager does - ten from a
+    # Thursday entry with Labor Day in between end on the second Thursday after, at the day trades' flatten
+    rules = engine.settings.config.exit_manager
+    monkeypatch.setattr(rules, "max_swing_hold_days", 10)
+    monkeypatch.setattr(rules, "flatten_intraday_before_close_min", 10)
+    held, by_hand = _open(engine, "AAA"), _open(engine, "BBB")
+    engine.repo.update_trade_risk(by_hand, managed_exit=False)
+    stored = engine.repo.open_trades
+    monkeypatch.setattr(engine.repo, "open_trades",
+                        lambda: [{**t, "entry_time": "2026-09-03T13:40:00"} for t in stored()])
+    rows = {t["id"]: t for t in engine.open_positions()}
+    assert dt.datetime.fromisoformat(rows[held]["time_stop_at"]) == dt.datetime(2026, 9, 17, 15, 50, tzinfo=clock.NY)
+    assert rows[by_hand]["time_stop_at"] is None                    # exits by hand: no time stop closes it
+    monkeypatch.setattr(rules, "enabled", False)                    # automatic exits off
+    assert {t["time_stop_at"] for t in engine.open_positions()} == {None}
+
+
 # ---------------------------------------------------------------- what became of a play, in the play log
 def test_the_executor_tells_autopilot_about_an_entry_that_bought_nothing_even_after_a_switch(engine):
     assert engine.executor.on_entry_unfilled == engine.autopilot.entry_unfilled
@@ -2212,7 +3184,7 @@ def test_a_click_is_answered_once_the_order_is_out_and_autopilot_still_reads_the
     engine.board.replace([web, auto])
     monkeypatch.setattr(engine, "assess_play",
                         lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
-    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen: None)
+    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen, **kw: None)
     monkeypatch.setattr(engine.executor, "execute_play", lambda p, account, **kw: {"ok": True, "status": "SUBMITTED"})
     reads, read_now = [], threading.Event()
 
@@ -2286,6 +3258,65 @@ def test_any_scan_on_a_newer_candle_confirms_a_day_play_and_the_setting_turns_it
     engine._run_scan("cycle")
     engine._run_scan("cycle")
     assert count() == 4
+
+
+def test_a_day_play_reaching_autopilots_confirmations_is_stamped_and_logged_with_it(engine, monkeypatch):
+    """The scans stamp the moment a day play's confirmations reach Autopilot's minimum - when Autopilot would
+    take it - and the play-log row carries it, so the review follows a play not taken from then."""
+    import pandas as pd
+    from autotradebot.scanner.scanner import ScanResult
+
+    engine.autopilot.enabled, engine.autopilot.min_confirmations = False, 3
+    opened = pd.Timestamp("2026-03-02 10:00", tz="America/New_York")
+    candle = {"at": 0}
+
+    def seen(fast=False):
+        p = _play("AAA")
+        p.timeframe = Timeframe.INTRADAY
+        p.evidence["bar_at"] = (opened + pd.Timedelta(minutes=candle["at"])).isoformat()
+        return ScanResult(kind="cycle", symbols=["AAA"], plays=[p])
+
+    monkeypatch.setattr(engine.scanner, "run_cycle", seen)
+    for at in (0, 5):
+        candle["at"] = at
+        engine._run_scan("cycle")
+    [p] = engine.board.plays.values()
+    assert p.confirmations == 2 and "confirmed_at" not in p.evidence       # Autopilot asks for three
+    candle["at"] = 10
+    engine._run_scan("cycle")
+    [p] = engine.board.plays.values()
+    stamped = p.evidence["confirmed_at"]
+    assert p.confirmations == 3 and p.evidence["as_confirmed"]["confirmations"] == 3
+    assert engine.repo.get_play(p.id)["evidence"]["confirmed_at"] == stamped
+    candle["at"] = 15
+    engine._run_scan("cycle")
+    assert engine.repo.get_play(p.id)["evidence"]["confirmed_at"] == stamped   # the first time it got there
+
+
+def test_a_last_look_that_refuses_an_entry_is_kept_with_its_play(engine, monkeypatch):
+    """The quote a refusing last look read is logged with the play - the review charges the spread it saw -
+    and the first refusal is the one kept."""
+    p = _play("T07")
+    engine.board.replace([p])
+    monkeypatch.setattr(engine, "assess_play",
+                        lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
+    quotes = iter([(99.9, 100.1), (99.0, 101.0)])
+
+    def refuse(play, plan, seen, **_):
+        bid, ask = next(quotes)
+        seen.update(mid=(bid + ask) / 2, bid=bid, ask=ask, spread_bps=round((ask - bid) / 100.0 * 1e4, 2))
+        return "the spread is too dear to cross"
+
+    monkeypatch.setattr(engine, "_chase_check", refuse)
+    monkeypatch.setattr(engine.executor, "execute_play", lambda *a, **k: pytest.fail("a refused entry never goes out"))
+    out = engine.approve_play(p.id, operator="autopilot")
+    assert not out["ok"] and out["reason"] == "the spread is too dear to cross"
+    look = engine.repo.get_play(p.id)["evidence"]["last_look"]
+    assert (look["by"], look["why"], look["bid"], look["ask"], look["spread_bps"]) == (
+        "autopilot", "the spread is too dear to cross", 99.9, 100.1, 20.0)
+    assert not engine.approve_play(p.id)["ok"]                              # a second refusal...
+    assert engine.repo.get_play(p.id)["evidence"]["last_look"] == look      # ...leaves the first
+    assert engine.repo.get_play(p.id)["status"] == "PROPOSED"
 
 
 def test_the_strategies_panel_says_when_a_day_setup_fires_on_one_candle(engine, monkeypatch):

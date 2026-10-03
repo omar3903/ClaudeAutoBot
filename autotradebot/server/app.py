@@ -226,7 +226,7 @@ def create_app(engine_factory: Callable[[Settings], TradingEngine] = TradingEngi
 
     @app.get("/api/pnl")
     def pnl():
-        return eng().repo.pnl_summary()
+        return eng().pnl_summary()
 
     # ---- account and routing -------------------------------------------- #
     @app.post("/api/account/refresh")

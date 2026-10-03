@@ -75,7 +75,8 @@ IBKR_STEPS = (
     "After-hours trading has ended at 8:00 PM, IBKR's nightly maintenance (about 11:45 PM–12:45 AM ET) "
     "hasn't started, and pre-market (4:00 AM) and the pre-market scan are hours away. The app rides "
     "through it: it waits, reconnects, and checks positions only once the account has reloaded. IBKR still "
-    "asks for a full login about once a week - the app tells you when the Gateway has been gone 10 minutes. For hands-off logins, run it through "
+    "asks for a full login about once a week - the app tells you when the Gateway has been gone 10 minutes, and "
+    "again at 07:45 ET on a trading day if it's still gone. For hands-off logins, run it through "
     "IBC (github.com/IbcAlpha/IBC).",
     "Click Test paper (or Test live). There's no token to store - IBKR's login is the running Gateway, "
     "and the app connects by itself as soon as the Gateway answers.",

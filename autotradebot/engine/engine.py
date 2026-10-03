@@ -29,13 +29,15 @@ Whatever the user changes on the dashboard applies straight away, is
 remembered in data/runtime.json (runtime.py) and is broadcast to every tab.
 
 Safety rules: no order without :meth:`approve_play` (or Autopilot, inside its
-caps); no venue change while positions are open on the current one; while
+caps); no venue change while positions are open on the current one, and none
+because a connection failed (its orders are refused until it's back); while
 quitting with positions open, nothing but exits may change; and an OPEN trade
 record is deleted only when a connected broker confirms the position is gone
 (reconcile.py).
 """
 
 
+import dataclasses
 import datetime as dt
 import itertools
 import logging
@@ -64,14 +66,14 @@ from ..data.sectors import sector_allowed
 from ..data.symbols import SymbolMaster
 from ..execution.autopilot import AutoPilot
 from ..execution.executor import Executor
-from ..execution.exit_manager import ExitManager, scale_out_plan
+from ..execution.exit_manager import ExitManager, scale_out_plan, swing_time_stop_at
 from ..execution.order_builder import plan_order
 from ..execution.protective_stops import TAG as STOP_TAG, TARGET_TAG, stop_exit_reason
 from ..indicators import ta
 from ..persistence.db import init_db
 from ..persistence.repository import Repository
 from ..risk.pdt_guard import PdtGuard
-from ..risk.position_sizing import liquidity_cap, size_play
+from ..risk.position_sizing import SizingResult, liquidity_cap, size_play
 from ..research.features import play_features
 from ..research.model import Scorer, risk_factor
 from ..research.history import IntradayHistory
@@ -87,8 +89,9 @@ from .chart import (INTRADAY_MAX_SESSIONS, TRADE_CANDLES_TTL_S, candle_request, 
 from .market_regime import MarketRegime
 from ..scanner.noise import LABELS as NOISE_LABELS
 from ..scanner import schedule
+from ..scanner.evaluator import prev_close_known
 from ..scanner.filters import TradeFilters
-from ..scanner.scanner import Scanner, ScanResult
+from ..scanner.scanner import BENCHMARK, Scanner, ScanResult
 from ..scanner.schedule import ScanSettings
 from ..strategies.registry import REGISTRY, build_strategies, strategy_catalog
 from ..util import clock
@@ -102,7 +105,7 @@ from .journal_ops import JournalOps
 from .pairs_ops import PairsOps
 from .capital_ops import CapitalOps
 from .quit_ops import QuitOps
-from .connections import Connections
+from .connections import Connections, Unreachable
 from .reconcile import PositionCheck
 from .runtime import (RuntimeFile, load_capital, load_capital_mode, load_day_trade_pct, load_filters,
                       load_position_pct, load_size_factor, load_strategy_overrides)
@@ -120,6 +123,9 @@ LIVE_MODE_OFF = ("Live trading is switched off. To allow it, set  account.allow_
 #: the session a price was traded in, as a stock's price line says it
 SESSION_WORDS = {clock.Session.PRE: "pre-market", clock.Session.REGULAR: "regular",
                  clock.Session.POST: "after-hours", clock.Session.CLOSED: "closed"}
+#: why an entry is refused while the open trades can't be read (open_risk_usd)
+OPEN_RISK_UNREAD = ("the open trades couldn't be read, so the risk already open is unknown - nothing is sized "
+                    "until they can be")
 
 
 def tick_exit_wait(now: float, last_exit: float, deadline: float, gap: float) -> Tuple[float, bool]:
@@ -276,6 +282,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._gateway_seen_up = False
         self._gateway_down_at: Optional[float] = None
         self._gateway_alerted = False
+        #: when (New York time) the Gateway was last seen go down, and the day it was last said to be down still at
+        #: scanner.gateway_alert_time (_say_gateway_late)
+        self._gateway_down_since: Optional[dt.datetime] = None
+        self._gateway_late_on: Optional[dt.date] = None
         self._account: Optional[Account] = None
         self._account_at = 0.0
         self._account_warned_at = float("-inf")     # the last time a failing account read was logged
@@ -322,6 +332,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         # guards the queue only - it is never held across a request, the scanner, the board or Autopilot
         self._close_lock = threading.Lock()
         self._close_due: Optional[Tuple[dt.datetime, float]] = None   # the 5-minute close, and the monotonic time due
+        self._close_only: Optional[List[str]] = None       # ...the stocks its second ask is for (None = the whole tier)
         self._movers_due: Dict[str, dt.datetime] = {}      # early movers to check: the minute each was found in
         self._mover_why: Dict[str, str] = {}               # ...and why, for the check's log line
         self._mover_at: Dict[str, float] = {}              # when each stock was last queued as a mover (epoch)
@@ -409,23 +420,33 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     # ------------------------------------------------------------------ #
     #  Where orders go                                                   #
     # ------------------------------------------------------------------ #
-    def _bind(self) -> None:
-        """Hold the Gateway connection the switches need and point order handling
-        at the right broker. Live falls back to paper when it can't connect."""
+    def _bind(self, fall_back: bool = False) -> None:
+        """Hold the Gateway connection the switches need and point order handling at the right broker. An IBKR
+        account that can't be connected keeps the orders all the same - they are refused until it answers
+        (Connections.unreachable) and the background retry connects it, so a failed connect never sends them to the
+        simulator, or to paper, in its place. Only a switch to Live (``fall_back``) is undone instead: back to paper."""
         plan = plan_venue(self.mode, self.paper_platform)
         ibkr = self.connections.ensure(plan)
         if self.mode == "live" and ibkr is None:
             self._live_blockers = list(self.connections.blockers)
-            log.warning("falling back to paper - your live IBKR account isn't reachable: %s",
-                        "; ".join(self._live_blockers))
-            self.mode = "paper"
-            self._bind()
-            return
-        if self.mode == "live":
+            if fall_back:
+                log.warning("falling back to paper - your live IBKR account isn't reachable: %s",
+                            "; ".join(self._live_blockers))
+                self.mode = "paper"
+                self._bind()
+                return
+        elif self.mode == "live":
             self._live_blockers = []
 
-        if plan.trade and ibkr is not None:
+        if plan.trade:
             broker, venue = ibkr, venue_id(plan)
+            if ibkr is None:
+                again = isinstance(self._broker, Unreachable) and self._venue == venue     # a retry that failed
+                broker = self.connections.unreachable(plan)
+                log.log(logging.DEBUG if again else logging.WARNING,
+                        "%s isn't reachable - orders stay pointed at it and are refused until it's back (none go to "
+                        "the simulator in its place): %s", venue_label(venue),
+                        "; ".join(self.connections.blockers) or "not connected")
         else:
             broker, venue = self.connections.simulator(), "paper"
         if broker is not self._broker:
@@ -433,7 +454,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._broker, self._venue = broker, venue
 
         cfg = self.settings.config
-        self.pdt = PdtGuard(cfg.account, trade_repo=self.repo, paper=self.mode == "paper")
+        self.pdt = PdtGuard(cfg.account, trade_repo=self.repo, paper=self.mode == "paper", venue=venue)
         if self.executor is None:
             self.executor = Executor(broker, self.repo, cfg.execution, bus=BUS, venue=venue)
             self.executor.scale_out = 0.0 < float(getattr(cfg.exit_manager, "scale_out_pct", 0.0) or 0.0) < 100.0
@@ -446,16 +467,22 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         # a later order sync; either way Autopilot hears of the entries it sent (on_entries_adopted)
         self.executor.adopt_working_orders()
         self.exit_manager = ExitManager(self.repo, self.executor, quote_fn=self.md.quote,
-                                        cfg=cfg.exit_manager, bus=BUS, venue=venue)
+                                        cfg=cfg.exit_manager, bus=BUS, venue=venue,
+                                        quotes_live=lambda: not bool(getattr(self.md, "delayed", True)))
         self.position_check.reset()
 
     def _retry_connection(self, force: bool = False) -> bool:
         """Connect the account the switches want once it's reachable - IB Gateway
-        started after the app, say. Never touches Live (a live switch that couldn't
-        connect already put you back on paper), never acts while quitting, and
-        never moves orders away from open positions."""
+        started after the app, say. Never switches to Live (a live switch that couldn't
+        connect already put you back on paper), never moves orders while quitting, and
+        never moves orders away from open positions. The account orders already go to,
+        refused while it was away (_bind), is connected on Live and while quitting too:
+        that moves nothing."""
         plan = plan_venue(self.mode, self.paper_platform)
-        if self.mode == "live" or self.quit_state or self.connections.holds(plan):
+        if self.connections.holds(plan):
+            return False
+        waiting = plan.trade and self._venue == venue_id(plan)       # its orders are refused until it's back
+        if not waiting and (self.mode == "live" or self.quit_state):
             return False
         now = time.monotonic()
         if not force and now < self._connect_retry_at:
@@ -469,10 +496,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return False                                  # a switch is running; try next time
         try:
             target = venue_id(plan) if plan.trade else self._venue
-            if target == self._venue:
+            if target == self._venue and not waiting:
                 ok = self.connections.ensure(plan) is not None     # prices only - orders stay put
             else:
-                blocked = self._switch_blocked(target)
+                blocked = self._switch_blocked(target)             # (none when waiting: the venue doesn't change)
                 if blocked:
                     self.connections.blockers = [f"{venue_label(target)} is reachable, but orders can't "
                                                  f"move there yet. {blocked}"]
@@ -498,15 +525,18 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     #: after this long without IB Gateway, the dashboard is told what to check
     GATEWAY_DOWN_ALERT_S = 600.0
 
-    def _watch_gateway(self) -> None:
+    def _watch_gateway(self, at: Optional[dt.datetime] = None) -> None:
         """Say when IB Gateway drops and when it's back - its nightly restart, IBKR's maintenance - and,
-        once it has been gone a while, what to check. Positions are only trusted again once the account
-        has settled (see _reconcile_open_trades)."""
+        once it has been gone a while, what to check; and on a trading day, when it's still gone at
+        scanner.gateway_alert_time (_say_gateway_late). Positions are only trusted again once the account
+        has settled (see _reconcile_open_trades). ``at``: the time in New York now (tests)."""
         up, now = self.connections.connected, time.monotonic()
+        wall = (at or clock.now_ny()).astimezone(clock.NY)
         if self._gateway_up is None or up == self._gateway_up:
             if self._gateway_up is None:
                 self._gateway_up, self._gateway_seen_up = up, up
                 self._gateway_down_at = None if up else now
+                self._gateway_down_since = None if up else wall
             elif (not up and self._gateway_down_at is not None and not self._gateway_alerted
                   and now - self._gateway_down_at >= self.GATEWAY_DOWN_ALERT_S):
                 self._gateway_alerted = True
@@ -515,16 +545,17 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                         "by itself. Until then there are no prices, and no automatic exits.")
                 log.warning(note)
                 self._publish("broker.down", note=note)
+            self._say_gateway_late(up, wall)
             return
         self._gateway_up = up
         if not up:
-            self._gateway_down_at, self._gateway_alerted = now, False
+            self._gateway_down_at, self._gateway_alerted, self._gateway_down_since = now, False, wall
             if self._gateway_seen_up:
                 log.warning("IB Gateway disconnected - reconnecting by itself")
                 self._publish("broker.disconnected", note=("IB Gateway disconnected - its nightly restart or IBKR's "
                                                          "maintenance. The app reconnects by itself."))
             return
-        down_for, self._gateway_down_at = now - (self._gateway_down_at or now), None
+        down_for, self._gateway_down_at, self._gateway_down_since = now - (self._gateway_down_at or now), None, None
         if not self._gateway_seen_up:
             self._gateway_seen_up = True                  # the first connection is announced by _retry_connection
             return
@@ -533,6 +564,30 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         log.warning("IB Gateway is back after %s", duration(down_for))
         self._publish("broker.reconnected", state=self.snapshot(),
                     note=f"IB Gateway is back after {duration(down_for)}.")
+
+    def _say_gateway_late(self, up: bool, at: dt.datetime) -> bool:
+        """On a trading day, IB Gateway gone since before scanner.gateway_alert_time (ET) and still gone at it - a
+        nightly restart that never came back, the weekly login IBKR wants - is said once that day, so it can be put
+        right before the full scan needs it. The alert of a drop the night before came while no one was looking;
+        one that starts after that time is GATEWAY_DOWN_ALERT_S's to say. Returns whether it was said."""
+        raw = self.settings.config.scanner.gateway_alert_time
+        day = at.date()
+        if (up or not raw or self._gateway_down_since is None or self._gateway_late_on == day
+                or not clock.is_trading_day(day)):
+            return False
+        due = dt.datetime.combine(day, dt.time.fromisoformat(raw), tzinfo=clock.NY)
+        if at < due or self._gateway_down_since > due:
+            return False
+        self._gateway_late_on = day
+        scan = self.scan_settings.full_scan_time
+        before = f" The full scan is due at {scan:%H:%M}." if at.time() < scan else ""
+        note = (f"IB Gateway still isn't connected at {at:%H:%M} ET, on a trading day - it has been gone since "
+                f"{self._gateway_down_since:%a %H:%M}.{before} If it's asking you to log in - IBKR wants a full login "
+                "about once a week - log in again; the app reconnects by itself. Until then there are no prices, no "
+                "scans and no automatic exits.")
+        log.warning(note)
+        self._publish("broker.down", note=note)
+        return True
 
     def _open_trades(self) -> List[Dict[str, Any]]:
         try:
@@ -549,16 +604,23 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         orders the executor keeps resting at the broker for it (Executor.protective_stops / resting_targets -
         the ones it placed and follows, the same the exit manager leaves the target to), and whether this venue
         rests them at all (``native``: IBKR does; on the simulator the app watches the price itself). None for
-        a trade held on another venue: nothing is placed for it while it's parked."""
+        a trade held on another venue: nothing is placed for it while it's parked. A swing trade the time stop
+        will close also has ``time_stop_at``, when it falls due (exit_manager.swing_time_stop_at): trading days,
+        which the dashboard can't count without the holiday calendar."""
         ex = self.executor
         native = bool(ex is not None and ex.native_stops_on())
         stops = {s["trade_id"]: s for s in ex.protective_stops()} if ex is not None else {}
         targets = {s["trade_id"]: s for s in ex.resting_targets()} if ex is not None else {}
+        rules = self.settings.config.exit_manager
+        hold = int(rules.max_swing_hold_days or 0) if rules.enabled else 0
         trades = self.repo.open_trades()
         for t in trades:
             here = (t.get("broker") or "paper") == self._venue
             t["protection"] = ({"native": native, "stop": stops.get(t["id"]), "target": targets.get(t["id"])}
                                if here else None)
+            due = (swing_time_stop_at(t.get("entry_time"), hold, float(rules.flatten_intraday_before_close_min or 0))
+                   if t.get("timeframe") == "SWING" and t.get("managed_exit", True) else None)
+            t["time_stop_at"] = due.isoformat() if due else None
         return trades
 
     def working_entries(self) -> List[Dict[str, Any]]:
@@ -578,6 +640,39 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def gross_exposure(self) -> float:
         return sum(self.exposure_by_symbol().values())
+
+    def open_risk_usd(self) -> Optional[float]:
+        """The risk already at work on the account orders go to, in US dollars - what risk.max_open_risk_pct caps,
+        so sizing (size_play's open_risk_used) gives a new trade only what's left under that ceiling. An open trade
+        risks the distance from its entry to the stop it was opened with, times its shares - a stop moved since
+        doesn't hand its risk back; an entry order still working risks what it was sized for. Pair legs are left
+        out: their stops are placeholders, the desk closes the legs together. A trade's prices are dollars and so
+        is the account sizing sees (Account: US stocks are sized in dollars), so nothing needs converting.
+        None when the open trades can't be read: no trades read would hand a new trade the whole ceiling, so the
+        callers size nothing instead (_risk_used). The working entries are read first: one whose fill the order sync
+        books in between is then counted twice - working, and in the records - rather than not at all."""
+        working = sum(float(w.get("risk") or 0.0) for w in self.working_entries() if not w.get("pair_leg"))
+        try:
+            opens = self.repo.open_trades()
+        except Exception:  # noqa: BLE001
+            log.debug("could not read the open trades for the open risk", exc_info=True)
+            return None
+        total = 0.0
+        for t in opens:
+            if t.get("pair_id") or (t.get("broker") or "paper") != self._venue:
+                continue
+            entry = float(t.get("entry_price") or 0.0)
+            stop = float(t.get("initial_stop_price") or t.get("stop_price") or 0.0)
+            if entry and stop:
+                total += abs(entry - stop) * abs(float(t.get("quantity") or 0.0))
+        return total + working
+
+    def _risk_used(self, open_risk: Optional[float], sized_on: Account) -> float:
+        """open_risk_usd() as sizing takes it: when the open trades couldn't be read (None), the whole open-risk
+        ceiling of ``sized_on`` - no room for a new trade, rather than all of it."""
+        if open_risk is not None:
+            return open_risk
+        return float(sized_on.equity) * float(self.settings.config.risk.max_open_risk_pct) / 100.0
 
     def active_orders(self, max_age_s: Optional[float] = None) -> Dict[str, Any]:
         """The orders still working at the broker orders go to, and what each is for (see
@@ -677,7 +772,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             if blocked:
                 return {"ok": False, "reason": blocked}
             prev, self.mode = self.mode, mode
-            self._bind()                                   # knocks mode back to paper if live isn't reachable
+            self._bind(fall_back=True)                     # knocks mode back to paper if live isn't reachable
             if mode == "live" and self.mode != "live":
                 return {"ok": False, "reason": "Your live IBKR account isn't reachable.",
                         "blockers": self._live_blockers}
@@ -717,7 +812,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         state = self._venue_state()
         problems = self.connections.blockers or (self._live_blockers if prev != self.mode else [])
         if problems:
-            return {"ok": False, "reason": "; ".join(problems), "venue": state}
+            refused = self._venue != "paper" and not self.connections.connected      # orders wait for it (_bind)
+            return {"ok": False, "venue": state,
+                    "reason": "; ".join(problems) + (" - no order goes out until it's back." if refused else "")}
         return {"ok": True, "venue": state,
                 "note": f"Connected - {'live' if self.mode == 'live' else 'paper'} orders go to "
                         f"{venue_label(self._venue)}."}
@@ -834,7 +931,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _next_scan_wait(self) -> float:
         """How long the scan loop waits before its next pass: 5 s, or until a candle-close check is due if that
-        is sooner - so the check starts CLOSE_GRACE_S after the close without the candle thread sleeping."""
+        is sooner - so the check starts scanner.close_grace_s after the close (and its second ask CLOSE_RETRY_S
+        after it read) without the candle thread sleeping."""
         with self._close_lock:
             due = self._close_due
         return 5.0 if due is None else max(0.0, min(5.0, due[1] - time.monotonic()))
@@ -1035,13 +1133,14 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             except Exception:  # noqa: BLE001
                 log.exception("live candles: the minute roll failed")
 
-    #: the candle-close check starts this long after a 5-minute close, so IBKR has finished the bar
-    CLOSE_GRACE_S = 2.0
     #: a check that can't start within this long of its close is dropped - a long scan held the thread; the fast
     #: cycle and the next close cover it
     CLOSE_STALE_S = 60.0
     #: no stock is asked for its bars by two checks within this long: IBKR refuses identical requests within 15 s
     CLOSE_ASK_GAP_S = 15.0
+    #: the stocks whose new bar a check at a close (it starts scanner.close_grace_s after it) didn't find are asked
+    #: once more this long after it read - no sooner than IBKR's 15 s rule lets the same request go again
+    CLOSE_RETRY_S = 15.0
     #: a stock is queued as an early mover at most this often
     MOVER_EVERY_S = 300.0
     #: a new high or low of the day counts as a move on this many times the stream's mean minute volume...
@@ -1052,8 +1151,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def _on_minute(self, minute: float) -> Dict[str, Candle]:
         """The minute ending at ``minute`` (epoch seconds) is over: close its live candles, and the 5-minute ones
         on a :00/:05... boundary. Then, in regular hours on real-time data, queue the candle-close check at a
-        5-minute close (due CLOSE_GRACE_S later, over the whole watch tier) or, between closes, the watch stocks
-        whose minute was a move (_find_movers), and wake the scan loop. Here on the candle thread it only reads
+        5-minute close (due scanner.close_grace_s later, over the whole watch tier) or, between closes, the watch
+        stocks whose minute was a move (_find_movers), and wake the scan loop. Here on the candle thread it only reads
         and queues: the scan thread fetches the bars, runs the setups and lets Autopilot enter. Returns {symbol:
         the 1-minute candle just closed}."""
         closed = self.md.candles.roll(minute)
@@ -1071,8 +1170,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             movers = self._find_movers(closed, watch, at)
         queued = boundary
         with self._close_lock:
-            if boundary:
-                self._close_due = (at, time.monotonic() + self.CLOSE_GRACE_S)
+            if boundary:                                 # it covers the last close's second ask, if still due
+                self._close_due = (at, time.monotonic() + float(cfg.scanner.close_grace_s))
+                self._close_only = None
             if movers:
                 self._mover_at = {s: t for s, t in self._mover_at.items() if minute - t < self.MOVER_EVERY_S}
             for symbol, why in movers.items():
@@ -1159,13 +1259,15 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def _live_scan_once(self, now: Optional[dt.datetime] = None) -> List[str]:
         """One round of IBKR's live scans (LIVE_SCAN_CODES, one after another): their names interleaved by rank -
         each scan's first, then each one's second... - that SymbolMaster calls ordinary tradable shares, in a sector
-        the filters allow, with daily candles (the morning's download covers every tradable listing), not on the
-        hot list already and not found too thin today (_thin_live_names). The first scanner.live_scan of them take
-        watch-tier slots right after the hot list (Scanner.set_live_names), so a stock too quiet for the morning's
-        ranking is streamed and checked once it moves. Names never seen before are looked up first, LIVE_LOOKUPS a
-        round, and kept in symbols.json. Only in regular hours on real-time data, with today's watchlist and the
-        watch tier on, and not while quitting - otherwise nothing is asked and the names held are let go. Returns
-        the names held now."""
+        the filters allow, with daily candles (the morning's download covers every tradable listing) that reach the
+        last session - or 5-minute candles in hand that do, as the setups would take yesterday's close from them
+        (scanner/evaluator.py prev_close_known; the last session is the latest the stock's or the S&P 500 ETF's
+        cached 5-minute candles hold before today, the calendar's without them) - not on the hot list already and not found too thin today
+        (_thin_live_names). The first scanner.live_scan of them take watch-tier slots right after the hot list
+        (Scanner.set_live_names), so a stock too quiet for the morning's ranking is streamed and checked once it
+        moves. Names never seen before are looked up first, LIVE_LOOKUPS a round, and kept in symbols.json. Only in
+        regular hours on real-time data, with today's watchlist and the watch tier on, and not while quitting -
+        otherwise nothing is asked and the names held are let go. Returns the names held now."""
         cfg = self.settings.config
         now = (now or clock.now_ny()).astimezone(clock.NY)
         n, wl = int(cfg.scanner.live_scan or 0), self.scanner.watchlist
@@ -1196,12 +1298,14 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             except Exception as e:  # noqa: BLE001 - the names already known still count; the rest wait a round
                 log.debug("live scan: contract details unavailable: %s", e)
         hot, thin, sectors = set(wl.hot_symbols()), set(self._live_thin), self.scanner.filters.sectors
+        market = self.md.cached_intraday(BENCHMARK)   # its sessions are the market's: a closure leaves no bars
         names: List[str] = []
         for symbol in master.tradable(found):
             if len(names) >= n:
                 break
             if (symbol not in hot and symbol not in thin and sector_allowed(master.sector(symbol), sectors)
-                    and self.md.daily_frame(symbol) is not None):
+                    and (daily := self.md.daily_frame(symbol)) is not None
+                    and prev_close_known(daily, self.md.cached_intraday(symbol), now.date(), market)):
                 names.append(symbol)
         before = list(self.scanner.live_names)
         if names != before:
@@ -1253,15 +1357,11 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return "gappers"
         if wl is None or not clock.is_market_open(now):
             return None
-        with self._close_lock:
-            close_due, movers = self._close_due, bool(self._movers_due)
-        # the early movers wait for a 5-minute close queued behind them: it covers them, and run now it would read
-        # IBKR's bars before CLOSE_GRACE_S has let IBKR finish them
-        if (close_due is not None and mono >= close_due[1]) or (close_due is None and movers):
+        due, waiting = self._close_check_due(mono)
+        if due:
             return "close"
-        # a candle-close check starts within seconds: it stands in for the fast cycle, and the quick re-check
-        # waits for it rather than hold it up
-        waiting = close_due is not None
+        # a candle-close check (or its second ask) starts within seconds (waiting): it stands in for the fast cycle,
+        # and the quick re-check waits for it rather than hold it up
         if mono - self._last_cycle_at >= self.scan_settings.cycle_minutes * 60:
             return "cycle"
         if self.scan_settings.wide_on and mono - self._last_wide_at >= self.scan_settings.wide_minutes * 60:
@@ -1269,10 +1369,45 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if (not waiting and self._autopilot_day_active()
                 and mono - self._last_fast_at >= self.settings.config.scanner.fast_cycle_seconds):
             return "fast"
-        refresh = self.settings.config.scanner.plays_refresh_seconds
-        if not waiting and refresh and mono - self._last_plays_at >= refresh and self._board_symbols():
+        if not waiting and self._plays_due(mono):
             return "plays"
         return None
+
+    def _close_check_due(self, mono: float) -> Tuple[bool, bool]:
+        """(the candle-close or early-mover check _on_minute queued is due now, a 5-minute close's check is queued
+        at all) - for _due_scan and the wide scan's pauses (_between_wide_chunks)."""
+        with self._close_lock:
+            close_due, movers = self._close_due, bool(self._movers_due)
+        # the early movers wait for a 5-minute close queued behind them: it covers them, and run now it would read
+        # IBKR's bars before scanner.close_grace_s has let IBKR finish them (a close's second ask takes them along)
+        due = (close_due is not None and mono >= close_due[1]) or (close_due is None and movers)
+        return due, close_due is not None
+
+    def _plays_due(self, mono: float) -> bool:
+        """The quick re-check of the plays on the board is due (scanner.plays_refresh_seconds, 0 = off)."""
+        refresh = self.settings.config.scanner.plays_refresh_seconds
+        return bool(refresh and mono - self._last_plays_at >= refresh and self._board_symbols())
+
+    def _between_wide_chunks(self) -> List[str]:
+        """Scanner.run_wide's pause between two chunks, on the scan thread the wide scan holds: a candle-close or
+        early-mover check that came due runs now, else the quick re-check of the plays if it is due - each ends in
+        Autopilot's pass, so a sweep of minutes holds up neither the check (CLOSE_STALE_S would drop it) nor an
+        entry. Only those light checks run here: never a cycle, a full scan or another wide scan, and a scan asked
+        for waits for the sweep to end. A failure is logged and the sweep goes on. Returns the stocks it read."""
+        if self.quit_state or not clock.is_market_open():
+            return []
+        mono = time.monotonic()
+        due, waiting = self._close_check_due(mono)
+        kind = "close" if due else "plays" if not waiting and self._plays_due(mono) else None
+        if kind is None:
+            return []
+        try:
+            result = self._run_scan(kind)
+        except Exception:  # noqa: BLE001 - the check's failure, not the sweep's
+            log.exception("the %s between the wide scan's chunks failed",
+                          "candle-close check" if kind == "close" else "quick re-check")
+            return []
+        return list(result.symbols) if result is not None else []
 
     def _settings_changed(self) -> None:
         """Called by everything that changes a setting while the app runs - the day/swing split, the
@@ -1297,7 +1432,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 self._scan_request = kind
         self._scan_wake.set()
 
-    def _run_scan(self, kind: str) -> None:
+    def _run_scan(self, kind: str) -> Optional[ScanResult]:
+        """Run the ``kind`` of scan and put what it found on the board, then Autopilot's pass. Returns the result -
+        None when it ran nothing or failed, or for the gap check."""
         quick = kind == "plays"                         # the quick re-check of the plays on the board
         # ...and the candle-close check are light: seconds matter, so no lead-in, and a failure is only logged
         light = quick or kind == "close"
@@ -1322,7 +1459,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             elif kind == "gappers":
                 result = self.scanner.run_gappers()
             elif kind == "wide":
-                result = self.scanner.run_wide(self.scan_settings.wide_stocks, self.scan_settings.movers)
+                result = self.scanner.run_wide(self.scan_settings.wide_stocks, self.scan_settings.movers,
+                                               between=self._between_wide_chunks)
             elif kind == "close":
                 result = self._close_check(queued)
                 if result is None:
@@ -1357,9 +1495,11 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if quick:
             self._last_plays_at = mono
         elif kind == "close":
-            # a check at a 5-minute close stood in for the fast cycle: the next one comes fast_cycle_seconds on.
-            # An early-mover check covered a few stocks only, so it moves no timer
-            if self._close_ran is not None and self._close_ran["boundary"] is not None:
+            # a check at a 5-minute close that read at least half the stocks it asked stood in for the fast cycle:
+            # the next one comes fast_cycle_seconds on. One that found most new bars not printed yet leaves the
+            # fast cycle due. An early-mover check covered a few stocks only, so it moves no timer
+            ran = self._close_ran
+            if ran is not None and ran["boundary"] is not None and 2 * len(result.symbols) >= ran["asked"]:
                 self._last_fast_at = mono
         else:
             self._scan_retry_at = 0.0
@@ -1386,11 +1526,13 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._size_plays(result.plays)
         # the cycles don't re-check valuation setups, so those stay. A quick re-check isn't a scan confirming
         # a setup - but with confirm_on_new_candle a day play counts candles, not scans, and a newer candle
-        # counts whichever scan read it
+        # counts whichever scan read it. A day play reaching Autopilot's confirmations is stamped confirmed:
+        # the review follows a play not taken from then
         self._score_plays(result.plays)
         changes = self.board.replace(result.plays, None if kind == "full" else result.symbols,
                                      keep=lambda p: p.kind.value == "FUNDAMENTAL", confirm=not quick,
-                                     new_candle=self.autopilot.confirm_on_new_candle)
+                                     new_candle=self.autopilot.confirm_on_new_candle,
+                                     min_confirmations=self.autopilot.min_confirmations)
         self._last_scans[kind] = result.summary()
         self._day_changed()
         if not quick:
@@ -1412,36 +1554,43 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             self._log_close_check(result, changes)
             self._thin_live_names(result)
         self._note_changes(changes)
+        return result
 
-    def _take_close_queue(self) -> Tuple[Optional[dt.datetime], Dict[str, dt.datetime], Dict[str, str]]:
-        """Take what the candle loop queued (_on_minute): the 5-minute close once it is due, and the early movers
-        with why. A close not due yet stays queued, and the movers with it - it covers them, and IBKR is still
-        finishing its bar (CLOSE_GRACE_S); the scan loop wakes for it when it is due."""
+    def _take_close_queue(self) -> Tuple[Optional[dt.datetime], Dict[str, dt.datetime], Dict[str, str],
+                                         Optional[List[str]]]:
+        """Take what the candle loop queued (_on_minute): the 5-minute close once it is due - with the stocks it
+        is for when it is a close's second ask, None for the whole tier - and the early movers with why. A close
+        not due yet stays queued, and the movers with it - it covers them, and IBKR is still finishing its bar
+        (scanner.close_grace_s); the scan loop wakes for it when it is due."""
         with self._close_lock:
             due = self._close_due
             if due is not None and time.monotonic() < due[1]:
-                return None, {}, {}
-            movers, why = self._movers_due, self._mover_why
-            self._close_due, self._movers_due, self._mover_why = None, {}, {}
-        return (due[0] if due is not None else None), movers, why
+                return None, {}, {}, None
+            movers, why, only = self._movers_due, self._mover_why, self._close_only
+            self._close_due, self._movers_due, self._mover_why, self._close_only = None, {}, {}, None
+        return (due[0] if due is not None else None), movers, why, (only if due is not None else None)
 
-    def _close_check(self, queued: Optional[Tuple[Optional[dt.datetime], Dict[str, dt.datetime],
-                                                  Dict[str, str]]] = None) -> Optional[ScanResult]:
+    def _close_check(self, queued: Optional[Tuple[Optional[dt.datetime], Dict[str, dt.datetime], Dict[str, str],
+                                                  Optional[List[str]]]] = None) -> Optional[ScanResult]:
         """The check the candle loop queued (_on_minute), on the scan thread - ``queued`` as _take_close_queue
         took it (taken here when not given): at a 5-minute close the whole watch tier, else the early movers still
-        in it, on IBKR's newest 5-minute bars (Scanner.run_close). A check that couldn't start within
-        CLOSE_STALE_S of its close is dropped, and no stock is asked twice within CLOSE_ASK_GAP_S. None when
-        nothing is left to check."""
-        boundary, movers, why = queued if queued is not None else self._take_close_queue()
+        in it, on IBKR's newest 5-minute bars (Scanner.run_close). The stocks whose new bar a close's check didn't
+        find are queued for a second ask CLOSE_RETRY_S after it read - once: that ask leaves the rest to the fast
+        cycle and the next close. A check that couldn't start within CLOSE_STALE_S of its close is dropped, and no
+        stock is asked twice within CLOSE_ASK_GAP_S. None when nothing is left to check."""
+        boundary, movers, why, only = queued if queued is not None else self._take_close_queue()
         now = clock.now_ny()
         if boundary is not None and (now - boundary).total_seconds() > self.CLOSE_STALE_S:
-            log.debug("the %s ET candle-close check is dropped: it couldn't start until %.0f s after the close",
-                      boundary.strftime("%H:%M"), (now - boundary).total_seconds())
-            boundary = None
+            log.debug("the %s ET candle-close check%s is dropped: it couldn't start until %.0f s after the close",
+                      boundary.strftime("%H:%M"), "'s second ask" if only is not None else "",
+                      (now - boundary).total_seconds())
+            boundary = only = None
         movers = {s: m for s, m in movers.items() if (now - m).total_seconds() <= self.CLOSE_STALE_S}
         watch = self.scanner.watch_symbols(int(self.settings.config.execution.stream_watch or 0))
         if boundary is not None:
-            symbols, since = watch, boundary
+            # a second ask is for the stocks still in the tier - and any early mover that waited behind it
+            again = None if only is None else set(only) | set(movers)
+            symbols, since = [s for s in watch if again is None or s in again], boundary
         else:
             tier = set(watch)
             symbols = [s for s in movers if s in tier]
@@ -1452,10 +1601,18 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if not symbols:
             return None
         self._close_asked.update(dict.fromkeys(symbols, mono))
-        self._close_ran = {"boundary": boundary, "asked": len(symbols),
+        self._close_ran = {"boundary": boundary, "asked": len(symbols), "again": only is not None,
                            "minute": max((movers[s] for s in symbols if s in movers), default=since),
                            "why": {s: why[s] for s in symbols if s in why}}
-        return self.scanner.run_close(symbols, since)
+        result = self.scanner.run_close(symbols, since)
+        if boundary is not None and only is None:
+            # IBKR prints some stocks' new bars later than others: those are asked once more, past its 15 s rule
+            read = set(result.symbols)
+            late = [s for s in symbols if s not in read]
+            with self._close_lock:
+                if late and self._close_due is None:       # a newer close queued meanwhile covers them
+                    self._close_due, self._close_only = (boundary, time.monotonic() + self.CLOSE_RETRY_S), late
+        return result
 
     def _log_close_check(self, result: ScanResult, changes: List[Any]) -> None:
         """The check's one INFO line: what it read and found, and how long after the close its plays were out."""
@@ -1465,8 +1622,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         plays = f"{n} play{'' if n == 1 else 's'}"
         boundary = ran.get("boundary")
         if boundary is not None:
-            log.info("close check %s ET: %d of %d stocks read, %s (%d new) - published %.1f s after the candle closed "
-                     "(candles %.1f s, setups %.1f s)", boundary.strftime("%H:%M"), len(result.symbols),
+            log.info("close check %s ET%s: %d of %d stocks read, %s (%d new) - published %.1f s after the candle "
+                     "closed (candles %.1f s, setups %.1f s)", boundary.strftime("%H:%M"),
+                     " (second ask)" if ran.get("again") else "", len(result.symbols),
                      ran.get("asked", 0), plays, new, (now - boundary).total_seconds(),
                      result.timings.get("intraday_candles", 0.0), result.timings.get("setups", 0.0))
             return
@@ -1741,8 +1899,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _reconcile_open_trades(self, force: bool = False) -> List[Dict[str, Any]]:
         """Delete OPEN trade records whose position no longer exists at the broker
-        that holds it, and report positions of a different size than their records
-        add up to (see reconcile.py for when an answer is trusted)."""
+        that holds it, report positions of a different size than their records
+        add up to, and shares no record explains (see reconcile.py for when an
+        answer is trusted)."""
         broker, venue, acc = self._broker, self._venue, self._account
         if broker is None or not broker.is_connected or acc is None or self.executor is None:
             return []
@@ -1757,56 +1916,156 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             account_age_s=account_age_s, connection_age_s=connection_age_s, force=force)
         closed, removed = self._settle_gone(gone)
         if closed:
-            log.warning("booked %d record(s) closed outside the app from %s's fills: %s", len(closed), venue,
-                        ", ".join(f"{c['symbol']} at {c['exit_price']}" for c in closed))
-        if removed:
-            log.warning("removed %d trade record(s) no longer held at %s: %s", len(removed), venue,
-                        ", ".join(r["symbol"] for r in removed))
+            log.warning("booked %d record(s) whose position is gone from %s's fills: %s", len(closed), venue,
+                        ", ".join(f"{c['symbol']} at {c['exit_price']} ({c['reason']})" for c in closed))
+        if removed:                                      # each said, with why, as it was deleted (_settle_gone)
             self._publish("trades.removed", trades=removed, venue=venue, venue_label=venue_label(venue))
 
         removed_ids = {r["id"] for r in removed} | {c["id"] for c in closed}
         if account_age_s <= self.position_check.FRESH_ACCOUNT_S and connection_age_s >= self.position_check.SETTLE_S:
             self._settle_short([t for t in mine if t["id"] not in removed_ids], held)
+        # an entry that filled whose booking the database keeps refusing is no order in flight here: its shares are
+        # held for good, with no record and no stop until the booking takes, and these checks must see them
+        flying = self.executor.symbols_in_flight(unbooked=False)
         new = self.position_check.share_counts(
             venue, venue_label(venue), [t for t in mine if t["id"] not in removed_ids], held=held,
-            in_flight=self.executor.symbols_in_flight(),
+            in_flight=flying,
             account_age_s=account_age_s, connection_age_s=connection_age_s)
         for m in new:
             log.warning("share counts disagree: %s", m["note"])
         if new:
             self._publish("positions.mismatch", mismatches=new)
+        # shares no record explains - none at all, or the other way round - once they have stayed so a couple of
+        # minutes of the regular session: said, never unwound (the shares' Exit in Open positions is the operator's)
+        drift = self.position_check.drift(
+            venue, venue_label(venue), [t for t in mine if t["id"] not in removed_ids], held=held,
+            in_flight=flying, regular=clock.current_session() is clock.Session.REGULAR,
+            account_age_s=account_age_s, connection_age_s=connection_age_s)
+        for d in drift:
+            log.warning("shares the records don't explain: %s", d["note"])
+        if drift:
+            self._publish("positions.drift", alerts=drift, urgent=any(d["urgent"] for d in drift))
         return closed + removed
 
     def _settle_gone(self, gone: List[Mapping[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Each record whose position is gone: closed at the price the broker's fills say it went
-        for, so the journal, the strategy records and the sizing learn its outcome - or, when the
-        broker reports no such fill, deleted as before. Returns (closed, removed)."""
+        """Each record whose position is gone: closed at the price the broker's fills say its remaining
+        shares went for (_exit_fill), so the journal, the strategy records and the sizing learn its outcome -
+        with the reason the orders that sold them give (_gone_reason): "closed-outside" only when an order
+        from outside the app sold some of them; one of its own exits - a quit's - is closed as what it was sent
+        for, its stop as a stop. One whose fills couldn't be read is left for a later check - its exit may well
+        be there, and deleted the trade would be lost. One whose fills, read fine, show no exit since the entry it
+        hasn't booked already (IBKR keeps only the current session's) is deleted, the last resort - only while it has
+        booked no exit at all: one with a part off already (an exit capped at the shares held, a target's part) keeps
+        that part's outcome, and the shares no execution accounts for are closed at the price of its last exit booked,
+        noted on the record as an estimate. Decided and booked under the executor's lock, as _settle_short's are, and
+        a trade the order sync is about to book - an exit still working, a fill of its stop or target waiting to be
+        saved, or one of a stop or target this run follows - is left to it. A booking the database refuses changes
+        nothing and is tried again on a later check (_booking_refused). Returns (closed, removed)."""
         closed: List[Dict[str, Any]] = []
         removed: List[Dict[str, Any]] = []
+        ex, get = self.executor, getattr(self._broker, "get_fills", None)
+        if ex is None:
+            return closed, removed
         for t in gone:
-            row = {"id": t["id"], "symbol": t["symbol"], "side": t["side"], "quantity": t["quantity"]}
-            fill = self._exit_fill(t)
-            out = None
-            if fill is not None:
-                out = self.repo.close_trade(t["id"], fill["price"], exit_reason="closed-outside",
-                                            commission=fill["commission"], exit_time=fill["at"])
-            if out:
-                if self.executor is not None:
-                    self.executor.forget_open(t["symbol"])
-                closed.append({**row, "exit_price": fill["price"], "fills": fill["fills"],
-                               "realized_pl": out.get("realized_pl")})
-                self._publish("trade.closed", trade=out, reason="closed outside the app, booked from the broker's fills")
-            elif self.repo.delete_trade(t["id"]):
-                removed.append(row)
+            tid, sym = t["id"], t["symbol"]
+            row = {"id": tid, "symbol": sym, "side": t["side"], "quantity": t["quantity"]}
+            try:
+                fills = list(get(sym) or []) if callable(get) else []
+            except Exception as e:  # noqa: BLE001 - the broker couldn't say what closed it: nothing is changed
+                # the position check hands it back after its next misses, and the fills are read again then
+                log.info("%s's position is gone from %s, but its fills couldn't be read (%s) - the record %s is "
+                         "kept and looked at again on a later check", sym, venue_label(self._venue), e, tid)
+                continue
+            # decided and booked under the executor's lock: the order sync books its own orders' fills, and one of its
+            # bookings landing between the read of the record and the close would count those shares twice, or go
+            # with a deleted record
+            with ex.lock:
+                if tid in ex.pending_exit_trade_ids() or ex.fill_unbooked(tid):
+                    continue            # the order sync books it: an exit still working, or a fill waiting to be saved
+                rec = self.repo.trade_record(tid) or {}
+                now = rec.get("trade") or {}
+                if now.get("status") != "OPEN":
+                    continue            # booked closed meanwhile (the order sync heard its exit): nothing left
+                fill = self._exit_fill(now, fills, rec)
+                if fill is not None and fill["orders"] & ex.resting_order_ids(tid):
+                    continue            # its stop or target this run follows filled: the order sync books it when done
+                exits = [f for f in rec.get("fills") or [] if f.get("leg") == "EXIT"]
+                holds = abs(float(now.get("quantity") or 0.0))
+                untouched = (not exits and not float(now.get("banked_pl") or 0.0)
+                             and abs(abs(float(now.get("initial_quantity") or holds)) - holds) < 1e-9)
+                try:
+                    if fill is None and untouched:
+                        if self.repo.delete_trade(tid, open_only=True):
+                            log.warning("TRADE RECORD DELETED  %s (%s): its position is gone from %s and the broker's "
+                                        "fills, read fine, show no exit since the entry that the record hasn't booked "
+                                        "already (IBKR keeps only the current session's)",
+                                        sym, tid, venue_label(self._venue))
+                            removed.append(row)
+                        continue
+                    if fill is None:
+                        # a part is booked off already, and nothing the broker reports sold the rest: those shares went
+                        # on an earlier session (IBKR keeps only today's executions) - priced as its last exit booked
+                        price = round(float(exits[-1]["price"] if exits else now["entry_price"]), 4)
+                        fill = {"price": price, "quantity": 0.0, "fills": 0, "commission": 0.0, "at": None,
+                                "order_id": "", "reason": "closed-outside", "orders": set()}
+                    rest = holds - fill["quantity"]
+                    note = "" if rest <= 1e-9 else (
+                        f"{rest:,.0f} of the shares closed have no execution at the broker (IBKR keeps only today's) - "
+                        f"estimated at {fill['price']:.2f}, "
+                        + ("the price of its fills found" if fill["fills"] else "the price of its last exit booked"))
+                    reason = fill["reason"]
+                    out = self.repo.close_trade(tid, fill["price"], exit_reason=reason,
+                                                commission=fill["commission"], exit_time=fill["at"],
+                                                broker_order_id=fill["order_id"], note=note)
+                except Exception as e:  # noqa: BLE001 - the database busy, say: nothing is changed
+                    self._booking_refused(tid, sym, "the deletion" if fill is None else "the close", e)
+                    continue
+            if out and out.get("status") == "CLOSED":
+                ex.forget_open(sym, tid)
+                if note:
+                    log.warning("%s (%s) closed from the broker's fills: %s", sym, tid, note)
+                closed.append({**row, "exit_price": fill["price"], "fills": fill["fills"], "reason": reason,
+                               "estimated": bool(note), "realized_pl": out.get("realized_pl")})
+                self._publish("trade.closed", trade=out,
+                              reason=("closed outside the app" if reason == "closed-outside" else reason)
+                              + (", booked from the broker's fills" if fill["fills"] else "")
+                              + (f" ({note})" if note else ""))
         return closed, removed
 
+    #: seconds before a booking from the broker's fills that the database keeps refusing is said on the dashboard again
+    BOOKING_REPEAT_S = 300.0
+
+    def _booking_refused(self, tid: str, symbol: str, what: str, e: BaseException) -> None:
+        """A booking from the broker's fills the database refused (busy with another writer past its wait, say):
+        nothing was changed, and the next position check tries it again. Logged each time, and the dashboard told
+        (order.unbooked) the first time and again every BOOKING_REPEAT_S while it keeps failing."""
+        why = (str(e).strip().splitlines() or [type(e).__name__])[0][:200]     # the database's first line, not its SQL
+        log.warning("BOOKING FAILED  %s of %s (%s) couldn't be saved: %s - tried again on the next position check",
+                    what, symbol, tid, why)
+        said, now = self.__dict__.setdefault("_refused_said", {}), time.monotonic()
+        if now - said.get(tid, float("-inf")) >= self.BOOKING_REPEAT_S:
+            said[tid] = now
+            self._publish("order.unbooked", kind="exit", symbol=symbol, reason=why,
+                          msg=f"The {symbol} record couldn't be brought in line with the broker's fills ({why}). The "
+                              f"app tries again at its next position check.")
+
+    #: what sold the shares _settle_short books, by the kind of the trade's own order, in its log's words
+    SHORT_SOURCES = {"exit": "an exit the app sent that was called off after filling in part",
+                     "stop": "its stop at the broker, which filled while the app wasn't following it",
+                     "target": "its target at the broker, which filled while the app wasn't following it"}
+
     def _settle_short(self, trades: List[Mapping[str, Any]], held: Mapping[str, float]) -> List[Dict[str, Any]]:
-        """A record holding more shares than the broker, the same way round, because an exit the app sent
-        filled in part before it was called off - "Stop quitting", an exit cancelled - and the app stopped
-        before it heard: the part that filled is booked, from the broker's fills tagged with that trade's
-        own exit orders, at their prices. Only fills of its ``exit:`` orders, never more than the record
-        is over by, never while an exit for it is still working (the executor books those), and only for a
-        symbol with one record. A stop or target filling is booked by its own watcher. Returns what it booked."""
+        """A record holding more shares than the broker, the same way round, because one of its own orders sold some
+        the app never booked: an exit it sent that filled in part before it was called off - "Stop quitting", an exit
+        cancelled - and the app stopped before it heard, or its stop or target at the broker filling while the app
+        wasn't following it (it was restarting, say). The part sold is booked from the broker's executions of the
+        trade's own orders (``exit:``, ``stop:``, ``tgt:``), oldest first, past the shares the record has booked
+        already (_not_booked): each order's at its own price, with its own reason - "exit", the stop's (stop or
+        trailing-stop) or "target-1" - and never more than the record is over by. Never while an exit for it is
+        still working, nor from a stop or target this run follows (the order sync books those when they finish, and
+        what they have filled meanwhile comes off what is booked here), and only for a symbol with one record. A
+        booking the database refuses is tried again on the next check (_booking_refused). Returns what it booked, a
+        row per order."""
         get = getattr(self._broker, "get_fills", None)
         if not callable(get) or self.executor is None:
             return []
@@ -1827,65 +2086,148 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             seen = self.__dict__.setdefault("_short_checked", {})
             if seen.get(tid) == (record, now_held):
                 continue                                 # looked already: the fills don't explain it (sold in TWS, say)
-            seen[tid] = (record, now_held)
+            own = {f"exit:{tid}": "exit", f"{STOP_TAG}{tid}": "stop", f"{TARGET_TAG}{tid}": "target"}
             try:
-                fills = [f for f in get(sym) if getattr(f, "tag", "") == f"exit:{tid}"
+                fills = [f for f in get(sym) if (getattr(f, "tag", "") or "") in own
                          and (f.side is Side.SHORT) == (t["side"] == "LONG")]
-            except Exception:  # noqa: BLE001 - the broker couldn't say: nothing is booked
+            except Exception:  # noqa: BLE001 - the broker couldn't say: nothing is booked, and it's looked at again
                 continue
-            # the shares its record already took off were booked when they filled: the rest of the fills weren't
-            done = max(0.0, abs(float(t.get("initial_quantity") or record)) - record)
-            left, qty, value = done, 0.0, 0.0
-            for f in sorted(fills, key=lambda f: f.ts):
-                take = float(f.quantity)
-                if left > 0:
-                    skip = min(left, take)
-                    left, take = left - skip, take - skip
-                take = min(take, short - qty)
-                if take > 0:
-                    qty, value = qty + take, value + take * float(f.price)
-            if qty <= 1e-9:
-                continue
-            price = round(value / qty, 6)
-            out = self.repo.reduce_trade(tid, qty, price, exit_reason="exit")
-            if not out:
-                continue
-            booked.append({"id": tid, "symbol": sym, "qty": qty, "price": price})
-            log.warning("booked %s shares of %s sold by an exit that was called off after filling in part (@ %.4f) - "
-                        "the record now matches the %s shares held", f"{qty:,.0f}", sym, price, f"{abs(now_held):,.0f}")
-            self._publish("trade.reduced", trade=out, reason="an exit that filled in part, booked from the broker's fills",
-                          qty=qty, price=price)
+            # decided and booked under the executor's lock: the order sync books its own orders' fills, and this must
+            # neither book one of them at the same moment nor miss one it has booked since the check began - a record
+            # changed since then is looked at afresh on the next check
+            with self.executor.lock:
+                if tid in self.executor.pending_exit_trade_ids() or sym in self.executor.symbols_in_flight():
+                    continue
+                rec = self.repo.trade_record(tid) or {}
+                fresh = rec.get("trade") or {}
+                if fresh.get("status") != "OPEN" or abs(abs(float(fresh.get("quantity") or 0.0)) - record) > 1e-9:
+                    continue
+                seen[tid] = (record, now_held)
+                unbooked = _not_booked(rec.get("fills") or [], fills)
+                # a stop or target this run follows is the order sync's to book when it finishes - and the shares it has
+                # sold meanwhile are out of the account already, so they come off what the record may be over by here
+                resting = self.executor.resting_order_ids(tid)
+                room = short - sum(q for f, q in unbooked if str(f.order_id) in resting)
+                parts: Dict[str, List[Any]] = {}             # order id -> [kind, shares, value, fees], oldest first
+                taken = 0.0
+                for f, qty in unbooked:
+                    oid = str(f.order_id)
+                    take = min(qty, room - taken)
+                    if oid in resting or take <= 1e-9:
+                        continue
+                    part = parts.setdefault(oid, [own[f.tag], 0.0, 0.0, 0.0])
+                    part[1] += take
+                    part[2] += take * float(f.price)
+                    part[3] += float(f.commission or 0.0) * take / float(f.quantity)
+                    taken += take
+                for oid, (kind, qty, value, fees) in parts.items():
+                    price, after = round(value / qty, 6), {}
+                    if kind == "stop":
+                        # the stop order rests at the record's stop: moved from where it began, it was a trailing stop
+                        rested = float(fresh.get("stop_price") or fresh.get("initial_stop_price") or 0.0)
+                        reason = stop_exit_reason(fresh.get("initial_stop_price"), rested)
+                    elif kind == "target":
+                        # the scale-out's part came off at the first target: the rest gets the plan's stop and target
+                        reason = "target-1"
+                        plan = scale_out_plan(fresh, self.settings.config.exit_manager)
+                        after = dict(plan[1]) if plan else {}
+                    else:
+                        reason = "exit"
+                    try:
+                        out = self.repo.reduce_trade(tid, qty, price, exit_reason=reason, commission=round(fees, 6),
+                                                     broker_order_id=oid, **after)
+                    except Exception as e:  # noqa: BLE001 - the database busy, say: this part isn't booked
+                        # not taken as looked at: the next check books it (and the ones after it) - and the rest of
+                        # this one's checks of the share counts still run
+                        seen.pop(tid, None)
+                        self._booking_refused(tid, sym, f"the {reason} part of {qty:,.0f} shares", e)
+                        break
+                    if not out:
+                        break
+                    fresh = out
+                    booked.append({"id": tid, "symbol": sym, "qty": qty, "price": price, "reason": reason})
+                    log.warning("booked %s shares of %s sold by %s (order %s @ %.4f, %s) - the record now holds %s; %s "
+                                "holds %s", f"{qty:,.0f}", sym, self.SHORT_SOURCES[kind], oid, price, reason,
+                                f"{abs(float(out.get('quantity') or 0.0)):,.0f}", venue_label(self._venue),
+                                f"{abs(now_held):,.0f}")
+                    self._publish("trade.reduced", trade=out, qty=qty, price=price,
+                                  reason=f"{reason}: {self.SHORT_SOURCES[kind]}, booked from the broker's fills")
         return booked
 
-    def _exit_fill(self, t: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-        """What closed a position outside the app, from the broker's executions: the exit-side fills
-        of the symbol since the trade was entered, averaged by size. None when the broker reports
-        none (IBKR keeps only the current session's)."""
-        get = getattr(self._broker, "get_fills", None)
-        if not callable(get):
-            return None
-        try:
-            fills = get(t["symbol"]) or []
-        except Exception:  # noqa: BLE001
-            log.debug("fills for %s unavailable", t["symbol"], exc_info=True)
-            return None
-        entered = _utc(t.get("entry_time"))
+    def _exit_fill(self, t: Mapping[str, Any], fills: Sequence[Any],
+                   rec: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """What closed a position outside the app, from the broker's executions of its stock (``fills``): the
+        exit-side ones since the trade (``t``, OPEN, as just read) was entered - of its own orders, and of ones from
+        outside the app, never another trade's - oldest first, past the shares the record (``rec``: its
+        Repository.trade_record) has booked already (_not_booked), averaged by size up to the shares it still holds,
+        with only those fills' fees. ``order_id`` is the order they came from when there was one (a fee reported
+        later goes on it), else ""; ``orders`` every order they came from; ``reason`` the exit reason those orders
+        give (_gone_reason). None when the broker reports none the record hasn't booked (IBKR keeps only the
+        current session's)."""
+        tid, entered = t["id"], _utc(t.get("entry_time"))
         exit_side = Side.SHORT if t["side"] == "LONG" else Side.LONG
+        own = {f"{STOP_TAG}{tid}": "stop", f"{TARGET_TAG}{tid}": "target", f"exit:{tid}": "exit"}
         picked = [f for f in fills if f.side == exit_side and float(f.quantity) > 0
-                  and (entered is None or _utc(f.ts) >= entered - dt.timedelta(minutes=1))]
-        if not picked:
+                  and (entered is None or _utc(f.ts) >= entered - dt.timedelta(minutes=1))
+                  and ((getattr(f, "tag", "") or "") in own
+                       or not (getattr(f, "tag", "") or "").startswith((STOP_TAG, TARGET_TAG, "exit:", "unwind:")))]
+        holds = abs(float(t.get("quantity") or 0.0))
+        qty = value = fees = 0.0
+        used: List[Any] = []
+        for f, part in _not_booked(rec.get("fills") or [], picked):
+            take = min(part, holds - qty)
+            if take <= 1e-9:
+                break
+            qty, value = qty + take, value + take * float(f.price)
+            fees += float(f.commission or 0.0) * take / float(f.quantity)
+            used.append(f)
+        if qty <= 1e-9:
             return None
-        qty = sum(float(f.quantity) for f in picked)
-        price = sum(float(f.price) * float(f.quantity) for f in picked) / qty
-        return {"price": round(price, 4), "quantity": qty, "fills": len(picked),
-                "commission": round(sum(float(f.commission or 0.0) for f in picked), 2),
-                "at": max(_utc(f.ts) for f in picked)}
+        orders = {str(f.order_id) for f in used}
+        return {"price": round(value / qty, 4), "quantity": qty, "fills": len(used), "commission": round(fees, 2),
+                "at": max(_utc(f.ts) for f in used), "order_id": next(iter(orders)) if len(orders) == 1 else "",
+                "orders": orders, "reason": self._gone_reason(t, rec, used, own)}
+
+    def _gone_reason(self, t: Mapping[str, Any], rec: Mapping[str, Any], used: Sequence[Any],
+                     own: Mapping[str, str]) -> str:
+        """The exit reason of a record closed from the broker's fills (``used``, oldest first), by the orders that
+        sold its shares - their tags: "closed-outside" when an order from outside the app sold any of them; else the
+        trade's own order that sold the last of them says - its stop the stop's reason (stop, or trailing-stop once
+        it had moved), its target "target", and an exit the app sent the reason it was sent for, as the order audit
+        kept it (a quit's exit is "quit"). An exit sent before the audit kept why is "quit" while a quit that is
+        closing the trade is under way, else "exit" - an exit of the app's own, whatever sent it."""
+        kinds = [own.get(getattr(f, "tag", "") or "", "outside") for f in used]
+        if "outside" in kinds:
+            return "closed-outside"
+        last, kind = used[-1], kinds[-1]
+        if kind == "stop":
+            # the stop order rests at the record's stop: moved from where it began, it was a trailing stop
+            return stop_exit_reason(t.get("initial_stop_price"),
+                                    float(t.get("stop_price") or t.get("initial_stop_price") or 0.0))
+        if kind == "target":
+            return "target"
+        tag, filled_at = f"exit:{t['id']}", _utc(last.ts)
+        sent = [o for o in rec.get("orders") or [] if o.get("action") == "PLACE"
+                and isinstance(o.get("request"), dict) and o["request"].get("tag") == tag]
+        mine = next((o for o in sent if o.get("order_id") and o["order_id"] == str(last.order_id)), None)
+        if mine is None:
+            # its send got no answer in time, so the audit has no order id for it: the last exit sent before it filled
+            before = [o for o in sent if filled_at is None or (_utc(o.get("ts")) or filled_at) <= filled_at]
+            mine = before[-1] if before else None
+        why = str((mine or {}).get("request", {}).get("reason") or "")
+        if why:
+            return why
+        quitting = self.quit_state
+        if quitting and t["id"] not in set(quitting.get("keeping") or ()):
+            return "quit"
+        return "exit"
 
     def untracked_positions(self) -> List[Dict[str, Any]]:
         """Shares the current venue's account holds beyond what its open-trade records cover:
         opened or changed outside the app, or a fill the app couldn't book. Shown so they can be
         exited - the app doesn't manage their exits. Shares an entry order is still working for
-        aren't counted (their record follows the fill)."""
+        aren't counted (their record follows the fill) - unless it has filled and the database refuses its booking:
+        those shares are held, with no record and no stop until it takes, and are listed meanwhile."""
         acc = self._account
         if acc is None or self._broker is None or not self._broker.is_connected:
             return []
@@ -1893,7 +2235,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         for t in self._positions_here():
             sign = -1.0 if t.get("side") == "SHORT" else 1.0
             recorded[t["symbol"]] = recorded.get(t["symbol"], 0.0) + sign * abs(float(t.get("quantity") or 0.0))
-        working = {w["symbol"] for w in self.working_entries()}
+        working = {w["symbol"] for w in self.working_entries() if not w.get("unbooked")}
         out: List[Dict[str, Any]] = []
         for p in acc.positions:
             if abs(p.quantity) < 1e-9 or p.symbol in working:
@@ -1919,7 +2261,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if out.get("ok"):
             status = str(out.get("status") or "")
             tail = "" if status == "FILLED" else f" ({status.lower()})"
-            out["note"] = f"Exit sent for {row['qty']:,.0f} {symbol} shares that had no record{tail}."
+            out["note"] = f"Exit sent for {out.get('qty', row['qty']):,.0f} {symbol} shares that had no record{tail}."
         return out
 
     # ------------------------------------------------------------------ #
@@ -2161,7 +2503,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._check_arm()
         if self.executor:
             try:
-                self.executor.sync_open_orders()
+                # never a second pass beside the sync loop's: while it is mid-pass (or an order is going out) this one
+                # is skipped - the loop's pass reads the orders all the same, within seconds
+                if not self.executor.sync_open_orders(wait=False):
+                    log.debug("Refresh: the order sync is mid-pass (or an order is going out) - no second pass")
             except Exception:  # noqa: BLE001
                 log.debug("order sync failed", exc_info=True)
         priced = self.refresh_prices() if read else 0
@@ -2207,17 +2552,23 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if acc is None:
             return {"ok": False, "reason": "no account data"}
         cfg = self.settings.config
-        # sized against the trading capital; the PDT rule and the floor see the real account
-        sizing = size_play(p, self.sizing_account(p.timeframe) or acc, cfg.risk,
-                           symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0),
-                           risk_pct=self._play_risk_pct(p), risk_why=self.strategy_risk_why(p.strategy),
-                           size_factor=self.size_factor)
+        acted_on = p.status in _ACTED_ON
+        # sized against the trading capital, less the risk already at work (all of it, when that can't be read);
+        # the PDT rule and the floor see the real account. A play already sent keeps the size it went out at - the
+        # last look may have re-sized it at a re-priced limit, and the dashboard assesses the play it shows again
+        # after an approval - so it is sized on a copy
+        sized_on, open_risk = self.sizing_account(p.timeframe) or acc, self.open_risk_usd()
+        sizing = self._size_entry(dataclasses.replace(p) if acted_on else p, sized_on,
+                                  self._risk_used(open_risk, sized_on))
         decision = self.pdt.assess(acc, p)
         session = clock.current_session()
         plan = plan_order(p, session, cfg.execution)
-        acted_on = p.status in _ACTED_ON
 
         reasons: List[str] = []
+        # a refusal that clears by itself - room under the open-risk ceiling frees as trades close, a read that
+        # failed is tried again: a play refused for that alone is ``transient``, and Autopilot asks again on its next
+        # pass rather than dropping it for the day
+        waits = ""
         locked = self._locked()
         if locked:
             reasons.append(locked)
@@ -2231,14 +2582,21 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             reasons.append(decision.reason)
         if not acc.usd_per_base:
             reasons.append(f"no {acc.base_currency}->USD exchange rate yet, so the trade can't be sized")
+        elif open_risk is None:
+            waits = OPEN_RISK_UNREAD
+            reasons.append(waits)
         elif p.suggested_qty <= 0:
+            full = (self._open_risk_full_reason(open_risk, sized_on.equity, cfg.risk)
+                    if "portfolio open-risk ceiling" in sizing.caps_hit
+                    and "risk budget too small for one share" in sizing.caps_hit else "")
             reasons.append("the position size factor is 0, so new positions are sized at nothing"
                            if self.size_factor <= 0
                            else f"{p.symbol} already takes up the {cfg.risk.max_symbol_pct_of_equity:.0f}% of equity "
                            "allowed in one stock" if "max exposure per stock" in sizing.caps_hit
                            else self._too_thin_reason(p, cfg.risk) if liquidity_cap(p, cfg.risk) == 0
                            else self._no_room_reason(p) if "trading capital" in sizing.caps_hit
-                           else "position size rounds to zero for this risk budget")
+                           else full or "position size rounds to zero for this risk budget")
+            waits = full if reasons[-1] == full else ""
         if p.reward_risk < cfg.risk.min_reward_risk and p.kind.value != "FUNDAMENTAL":
             reasons.append(f"reward:risk {p.reward_risk:.1f} below minimum")
         filtered = self.filters.refusal(p.side.value, p.timeframe.value, p.sector)
@@ -2248,7 +2606,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         hold_unit = "min" if p.timeframe is Timeframe.INTRADAY else "trading days"
         return {
             "ok": True, "can_execute": not reasons, "already_executed": acted_on,
-            "reasons": reasons, "mode": self.mode, "session": session.value,
+            "reasons": reasons, "transient": bool(waits) and reasons == [waits],
+            "mode": self.mode, "session": session.value,
             "noise": [NOISE_LABELS.get(n, n) for n in p.noise],
             "play": self._decorate(p), "pdt": decision.as_dict(), "order_plan": plan,
             "order_preview": {
@@ -2260,10 +2619,31 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 "expected_hold": (f"~{p.expected_hold_typical:.0f} {hold_unit} "
                                   f"(review after {p.expected_hold_max:.0f})"),
                 "est_cost": round(p.notional, 2), "est_risk": round(p.dollar_risk, 2),
-                "caps": list(sizing.caps_hit),
+                "caps": list(sizing.caps_hit), "sizing": self._sizing_record(sizing),
                 "note": plan.get("note", ""), "routes_to": ROUTE_LABELS.get(self._venue, self._venue.upper()),
             },
         }
+
+    def _size_entry(self, p: Play, sized_on: Account, open_risk: float) -> SizingResult:
+        """size_play as an entry is sized: against ``sized_on`` (the trading capital) less ``open_risk`` (the risk
+        already at work), beside what the stock already holds, at the strategy's risk and the size factor. The
+        order preview (assess_play) and the last look at a re-priced limit (_repriced_check) both size here, so the
+        two never size by different rules."""
+        return size_play(p, sized_on, self.settings.config.risk, open_risk_used=open_risk,
+                         symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0),
+                         risk_pct=self._play_risk_pct(p), risk_why=self.strategy_risk_why(p.strategy),
+                         size_factor=self.size_factor)
+
+    def _sizing_record(self, sizing: SizingResult) -> Dict[str, Any]:
+        """How an entry was sized, for the entry context its trade keeps (_entry_context): the shares, their risk
+        and cost, the position size factor, the limit the share count stopped at (``decided_by``: the risk budget,
+        the open-risk ceiling, the per-position %, the cap on one stock, the slice of its daily volume, buying power
+        or the trading capital's room - or, re-sized at the last look, the preview's count: _repriced_check) and
+        every limit's value - so a review can tell a trade the risk budget sized
+        from one a cap cut down, and by how much."""
+        return {"qty": sizing.qty, "est_risk": sizing.dollar_risk, "est_cost": sizing.notional,
+                "size_factor": float(self.size_factor), "decided_by": sizing.decided_by,
+                "caps": list(sizing.caps_hit), "limits": dict(sizing.limits)}
 
     def approve_play(self, play_id: str, operator: str = "operator") -> Dict[str, Any]:
         with self._switch_lock:
@@ -2282,14 +2662,18 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             if not pre["can_execute"]:
                 return {"ok": False, "reason": "; ".join(pre["reasons"]) or "not executable"}
             seen: Dict[str, Any] = {}
-            chased = self._chase_check(p, pre["order_plan"], seen)
+            # how the entry is sized: the order preview's, unless the last look re-sizes it at a re-priced limit
+            sized = dict((pre.get("order_preview") or {}).get("sizing") or {})
+            chased = self._chase_check(p, pre["order_plan"], seen, operator=operator, sized=sized)
             if chased:
+                self._keep_last_look(p, chased, seen, operator)
                 return {"ok": False, "reason": chased}
 
             p.status = PlayStatus.ACCEPTED
-            p.evidence["at_entry"] = at_entry = self._entry_context(p, operator)
+            p.evidence["at_entry"] = at_entry = self._entry_context(p, operator, sizing=sized or None)
             context = play_features(p, now=clock.now_ny(), market=self.regime.context(), at_entry=at_entry,
                                     by=operator)
+            context["sizing"] = at_entry.get("sizing")    # the trade's own record says how it was sized, too
             self.repo.record_play(p)
             self.repo.set_play_status(p.id, p.status.value, operator)
             try:
@@ -2301,9 +2685,11 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 log.exception("execute_play crashed")
                 self._publish("play.decided", play_id=p.id, decision="error", result={"reason": str(e)})
                 return {"ok": False, "reason": f"execution error: {e}"}
-            if not out.get("ok"):
+            if not out.get("ok") and not out.get("sent_unknown"):
                 p.status = PlayStatus.PROPOSED            # let them try again once the reason clears
                 self.repo.set_play_status(p.id, p.status.value, operator)
+            # (one the broker didn't answer in time may be working: it stays SUBMITTED, as the executor saved it, and
+            # is never offered again - the order syncs look for it at the broker)
             # sent: the executor has saved it SUBMITTED (or the fill FILLED) - and the sync loop may already
             # have saved how it ended, which a write here would overwrite
             self._publish("play.decided", play_id=p.id, decision="approved", result=out, play=self._decorate(p))
@@ -2317,7 +2703,23 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 # runs alongside its own
                 self._snapshot_wake.set()
             self._day_changed(now=True)                   # a restart mustn't offer this setup again today
-            return {"ok": out.get("ok", False), **out}
+            # the shares sent and their risk - the last look may have re-sized them at a re-priced limit, so the
+            # preview's are not always what went out (a fill's own count, in ``out``, wins)
+            return {"ok": out.get("ok", False), "qty": p.suggested_qty, "est_risk": round(p.dollar_risk, 2), **out}
+
+    def _keep_last_look(self, p: Play, why: str, seen: Mapping[str, Any], operator: str) -> None:
+        """Keep a last look that refused an entry with its play, and the quote it read: the daily review follows
+        the setup as if it had been taken, and charges it the spread a fill would have crossed
+        (research/journal.py). The first is kept - the look when the entry was first wanted - and the board
+        carries it on to the scans that find the setup again (engine/board.py)."""
+        if p.status is not PlayStatus.PROPOSED or "last_look" in p.evidence:
+            return
+        p.evidence["last_look"] = {"at": dt.datetime.now(dt.timezone.utc).isoformat(), "by": operator, "why": why,
+                                   **{k: seen.get(k) for k in ("mid", "bid", "ask", "spread_bps")}}
+        try:
+            self.repo.record_play(p)                      # a setup the next scans don't find again keeps it too
+        except Exception:  # noqa: BLE001
+            log.debug("could not keep the last look at %s", p.id, exc_info=True)
 
     @staticmethod
     def _too_thin_reason(p: Play, risk) -> str:
@@ -2325,6 +2727,15 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         return (f"{p.symbol} is too thin to trade: it usually trades {float(p.evidence['adv_shares']):,.0f} "
                 f"shares a day, and the liquidity cap of {float(risk.max_adv_pct):g}% of that "
                 "(risk.max_adv_pct) is less than one share")
+
+    @staticmethod
+    def _open_risk_full_reason(open_risk: float, equity: float, risk) -> str:
+        """Why a play sized to nothing under the open-risk ceiling: the trades and entries already at work risk
+        (nearly) all it allows."""
+        pct = float(risk.max_open_risk_pct)
+        return (f"the open trades and working entries already risk ${open_risk:,.0f} of the "
+                f"${equity * pct / 100.0:,.0f} the open-risk ceiling allows ({pct:g}% of the trading capital, "
+                "risk.max_open_risk_pct) - too little is left for one share")
 
     def _no_room_reason(self, p: Play) -> str:
         """Why a play sized to nothing under the trading capital: its kind's share is full, or all of it is."""
@@ -2336,7 +2747,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             if part.get("available", 1.0) <= 0 < state.get("available", 0.0):
                 return (f"{kind} trades already hold their {part.get('pct', 0):g}% share of the trading capital "
                         "(the day / swing split) - no room for another")
-        return "the trading capital is fully invested - no room for another position"
+        untracked = float(state.get("untracked") or 0.0)
+        return ("the trading capital is fully invested - no room for another position"
+                + (f" (that counts {capital.money(untracked, state.get('currency') or 'USD')} in shares the account "
+                   "holds without a trade record)" if untracked > 0 else ""))
 
     def _score_plays(self, plays) -> None:
         """The learned model's odds on each fresh play (research/model.py), kept in its evidence so
@@ -2369,26 +2783,32 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return round(base * risk_factor(float(score["p"])), 4)
         return pct
 
-    def _chase_check(self, p: Play, plan: Dict[str, Any], seen: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    def _chase_check(self, p: Play, plan: Dict[str, Any], seen: Optional[Dict[str, Any]] = None, *,
+                     operator: str = "operator", sized: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """The last look before an order goes out, at the live quote. Returns why the entry is
         refused, if it is; ``seen`` is filled with the quote (mid, bid, ask, spread_bps, live), which
         the fill is later measured against - Harris's implementation shortfall.
 
+        * A price already at or through the play's stop: the setup is void - the move it was waiting
+          for has failed before the order is sent.
         * Harris: the spread is the price of immediacy, paid going in and again coming out. On live
           quotes an entry is refused when the spread is more than ``execution.max_spread_r`` of the
           distance to the stop.
         * Aziz: never chase. Once the price has run past the play's entry by more than
           ``execution.max_chase_r`` of the distance to the stop, the reward:risk the play was judged
           on is gone. Within that, a limit entry is priced off the quote so it fills now instead of
-          waiting for the price to come back through the entry, which is the move failing. A
-          pullback under the entry is not a chase.
+          waiting for the price to come back through the entry, which is the move failing - and is
+          judged again at that price (_repriced_check): its reward:risk to the first target, and its
+          size, which then replaces the play's. A pullback under the entry is not a chase.
 
         With no price source attached there is nothing to check (and no plays to take). With one
         attached, an entry whose price can't be read is refused - an order is never sent blind.
 
         The quote is quote()'s: a stream's latest when it ticked in the last 2 s, else a snapshot - an
         entry never waits for a stream. Where it came from and how old it was are logged, and kept in
-        ``seen`` as quote_source / quote_age_ms (the trade record keeps only the mid and the spread)."""
+        ``seen`` as quote_source / quote_age_ms (the trade record keeps only the mid and the spread).
+        ``sized``: the entry's sizing record (_sizing_record), replaced by the re-sized one when a re-priced
+        entry passes."""
         cfg = self.settings.config.execution
         risk = abs(float(p.entry) - float(p.stop))
         if risk <= 0 or not self.md.attached:
@@ -2415,6 +2835,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             seen.update(mid=round(mid, 4), bid=bid or None, ask=ask or None, live=live,
                         spread_bps=round(spread / mid * 1e4, 2) if spread and mid else None,
                         quote_source=source, quote_age_ms=age_ms)
+        sign = 1.0 if p.side is Side.LONG else -1.0
+        if (px - float(p.stop)) * sign <= 0:
+            return f"the price ({px:.2f}) is already through the stop {p.stop:.2f} - the setup is void"
         max_spread = float(getattr(cfg, "max_spread_r", 0.0) or 0.0)
         if live and max_spread > 0 and spread / risk > max_spread:
             return (f"the spread ({bid:.2f} x {ask:.2f}) is {spread / risk:.2f}R of this trade's risk - too dear to "
@@ -2422,14 +2845,69 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         max_r = float(getattr(cfg, "max_chase_r", 0.0) or 0.0)
         if max_r <= 0:
             return None
-        sign = 1.0 if p.side is Side.LONG else -1.0
         run = (px - float(p.entry)) * sign / risk
         if run > max_r:
             return (f"the price ({px:.2f}) has run {run:.2f}R past the entry {p.entry:.2f} - not chasing "
                     f"(execution.max_chase_r {max_r:g})")
         if run > 0 and plan.get("order_type") == "LIMIT" and plan.get("limit_price"):
             offset = float(getattr(cfg, "limit_offset_bps", 5.0)) / 1e4
-            plan["limit_price"] = round(px * (1 + sign * offset), 2)
+            limit = round(px * (1 + sign * offset), 2)
+            refused = self._repriced_check(p, limit, operator, sized)
+            if refused:
+                return refused
+            plan["limit_price"] = limit
+        return None
+
+    def _repriced_check(self, p: Play, limit: float, operator: str,
+                        sized: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """A limit entry the last look re-priced off the quote, judged again at that price - where the order
+        fills, not the play's entry: the further it runs, the more the risk to the stop and the less the reward to
+        the target. Refused when the reward:risk to the first target falls below the floor the entry was judged by
+        (risk.min_reward_risk for a click; for Autopilot's entries that or its own, whichever is higher - assess_play
+        held them to both), or when the size at that price - the risk budget over the wider stop distance, the
+        per-position cap at the dearer price - comes to nothing. Otherwise the play takes that size, never more
+        shares than the order preview sized it at (``decided_by`` "preview" when that count is what held it), so the
+        shares sent, and the risk and cost the trade records, are the re-priced entry's - and so is ``sized``, the
+        sizing record its entry context keeps. None when it passes."""
+        sign = 1.0 if p.side is Side.LONG else -1.0
+        risk = (limit - float(p.stop)) * sign
+        target = p.primary_target
+        if target is not None and p.kind.value != "FUNDAMENTAL":     # assess_play leaves a valuation play's alone too
+            floor, own = float(self.settings.config.risk.min_reward_risk), float(self.autopilot.min_reward_risk)
+            whose = "the minimum of {:g} (risk.min_reward_risk)"
+            if operator == "autopilot" and own > floor:
+                floor, whose = own, "Autopilot's minimum of {:g} (autopilot.min_reward_risk)"
+            rr = (float(target) - limit) * sign / risk if risk > 0 else 0.0
+            if rr < floor:
+                return (f"re-priced to {limit:.2f}, the entry's reward:risk to the first target {float(target):.2f} is "
+                        f"only {max(rr, 0.0):.2f} - below {whose.format(floor)}")
+        sized_on = self.sizing_account(p.timeframe) or self._account
+        if sized_on is None:
+            return f"no account data - the entry re-priced to {limit:.2f} can't be sized"
+        open_risk = self.open_risk_usd()
+        if open_risk is None:
+            return f"re-priced to {limit:.2f}, the entry can't be sized again: {OPEN_RISK_UNREAD}"
+        previewed = int(p.suggested_qty or 0)               # the shares the order preview sized it at
+        at_limit = dataclasses.replace(p, entry=limit)      # sized on a copy: a refusal leaves the play's size
+        sizing = self._size_entry(at_limit, sized_on, open_risk)
+        # never more than the preview's shares - what a click confirmed and Autopilot's checks were made on. A short
+        # re-priced under its entry would buy more: every dollar cap goes further at the lower price
+        qty = min(sizing.qty, previewed)
+        if qty <= 0:
+            return (f"re-priced to {limit:.2f}, the position sizes to nothing ("
+                    f"{', '.join(sizing.caps_hit) or 'risk budget too small for one share'}) - not entering")
+        p.suggested_qty, p.risk_per_share = qty, at_limit.risk_per_share
+        if qty == sizing.qty:
+            p.dollar_risk, p.notional = at_limit.dollar_risk, at_limit.notional
+        else:
+            p.dollar_risk, p.notional = round(qty * at_limit.risk_per_share, 2), round(qty * limit, 2)
+        if sized is not None:
+            record = self._sizing_record(sizing)
+            if qty < sizing.qty:
+                record.update(qty=qty, est_risk=p.dollar_risk, est_cost=p.notional, decided_by="preview")
+                record["limits"]["preview"] = {"shares": previewed}
+            sized.clear()
+            sized.update(record, repriced_to=limit)
         return None
 
     def reject_play(self, play_id: str, operator: str = "operator") -> Dict[str, Any]:
@@ -2466,8 +2944,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         return {"ok": not failed, "note": note, "results": results}
 
     def _close_all(self, trades: List[Dict[str, Any]], reason: str) -> List[Dict[str, Any]]:
-        """Send every close at once - the broker calls are independent, so a thread
-        per position turns N round-trips into about one."""
+        """Send every close, a thread per position - the executor still sends them one at a
+        time (Executor._lock), never beside the order sync or one another."""
         if not trades:
             return []
 
@@ -2761,9 +3239,13 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             "market_data": (status or {}).get("market_data", "none") if connected else "none",
         }
 
+    def pnl_summary(self) -> Dict[str, Any]:
+        """The P/L summary (repo.pnl_summary), today's and the week's for the account orders go to now."""
+        return self.repo.pnl_summary(venue=self._venue)
+
     def _pnl(self) -> Dict[str, Any]:
         try:
-            return self.repo.pnl_summary()
+            return self.pnl_summary()
         except Exception:  # noqa: BLE001
             return {}
 
@@ -2791,7 +3273,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             "positions": views.positions(acc, self._marks()),
             "untracked": self.untracked_positions(),
             "mismatches": self.position_check.mismatches,
-            "day_trades_5d": self.repo.count_day_trades(5),
+            "day_trades_5d": self.repo.count_day_trades(5, venue=self._venue),
             "day_trade_limit": cfg.account.max_day_trades_under_threshold,
             "pnl": self._pnl(),
             "scan": self.scan_status(),
@@ -2822,6 +3304,36 @@ def _utc(value: Any) -> Optional[dt.datetime]:
     if not isinstance(value, dt.datetime):
         return None
     return value.replace(tzinfo=dt.timezone.utc) if value.tzinfo is None else value.astimezone(dt.timezone.utc)
+
+
+def _not_booked(booked: Sequence[Mapping[str, Any]], executions: Sequence[Any]) -> List[Tuple[Any, float]]:
+    """The broker's ``executions`` (of one stock, the exit side) that a record hasn't booked, oldest first, each with
+    its shares not booked yet. ``booked`` is the record's own fills (Repository.trade_record): as many shares of an
+    order as the record booked from it - its fills keep the order's id - are skipped, and then the first shares of the
+    rest for what it booked off today with no id the executions carry (a booking from before the ids were kept, or
+    one a share-count fix made). Its earlier days' bookings aren't among the executions: IBKR reports only today's."""
+    reported, today = {str(f.order_id) for f in executions}, clock.session_date()
+    by_order: Dict[str, float] = {}
+    loose = 0.0
+    for b in booked:
+        if b.get("leg") != "EXIT":
+            continue
+        qty, oid, at = float(b.get("quantity") or 0.0), str(b.get("broker_order_id") or ""), _utc(b.get("ts"))
+        if oid and oid in reported:
+            by_order[oid] = by_order.get(oid, 0.0) + qty
+        elif at is not None and clock.session_date(at) == today:
+            loose += qty
+    out: List[Tuple[Any, float]] = []
+    for f in sorted(executions, key=lambda f: _utc(f.ts) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)):
+        take, oid = float(f.quantity), str(f.order_id)
+        skip = min(by_order.get(oid, 0.0), take)
+        if skip > 0:
+            by_order[oid], take = by_order[oid] - skip, take - skip
+        skip = min(loose, take)
+        loose, take = loose - skip, take - skip
+        if take > 1e-9:
+            out.append((f, take))
+    return out
 
 
 def _quote_origin(q: Any) -> Tuple[str, Optional[int]]:

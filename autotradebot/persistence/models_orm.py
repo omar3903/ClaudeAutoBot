@@ -7,7 +7,7 @@ play_logs          every play the board took (accepted or not) and what became o
 trades             an executed position's full lifecycle + realised P/L
 fills              individual executions attached to a trade
 account_snapshots  periodic equity / cash / buying-power / day-trade count
-order_audit        raw order request + broker response
+order_audit        every order placed, cancel or change asked for, and error the broker sent - request + answer
 insider_trades     open-market insider purchases and sales, from SEC Form 4 filings
 filings_read       the SEC filings already read, so none is fetched twice
 news_items         company headlines and 8-K filings, with their sentiment
@@ -214,7 +214,7 @@ class OrderAudit(Base):
     play_id: Mapped[Optional[str]] = mapped_column(sa.String(32), nullable=True, index=True)
     trade_id: Mapped[Optional[str]] = mapped_column(sa.String(32), nullable=True, index=True)
     broker: Mapped[str] = mapped_column(sa.String(16), default="paper")
-    action: Mapped[str] = mapped_column(sa.String(24), default="")     # PLACE / CANCEL / REPLACE
+    action: Mapped[str] = mapped_column(sa.String(24), default="")     # PLACE / CANCEL / MODIFY / ERROR
     request: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     response: Mapped[Optional[dict]] = mapped_column(sa.JSON, nullable=True)
     ok: Mapped[bool] = mapped_column(sa.Boolean, default=True)

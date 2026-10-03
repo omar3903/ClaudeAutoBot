@@ -124,7 +124,8 @@ history** and **P/L summary**. Stop the app with **Quit** or Ctrl+C — see
 [Quitting](#quitting).
 
 Without IB Gateway there are no prices: nothing is scanned, the simulator can't
-fill, and the data pill reads `data: none`. Nothing is ever made up.
+fill, orders meant for an IBKR account are refused until it's back, and the data
+pill reads `data: none`. Nothing is ever made up.
 
 ---
 
@@ -144,7 +145,17 @@ Settings so it's done before the bell):
    stock type (common stock, ADR, REIT…) and IBKR's industry, which maps onto the
    11 sectors. Kept in `data/symbols.json`, so only new listings cost a request.
 3. **Daily candles.** Each stock's daily candles live on disk (`data/bars/`); a
-   stock is downloaded in full once, then only the sessions it's missing.
+   stock is downloaded in full once, then only the sessions it's missing. The
+   ranking lets a stock miss one session, and a download can fail: during the
+   session such a stock's candle for yesterday is built from its 5-minute bars,
+   so its gap, its prior close and its intraday heat start from yesterday's
+   close and never an older one. When the 5-minute bars don't hold yesterday
+   either, its day-trade setups are skipped; the swing setups still run (the
+   first such stock each session is logged at INFO). Yesterday is the last
+   session the stock's 5-minute bars or the S&P 500 ETF's candles hold, so a
+   weekday the market was shut that the holiday calendar doesn't list isn't
+   taken for a missed session; the calendar decides only when no candles reach
+   today.
 4. **Daily heat** — no requests: relative volume in the last session, the size of
    its move against its ATR, a close near a 20-day high or low, volatility and
    dollar volume, each turned into a percentile across every **liquid** stock
@@ -177,6 +188,9 @@ buffer name looked at is:
 - **kept** — among the two best seen so far in its sector, waiting for a slot;
 - **dropped** — of less use than what's already hot or kept.
 
+A hot-list stock whose candles didn't come this cycle keeps the heat it had, so
+a missed request doesn't make it the coolest and cost it its slot.
+
 So each sector's buffer is worked through over the day for a handful of requests
 per cycle — about 60 every 15 minutes. While **Autopilot** is day-trading an
 open session, the hot list alone is also rescanned every minute.
@@ -191,7 +205,11 @@ the board within the half hour. Its intraday heat refreshes the hot list: a
 stock hotter than the coolest hot-list name by 10 % takes its slot (within the
 cap of a third per sector), and the best of the rest per sector are kept
 waiting. It takes two to three minutes of Gateway time and the 5-minute cycle
-waits for it. (The Gateway takes about half a second over a candle request
+waits for it. Between its chunks it steps aside for a candle-close check that
+has come due and for the 15-second re-check of the plays, each followed by
+Autopilot's pass, so neither waits out the sweep; a stock such a check read
+after the sweep did keeps the check's plays, which are on the newer candle.
+(The Gateway takes about half a second over a candle request
 whether it asks for an hour or a week, so the rate is set by how many are in
 flight: twelve at once read about 17 stocks a second, none refused in a test of
 700; thirty-two timed out.) The plays it finds stay on the board and are
@@ -225,8 +243,8 @@ next buffer names.
 
 Also in `config.yaml`: `gapper_symbols` (400), `gapper_min_gap_pct` (2), `gapper_min_volume`
 (50,000), `buffer_picks_per_sector` (2), `kept_per_sector` (2),
-`fast_cycle_seconds` (60), `close_check` (true) and `mover_atr` (1.0) (see
-**Candle-close check**), `live_scan` (10; see **Live scans**),
+`fast_cycle_seconds` (60), `close_check` (true), `close_grace_s` (8) and
+`mover_atr` (1.0) (see **Candle-close check**), `live_scan` (10; see **Live scans**),
 `fundamentals_leaders` (8), the liquidity `prefilter`,
 and `max_universe` (0 = every listing; `SCANNER_MAX_UNIVERSE` caps it without
 editing the file).
@@ -262,10 +280,12 @@ Two switches, both in the dashboard and remembered in `data/runtime.json`
   live** show the same warning. The two ports must differ, 4001 / 7496 (IBKR's
   live ports) can't be the paper port, and `IBKR_PORT` (one port for both) is
   only accepted with `IBKR_READONLY=1`.
-- If the Gateway isn't reachable, paper orders fall back to the simulator (which
-  has no prices until the Gateway answers) and the header pill turns red with the
-  fix. **Live** is never faked: if your live account isn't reachable, the switch
-  is refused and tells you why.
+- If the Gateway isn't reachable, orders stay pointed at the IBKR account the
+  switches choose and are refused until it answers — never sent to the simulator
+  in its place — and the header pill turns red with the fix; the app connects by
+  itself once it answers. **Live** is never faked: a switch to Live that can't
+  connect is refused and tells you why, and an app already on Live stays on it,
+  its orders refused, until the live account is back.
 - Every trade is stamped with its venue (`paper`, `ibkr-paper`, `ibkr-live`). The
   exit manager only manages trades on the active venue, a manual **Exit** is
   refused for a position held elsewhere, and a platform or Paper/Live switch is
@@ -318,8 +338,8 @@ re-enters your login automatically, and the app reconnects on its own.
 
 The app keeps checking (every 15 s) and connects as soon as the Gateway answers;
 a successful **Test paper** connects it straight away. It never switches to Live
-on its own, and it won't move paper orders from the simulator to IBKR while
-positions are still open on the simulator — the connection pill says why.
+on its own (a live account it was already on is connected again the same way),
+and it never moves orders away from open positions — the connection pill says why.
 
 **Accounts in another currency.** An IBKR Canada account is kept in CAD. The
 header shows equity, cash and buying power in the account's own currency (hover
@@ -351,19 +371,26 @@ speed and show only: the setups, confirmations and the replay still run on
 IBKR's own 5-minute candles.
 
 **Candle-close check.** At every 5-minute close in regular hours (09:35 to
-15:55) the watch tier's setups are checked on IBKR's just-closed bars about 2
-seconds after the close - one request per stock for the last hour of bars - so
-a setup is typically published 5-8 seconds after its candle closes instead of
-up to a couple of minutes later. The check stands in for the fast cycle due
-then. Between closes, a watch stock whose streamed 1-minute candle spans at
-least `scanner.mover_atr` (1.0; 0 = off) of its 5-minute ATRs, or makes a new
+15:55) the watch tier's setups are checked on IBKR's just-closed bars
+`scanner.close_grace_s` (8; 0-30) seconds after the close - one request per
+stock for the last hour of bars - so a setup is typically published within a
+few seconds of that instead of up to a couple of minutes later. IBKR prints a
+stock's new bar a few seconds after the close, and a check much sooner finds
+few of them; the stocks whose new bar isn't in yet are asked once more about
+15 seconds after the check read (IBKR refuses the same request within 15 s),
+and any still missing then wait for the fast cycle or the next close. A check
+that read at least half its stocks stands in for the fast cycle due then; one
+that read fewer leaves the fast cycle to its second ask. Between closes, a
+watch stock whose streamed 1-minute candle spans at least
+`scanner.mover_atr` (1.0; 0 = off) of its 5-minute ATRs, or makes a new
 high or low of the day on 3x its average minute volume, gets an early-mover
 check at once (at most once per 5 minutes). An early-mover check can't add a
 candle confirmation - its 5-minute candle hasn't closed - so it catches
 price-level setups and refreshes the stock's plays. `scanner.close_check:
 false` turns both off (the fast cycle as before). The log says `close check
-10:05 ET: ... published 5.4 s after the candle closed` or `early-mover check
-10:07 ET (...)` for each one, and once a session `live candles vs IBKR
+10:05 ET: ... published 9.4 s after the candle closed` (`close check 10:05 ET
+(second ask): ...` for the second ask) or `early-mover check 10:07 ET (...)`
+for each one, and once a session `live candles vs IBKR
 5-minute bars` with the volume ratio that tells whether the stream counts
 shares or lots of 100.
 
@@ -372,7 +399,8 @@ live market scans - the biggest % gainers, the biggest % losers and the
 stocks hottest by volume (US stocks and ADRs at $3-600), one open at a time
 and each cancelled once it answers. The first `scanner.live_scan` (10; 0 =
 off) of their names that are ordinary shares in the sectors the filters
-allow, with daily candles and not on the hot list already, take watch-tier
+allow, with daily candles through yesterday (or 5-minute candles in hand that
+hold yesterday's session) and not on the hot list already, take watch-tier
 slots right after the hot list - so a stock that was quiet until today is
 streamed and checked at each close like the rest. Liquidity is judged on
 today's volume: after a candle-close check, a live name whose dollar volume
@@ -590,12 +618,22 @@ The app is built to be left running:
   minute or two) and reconnects once the Gateway has logged back in. A Gateway that takes connections
   before it has loaded the account isn't trusted - the app tries again - and for a minute after any
   reconnect, positions aren't compared with the trade records and working orders aren't given up on,
-  so nothing is deleted because an answer came back half-loaded.
+  so nothing is deleted because an answer came back half-loaded. An order that finished while the
+  connection was down comes back from IBKR without its order id; the app finds it by IBKR's permId or
+  its executions and books it as if it had heard it live. An entry, stop or target IBKR no longer knows
+  at all is looked for in IBKR's executions before it is given up, so what it filled is booked.
 * **IBKR's nightly maintenance** (about 11:45 PM-12:45 AM ET). When the Gateway stays up but loses
   IBKR's servers, the app waits on the same connection for IBKR's all-clear; if that hasn't come after
   10 minutes it starts the connection afresh.
 * **The weekly login.** About once a week IBKR wants a full login (with two-factor). If the Gateway
-  has been gone for 10 minutes, the dashboard says so - log in and the app picks up by itself.
+  has been gone for 10 minutes, the dashboard says so - log in and the app picks up by itself. That
+  notice comes at night when the 9 PM restart doesn't come back, so on a trading day a Gateway still
+  gone at 07:45 ET (`scanner.gateway_alert_time`, `""` = off) is said again, once, before the full scan
+  needs it.
+* **A failed connect never moves the orders.** While the IBKR account the switches choose can't be
+  connected - at the start, after **Reconnect**, or on Live - orders stay pointed at it and are refused
+  until it answers; none go to the simulator (or to paper) in its place, so its positions get their
+  exits back the moment it reconnects. The connection pill says so.
 * **A replay running at 9 PM** waits up to 15 minutes for the Gateway instead of failing.
 * **A slow answer never reads as an empty account.** An account or positions read IBKR doesn't
   answer in time (the Gateway busy with a big download, say) keeps the last snapshot, which then
@@ -605,6 +643,34 @@ The app is built to be left running:
   IBKR hasn't answered within 10 s is called off and counts as *unknown* - no stop is placed beside
   one that may be resting, an exit still goes out capped by the shares held, and the orders an earlier
   run left working are taken over by the next order sync that can list them.
+* **An order IBKR doesn't answer in time is never taken as not sent.** One the Gateway's connection
+  hadn't got to when the wait ran out is called off unsent. One it had started may have reached IBKR, so
+  the next order syncs look for it there by its tag: it is followed if it is working, booked if IBKR's
+  executions show it filled, and taken as never sent only once IBKR shows it neither, half a minute on.
+  Nothing goes out in its place meanwhile: an entry's play stays sent and Autopilot keeps its slot
+  (handed back if the order never went out), a position's exit waits, and a stop or target found resting
+  is taken over rather than placed twice. The dashboard hears of an unanswered exit at once - its stop at
+  the broker may already be cancelled for it - and of any order still not found a minute and a half on,
+  again every five minutes, even while IBKR's orders can't be read or the Gateway is down.
+* **A fill the trade log can't save is saved on the next pass, never lost.** A busy database is waited
+  on first: SQLite waits up to 30 s for another writer to finish (sqlite3 alone waits 5), and a trade's
+  opening, close, part taken off or stop move it still turns away as locked is tried twice more, a moment
+  apart - the refused try was undone whole, so nothing is booked twice. (Its journal mode is left as it is:
+  the database can sit in a synced folder, where WAL isn't safe.) When the database still refuses
+  to book a fill - an entry, an exit, or a stop or target IBKR filled - the
+  app logs it, the dashboard says so (again every five minutes while it keeps failing), and the order stays
+  followed until the next order sync books it. Meanwhile it still counts as working: an entry keeps
+  Autopilot's slot, and nothing else is done for the position - no second exit, and its stop is neither
+  moved nor placed afresh. An entry's shares are no order in flight, though: until the booking takes they
+  have no record and no stop, so Shares without a record lists them, with their own Exit, and the warning
+  on shares the records don't explain counts them. That Exit settles them: the entry is no longer booked,
+  so no record, stop or second exit appears later for shares already sold (and if the booking took just
+  before the click, the Exit sells only what the records still don't cover) - and while any closing order
+  works for a stock (that one, or one placed by hand), an exit counts the shares it still has to sell and a
+  stop isn't placed beside it (an exit that has filled, its booking waiting, counts for nothing: those
+  shares are gone already). A quit doesn't cancel such an entry: it waits for its record and closes it like
+  any other before it shuts down, and a pair leg whose pair is called off meanwhile stays followed too -
+  once booked, the pairs desk closes it.
 * **A restart picks the day up where it left off.** The plays on the board, the setups already traded
   or dismissed this session, the pre-market levels the gap check read and the time of the last wide
   scan are saved as the day goes (`data/day_state.bin`: after a scan at most every two minutes, at once
@@ -616,7 +682,10 @@ The app is built to be left running:
   and no price is restored: the first cycle reads fresh candles within seconds, and an entry still
   needs a current quote. With today's watchlist on disk the full scan isn't repeated either; open
   positions and their resting stop and target orders are found again from the trade records and the
-  order tags. A replay the restart cut short resumes from its last finished job (see *The replay*).
+  order tags. An entry sent before the restart that filled while the app was off (its play still
+  *sent*, with no trade and no order working) is booked from IBKR's executions tagged with the play (a
+  read of them that fails is tried again), and gets its stop. A replay the restart cut short resumes
+  from its last finished job (see *The replay*).
 * **An open dashboard tab updates itself.** After the app is updated and restarted, a tab that was already
   open reconnects - and would go on running the scripts it loaded before. The server stamps the dashboard's
   files in its first message; a tab that started on another stamp reloads (or, with a dialog open, asks you to).
@@ -644,9 +713,12 @@ positions:
 | **IBKR (paper or live), swing positions with a stop at the broker** | the dialog also offers **Keep them open & quit**: those positions stay open, protected by their stop orders resting at IBKR, and the app picks them up again when it starts; day trades, pair legs and any position without a resting stop are closed first. Targets and trailing are not worked while the app is off |
 
 **After hours** an exit can't fill, so the app never sends one into a closed exchange - and never takes a
-position's stop off the broker for an exit that can't go out. **Close all & quit** is refused while the market is
-closed; **Keep them open & quit** then keeps every position. A quit that can't finish can be stopped from the
-banner (**Stop quitting**): the positions still open stay open and managed, and the app unlocks.
+position's stop off the broker for an exit that can't go out. An automatic exit turned away for that waits for
+the open (the dashboard says so once) without counting as a failed try, and the first pass of the regular session
+starts every exit's retries afresh, so each goes at the open rather than minutes into it. **Close all & quit**
+is refused while the market is closed; **Keep them open & quit** then keeps every position. A quit that can't
+finish can be stopped from the banner (**Stop quitting**): the positions still open stay open and managed, and
+the app unlocks.
 
 The Active orders tab has **Cancel working orders**: every working entry, exit and stray order is cancelled;
 the stops protecting open positions stay (close the position and its stop goes with it).
@@ -667,7 +739,10 @@ the market at any time, including while quitting.
 Click an open position or a closed trade for its **record**: status, entry and
 exit, stop moves, what the broker holds right now, why it was taken (the play's
 explanation), every fill and every order sent to the broker — with an **Exit**
-button while it's open. The record opens as a panel across the window, and a
+button while it's open. A closed position taken off in parts shows whole, there
+and in the **Trade history**: the shares it was entered with and the average of
+its exits weighted by their shares, with the last part's price beside it. Times
+are your computer's local time. The record opens as a panel across the window, and a
 chart of the trade fills the rest of it (`GET /api/trades/{id}/chart`): 5-minute
 candles from the session before the entry (daily candles once it has been held
 longer than ten sessions), the entry, stop and target lines with the first stop
@@ -683,23 +758,85 @@ one candle to another shades the span green or red for what the move would have
 made or lost this position, with the two closes and the change; a click clears
 it.
 
+The orders in a record are the **broker order audit** (`order_audit`), which
+keeps what happened to each order: every order placed, with the broker's order
+id, status and message; every cancel the app asked for, and why; every move of
+a stop resting at the broker; and every error the broker sent about one of the
+app's orders — a rejection, a cancel it refused (IBKR's 10148, with the state it
+names: the stop may be filling), a cancel it made without being asked (a DAY
+order at the close, say) — marked failed. A call the broker refused or didn't
+answer in time is marked failed too, with the reason. The account number is
+never written into it.
+
 An open-trade record whose position no longer exists where it was opened —
 closed in the broker's own app, or by an exit that filled while the app was down
 — is **closed from the broker's fills**: the exit-side fills of the stock since
-the entry give the exit price and time, so the trade's outcome reaches the
-history, the journal and the strategy records (exit reason `closed-outside`).
-When the broker reports no such fill (IBKR keeps only the current session's) the
-record is **deleted** instead, as after **Reset paper**. A wrong deletion would
-orphan a real position, so the check is strict: it only acts on a connected
+the entry (its own orders' and ones placed outside the app, never another
+trade's), oldest first, give the exit price and time of the shares it still
+holds, so the trade's outcome reaches the history, the journal and the strategy
+records. The exit reason comes from the orders that sold them: `closed-outside`
+when an order from outside the app sold any of them; otherwise the trade's own
+order that sold the last of them names it — its stop `stop` (or `trailing-stop`
+once it had moved), its target `target`, and an exit the app sent the reason it
+was sent for, which the order audit keeps with each exit (a quit's exit that
+filled as the app stopped is `quit`, not a close outside the app). Fills the
+record has booked already — a part taken off earlier, known by its order id —
+are skipped, and only those
+fills' fees come off. Shares no fill accounts for are priced as the fills found
+were, and the record's notes say they are an estimate. When the broker reports no
+such fill (IBKR keeps only the current session's) the record is **deleted**
+instead, as after **Reset paper** — but only once the broker has answered: when
+its fills can't be read (the connection dropped, no answer in time) the record is
+kept and looked at again on a later check, never deleted for a fill the app
+couldn't see. A record with a part already booked off (an exit capped at the
+shares held, a target's part) is never deleted: it keeps that part, and the rest
+is closed at the price of its last exit booked, noted as an estimate. The check
+decides and books under the order sync's lock, and leaves to the sync a trade
+whose exit is still working or whose stop or target fill it is about to book; a
+booking the database refuses is said on the dashboard and tried again on the next
+check. An exit IBKR reports filled with no price is never booked at zero: it stays
+followed until its executions can be read, and is left to this check when they
+show none. A wrong deletion
+would orphan a real position, so the check is strict: it only acts on a connected
 broker's fresh account snapshot, after the connection has been up a minute, for
 trades older than 90 s whose close isn't in flight, and after two misses in a
 row. Closed trades are never deleted, and the broker order audit log is always
 kept.
 
+**Fees** are booked with each fill — the entry's, every part taken off and the
+exit's — and a trade's realised P/L, % and R are after all of them (a part taken
+off banks what it made after its own fee). IBKR sends its commission report a
+moment after each execution, so a fill is mostly booked before its fee is known:
+about once a minute the order sync reads IBKR's executions for the day's recent
+fills (waiting three seconds at most, so a slow Gateway never holds the exits up)
+and adds what IBKR has reported since to the fill, the trade's fees and a
+closed trade's P/L and R. Fifteen minutes after its booking a fill's fee is
+settled and no longer looked up. IBKR keeps only the current day's executions, so
+records booked before fees were recorded stay before commissions; the session
+review says so ("Fees not recorded before …") rather than making numbers up.
+
+Each booking checks and writes the record in one transaction: a close takes it
+from open in one conditional write, and a part comes off only a record still
+holding more shares than it, so two bookings of one record at once — the order
+sync's and the position check's, say — can't both land. A part's fill counts in
+the trade's best and worst prices (MFE, MAE, high-water mark) as the exit's does.
+
+The header's **P/L today** and the **P/L summary**'s *Realized today* and
+*Realized week* add up the trades closed this session and in the last five, by
+when they closed — a swing trade entered last week and closed today is today's —
+on the account orders go to now (the simulator, the IBKR paper account or the
+live one). The summary's other figures cover every closed trade.
+
 The reverse case is shown too: **shares without a record** — held at the broker
 beyond what the open-trade records cover, because they were bought or sold
 outside the app or a fill couldn't be booked — are listed under **Open
 positions** with their own **Exit** button. The app doesn't manage their exits.
+A stock held with no open record at all, or held the other way round from its
+record, that stays so for two minutes of the regular session is also logged as
+a warning and said on the dashboard once a session (again if the count changes).
+An account **short** with nothing recorded, or short where the record is long
+(and the reverse), is **urgent** — a position nothing manages — and its notice
+stays up longer. Nothing is traded because of it: the **Exit** above is yours.
 
 ---
 
@@ -794,13 +931,30 @@ Either way:
 - Risk per trade, the open-risk ceiling and the per-position size limit are
   measured against the **account's value** (or the set amount), never against
   margin: margin only lets more positions be open at once. New positions only use
-  what's left of the trading capital after the bot's open positions.
+  what's left of the trading capital after the bot's open positions. Cash only or
+  with a set amount, that counts everything the broker holds on the account, entries
+  still working included - shares with no trade record (bought by hand, or left
+  untracked) use the same money. The day / swing split counts the bot's own trades.
+- The open-risk ceiling (`risk.max_open_risk_pct`, 4%) counts the risk already at
+  work on the account: each open trade from its entry to the stop it opened with,
+  times its shares, plus the entries still working (pair legs aside) at the price
+  each was sized at when it was sent - one whose fill is being saved counts as
+  working until its record is there. A new position is sized with only what's
+  left under it - and is refused when that isn't enough for one share (Autopilot
+  asks again on its next pass: room frees as trades close). While the open trades
+  can't be read, nothing is sized.
 - Two sliders over the plays tune position size for you and Autopilot alike:
   the **Position Size factor** (0-5, every new position's risk times this) and
   **Max % per position** (1-100, the most one position may hold, as a share of
   the account's value - `risk.max_position_pct_of_equity`). A day trade's stop
   is usually tight, so its risk budget would buy far more than this cap allows:
   for most day trades the cap, not the factor, decides the size.
+- Every entry's record says how it was sized (`sizing` in the play's
+  `evidence.at_entry` and in `trades.entry_context`): its risk, the size factor,
+  which limit decided the share count - the risk budget, the open-risk ceiling,
+  the per-position %, the per-stock cap, the volume cap, buying power or the
+  trading capital's room (or `preview`: an entry re-sized at the last look held
+  to the order card's count) - and what each limit allowed, in dollars and shares.
 - Autopilot and the pair desk fill up to **Max % of trading capital in positions**
   (`autopilot.max_gross_exposure_pct`, 10-100) of it. With margin, IBKR closes
   positions itself if the account's excess liquidity runs out, so a maximum under
@@ -841,8 +995,13 @@ shown so you can see where live would stop you.
 - **PDT** — FINRA flags a *pattern day trader* at **4 day trades in 5 business
   days** on a **margin** account; flagged accounts must hold **$25,000**. Below
   that line you get **3 day trades per rolling 5 sessions**. The guard counts
-  closed same-session round-trips (plus still-open intraday trades opened today)
-  and **blocks the 4th**, warning from the 2nd–3rd.
+  closed same-session round-trips, trades with a part sold on the session they
+  were entered (a day trade then, even while the rest is held or goes later;
+  one per trade, however many parts) and still-open intraday trades opened
+  today, and **blocks the 4th**, warning from the 2nd–3rd. It counts the trades
+  of the account orders go to now — the rule is per account, so the paper
+  account's or the simulator's day trades don't use up the live account's — and
+  the header's day-trade tally is the same count.
 - Every **intraday** play is treated as a *potential* day trade.
 - **Cash account** (`account.cash_account: true`) — PDT does not apply, but the
   guard warns about T+1 settlement / good-faith violations.
@@ -855,7 +1014,10 @@ shown so you can see where live would stop you.
 (full-day holidays **and** 1:00 pm half-days) through 2028.
 
 * **Regular hours** → the order type from `execution.default_order_type`
-  (`LIMIT` / `MARKET` / `STOP_LIMIT`).
+  (`LIMIT` / `MARKET` / `STOP_LIMIT`). A `STOP_LIMIT` entry rests at IBKR as a
+  real stop-limit: it waits for the price to reach the entry, then pays no more
+  than its limit. An order type the IBKR adapter can't send is refused, never
+  sent as some other order.
 * **Pre-market / after-hours** → **limit only**, and only for setups flagged
   extended-hours-eligible (all swing/valuation setups, plus `gap_and_go`).
 * **Closed** (overnight / weekend / holiday) → execution is blocked; the
@@ -869,7 +1031,15 @@ checked against the play: once the price has run past the entry by more than
 `execution.max_chase_r` (0.25) of the distance to the stop, the reward:risk the
 play was judged on is gone and the entry is refused. Within that, a limit entry
 is priced off the quote so it fills now instead of waiting for the price to come
-back through the entry — which is the move failing. A day-trade entry still
+back through the entry — which is the move failing — and is judged again at that
+price: it is re-sized there (the risk budget over the wider distance to the stop,
+the per-position cap at the price paid), so the shares that go out can be fewer
+than the order card's - never more - and it is refused when that comes to nothing
+or when its reward:risk to the first target falls under the floor —
+`risk.min_reward_risk` for a click, the higher of that and Autopilot's
+`min_reward_risk` for its entries. A price
+already at or through the play's stop refuses the entry outright: the setup is
+void. A day-trade entry still
 working after `execution.entry_timeout_min` (10) minutes is cancelled for the
 same reason; swing entries keep their DAY life. The log says which quote each
 check read (a stream's, a snapshot or a candle) and how old it was.
@@ -903,10 +1073,21 @@ match too, so check the untracked shares first).
 **What fills cost (Harris).** The same last look keeps the quote it saw, and the
 trade record stores the fill against it: `decision_price`, `spread_bps`,
 `entry_slippage_bps`, and for exits `exit_decision_price`, `exit_slippage_bps` -
-the implementation shortfall. On live quotes an entry is refused when the spread
-is more than `execution.max_spread_r` (0.10) of the distance to the stop. The
-daily review averages the measured slippage and says when the account pays more
-than the replay charges.
+the implementation shortfall. The slippage is kept only when the quote the
+decision was made on was live: a delayed quote is minutes old, and a fill against
+it says how far the price moved since, not what the fill cost (a stop or target
+resting at the broker is measured against its own price either way). On live
+quotes an entry is refused when the spread is more than `execution.max_spread_r`
+(0.10) of the distance to the stop. A look that refuses an entry keeps its quote
+with the play (`last_look`, the first refusal), and the daily review charges that
+spread to the play's shadow trade. The daily review averages the measured
+slippage, leaving out the fills with none, and says when the account pays more
+than the replay charges. Records from before this change: `python
+scripts/repair_records.py` says which trades it would put right (`--apply` changes
+them) - it clears the slippage measured before the account had real-time prices
+(`--live-since`, default 2026-09-23: the entry's on the trades entered before it,
+the exit's on those that exited before it), and relabels `stop` the closed trades
+booked `trailing-stop` whose stop never moved. It prints trade ids only.
 
 ---
 
@@ -922,10 +1103,45 @@ truth: every few seconds the order is made to match it - the break-even and
 trailing ratchets move it (at most once every 15 s), the scale-out resizes it.
 Two rules keep it safe:
 
-* **Never two exits on one position.** Before the app sends an exit of its own it
+* **Never two exits on one position.** When the price crosses the stop while it rests at
+  IBKR, the app first gives that stop `broker_stop_grace_s` (10 s from the first cross) to
+  fill: IBKR fills it on real prices and the order sync books it, where cancelling it for a
+  market order of the app's own costs a round trip and a worse fill, and may find it already
+  filling. Back inside the stop, the next cross gets its 10 s afresh; past them, with no
+  stop resting or with IBKR disconnected, the app's exit goes as below (`0` = at once). So
+  it does when the price hasn't reached the stop where it rests at IBKR (a ratchet not sent
+  yet) - and the grace counts only in the regular session, where IBKR's stop can fill.
+  Before the app sends an exit of its own it
   cancels the stop and waits for IBKR to confirm; if the stop filled first, that
   fill is booked and nothing else is sent; if IBKR hasn't confirmed, the exit waits
-  for the next pass. A partial exit first shrinks the stop to the shares that remain.
+  for the next pass. A cancel IBKR refuses (the stop is already filling) is no
+  confirmation - ib_async would report that stop as cancelled, the app keeps it as
+  working until IBKR says it filled or is cancelled - and a stop that read cancelled is
+  read once more, for a fill landing just behind the cancel, before the exit goes out.
+  A cancel IBKR answers with neither its confirmation nor a fill holds the exit back
+  for half a minute, and the order sync leaves that stop alone meanwhile. A stop move IBKR
+  refuses leaves the stop as it was, and it is replaced; one refused a few seconds after the
+  move seemed taken reads where IBKR still holds it and rests on there - never cancelled for
+  the next move - which goes once IBKR's list of its orders shows the stop still working.
+  A close that waited while another (a second click, a quit, the order sync booking the
+  stop's fill) had the position's orders looks again: if that one sent its exit or closed
+  the record, nothing more goes out. The order sync, the dashboard's buttons, a quit's
+  closes and Autopilot's entries take turns at the broker, one at a time: a second close
+  for a position whose exit is being sent comes back at once, a Refresh while the sync is
+  mid-pass doesn't start a second pass beside it, and a stop's fill is booked once, by
+  whichever of them takes it off the books first - one the database couldn't save goes back on
+  them, and the exit waits until the next pass has booked it. A stop IBKR no longer knows at all is
+  looked for in its executions before an exit stands it down; while they can't be read the
+  exit waits.
+  An exit right after a start stands down the stop and target an earlier run left
+  too, before the app has taken them over; while IBKR's order list can't be read (the
+  connection down too: no list is no empty list), or is still reloading after a connect,
+  the exit waits rather than go out beside one - and goes within seconds once it may.
+  Once a full list has shown nothing of an earlier run's for a position (or the app
+  opened it itself), a list that can't be read no longer holds its exit back. An exit still
+  waiting after a minute and a half - however far apart its tries - is reported on the
+  dashboard like a failed one. A partial exit first shrinks the stop to the
+  shares that remain, and is never sent while a target rests at IBKR.
 * **Never a stop without a position.** A stop is placed only while the account shows
   the shares and the broker's orders could be read; a stop whose trade is no longer
   open is cancelled; a stop an earlier run left is followed, never doubled. If it (or
@@ -939,31 +1155,44 @@ that comes off at the first target when the position scales out, for all of it
 otherwise. The two share a **one-cancels-all group** at IBKR (type 3: when one fills,
 the other is reduced by the shares filled) - the target taking half off shrinks the
 stop to the other half, the stop filling cancels the target, and the two can never
-both fill for the whole position. IBKR works them on real prices, so profit is taken
-at the target even on delayed quotes, and while the app is off. When the first
+both fill for the whole position. Moving the stop's price leaves its size as IBKR holds
+it, so a target that has filled in part keeps the stop cut to what is left, and a resize
+never asks for more than the record holds less what the target has filled. IBKR works
+them on real prices, so profit is taken at the target even on delayed quotes, and while
+the app is off. When the first
 target fills, the app books the scale-out (stop to break-even, second target) and
 rests a fresh pair for what is left; while a target rests the exit manager leaves
 the target to the broker. A plain stop left by an earlier version is stood down and
-replaced by the pair. If IBKR refuses the pair, the trade gets a stop alone and the
-app works its target itself, as before.
+replaced by the pair. A pair is only stood down to be placed afresh once IBKR's orders
+have been read, so a stop is never cancelled that can't be replaced. If IBKR refuses the
+pair, the trade gets a stop alone and the app works its target itself, as before.
 
 **A position without a stop at the broker is never silent.** A stop is only ever rested for shares
 the broker shows - triggered, one for shares it doesn't hold would open a position the other way - so
 during a fill landing in pieces it waits a few seconds, and if the broker's count and the record
 disagree (part sold by hand in TWS, say) it waits for them to agree. Meanwhile the app's exit
-manager still watches the price and sends the exit itself; what nothing covers is the app being off.
+manager still watches the price and sends the exit itself - unless IBKR's orders can't be read for a
+position never looked for in a full list, when its exit waits too (and the report says so); what
+nothing covers is the app being off.
 So a position with no stop at the broker is marked **no stop at the broker yet** in red in the Open
 positions tab's **Protection** column, and once that has lasted 90 seconds the log and the dashboard say
 so, with the reason, and again every five minutes until it's fixed.
 
 **An exit called off after filling in part is booked.** Quitting and then pressing *Stop quitting*, or
 cancelling an exit, can call off an exit order that has already sold part of the position. The app books
-that part when the broker reports the cancelled order - unless it stops first. So the position check also
-books it from the broker's executions: when a record holds more shares than the broker, the same way round,
-the fills tagged with that trade's own exit orders (`exit:<trade>`) are booked at their prices - never more
-than the record is over by, never while an exit for it is still working, only for a symbol with one record.
-The counts then agree, and the stop and target go back at the broker for what's left. A difference its own
-fills don't explain (shares sold by hand in TWS) is left alone and reported, as before.
+that part off the record at its own price when the broker reports the order ended (rejected, cancelled,
+expired, or found in the executions after an order the broker didn't answer in time), and the next exit
+sells what the record then holds - unless it stops first. An exit capped by the shares the account holds
+(fewer than the record: some went without the record hearing) books only what it sells, never the whole
+record at its price. So the position check also books from the broker's executions: when a record holds
+more shares than the broker, the same way round, the fills of that trade's own orders - its exits
+(`exit:<trade>`), and its stop (`stop:<trade>`) or target (`tgt:<trade>`) that filled while the app wasn't
+following them (a restart) - are booked oldest first, each order at its own price and with its own reason
+(`exit`, `stop` / `trailing-stop`, `target-1`), past the shares the record has booked already and never
+more than it is over by. Never while an exit for it is still working, never from a stop or target the app
+follows (it books those when they finish), only for a symbol with one record. The counts then agree, and
+the stop and target go back at the broker for what's left. A difference its own fills don't explain
+(shares sold by hand in TWS) is left alone and reported, as before.
 
 **A share count that disagrees can be fixed from its warning.** Each yellow share-count warning has a
 **Fix…** button. It reads the account again and shows what the record and the account hold, the broker's
@@ -982,23 +1211,29 @@ record or a pair leg, and - the exit only - while the market is closed. More sha
 exited from **Shares without a record**, as before.
 
 The Open orders panel lists them as **stop** and **target** with their trade. The
-simulator keeps its own bracket and gets no such orders.
+simulator keeps its own bracket and gets no such orders. A fill of the bracket's stop or
+target closes the trade whose entry it was attached to, once, and never another trade of the
+stock. An exit the app sends for the whole position cancels what is left of the bracket
+first, and so does a record closed because its position is gone, so the bracket can't fill
+later and open the other side.
 
 `autotradebot/execution/exit_manager.py` runs every few seconds on every open trade
 held on the active platform — **entries need your click, exits never do**:
 
 | rule | default | config key |
 |---|---|---|
-| cut losses at the working stop | on | — |
+| cut losses at the working stop - one resting at IBKR gets a moment to fill first | on, 10 s grace | `broker_stop_grace_s` |
 | take profit at the target | on | — |
 | **take half off at the first target**, stop to break-even, the rest runs to the second target (Aziz) | 50 % | `scale_out_pct`, `scale_out_lock_r` (plays with one target exit whole) |
 | tighten the stop to **lock a small profit** once green | at +1.3 R, lock +0.3 R | `breakeven_at_r`, `breakeven_lock_r` |
 | **trail** the stop, keeping a fraction of the open R | from +2.0 R, lock 50% | `trail_start_r`, `trail_lock_ratio` |
 | **close a day trade that isn't working** once its setup's window has passed | on | `intraday_time_stop` |
-| **flatten day trades** before the (holiday-aware) close | 10 min before | `flatten_intraday_before_close_min` |
-| force-close **stale swings** | 10 days | `max_swing_hold_days` |
+| **flatten day trades** before the (holiday-aware) close - one still open from an earlier session at the next regular-session pass | 10 min before | `flatten_intraday_before_close_min` |
+| force-close **stale swings** at the flatten on their last day | 10 trading days, the entry's counted | `max_swing_hold_days` |
 
-The stop only ever ratchets in your favour and never through the last price. R
+The stop only ever ratchets in your favour and never through the last price, and
+only in the regular session: a pre-market or after-hours print is thin, so it still
+counts in the trade's excursions and trips its stop or target, but moves no stop. R
 is measured against the **original** stop. Each open position has an **Auto
 exit** toggle in the blotter if you want to hand-manage it.
 
@@ -1007,6 +1242,15 @@ runs its stop and target checks, and moves its stop, within about a second. The
 note on the record and the message about a moved stop wait for the next full
 pass a few seconds later (or the exit, if one goes out first), and so do the time
 exits.
+
+The time exits read no price, so they go out even when a pass has no quote for
+the stock (or only one from before the entry). A day trade still open from an
+earlier session - the app was down at the flatten, say - is closed at the first
+pass of the next regular session, with the reason `eod-flatten`: the flatten it
+missed. A swing trade's limit counts trading days the way the replay counts its
+daily candles, the entry's day included, and it goes at the flatten on the last
+one (at the next open with the flatten off); the Open positions tab shows that
+day.
 
 Every strategy also declares how long its trade *should* take. The blotter shows
 an **Age / Expected** bar per position (green → amber **aging** → red **⏰
@@ -1039,16 +1283,17 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | minimum strategy confidence, swing trades | 0.5 | `min_swing_confidence` (the swing setups state flat 0.55–0.58 confidences; the replay's proof is their real gate) |
 | minimum reward : risk | 2.0 | `min_reward_risk` (Aziz Rule 5) |
 | concurrent open auto positions | 2 | `max_auto_positions` - divided between day and swing trades by the day / swing split of the trading capital; Autopilot counts the positions it opened before a restart too |
-| auto trades per session | 3 | `max_auto_trades_per_day` - an entry that ends with nothing bought (timed out, cancelled, refused) hands its slot back, once; one the broker lost keeps it, as it may have filled. The setup itself isn't offered again that day. No more than twice this many entry orders go out in a day, whatever happened to them (the play's bar turns amber and says so; the Autopilot button's tooltip shows the orders sent) |
+| auto trades per session | 3 | `max_auto_trades_per_day` - an entry that ends with nothing bought (timed out, cancelled, refused) hands its slot back, once; one the broker lost keeps it, as it may have filled, and so does one IBKR didn't answer in time until IBKR shows it never went out. The setup itself isn't offered again that day. No more than twice this many entry orders go out in a day, whatever happened to them (the play's bar turns amber and says so; the Autopilot button's tooltip shows the orders sent) |
 | aggregate open auto $-risk | 4 % of equity | `max_open_risk_pct` |
 | concurrent auto trades from **one** strategy | 2 | `max_per_strategy` |
 | new auto entries **per scan cycle** | 1 | `max_new_per_cycle` - a cycle is a scan of the market (5 minutes for swing trades, the 60-second fast cycle for day trades), not the 15-second re-check of the board |
 | **no entries while prices can't be read** | always | IBKR refusing candles (the login active somewhere else) stops every entry, and an order whose last-look quote fails is refused - never sent blind |
-| **cool off** a ticker after it stops out today | on | `cooldown_after_loss` |
+| **no entries while its own records can't be read** | always | a database read that fails refuses rather than guesses: a pass that can't read Autopilot's open trades takes nothing and the log warns (once, until they read again); a play whose already-held or cool-off check can't be read is refused; today's realized P/L keeps the last figure read, so a stop for the day holds |
+| **cool off** a ticker after it stops out today | on | `cooldown_after_loss` (goes by the day the trade closed, so a position held overnight and stopped out today counts) |
 | **proof is not luck**: the replayed edge, net of the stocks' own drift, survives a reality check across every setup tried, and costs take no more than a third of it | p ≤ 0.10 | `proof_p_value` (Aronson; Carver's speed limit; 0 = the luck test off) |
 | **the learned model** | shadow | `model_mode`: `shadow` logs its odds, `gate` refuses plays under `model_min_p`, `size` also scales the risk - only while the model is usable |
-| **stop for the day** once today's closed trades have lost this % of equity | 2 % | `max_daily_loss_pct` (Aziz's daily maximum loss; 0 = off) |
-| **stop for the day** once the day's realized gain has given back this % of its best | 30 % | `max_giveback_pct` (Aziz: never lose more than 30 % of what the morning made; `giveback_floor_pct` 0.25 % of equity is the smallest gain that counts; 0 = off) |
+| **stop for the day** once today's closed trades have lost this % of equity | 2 % | `max_daily_loss_pct` (Aziz's daily maximum loss; every trade closed today counts, swing trades too; 0 = off) |
+| **stop for the day** once the day trades' realized gain has given back this % of its best | 30 % | `max_giveback_pct` (Aziz: never lose more than 30 % of what the morning made; only day trades count, so a swing closed at a profit doesn't make a peak one day-trade loss gives back; `giveback_floor_pct` 0.25 % of equity is the smallest gain that counts; 0 = off). Either stop holds for the rest of the session, even if a later trade brings the P/L back, and through a restart; only changing one of the two limits lifts it |
 | **no new day trades** in the last minutes of the session | 30 | `min_minutes_to_close` (Aziz keeps the last half hour for closing; the exit manager flattens day trades 10 minutes before the bell; 0 = off) |
 | require a catalyst / dry-run | off | `require_catalyst`, `dry_run` |
 
@@ -1065,9 +1310,13 @@ Autopilot is on, a play it won't take gets a faded grey robot: hovering it gives
 the first check the play fails, in the words the entry gate itself uses (the
 badge and the gate share one set of checks). The play's detail panel says the
 same in one line. A play Autopilot tried and was refused - by the engine's
-assessment (say as too thin to trade) or the broker - gets the faded robot with
-the refusal, and a note in **Autopilot notes**; it isn't tried again that day
-unless a setting changes.
+assessment (say as too thin to trade), the last look at the quote (the spread, a
+chase) or the broker - gets the faded robot with the refusal, and a note in
+**Autopilot notes**; it isn't tried again that day unless a setting changes (one
+refused only for want of room under the open-risk ceiling is tried on each pass
+until room frees). The
+refusal is logged too, and kept on the play's row (`evidence.autopilot_refused`)
+with the play's confidence, reward:risk, confirmations and noise flags then.
 
 **The strip under the header** says what Autopilot is doing now and why, in one
 line: off, paper-only, no prices, stopped for the day, done (the day's entries
@@ -1098,8 +1347,12 @@ taken, averaging at least `min_replay_expectancy_r` (+0.05R) — **and** at leas
 of them in the held-out latest third of the sessions, averaging more than 0R
 there. The statistical noise checks (`not_trending`, `not_mean_reverting`,
 `turbulent_market`) and the two news checks (`news_driven_move`,
-`move_without_news`) are skipped by themselves once the replay shows that the
-trades they remove did worse on every session and on the held-out ones. Each
+`move_without_news`) are skipped by themselves once the replay shows real
+evidence that the trades they remove are worse: over every session they averaged
+at least 0.05R a trade below the ones kept, two standard errors or more apart
+(Welch's t of -2 or lower), and they did worse on the held-out sessions too. A
+gap of a few hundredths of an R, or one inside the noise, would flip the skip on
+and off from one replay to the next. Each
 entry risks no more than `risk.max_risk_per_trade_pct`, lowered to **half-Kelly**
 when the strategy's record calls for less.
 
@@ -1128,7 +1381,8 @@ lists what is skipped now, and each trade keeps that list.
 the regular session is open, the hot list is rescanned every
 `scanner.fast_cycle_seconds` (60) between the regular cycles. The header button
 shows it (`Autopilot: day ⚡60s`). At each 5-minute close the candle-close check
-(see **Candle-close check**) takes the place of the fast cycle due then.
+(see **Candle-close check**) takes the place of the fast cycle due then, once it
+has read at least half the watch stocks.
 
 ---
 
@@ -1223,13 +1477,17 @@ A background service (`autotradebot/signals/`) watches what happens off the pric
 * **Connections** — paper platform, IB Gateway settings, **Test paper / Test
   live**, **Reconnect**.
 * **Settings** — the scan schedule and list sizes, the scan status, **Run full
-  scan now** and **Rescan hot list now**.
+  scan now** and **Rescan hot list now**. A setup that raised an error in a scan is
+  named in its status line with how many stocks it failed on (it found nothing on
+  them); its first failure each day is logged as a warning with the traceback, the
+  rest at DEBUG.
 * **Signals** — insider trades and company news, their sources and what they do to plays (see [Signals](#signals--insider-trades-and-company-news)).
 * **Reports** — each session's report (see [Reports](#reports--every-session-the-market-and-the-bot));
   a dot marks one you haven't opened.
 * **Scan now** — rescan the hot list and the next buffer names. The plays header
-  shows the last scan, a progress bar while one runs, when the next full
-  scan is due, and "replay running" while a replay runs in the background.
+  shows the last scan (and any setup that failed in it), a progress bar while one
+  runs, when the next full scan is due, and "replay running" while a replay runs in
+  the background.
 * **Long / Short / Intraday / Swing** and **Sectors** — what the bot scans for
   and may trade.
 * **Strategies** — switch setups on or off and weight them.
@@ -1388,11 +1646,13 @@ next replays go on from there until the sixty sessions are covered. A request th
 asked again; a session IBKR really has nothing for is remembered and isn't.
 
 Every day setup is followed twice: **entered on sight** (the record of all trades) and **entered
-after it has shown two bars in a row**, one bar later and once a session per setup - which is how
-Autopilot enters when it asks a day trade to be seen on two candles running. Autopilot's record,
-the one the proof rule reads, is built from the way in it really uses. Before, nearly every
-replayed day trade was entered on sight, so 27 of 1,466 counted and no day setup could ever
-reach the 30 trades proof asks for.
+after it has shown two bars in a row**, one bar later - which is how Autopilot enters when it asks a
+day trade to be seen on two candles running. Either way a setup is entered once a session, the way
+the board settles a setup it has acted on: one that shows again after its trade has closed isn't
+offered again, so it isn't a new trade (before, the entries on sight re-entered it every time it
+fired). Autopilot's record, the one the proof rule reads, is built from the way in it really uses.
+Before, nearly every replayed day trade was entered on sight, so 27 of 1,466 counted and no day
+setup could ever reach the 30 trades proof asks for.
 
 What the day-trade replay still can't know: it reads 5-minute candles, so a stop and a target
 inside one candle count as the stop, fills are the next candle's open with a flat slippage, the
@@ -1409,6 +1669,11 @@ follows every play the way the automatic exits would. Its settings are in
   worker process, and a day-trade replay is cut into jobs of `sessions_per_job` (10) sessions so the
   long ones don't leave workers idle at the end. Series that are the same for every bar of a session
   (the session VWAP, the opening range) are computed once per session.
+* **The candles live sees.** At each 5-minute close a day setup is handed the candle that has just begun
+  as well - priced at its open, no volume yet - the way the candle-close check reads IBKR's bars seconds
+  after a close. So a setup confirms on the bar that has just closed, on the same bar as live, and fills at
+  that new candle's open; before, the replayed candles stopped at the closed bar and every closed-bar
+  confirmation came a bar late.
 * **Only the plays the app would show and take.** A play under the scanner's reward:risk floor
   (`risk.min_reward_risk`) is never on the board, so the replay never trades it; and a strategy's
   Autopilot record counts only the trades Autopilot would take - its skipped flags, its confirmations,
@@ -1429,7 +1694,13 @@ follows every play the way the automatic exits would. Its settings are in
   after that the live store's candles keep it current for nothing. However long the
   history, a replayed setup sees the 300 sessions it would see live. Up to 120
   day-trade sessions can be asked for — 5-minute candles are downloaded once and kept.
-* **Costs**: 5 bps slippage on every market fill and 1 bp commission on every fill.
+* **Costs**: 5 bps slippage on every market fill and 1 bp commission on every fill, and on every
+  order IBKR's fixed commission as well - $0.005 a share, at least $1, at most 1% of the order's value
+  (`commission_per_share`, `commission_min`, `commission_max_pct`) - taken off the trade's R. The
+  replay counts in R and has no size, so the shares are the ones a trade risking
+  `nominal_risk_usd` ($1,000, 1% of a nominal $100k account) would buy. A share's commission over
+  its risk is the same R at any size; only the $1 minimum (a wide stop, or the half taken off at a
+  first target) and the 1% cap (a stock under 50 cents) depend on that assumption.
 * **Held out**: the latest third of the sessions. Every strategy record and every
   noise verdict is also given for those sessions alone, and Autopilot wants a
   strategy to have made money there too.
@@ -1463,7 +1734,7 @@ and they're added once it is. For each mover:
 * **what the bot made of it** — *traded* (with the move or against it, R and P/L),
   *sent, not filled* (an entry went out — Autopilot's or yours — and no trade came of it;
   the row it was sent from is listed beside the setup's first sighting, with what it would
-  have made followed on the candles),
+  have made had it filled, followed on the candles),
   *offered, not taken* (and what the setup would have made, followed on the candles),
   *watched, no setup* (on the hot list, adopted into it, or scanned from a sector buffer),
   or *not watched* — and why: the morning's ranking put it #412 of 2,950, it was too thin
@@ -1495,11 +1766,22 @@ ranking of the previous day's candles can't see them, and the report says so.
   before it was confirmed, going straight back into a stock that had just lost, a
   strategy without a proven record;
 * **the plays not taken**, each followed on the session's 5-minute candles as if
-  it had been, from the next bar after it was on the board with the values it was
-  recorded with (a play's row holds the last scan that wrote it, and a scan's plays
-  reach the board when it finishes); an entry sent that never filled (a sent row
-  no trade was booked from, even one still marked submitted) is followed
-  from the row it was sent from, from the moment it went out, however it scored —
+  it had been, the way Autopilot enters: from the next bar after its confirmations
+  first reached Autopilot's minimum, with the values and readings it had then (the
+  board keeps that moment and those values in the play's evidence, `confirmed_at`
+  and `as_confirmed` - each scan writes the play at its own prices, with readings
+  of the stock's run taken after the entry). A setup that left the board and came
+  back is logged again under a new play; when the comeback is the one that reached
+  the minimum, the comeback is followed from then. A play never
+  confirmed, or logged before that moment was kept, is followed from the next bar
+  after it was on the board with the values it was recorded with (a play's row
+  holds the last scan that wrote it, and a scan's plays reach the board when it
+  finishes). A play the last look refused pays the spread that look read, in R of
+  its risk - the refusal and its quote are kept with the play (`last_look`). An
+  entry sent that never filled (a sent row no trade was booked from, even one
+  still marked submitted) is followed from the row it was sent from, from the
+  moment it went out, however it scored, and counts as no fill: it made nothing,
+  and what it would have made had it filled is kept apart for the Reports page —
   grouped by noise flag and by whether Autopilot's checks passed
   it, so every check is tested on live plays every day. The checks are the ones in
   force that session, as the last Autopilot entry recorded them (a rebuild keeps
@@ -1601,10 +1883,15 @@ scales confidence by Aziz's session clock. **Every play's stop is floored**: a
 stop closer than ~0.6 % of price (or ~0.9 intraday ATRs) is widened, *then*
 reward:risk is re-checked. Indicators the setups share (ATRs, VWAP, relative
 volume, the S/R map, the daily trend) are computed once per stock per scan.
+Relative volume leaves out the 5-minute candle still printing: today's closed
+candles against earlier sessions' up to the same time. The swing setups read
+their signals on **completed daily candles** (during the session today's candle
+is still forming and is left out), the ones the replay signals on at each
+session's close, and enter at the price now.
 
 | key | timeframe | idea |
 |---|---|---|
-| `abcd_pattern` | intraday | hard push A→B, pullback to a **higher low C**; enter near C, target the B retest and measured move |
+| `abcd_pattern` | intraday | hard push A→B, pullback to a **higher low C**, drawn on **closed candles only** (the one still printing can't make the pullback, and a last candle that closed half an ATR through the pullback's low is refused); enter near C, never under it, target the B retest and measured move |
 | `bull_bear_flag` | intraday | near-vertical pole + tight sideways flag; enter on the flag break |
 | `opening_range_breakout` | intraday | break of the first N-min range **only when that range < the daily ATR**, VWAP-side stop |
 | `vwap_reclaim` | intraday | a **5-min close** back across session VWAP after ≥ 3 bars on the other side |
@@ -1666,9 +1953,11 @@ Implement `autotradebot/brokers/base.py::BrokerAdapter`, register it in
 `autotradebot/brokers/venues.py` and `autotradebot/engine/connections.py`. To use it as a
 price source too, give it the `PriceSource` methods from
 `autotradebot/data/market_data.py` (`history_many`, `contract_details_many`,
-`get_quote`, `quotes_from_bars`). Shipped: `paper_adapter.py` (simulator) and
-`ibkr_adapter.py` (`ib_async`, own asyncio-loop thread, auto-reconnect, paper +
-live by port).
+`get_quote`, `quotes_from_bars`). A venue that reports order errors after the
+call (a rejection, a refused cancel) hands them over through `order_errors()`,
+which the executor writes into the order audit. Shipped: `paper_adapter.py`
+(simulator) and `ibkr_adapter.py` (`ib_async`, own asyncio-loop thread,
+auto-reconnect, paper + live by port).
 
 ---
 

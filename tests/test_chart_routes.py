@@ -32,7 +32,11 @@ def test_a_short_swing_trade_reads_the_other_way_and_ends_on_a_time_stop():
     assert list(routes) == ["target", "stop", "breakeven", "time"]          # a 1.5R target ends before trailing starts
     assert (routes["breakeven"]["trigger"], routes["breakeven"]["price"]) == (47.4, 49.375)
     assert "bought back for about +1.5R" in routes["target"]["how"]
-    assert routes["time"]["label"] == "Time stop" and "after 10 days" in routes["time"]["how"]
+    assert routes["time"]["label"] == "Time stop" and "after 10 trading days" in routes["time"]["how"]
+    assert "10 minutes before the last one's close" in routes["time"]["how"]      # where the exit manager sends it
+    unflattened = exit_routes(_play(Side.SHORT, Timeframe.SWING, 50.0, 52.0, 47.0),
+                              ExitManagerCfg(flatten_intraday_before_close_min=0))
+    assert "at the next day's open" in unflattened[-1]["how"]
 
 
 def test_with_automatic_exits_off_only_the_stop_and_target_apply():

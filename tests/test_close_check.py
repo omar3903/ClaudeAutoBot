@@ -141,7 +141,7 @@ def test_the_check_reads_the_last_hour_of_bars_and_leaves_a_stock_whose_new_bar_
         assert pd.Timestamp(p.evidence["bar_at"]) == pd.Timestamp(_at(10, 0)) and p.scan_run_id == result.run_id
 
 
-def test_a_5_minute_close_queues_the_check_2_s_on_and_it_stands_in_for_the_fast_cycle(engine, gateway, now,
+def test_a_5_minute_close_queues_the_check_8_s_on_and_it_stands_in_for_the_fast_cycle(engine, gateway, now,
                                                                                          monkeypatch, caplog):
     from autotradebot.persistence.db import session_scope
     from autotradebot.persistence.models_orm import ScanRun
@@ -151,12 +151,12 @@ def test_a_5_minute_close_queues_the_check_2_s_on_and_it_stands_in_for_the_fast_
     engine._scan_wake.clear()
     engine._on_minute(_at(10, 5).timestamp())
     boundary, due = engine._close_due
-    assert boundary == _at(10, 5) and 1.5 < due - time.monotonic() <= 2.0 and engine._scan_wake.is_set()
-    assert engine._next_scan_wait() <= 2.0 and engine._movers_due == {}
+    assert boundary == _at(10, 5) and 7.5 < due - time.monotonic() <= 8.0 and engine._scan_wake.is_set()
+    assert 0 < engine._next_scan_wait() <= 5.0 and engine._movers_due == {}
     assert engine._due_scan() == "cycle"                         # not due yet: the cycle that is goes first
     engine._last_cycle_at = time.monotonic()
     monkeypatch.setattr(engine, "_autopilot_day_active", lambda: True)
-    assert engine._due_scan() is None                            # the fast cycle waits the 2 s for it
+    assert engine._due_scan() is None                            # the fast cycle waits the 8 s for it
     engine._close_due = (boundary, time.monotonic())
     engine._last_cycle_at = float("-inf")
     assert engine._due_scan() == "close"                         # due: ahead of the cycle
@@ -164,7 +164,7 @@ def test_a_5_minute_close_queues_the_check_2_s_on_and_it_stands_in_for_the_fast_
     published = []
     publish = engine._publish
     monkeypatch.setattr(engine, "_publish", lambda topic, **kw: published.append(topic) or publish(topic, **kw))
-    now["t"] = _at(10, 5, 2.4)
+    now["t"] = _at(10, 5, 8.4)
     with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
         engine._run_scan("close")
     assert "plays.updated" in published and "scan.started" not in published and "watchlist.updated" not in published
@@ -173,7 +173,7 @@ def test_a_5_minute_close_queues_the_check_2_s_on_and_it_stands_in_for_the_fast_
     assert engine._due_scan() is None                            # it counted as the fast cycle
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("close check")]
     assert len(lines) == 1 and lines[0].startswith("close check 10:05 ET: 6 of 6 stocks read, 6 plays (6 new) - "
-                                                   "published 2.4 s after the candle closed (candles ")
+                                                   "published 8.4 s after the candle closed (candles ")
     with session_scope() as s:
         assert s.get(ScanRun, engine._last_scans["close"]["run_id"]).kind == "close"
 
@@ -252,6 +252,155 @@ def test_an_early_mover_waits_for_the_close_queued_behind_it_until_ibkr_has_fini
     assert sorted(r[0] for r in _asked(gateway, asked)) == sorted(WATCH) and engine._movers_due == {}
     [result] = got
     assert result.symbols == WATCH and engine._close_due is None
+
+
+def test_the_wait_after_the_close_is_a_setting_of_8_s_within_0_to_30(engine, now, monkeypatch):
+    from autotradebot.config import ScannerCfg
+
+    assert ScannerCfg().close_grace_s == 8.0
+    assert ScannerCfg(close_grace_s=90).close_grace_s == 30.0 and ScannerCfg(close_grace_s=-1).close_grace_s == 0.0
+    monkeypatch.setattr(engine.settings.config.scanner, "close_grace_s", 4.0)
+    now["t"] = _at(10, 5, 0.3)
+    engine._on_minute(_at(10, 5).timestamp())
+    assert 3.5 < engine._close_due[1] - time.monotonic() <= 4.0
+
+
+def test_the_stocks_whose_new_bar_wasnt_printed_are_asked_once_more_15_s_after_the_check(engine, gateway, now,
+                                                                                         monkeypatch, caplog):
+    limits = _bars_until(gateway, monkeypatch, _at(10, 5))
+    limits["T02"] = limits["T03"] = _at(10, 0)                   # IBKR hasn't printed their 10:05 bars yet
+    got = _spy_run_close(engine, monkeypatch)
+    engine._close_due, now["t"] = (_at(10, 5), time.monotonic()), _at(10, 5, 8.5)
+    engine._run_scan("close")
+    assert got[0].symbols == ["T01", "T04", "T05", "T06"]
+    boundary, due = engine._close_due                            # queued again, for those two only
+    assert boundary == _at(10, 5) and engine._close_only == ["T02", "T03"] and 14 < due - time.monotonic() <= 15
+    assert engine._due_scan() != "close"
+
+    # due, past IBKR's 15 s rule: only those two are asked - T02's bar is in by now, T03's still isn't
+    limits["T02"] = _at(10, 5)
+    _later(engine, 15)
+    engine._close_due, now["t"] = (boundary, time.monotonic()), _at(10, 5, 24)
+    asked = len(gateway.requests)
+    assert engine._due_scan() == "close"
+    with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
+        engine._run_scan("close")
+    assert sorted(r[0] for r in _asked(gateway, asked)) == ["T02", "T03"] and got[1].symbols == ["T02"]
+    assert [pd.Timestamp(p.evidence["bar_at"]) for p in got[1].plays] == [pd.Timestamp(_at(10, 0))]
+    assert engine._close_due is None and engine._close_only is None              # once: T03 waits for the next
+    assert "close check 10:05 ET (second ask): 1 of 2 stocks read, 1 play" in caplog.text
+
+
+@pytest.mark.parametrize("printed", [True, False])
+def test_a_check_that_reads_under_half_the_stocks_leaves_the_fast_cycle_to_its_second_ask(engine, gateway, now,
+                                                                                         monkeypatch, printed):
+    limits = _bars_until(gateway, monkeypatch, _at(10, 0))       # IBKR has printed only T01's and T02's 10:05 bars
+    limits["T01"] = limits["T02"] = _at(10, 5)
+    monkeypatch.setattr(engine, "_autopilot_day_active", lambda: True)
+    engine._close_due, now["t"] = (_at(10, 5), time.monotonic()), _at(10, 5, 8.5)
+    engine._run_scan("close")                                    # 2 of 6 read: it doesn't stand in for the fast cycle
+    assert engine._last_fast_at == float("-inf") and engine._close_only == WATCH[2:]
+    engine._last_cycle_at = engine._last_plays_at = time.monotonic()
+    assert engine._due_scan() is None                            # ...which waits for the second ask
+
+    if printed:
+        limits["at"] = _at(10, 5)
+    _later(engine, 15)
+    engine._close_due, now["t"] = (_at(10, 5), time.monotonic()), _at(10, 5, 24)
+    engine._run_scan("close")
+    engine._last_plays_at = time.monotonic()
+    if printed:                                                  # 4 of 4 read: that stands in for it
+        assert time.monotonic() - engine._last_fast_at < 5 and engine._due_scan() is None
+    else:                                                        # none read: the fast cycle goes now
+        assert engine._last_fast_at == float("-inf") and engine._due_scan() == "fast"
+
+
+def test_a_newer_close_or_a_late_start_drops_a_second_ask(engine, gateway, now, monkeypatch, caplog):
+    limits = _bars_until(gateway, monkeypatch, _at(10, 5))
+    limits["T02"] = _at(10, 0)
+    engine._close_due = (_at(10, 5), time.monotonic())
+    engine._run_scan("close")
+    assert engine._close_only == ["T02"]
+    engine._on_minute(_at(10, 10).timestamp())                   # the next close covers the whole tier
+    assert engine._close_due[0] == _at(10, 10) and engine._close_only is None
+
+    engine._close_due, engine._close_only = (_at(10, 5), time.monotonic()), ["T02"]
+    _later(engine, 15)
+    now["t"], asked = _at(10, 6, 1), len(gateway.requests)
+    with caplog.at_level(logging.DEBUG, logger="autotradebot.engine.engine"):
+        engine._run_scan("close")                                # 61 s after its close: a scan held the thread
+    assert _asked(gateway, asked) == [] and engine._close_due is None and "check's second ask is dropped" in caplog.text
+
+
+# ---------------------------------------------------------------- the wide scan steps aside
+def test_a_close_check_due_during_the_wide_scan_runs_between_its_chunks_and_its_plays_stand(engine, gateway, now,
+                                                                                             monkeypatch, caplog):
+    limits = _bars_until(gateway, monkeypatch, _at(10, 0))       # the 10:05 candle hasn't closed yet
+    now["t"] = _at(10, 4, 30)
+    monkeypatch.setattr(engine.scanner, "WIDE_CHUNK", 2)
+    engine._last_plays_at = time.monotonic() + 60               # no quick re-check comes due in the sweep
+    intraday = engine.md.intraday
+
+    def first_chunk_then_the_close(symbols, con_ids=None):
+        got = intraday(symbols, con_ids)
+        if list(symbols) == WATCH[:2]:                           # the sweep has read T01 and T02; the candle closes
+            limits["at"], now["t"] = _at(10, 5), _at(10, 5, 8.5)
+            engine._close_due = (_at(10, 5), time.monotonic())
+        return got
+
+    monkeypatch.setattr(engine.md, "intraday", first_chunk_then_the_close)
+    checks, passes = _spy_run_close(engine, monkeypatch), []
+    monkeypatch.setattr(engine.autopilot, "consider", lambda plays: passes.append(
+        ((engine._scan_running or {}).get("kind"), sorted(p.symbol for p in plays.values()))) or [])
+    with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
+        engine._run_scan("wide")
+
+    # the check ran in the sweep's first pause, on the whole tier, and Autopilot had its plays then
+    [check] = checks
+    assert check.symbols == WATCH and engine._close_due is None
+    assert passes == [("wide", WATCH), (None, WATCH)]
+    assert "close check 10:05 ET: 6 of 6 stocks read, 6 plays (6 new)" in caplog.text
+    # the sweep's older read of T01 and T02 doesn't undo the check's plays on the candle that closed at 10:05
+    assert engine._last_scans["wide"]["scanned"] == len(WATCH)
+    assert sorted(p.symbol for p in engine.board.plays.values()) == WATCH
+    assert {pd.Timestamp(p.evidence["bar_at"]) for p in engine.board.plays.values()} == {pd.Timestamp(_at(10, 0))}
+
+
+def test_between_the_wide_scans_chunks_only_a_due_quick_recheck_or_close_check_runs(engine, gateway, now,
+                                                                                   monkeypatch, caplog):
+    _bars_until(gateway, monkeypatch, _at(10, 5))
+    monkeypatch.setattr(engine.scanner, "WIDE_CHUNK", 2)
+    engine.board.replace([_play("T06")], None)
+    rechecks = []
+    run_plays = engine.scanner.run_plays
+    monkeypatch.setattr(engine.scanner, "run_plays", lambda symbols: rechecks.append(list(symbols))
+                        or run_plays(symbols))
+    for scan in ("run_full", "run_cycle", "run_gappers"):
+        monkeypatch.setattr(engine.scanner, scan, lambda *a, **k: pytest.fail("a scan ran between the chunks"))
+    engine._queue_scan("full")
+    engine._last_cycle_at = float("-inf")                        # a cycle is due too
+    engine._run_scan("wide")
+    # the quick re-check was due at the first pause and not again 2 stocks later; the scan asked for still waits
+    assert rechecks == [["T06"]] and engine._scan_request == "full"
+
+    # a pause while quitting, with the market shut, or with nothing due runs nothing
+    engine._close_due, engine._last_plays_at = (_at(10, 5), time.monotonic()), float("-inf")
+    engine.quit_state = {"by": "operator"}
+    assert engine._between_wide_chunks() == [] and engine._close_due is not None
+    engine.quit_state, now["t"] = None, _at(16, 5)
+    assert engine._between_wide_chunks() == [] and engine._close_due is not None
+    now["t"], engine._close_due, engine._last_plays_at = _at(10, 5, 9), None, time.monotonic()
+    assert engine._between_wide_chunks() == [] and rechecks == [["T06"]]
+
+    # a check that fails between the chunks is logged, and the sweep goes on
+    def broken(kind):
+        raise RuntimeError("the board is locked")
+
+    monkeypatch.setattr(engine, "_run_scan", broken)
+    engine._close_due = (_at(10, 5), time.monotonic())
+    with caplog.at_level(logging.ERROR, logger="autotradebot.engine.engine"):
+        assert engine._between_wide_chunks() == []
+    assert "the candle-close check between the wide scan's chunks failed" in caplog.text
 
 
 # ---------------------------------------------------------------- early movers
@@ -430,6 +579,33 @@ def test_the_live_scans_put_the_first_passing_names_right_after_the_hot_list(liv
     # every scan empty is the scans failing: the names held stay
     monkeypatch.setattr(fakes, "SCANS", {})
     assert live._live_scan_once() == ["T20", "T26", "T21"] and len(gateway.scan_calls) == 9
+
+
+def test_a_live_name_whose_daily_candles_stop_short_of_yesterday_waits_for_candles_that_reach_it(live, monkeypatch):
+    before_yesterday = clock.prev_trading_day(clock.prev_trading_day(DAY))
+    full = live.md.daily_frame("T20")
+    short = full[full.index.date <= before_yesterday]                # yesterday's download didn't come for it
+    daily_frame = live.md.daily_frame
+    monkeypatch.setattr(live.md, "daily_frame", lambda s: short if s == "T20" else daily_frame(s))
+    assert live._live_scan_once() == ["T26", "T21", "T27"]           # its setups would read an older close
+    # 5-minute candles in hand that hold yesterday's session give the setups yesterday's close: it is admitted
+    live.md.intraday(["T20"])
+    assert clock.prev_trading_day(DAY) in set(live.md.cached_intraday("T20").index.date)
+    assert live._live_scan_once() == ["T20", "T26", "T21"]
+
+
+def test_a_weekday_the_market_was_shut_that_the_calendar_doesnt_list_keeps_no_live_name_out(live, monkeypatch):
+    yesterday = clock.prev_trading_day(DAY)
+    full = live.md.daily_frame("T20")
+    short = full[full.index.date < yesterday]                        # current if the market was shut yesterday
+    daily_frame, cached = live.md.daily_frame, live.md.cached_intraday
+    monkeypatch.setattr(live.md, "daily_frame", lambda s: short if s == "T20" else daily_frame(s))
+    assert live._live_scan_once() == ["T26", "T21", "T27"]           # by the calendar it is a session short
+    # the S&P 500 ETF's 5-minute candles have none on yesterday - a closure the holiday calendar doesn't list
+    spy = live.md.intraday([BENCHMARK])[BENCHMARK]
+    shut = spy[spy.index.date != yesterday]
+    monkeypatch.setattr(live.md, "cached_intraday", lambda s: shut if s == BENCHMARK else cached(s))
+    assert cached("T20") is None and live._live_scan_once() == ["T20", "T26", "T21"]
 
 
 def test_the_live_scan_slots_default_to_10_within_0_to_20():

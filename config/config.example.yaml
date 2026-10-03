@@ -24,7 +24,8 @@ account:
 
 risk:
   max_risk_per_trade_pct: 1.0          # % of equity risked between entry and stop
-  max_open_risk_pct: 4.0               # sum of open-trade risk not allowed to exceed this
+  max_open_risk_pct: 4.0               # all the risk at work: each open trade from its entry to the stop it
+                                       # opened with, plus entries working; a new trade gets what's left
   max_position_pct_of_equity: 12.0     # notional cap per trade (the dashboard's "Max % per position" replaces it once moved)
   max_symbol_pct_of_equity: 15.0       # cap per stock: shares already held + entries working + the new trade
   max_adv_pct: 1.0                     # one order's shares, as % of the stock's median daily volume over its
@@ -58,9 +59,11 @@ scanner:
   kept_per_sector: 2                   # promising buffer names kept waiting for a hot-list slot
   fast_cycle_seconds: 60               # hot list only, while Autopilot day-trades an open session
   plays_refresh_seconds: 15            # re-check the stocks with plays on the board this often (0 = off)
-  close_check: true                    # at each 5-minute candle close in regular hours, +2 s, check the watch
-                                       # tier's setups on IBKR's just-closed bars at once, in place of the fast
-                                       # cycle due then (false = off, the fast cycle as before)
+  close_check: true                    # at each 5-minute candle close in regular hours, +close_grace_s, check the
+                                       # watch tier's setups on IBKR's just-closed bars at once, in place of the
+                                       # fast cycle due then (false = off, the fast cycle as before)
+  close_grace_s: 8                     # ...this many seconds after the close, once IBKR has printed most stocks'
+                                       # new bars; those still without one are asked once more ~15 s later (0-30)
   mover_atr: 1.0                       # a watch stock whose streamed 1-minute candle spans this many 5-minute ATRs,
                                        # or makes a new high/low of the day on 3x its average minute volume, is
                                        # checked at once, at most once per 5 minutes (0-5; 0 = off)
@@ -70,6 +73,8 @@ scanner:
   gapper_symbols: 400                  # at most this many names get a pre-market request
   gapper_min_gap_pct: 2.0              # a pre-market move this big, either way, counts as a gap...
   gapper_min_volume: 50000             # ...on at least this many pre-market shares (Aziz's gappers scan)
+  gateway_alert_time: "07:45"          # ET - on a trading day, IB Gateway still not connected by then is said once
+                                       # on the dashboard and in the log, before the full scan needs it ("" = off)
   max_universe: 0                      # 0 = every listing; a smaller number caps it (for testing)
   sectors: []                          # only scan + trade these, e.g. ["Technology", "Energy"]; [] = all.
                                        # The dashboard's Sectors button overrides this.
@@ -139,13 +144,17 @@ execution:
 exit_manager:
   # Automatic exit strategy - runs every few seconds, no manual input.
   enabled: true
+  broker_stop_grace_s: 10             # the stop crossed while it rests at IBKR: it gets this many s to fill before
+                                      # the app cancels it and sends its own exit (0 = the app's exit at once)
   breakeven_at_r: 1.3                 # tighten the stop once the trade is +this R (0 = off)
   breakeven_lock_r: 0.3               # ...to LOCK +this R of profit, not a pure scratch
   breakeven_buffer_bps: 5             # plus this nudge past the lock point
   trail_start_r: 2.0                  # begin trailing once past this R (0 = no trailing)
   trail_lock_ratio: 0.5               # keep the stop at this fraction of the open R
-  flatten_intraday_before_close_min: 10   # force-close day trades this many min before the bell
-  max_swing_hold_days: 10             # force-close swing trades held longer than this (0 = off)
+  flatten_intraday_before_close_min: 10   # force-close day trades this many min before the bell (one left open
+                                      # from an earlier session goes at the next regular-session pass)
+  max_swing_hold_days: 10             # force-close swing trades on this many TRADING days, the entry's counted,
+                                      # at the flatten on the last one - as the replay does (0 = off)
   scale_out_pct: 50                   # at the first target of a play with two, take this % off - Aziz: sell half,
   scale_out_lock_r: 0.0               # ...move the stop to the entry (+ this R), let the rest run to the second (0 = off)
 
@@ -188,8 +197,9 @@ autopilot:
   cooldown_after_loss: true          # skip a ticker for the rest of the session after it stops out
   max_daily_loss_pct: 2.0            # Aziz's daily maximum loss: once today's closed trades have lost this
                                      # % of equity, no more entries until the next session (0 = off)
-  max_giveback_pct: 30.0             # ...or once the day's realized gain has given back this % of its best
-                                     # (Aziz: never lose more than 30% of what the morning made; 0 = off)
+  max_giveback_pct: 30.0             # ...or once the day trades' realized gain has given back this % of its best
+                                     # (Aziz: never lose more than 30% of what the morning made; swing trades
+                                     # don't count; 0 = off). Either stop holds for the rest of the session
   giveback_floor_pct: 0.25           # the give-back rule only counts a peak gain of at least this % of equity
   require_catalyst: false            # true = only auto-take plays tagged gap / catalyst
   dry_run: false                     # true = log every entry it WOULD take but place nothing
@@ -224,6 +234,12 @@ replay:
                                       # just the day's watchlist (0 = watchlist only); their candles are on disk
   slippage_bps: 5.0                   # on every market fill, each way
   commission_bps: 1.0                 # on every fill
+  commission_per_share: 0.005         # IBKR's fixed commission on top, on every fill: this much a share...
+  commission_min: 1.0                 # ...at least this much an order...
+  commission_max_pct: 1.0             # ...and at most this % of the order's value (0 = no cap)
+  nominal_risk_usd: 1000              # the replay counts in R and has no size: the commission is charged on the
+                                      # shares a trade risking this much would buy (1% of a nominal $100k account);
+                                      # only the minimum and the cap depend on it
   held_out_fraction: 0.3334           # the latest sessions kept out of sample; Autopilot wants profits there too
   workers: 0                          # processes replaying stocks side by side; 0 = every core but two
   sessions_per_job: 10                # a day-trade job replays this many sessions of one stock (spreads the work)

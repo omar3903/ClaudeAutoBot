@@ -40,6 +40,30 @@ class FakeRepo:
         return {"symbol": sym} if sym in self.held else None
 
 
+class FailingRepo(FakeRepo):
+    """A repository whose named reads raise, the way a locked or vanished database does."""
+
+    def __init__(self, *failing):
+        super().__init__()
+        self.failing = set(failing)
+
+    def _read(self, name):
+        if name in self.failing:
+            raise RuntimeError("database is locked")
+
+    def open_trades(self):
+        self._read("open_trades")
+        return super().open_trades()
+
+    def trades_on(self, day):
+        self._read("trades_on")
+        return super().trades_on(day)
+
+    def get_open_trade_for_symbol(self, sym):
+        self._read("get_open_trade_for_symbol")
+        return super().get_open_trade_for_symbol(sym)
+
+
 class FakeEngine:
     def __init__(self, mode="paper", equity=100_000.0):
         self.mode = mode
@@ -142,6 +166,17 @@ def test_happy_path_enters_via_approve():
     assert eng.approved == [(p.id, "autopilot")]
     assert acts and acts[0]["action"] == "entered"
     assert ap.status()["auto_trades_today"] == 1
+
+
+def test_an_entry_is_reported_at_the_size_the_engine_sent_not_the_preview():
+    published = []
+    eng = FakeEngine()
+    ap = AutoPilot(eng, _cfg(), bus=SimpleNamespace(publish=lambda topic, **k: published.append((topic, k))))
+    # the preview said 10 shares risking 200; the engine's last look re-priced the limit and re-sized it
+    eng.approve_play = lambda pid, operator="operator": {"ok": True, "status": "WORKING", "qty": 8, "est_risk": 190.0}
+    acts = _run(ap, mkplay())
+    assert (acts[0]["action"], acts[0]["qty"], acts[0]["risk"]) == ("entered", 8, 190.0)
+    assert [(k["qty"], k["est_risk"]) for t, k in published if t == "autopilot.entered"] == [(8, 190.0)]
 
 
 def test_disabled_is_a_noop():
@@ -258,6 +293,30 @@ def test_open_risk_cap():
     assert len(eng.approved) == 2              # 200 + 200 == 400 ok; 3rd would be 600 > 400
 
 
+def test_an_entry_booked_while_a_play_is_assessed_still_counts_against_the_open_risk_cap():
+    """The order sync books one of Autopilot's working entries while the engine assesses the next play: the
+    entries are read before the trades, so it counts - working, or in the records - and never as neither."""
+    eng = FakeEngine(equity=10_000.0)          # 4% => $400 of open auto-risk; the new play risks $200
+    ap = AutoPilot(eng, _cfg(max_open_risk_pct=4.0, max_auto_positions=9), bus=SILENT)
+    eng.working = [{"order_id": "o1", "play_id": "play_w", "symbol": "T09", "strategy": "opening_range_breakout",
+                    "timeframe": "INTRADAY", "qty": 10, "risk": 300.0}]
+    ap._auto_play_ids.add("play_w")
+    assess = eng.assess_play
+
+    def booked_meanwhile(pid):
+        if eng.working:                        # its fill is booked as the play is assessed: $300 at its stop
+            eng.working = []
+            eng.repo._open.append({"id": "t_w", "play_id": "play_w", "symbol": "T09",
+                                   "strategy": "opening_range_breakout", "timeframe": "INTRADAY",
+                                   "entry_price": 100.0, "initial_stop_price": 70.0, "quantity": 10})
+        return assess(pid)
+
+    eng.assess_play = booked_meanwhile
+    p = mkplay(sym="AAA")
+    _run(ap, p)
+    assert eng.approved == [] and "aggregate open auto-risk" in ap._last_reason[p.id]   # 300 + 200 > 400
+
+
 def test_max_new_per_cycle_prevents_bursts():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(max_new_per_cycle=1, max_auto_positions=9,
@@ -303,6 +362,48 @@ def test_cooldown_after_loss_skips_a_stopped_name():
     eng.repo._closed[0]["realized_pl"] = 50.0
     _run(ap, mkplay(sym="AAA"))
     assert eng.approved_ids() and eng.approved_ids()[0].startswith("play_")
+
+
+def test_the_cooldown_counts_a_position_opened_yesterday_and_stopped_out_today(repo):
+    """The cooldown goes by the session a trade closed in: a position held overnight and stopped out
+    this morning cools the ticker off, one stopped out yesterday doesn't. The repository's own read of
+    the session's trades is used, so the test holds for how it really lists them."""
+    import datetime as dt
+    from autotradebot.persistence.db import session_scope
+    from autotradebot.persistence.models_orm import Trade
+    from autotradebot.util import clock
+
+    today = clock.session_date()
+    yesterday = clock.prev_trading_day(today)
+
+    def ny(day, hour):
+        return dt.datetime.combine(day, dt.time(hour, 0), tzinfo=clock.NY)
+
+    def stopped_out(sym, opened, closed):
+        tid = repo.open_trade(mkplay(sym=sym, tf=Timeframe.SWING), 100.0, 10, "paper")
+        with session_scope() as s:                       # entered on an earlier session
+            t = s.get(Trade, tid)
+            t.entry_time = ny(opened, 15).astimezone(dt.timezone.utc).replace(tzinfo=None)
+            t.session_date = opened
+        repo.close_trade(tid, 98.0, "stop", exit_time=ny(closed, 10))
+        return tid
+
+    tids = [stopped_out("OVA", yesterday, today), stopped_out("OVB", clock.prev_trading_day(yesterday), yesterday)]
+    try:
+        eng = FakeEngine()
+        eng.repo.trades_on = repo.trades_on              # trades opened or closed in a session
+        ap = AutoPilot(eng, _cfg(cooldown_after_loss=True, max_daily_loss_pct=0.0, max_giveback_pct=0.0),
+                       bus=SILENT)
+        held = mkplay(sym="OVA")
+        _run(ap, held)
+        assert eng.approved == []
+        assert "already stopped out today - cooling off" in ap.verdict(held)
+        earlier = mkplay(sym="OVB")
+        _run(ap, earlier)
+        assert eng.approved_ids() == [earlier.id]
+    finally:                                             # the test database is shared by the whole run
+        for tid in tids:
+            repo.delete_trade(tid)
 
 
 def test_live_mode_paper_only_gate():
@@ -395,6 +496,37 @@ def test_a_play_it_tried_and_was_refused_says_so_on_its_row():
     assert not bars["DDD"]["acted"] and not bars["DDD"]["skipped"]             # never looked at
     ap.settings_changed()                                                       # judged again on the next pass
     assert not ap.decorate_play(unassessed.to_row())["autopilot"]["skipped"]
+
+
+def test_a_refusal_at_the_assessment_or_the_last_look_is_logged_and_kept_with_how_the_play_stood(caplog):
+    """A play the engine's assessment refuses, or the last look before the order, isn't looked at again until a
+    setting changes: the reason goes in the log, and on the play's row with the play as it was then."""
+    import logging
+
+    eng = FakeEngine()
+    noted = []
+    eng.repo.note_refusal = lambda play, note: noted.append((play.id, note))
+    ap = AutoPilot(eng, _cfg(), bus=SILENT)
+    unassessed, unsent = mkplay(sym="AAA", conf=0.81), mkplay(sym="BBB", target=105.0)
+    unassessed.confirmations, unsent.confirmations, unsent.noise = 3, 2, ["conflict"]
+    eng.can_execute = False
+    with caplog.at_level(logging.INFO, logger="autotradebot.execution.autopilot"):
+        _run(ap, unassessed)
+        eng.can_execute = True
+        eng.approve_play = lambda pid, operator="operator": {"ok": False, "reason": "the spread is too dear to cross"}
+        _run(ap, unsent)
+    said = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert ("autopilot refused LONG AAA (opening_range_breakout) at the assessment: not executable in this session"
+            in said)
+    assert ("autopilot refused LONG BBB (opening_range_breakout) at the last look: the spread is too dear to cross"
+            in said)
+    assert [pid for pid, _ in noted] == [unassessed.id, unsent.id]
+    (_, first), (_, second) = noted
+    assert first.pop("at") and second.pop("at")
+    assert first == {"stage": "assessment", "reason": "not executable in this session", "confidence": 0.81,
+                     "reward_risk": 3.0, "confirmations": 3, "noise": []}
+    assert second == {"stage": "last look", "reason": "the spread is too dear to cross", "confidence": 0.75,
+                      "reward_risk": 2.5, "confirmations": 2, "noise": ["conflict"]}
 
 
 def test_configure_updates_and_persists():
@@ -595,9 +727,9 @@ def test_autopilot_can_be_told_to_take_pairs_only():
 # --------------------------------------------------------------------------- #
 #  the daily loss stop (Aziz: a daily maximum loss - live to trade another day)
 # --------------------------------------------------------------------------- #
-def _closed(symbol, pl, broker="paper"):
+def _closed(symbol, pl, broker="paper", timeframe="INTRADAY"):
     return {"id": f"t_{symbol}", "symbol": symbol, "status": "CLOSED", "realized_pl": pl, "broker": broker,
-            "session_date": "2000-01-01"}
+            "session_date": "2000-01-01", "timeframe": timeframe}
 
 
 def test_the_daily_loss_limit_stops_new_entries_for_the_session():
@@ -664,6 +796,100 @@ def test_the_daily_loss_limit_is_tunable_and_remembered():
     assert other.max_daily_loss_pct == 3.5 and other.max_giveback_pct == 40.0
 
 
+def test_a_daily_stop_holds_for_the_rest_of_the_day_when_the_pl_recovers(monkeypatch):
+    import datetime as dt
+
+    from autotradebot.execution import autopilot as module
+
+    eng = FakeEngine(equity=10_000.0)                      # 2% of equity = $200
+    eng.repo._closed = [_closed("AAA", -250.0)]
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    assert _run(ap, mkplay(sym="BBB")) == [] and ap.status()["daily_loss_stop"]
+    ap._realized = (float("-inf"), 0.0)
+    eng.repo._closed = [_closed("AAA", -250.0), _closed("SWG", 400.0, timeframe="SWING")]   # back above the limit
+    p = mkplay(sym="CCC")
+    assert _run(ap, p) == [] and eng.approved == []
+    st = ap.status()
+    assert st["daily_loss_stop"] and "past the daily limit" in st["daily_loss_reason"]
+    assert "past the daily limit" in ap.verdict(p)
+
+    ap.configure(max_giveback_pct=40.0)                    # moving a limit judges the day afresh: the gain lifts it
+    assert not ap.status()["daily_loss_stop"]
+    assert len(_run(ap, mkplay(sym="DDD"))) == 1
+
+    eng.repo._closed = [_closed("AAA", -250.0)]
+    ap._realized = (float("-inf"), 0.0)
+    assert _run(ap, mkplay(sym="EEE")) == [] and ap.stopped_for_the_day
+    tomorrow = module.clock.session_date() + dt.timedelta(days=1)
+    monkeypatch.setattr(module.clock, "session_date", lambda ts=None: tomorrow)
+    eng.repo._closed = []                                  # a new session starts unstopped
+    ap._realized = (float("-inf"), 0.0)
+    assert not ap.status()["daily_loss_stop"] and ap._loss_stop_reason == "" and ap._day == tomorrow.isoformat()
+    assert len(_run(ap, mkplay(sym="FFF"))) == 1
+
+
+def test_a_daily_stop_survives_a_restart_the_same_day_only():
+    import datetime as dt
+
+    from autotradebot.util import clock
+
+    eng = FakeEngine(equity=10_000.0)
+    eng.repo._closed = [_closed("AAA", -250.0)]
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    _run(ap, mkplay(sym="BBB"))
+    saved = ap.to_runtime()
+    assert saved["loss_stop_day"] == clock.session_date().isoformat()
+
+    eng2 = FakeEngine(equity=10_000.0)                     # the restarted app reads no loss (the record isn't back yet)
+    again = AutoPilot(eng2, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    again.load_runtime(saved)
+    assert _run(again, mkplay(sym="CCC")) == [] and eng2.approved == []
+    assert again.status()["daily_loss_stop"] and "past the daily limit" in again.status()["headline"]["text"]
+
+    yesterday = (clock.session_date() - dt.timedelta(days=1)).isoformat()
+    fresh = AutoPilot(eng2, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    fresh.load_runtime({**saved, "day": yesterday, "loss_stop_day": yesterday})
+    assert len(_run(fresh, mkplay(sym="DDD"))) == 1 and not fresh.status()["daily_loss_stop"]
+
+
+def test_a_daily_stop_is_lifted_by_moving_a_limit_not_by_the_on_switch_or_other_settings():
+    eng = FakeEngine(equity=10_000.0)                      # 2% of equity = $200
+    eng.repo._closed = [_closed("AAA", -250.0)]
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0, max_giveback_pct=30.0), bus=SILENT)
+    assert _run(ap, mkplay(sym="BBB")) == [] and ap.stopped_for_the_day
+    eng.repo._closed = []                                  # however the day reads now
+    ap._realized = (float("-inf"), 0.0)
+    ap.configure(enabled=True)                             # the on/off switch in the header
+    ap.configure(min_confidence=0.7, max_daily_loss_pct=2.0, max_giveback_pct=30.0)   # a save that keeps the limits
+    assert ap.stopped_for_the_day and _run(ap, mkplay(sym="CCC")) == [] and eng.approved == []
+    ap.configure(max_daily_loss_pct=2.5)                   # moving one lifts it
+    assert not ap.stopped_for_the_day and len(_run(ap, mkplay(sym="DDD"))) == 1
+
+
+def test_the_give_back_peak_counts_day_trades_only_and_the_loss_limit_counts_everything():
+    eng = FakeEngine(equity=10_000.0)                      # give-back floor $25; daily limit $200
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0, max_giveback_pct=30.0, giveback_floor_pct=0.25), bus=SILENT)
+    eng.repo._closed = [_closed("SWG", 500.0, timeframe="SWING")]                   # a swing closed at a profit
+    assert len(_run(ap, mkplay(sym="AAA"))) == 1 and ap.status()["peak_realized"] == 0.0
+    ap._realized = (float("-inf"), 0.0)
+    eng.repo._closed += [_closed("AAA", -180.0)]           # an ordinary day-trade loss isn't giving back the swing's gain
+    assert len(_run(ap, mkplay(sym="BBB"))) == 1 and not ap.status()["daily_loss_stop"]
+
+    eng2 = FakeEngine(equity=10_000.0)
+    ap2 = AutoPilot(eng2, _cfg(max_daily_loss_pct=2.0, max_giveback_pct=30.0, giveback_floor_pct=0.25), bus=SILENT)
+    eng2.repo._closed = [_closed("SWG", 500.0, timeframe="SWING"), _closed("AAA", 200.0)]
+    assert len(_run(ap2, mkplay(sym="BBB"))) == 1 and ap2.status()["peak_realized"] == 200.0
+    ap2._realized = (float("-inf"), 0.0)
+    eng2.repo._closed += [_closed("BBB", -70.0)]           # the day trades kept 130 of 200, whatever the swing made
+    p = mkplay(sym="CCC")
+    assert _run(ap2, p) == [] and "day trades' realized gain has fallen from 200 to 130" in ap2.verdict(p)
+
+    eng3 = FakeEngine(equity=10_000.0)                     # the loss limit still counts a swing trade's loss
+    eng3.repo._closed = [_closed("SWG", -250.0, timeframe="SWING")]
+    ap3 = AutoPilot(eng3, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    assert _run(ap3, mkplay(sym="AAA")) == [] and ap3.status()["daily_loss_stop"]
+
+
 def test_proof_also_asks_whether_the_edge_is_luck_drift_or_eaten_by_costs():
     eng = FakeEngine()
     ap = AutoPilot(eng, _cfg(require_proven=True, min_replay_trades=30, min_replay_expectancy_r=0.05,
@@ -718,6 +944,158 @@ def test_no_entries_while_prices_cannot_be_read():
     _run(ap, p)
     assert eng.approved == [] and "prices can't be read" in ap.verdict(p) and heard.count("autopilot.blocked") == 1
     state["why"] = ""                                                          # the other session logged out
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]
+
+
+# ---------------------------------------------------------------- its own state unreadable: it fails closed
+def test_no_entries_while_autopilots_open_trades_cannot_be_read(caplog):
+    """No positions read would let every cap through: the pass is skipped, the plays say why and the log
+    warns - and the next pass that reads them enters."""
+    import logging
+
+    eng = FakeEngine()
+    eng.repo = FailingRepo("open_trades")
+    ap = AutoPilot(eng, _cfg(), bus=SILENT)
+    p = mkplay()
+    with caplog.at_level(logging.WARNING, logger="autotradebot.execution.autopilot"):
+        assert _run(ap, p) == []
+    assert eng.approved == [] and eng.assess_calls == []
+    assert "positions could not be read" in ap.verdict(p)
+    assert any("positions could not be read" in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+    assert ap.status()["open_auto_positions"] == 0                             # the strip still draws
+    eng.repo.failing.clear()
+    _run(ap, p)
+    assert eng.approved_ids() == [p.id]
+
+
+def test_a_read_of_the_open_trades_that_fails_part_way_through_a_pass_ends_the_pass_there():
+    eng = FakeEngine()
+    eng.repo = FailingRepo()
+    approve = eng.approve_play
+
+    def approve_then_fail(pid, operator="operator"):
+        out = approve(pid, operator)
+        eng.repo.failing.add("open_trades")                                    # the database goes after the first entry
+        return out
+
+    eng.approve_play = approve_then_fail
+    ap = AutoPilot(eng, _cfg(max_auto_positions=9), bus=SILENT)
+    first, second = mkplay(sym="AAA"), mkplay(sym="BBB")
+    assert [a["play_id"] for a in _run(ap, first, second)] == [first.id]
+    assert eng.approved_ids() == [first.id] and "positions could not be read" in ap.verdict(second)
+
+
+def test_open_trades_that_go_on_failing_to_read_are_warned_of_once_until_they_read_again(caplog):
+    """consider() runs on every scan and every 15 s: a database locked for minutes warns once, not on each pass."""
+    import logging
+
+    eng = FakeEngine()
+    eng.repo = FailingRepo("open_trades")
+    ap = AutoPilot(eng, _cfg(), bus=SILENT)
+    p = mkplay()
+
+    def warnings():
+        return [r for r in caplog.records
+                if r.levelname == "WARNING" and "positions could not be read" in r.getMessage()]
+
+    with caplog.at_level(logging.INFO, logger="autotradebot.execution.autopilot"):
+        for _ in range(3):
+            assert _run(ap, p) == []
+        assert len(warnings()) == 1 and "positions could not be read" in ap.verdict(p)   # still said on the play
+        eng.repo.failing.clear()
+        assert len(_run(ap, mkplay(sym="BBB"))) == 1
+        assert "can read its open trades again" in caplog.text
+        eng.repo.failing.add("open_trades")                # failing again is a new episode: warned again
+        _run(ap, mkplay(sym="CCC"))
+        assert len(warnings()) == 2
+
+
+def test_a_play_refused_only_for_want_of_room_under_the_open_risk_ceiling_is_taken_once_room_frees():
+    """A full ceiling frees as trades close: the play is asked about again on the next pass, not dropped for the
+    day like a refusal for any other reason."""
+    heard = []
+    eng = FakeEngine()
+    full = {"on": True}
+    assess = eng.assess_play
+
+    def ceiling(pid):
+        out = assess(pid)
+        if full["on"]:                                     # as engine.assess_play answers with the ceiling full
+            out.update(can_execute=False, transient=True, reasons=["the open trades and working entries already "
+                                                                   "risk $3,990 of the $4,000 the ceiling allows"])
+        return out
+
+    eng.assess_play = ceiling
+    ap = AutoPilot(eng, _cfg(), bus=SimpleNamespace(publish=lambda topic, **kw: heard.append(topic)))
+    p = mkplay()
+    assert _run(ap, p) == [] and "already risk $3,990" in ap.verdict(p)
+    assert _run(ap, p) == [] and "autopilot.skipped" not in heard   # asked again, and not reported as refused
+    full["on"] = False                                     # a trade stopped out: room again
+    assert [a["play_id"] for a in _run(ap, p)] == [p.id]
+
+    other = FakeEngine()
+    other.can_execute = False                              # any other refusal: dropped for the day
+    ap2 = AutoPilot(other, _cfg(), bus=SILENT)
+    q = mkplay()
+    _run(ap2, q)
+    other.can_execute = True
+    assert _run(ap2, q) == [] and other.assess_calls == [q.id]
+
+
+def test_a_failed_read_of_todays_trades_keeps_the_last_figures_and_the_stop(monkeypatch):
+    """A zero, or a part-sum, would read as a day without its losses: the figures read last stand, and the
+    next call reads again. Moving a limit judges the day afresh - on those figures, so the stop holds. A new
+    session starts from nothing, not from yesterday's loss."""
+    import datetime as dt
+
+    from autotradebot.execution import autopilot as module
+
+    eng = FakeEngine(equity=10_000.0)                                          # 2% of equity = $200
+    eng.repo = FailingRepo()
+    eng.repo._closed = [_closed("AAA", -250.0), _closed("BBB", 40.0)]
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0), bus=SILENT)
+    assert _run(ap, mkplay(sym="CCC")) == [] and ap.stopped_for_the_day
+    tally = ap.status()["today"]
+
+    def part_read(day):                                                        # the read dies after the winner
+        yield _closed("BBB", 40.0)
+        raise RuntimeError("database is locked")
+
+    eng.repo.trades_on = part_read
+    ap._realized = (float("-inf"), ap._realized[1])                            # the cached figure is due a re-read
+    ap.configure(max_giveback_pct=40.0)                                        # lifts the stop: the day is judged afresh
+    p = mkplay(sym="DDD")
+    assert _run(ap, p) == [] and eng.approved == [] and ap.stopped_for_the_day
+    assert "past the daily limit" in ap.verdict(p)
+    st = ap.status()
+    assert st["realized_today"] == -210.0 and st["today"] == tally
+    assert ap._realized[0] == float("-inf")                                    # not refreshed: the next call reads again
+
+    def no_read(day):
+        raise RuntimeError("database is locked")
+
+    tomorrow = module.clock.session_date() + dt.timedelta(days=1)
+    monkeypatch.setattr(module.clock, "session_date", lambda ts=None: tomorrow)
+    eng.repo.trades_on = no_read
+    st = ap.status()
+    assert st["realized_today"] == 0.0 and st["today"] == [] and not st["daily_loss_stop"]
+    assert len(_run(ap, mkplay(sym="EEE"))) == 1                               # yesterday's loss stops nothing today
+
+
+def test_the_gate_refuses_a_play_it_cannot_check_against_the_trades():
+    """Already holding the ticker, or cooling off after a loss on it today: when the read that answers
+    fails, the play is refused with why - and taken once the read works."""
+    eng = FakeEngine()
+    eng.repo = FailingRepo("get_open_trade_for_symbol")
+    ap = AutoPilot(eng, _cfg(cooldown_after_loss=True), bus=SILENT)
+    p = mkplay(sym="AAA")
+    assert _run(ap, p) == [] and eng.approved == []
+    assert "could not check whether AAA is already held" in ap.verdict(p)
+    eng.repo.failing = {"trades_on"}
+    assert _run(ap, p) == [] and eng.approved == []
+    assert "could not check whether AAA already stopped out today" in ap.verdict(p)
+    eng.repo.failing.clear()
     _run(ap, p)
     assert eng.approved_ids() == [p.id]
 
@@ -1025,6 +1403,18 @@ def test_an_entry_that_ends_before_approve_returns_still_hands_its_slot_back():
     ap = AutoPilot(eng, _cfg(max_auto_trades_per_day=2, max_auto_positions=9), bus=SILENT)
     _run(ap, mkplay(sym="AAA"))
     assert len(eng.approved) == 1 and ap.status()["auto_trades_today"] == 0 and ap._sent_today == 1
+
+
+def test_an_entry_the_broker_didnt_answer_in_time_counts_as_sent_and_keeps_its_slot_until_known_unsent():
+    eng, ap = _two_a_day()
+    eng.approve_play = lambda pid, operator="operator": {"ok": False, "sent_unknown": True,
+                                                         "reason": "IBKR didn't answer the order in time"}
+    play = mkplay(sym="AAA")
+    _run(ap, play)
+    assert ap.status()["auto_trades_today"] == 1 and ap._sent_today == 1 and play.id in ap._auto_play_ids
+    assert play.id not in ap._refused
+    assert ap.entry_unfilled(play.id) and ap.status()["auto_trades_today"] == 0   # it never went out, as it turns out
+    assert ap._sent_today == 1
 
 
 def test_an_approve_that_fails_takes_no_slot_and_one_that_crashes_keeps_it():

@@ -29,7 +29,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Collection, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Collection, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -79,6 +79,9 @@ class ScanResult:
     decisions: List[Decision] = field(default_factory=list)
     gappers: List[Dict[str, Any]] = field(default_factory=list)      # the gap check's findings, hottest first
     errors: Dict[str, str] = field(default_factory=dict)
+    #: how many times each strategy raised in this scan (evaluator.evaluate) - a broken setup finds nothing,
+    #: and this is how the dashboard says so
+    strategy_errors: Dict[str, int] = field(default_factory=dict)
     timings: Dict[str, float] = field(default_factory=dict)
     elapsed_s: float = 0.0
 
@@ -92,6 +95,7 @@ class ScanResult:
             "decisions": {a: sum(d.action == a for d in self.decisions) for a in ("adopted", "kept", "dropped")},
             "gappers": [{"symbol": g["symbol"], "gap_pct": g["gap_pct"]} for g in self.gappers[:10]],
             "errors": dict(list(self.errors.items())[:5]), "n_errors": len(self.errors),
+            "strategy_errors": dict(self.strategy_errors),
             "elapsed_s": round(self.elapsed_s, 1),
             "timings": {k: round(v, 2) for k, v in self.timings.items()},
         }
@@ -237,13 +241,14 @@ class Scanner:
                                              equity=self._equity, params=self._params, activity=m, noise=self._noise,
                                              signals=self.signals, market=self.market,
                                              evidence_weights=self.evidence_weights,
-                                             records=self.strategy_records, benchmark=self._benchmark(False))
+                                             records=self.strategy_records, benchmark=self._benchmark(False),
+                                             failures=result.strategy_errors)
             result.plays += self._signal_plays(swing, {m.symbol for m in ranked[:self.SWING_LEADERS]},
-                                               result.run_id)[0]
+                                               result.run_id, result.strategy_errors)[0]
         with self._timed(result, "valuation_setups"):
             valuation = [s for s in strategies if swing_on and s.kind is StrategyKind.FUNDAMENTAL]
             if valuation:
-                result.plays += self._valuation_plays(valuation, ranked, result.run_id)
+                result.plays += self._valuation_plays(valuation, ranked, result.run_id, result.strategy_errors)
         return self._finish(result, filters)
 
     def update_market_daily(self, through: dt.date) -> List[str]:
@@ -286,7 +291,8 @@ class Scanner:
                 metrics.append(m)
         return rank_by_daily_heat(metrics)
 
-    def _valuation_plays(self, strategies: List[Strategy], ranked: List[DailyMetrics], run_id: str) -> List[Play]:
+    def _valuation_plays(self, strategies: List[Strategy], ranked: List[DailyMetrics], run_id: str,
+                         failures: Optional[Dict[str, int]] = None) -> List[Play]:
         leaders = self.settings.config.scanner.fundamentals_leaders
         benchmark = self.md.daily_frame(BENCHMARK)
         pool = [m.symbol for m in ranked]
@@ -304,7 +310,8 @@ class Scanner:
             plays += evaluate(m.symbol, strategies, self.md.daily_frame(m.symbol), None, run_id=run_id,
                               equity=self._equity, params=self._params, activity=m, fundamentals=fin, peers=peers,
                               noise=self._noise, signals=self.signals, market=self.market,
-                              evidence_weights=self.evidence_weights, records=self.strategy_records)
+                              evidence_weights=self.evidence_weights, records=self.strategy_records,
+                              failures=failures)
         return plays
 
     def _financials(self, symbol: str, benchmark: Optional[pd.DataFrame]) -> Optional[Financials]:
@@ -345,18 +352,19 @@ class Scanner:
             for symbol in symbols:
                 if symbol not in intraday or symbol not in daily:
                     continue
-                activity = intraday_metrics(symbol, intraday[symbol], daily[symbol])
-                plays = evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
+                candles = with_today(daily[symbol], intraday[symbol])   # yesterday's too if the store lacks it
+                activity = intraday_metrics(symbol, intraday[symbol], candles)
+                plays = evaluate(symbol, active, candles, intraday[symbol], run_id=result.run_id,
                                  equity=self._equity, params=self._params, activity=activity, noise=self._noise,
                                  signals=self.signals, market=self.market,
                                  evidence_weights=self.evidence_weights,
                                  records=self.strategy_records, benchmark=benchmark,
-                                 premarket=self.premarket.get(symbol))
+                                 premarket=self.premarket.get(symbol), failures=result.strategy_errors)
                 result.plays += plays
                 if activity is not None:
                     heat[symbol] = activity.heat + (_PLAY_BONUS if plays else 0.0)
             extra, looked_at = self._signal_plays([s for s in active if s.timeframe is Timeframe.SWING], set(symbols),
-                                                  result.run_id)
+                                                  result.run_id, result.strategy_errors)
             result.plays += extra
             result.symbols = symbols + looked_at
         with self._watchlist_lock:
@@ -367,12 +375,17 @@ class Scanner:
         return self._finish(result, filters)
 
     # ---- the wide scan: every liquid stock ------------------------------- #
-    def run_wide(self, stocks: int = 0, movers: int = 0) -> ScanResult:
+    def run_wide(self, stocks: int = 0, movers: int = 0,
+                 between: Optional[Callable[[], Collection[str]]] = None) -> ScanResult:
         """Every liquid stock the full scan ranked - or the hottest ``stocks`` of them - on its
         5-minute candles: the day-trade and swing setups the filters allow run on all of them, with
         today's partial candle, and the hot list is refreshed from what has heated up since the
         morning; today's ``movers`` biggest movers on volume hold slots outright. One request per
-        stock, in chunks; a chunk that fails is noted and skipped."""
+        stock, in chunks; a chunk that fails is noted and skipped. Between two chunks ``between``
+        has the thread - the engine's light checks that came due, so a sweep of minutes holds none of
+        them up - and returns the stocks it read: one this sweep had read before is left out of its
+        plays and the stocks it says it looked at, so the check's plays on the newer candles stand.
+        Its heat still counts for the hot list."""
         cfg = self.settings.config.scanner
         filters, strategies = self.filters, list(self.strategies)
         result = ScanResult("wide")
@@ -392,8 +405,14 @@ class Scanner:
         heat: Dict[str, float] = {}
         seen: Dict[str, Any] = {}                       # each stock's intraday metrics, for the movers
         scanned: List[str] = []
+        fresher: set = set()                            # stocks a check between the chunks read after this sweep
         with self._timed(result, "setups"):
             for start in range(0, len(symbols), self.WIDE_CHUNK):
+                if start and between is not None:
+                    paused = time.monotonic()
+                    fresher.update(set(between()) & set(scanned))
+                    result.timings["between_chunks"] = (result.timings.get("between_chunks", 0.0)
+                                                        + time.monotonic() - paused)
                 chunk = symbols[start:start + self.WIDE_CHUNK]
                 self._progress(result, "wide scan", start, len(symbols))
                 try:
@@ -409,18 +428,22 @@ class Scanner:
                     if symbol not in intraday or symbol not in daily:
                         continue
                     scanned.append(symbol)
-                    activity = intraday_metrics(symbol, intraday[symbol], daily[symbol])
-                    plays = evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
+                    candles = with_today(daily[symbol], intraday[symbol])
+                    activity = intraday_metrics(symbol, intraday[symbol], candles)
+                    plays = evaluate(symbol, active, candles, intraday[symbol], run_id=result.run_id,
                                      equity=self._equity, params=self._params, activity=activity, noise=self._noise,
                                      signals=self.signals, market=self.market,
                                      evidence_weights=self.evidence_weights,
                                      records=self.strategy_records, benchmark=benchmark,
-                                     premarket=self.premarket.get(symbol))
+                                     premarket=self.premarket.get(symbol), failures=result.strategy_errors)
                     result.plays += plays
                     if activity is not None:
                         heat[symbol] = activity.heat + (_PLAY_BONUS if plays else 0.0)
                         seen[symbol] = activity
-        result.symbols, result.scanned = scanned, len(scanned)
+        # the sweep's own time: the checks it stepped aside for are timed apart, under between_chunks
+        result.timings["setups"] -= result.timings.get("between_chunks", 0.0)
+        result.symbols, result.scanned = [s for s in scanned if s not in fresher], len(scanned)
+        result.plays = [p for p in result.plays if p.symbol not in fresher]
         with self._watchlist_lock:
             result.decisions = wl.apply_wide(heat, self.symbols.sector, cfg.kept_per_sector)
             if movers:
@@ -462,8 +485,8 @@ class Scanner:
         result.gappers = [{"symbol": g.symbol, **g.as_dict()} for g in gappers]
         return self._finish(result, filters)
 
-    def _signal_plays(self, strategies: Sequence[Strategy], done: Collection[str],
-                      run_id: str) -> Tuple[List[Play], List[str]]:
+    def _signal_plays(self, strategies: Sequence[Strategy], done: Collection[str], run_id: str,
+                      failures: Optional[Dict[str, int]] = None) -> Tuple[List[Play], List[str]]:
         """Swing setups on the stocks with unusual insider buying that this scan hasn't
         looked at already - most of them aren't among the day's hottest. Returns the
         plays and the stocks looked at."""
@@ -480,7 +503,8 @@ class Scanner:
             looked_at.append(symbol)
             plays += evaluate(symbol, strategies, daily, None, run_id=run_id, equity=self._equity, params=self._params,
                               activity=daily_metrics(symbol, daily), noise=self._noise, signals=self.signals,
-                              market=self.market, evidence_weights=self.evidence_weights, records=self.strategy_records)
+                              market=self.market, evidence_weights=self.evidence_weights, records=self.strategy_records,
+                              failures=failures)
         return plays, looked_at
 
     def run_plays(self, symbols: Sequence[str]) -> ScanResult:
@@ -544,13 +568,14 @@ class Scanner:
         seen: Dict[str, Optional[IntradayMetrics]] = {}
         with self._timed(result, "setups"):
             for symbol in symbols:
-                activity = seen[symbol] = intraday_metrics(symbol, intraday[symbol], daily[symbol])
-                result.plays += evaluate(symbol, active, daily[symbol], intraday[symbol], run_id=result.run_id,
+                candles = with_today(daily[symbol], intraday[symbol])
+                activity = seen[symbol] = intraday_metrics(symbol, intraday[symbol], candles)
+                result.plays += evaluate(symbol, active, candles, intraday[symbol], run_id=result.run_id,
                                          equity=self._equity, params=self._params, activity=activity,
                                          noise=self._noise, signals=self.signals, market=self.market,
                                          evidence_weights=self.evidence_weights,
                                          records=self.strategy_records, benchmark=benchmark,
-                                         premarket=self.premarket.get(symbol))
+                                         premarket=self.premarket.get(symbol), failures=result.strategy_errors)
         return seen
 
     #: stocks a comparison of the live candles with IBKR's bars wants before it says anything

@@ -58,6 +58,32 @@ def test_sizing_capped_by_notional():
     assert "max position % of equity" in r.caps_hit
 
 
+def test_the_sizing_names_the_limit_that_decided_the_share_count_and_what_each_limit_allowed():
+    cfg = SimpleNamespace(**vars(RISK_CFG), max_symbol_pct_of_equity=20.0, max_adv_pct=1.0)
+    wide = size_play(_play(100, 90), _acct(10000), cfg)                     # $100 of risk at $10 a share: 10
+    assert (wide.qty, wide.decided_by) == (10, "risk_budget")
+    assert wide.limits["risk_budget"] == {"pct": 1.0, "size_factor": 1.0, "usd": 100.0, "shares": 10}
+    assert wide.limits["open_risk"] == {"pct": 4.0, "used": 0.0, "usd": 400.0, "shares": 40}
+    assert wide.limits["per_position"] == {"pct": 35.0, "usd": 3500.0, "shares": 35}
+    assert wide.limits["per_symbol"] == {"pct": 20.0, "held": 0.0, "usd": 2000.0, "shares": 20}
+    assert wide.limits["buying_power"] == {"usd": 20000.0, "shares": 200}
+    assert "volume" not in wide.limits and "capital_room" not in wide.limits   # no volume known, no capital limit
+
+    assert size_play(_play(100, 90), _acct(10000), cfg, open_risk_used=350.0).decided_by == "open_risk"   # $50 left
+    no_symbol_cap = SimpleNamespace(**vars(RISK_CFG))
+    assert size_play(_play(100, 99.5), _acct(10000), no_symbol_cap).decided_by == "per_position"   # 200 by risk, 35
+    tight = size_play(_play(100, 99.5), _acct(10000), cfg, symbol_notional=500.0)
+    assert (tight.qty, tight.decided_by, tight.limits["per_symbol"]["usd"]) == (15, "per_symbol", 1500.0)
+    thin = _play(100, 99.5)
+    thin.evidence["adv_shares"] = 1200                                      # 1% of it: 12 shares
+    assert (size_play(thin, _acct(10000), cfg).decided_by, thin.suggested_qty) == ("volume", 12)
+    short_of_cash = Account(account_id="t", equity=10000, buying_power=900)
+    assert size_play(_play(100, 99.5), short_of_cash, cfg).decided_by == "buying_power"
+    capped = Account(account_id="t", equity=10000, buying_power=20000, raw={"capital_room": 800.0})
+    room = size_play(_play(100, 99.5), capped, cfg)
+    assert (room.qty, room.decided_by, room.limits["capital_room"]) == (8, "capital_room", {"usd": 800.0, "shares": 8})
+
+
 def test_pdt_blocks_below_floor():
     g = PdtGuard(ACC_CFG)
     d = g.assess(_acct(1500), _play())
@@ -92,6 +118,23 @@ def test_paper_mode_never_blocks():
     assert "paper" in d.reason.lower()
     # counter is still surfaced so the operator can see it
     assert d.day_trades_used == 9
+
+
+def test_the_pdt_guard_counts_only_the_day_trades_of_the_venue_orders_go_to():
+    class Repo:
+        asked = []
+
+        def count_day_trades(self, lookback_sessions=5, venue=None):
+            self.asked.append(venue)
+            return {"ibkr-live": 3, "ibkr-paper": 1}.get(venue, 4)
+
+    live = PdtGuard(ACC_CFG, trade_repo=Repo(), venue="ibkr-live")
+    blocked = live.assess(_acct(5000), _play(tf=Timeframe.INTRADAY))
+    assert not blocked.allowed and blocked.day_trades_used == 3
+    # the paper account's trades don't use up the live account's day trades
+    ok = PdtGuard(ACC_CFG, trade_repo=Repo(), venue="ibkr-paper").assess(_acct(5000), _play(tf=Timeframe.INTRADAY))
+    assert ok.allowed and ok.day_trades_used == 1
+    assert Repo.asked == ["ibkr-live", "ibkr-paper"]
 
 
 def test_one_stock_never_takes_more_than_its_share_of_equity():

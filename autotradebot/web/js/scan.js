@@ -35,6 +35,14 @@ export function progressHTML(run) {
   return `<span class="scan-run">${kindLabel(run.kind)}: ${detail}${bar}</span>`;
 }
 
+/** The setups that raised an error in a scan and how often, from its summary - "" when none did. A broken
+    setup finds nothing on the stocks it failed on; the app's log has the first error's traceback. */
+export function setupErrorsText(sum) {
+  const failed = Object.entries((sum && sum.strategy_errors) || {});
+  if (!failed.length) return "";
+  return `${plural(failed.length, "setup")} failed: ` + failed.map(([key, n]) => `${key} ×${count(n)}`).join(", ");
+}
+
 export function nextFullScanText(scan) {
   if (!scan.next_full_scan) return "–";
   return new Date(scan.next_full_scan) <= new Date() ? "due now" : fmtEt(scan.next_full_scan);
@@ -53,6 +61,8 @@ function renderScanMeta() {
   const parts = [];
   if (last) parts.push(`${kindLabel(last.kind)} ${fmtClock(last.finished_at)}: ${plural(last.n_plays, "play")}, ${last.elapsed_s}s`);
   if (last && last.hot && last.hot.length) parts.push(`hot list ${last.hot.length}`);
+  const failed = setupErrorsText(last);
+  if (failed) parts.push(failed);
   parts.push(`next full scan ${nextFullScanText(scan)}`);
   if (replaying) parts.push("replay running");
   el.textContent = parts.join(" · ");

@@ -91,6 +91,17 @@ def luck_test(rs: Sequence[float], draws: int = DRAWS, seed: int = SEED) -> Opti
             "ci_high": round(float(np.percentile(real, 95)), 3)}
 
 
+def welch_t(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
+    """How many standard errors apart two groups' averages are (Welch's t, which doesn't assume the two
+    spreads are alike). None when either group has no spread to measure, so a difference must stand on its size."""
+    if len(a) < 2 or len(b) < 2:
+        return None
+    ma, mb = sum(a) / len(a), sum(b) / len(b)
+    se = math.sqrt(sum((x - ma) ** 2 for x in a) / (len(a) - 1) / len(a)
+                   + sum((x - mb) ** 2 for x in b) / (len(b) - 1) / len(b))
+    return (ma - mb) / se if se else None
+
+
 def reality_check(groups: Mapping[str, Sequence[float]], draws: int = DRAWS, seed: int = SEED) -> Dict[str, float]:
     """White's reality check across every setup that was tried (Aronson ch. 6), on studentised
     means so a thin record and a thick one compete fairly. Each setup's adjusted p-value is the

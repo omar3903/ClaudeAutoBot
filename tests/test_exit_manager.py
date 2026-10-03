@@ -505,3 +505,362 @@ def test_a_trade_the_broker_doesnt_hold_waits_for_the_full_pass():
     assert ex.asked == 1
     em.run_once()                                                        # the full pass tries as before
     assert ex.asked == 2
+
+
+# ---------------------------------------------------------------- a stop resting at the broker gets a moment to fill
+class _StopRests(FakeExecutor):
+    """A stop rests at the broker for each trade in ``resting``."""
+
+    def __init__(self, repo):
+        super().__init__(repo)
+        self.resting, self.asked = {"t1"}, []
+
+    def stop_resting(self, tid, price=None, side=None):
+        self.asked.append((tid, price, side))         # (whether the price reaches it is the executor's to say)
+        return tid in self.resting
+
+
+_SHORT = dict(side="SHORT", stop_price=102.0, initial_stop_price=102.0, target_price=90.0, initial_target_price=90.0)
+
+
+@pytest.mark.parametrize("trade, crossed", [({}, 97.5), (_SHORT, 102.5)])
+def test_a_stop_crossed_while_it_rests_at_the_broker_gets_its_grace_before_the_apps_own_exit(monkeypatch, trade,
+                                                                                             crossed):
+    from autotradebot.execution import exit_manager as module
+
+    now = [1_000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    em, repo, ex, _, _ = _ticking([_trade(**trade)], {"AAA": crossed}, executor=_StopRests, broker_stop_grace_s=10)
+    em.run_once()                                                        # past the stop: the broker's to fill
+    assert ex.asked == [("t1", crossed, trade.get("side", "LONG"))]      # if this price reaches it where it rests
+    now[0] += 6.0
+    em.run_once(only={"AAA"})
+    now[0] += 3.9
+    em.run_once()
+    assert ex.closed == []
+    assert repo._t["t1"]["stop_price"] == _trade(**trade)["stop_price"]  # nor is the stop moved past the price
+    now[0] += 0.1                                                        # ten seconds after the first cross
+    em.run_once()
+    assert ex.closed == [("t1", "stop")]
+
+
+def test_a_price_back_inside_the_stop_gives_the_next_cross_its_grace_afresh(monkeypatch):
+    from autotradebot.execution import exit_manager as module
+
+    now = [1_000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    prices = {"AAA": 97.5}
+    em, _, ex, _, _ = _ticking([_trade()], prices, executor=_StopRests, broker_stop_grace_s=10)
+    em.run_once()
+    now[0] += 8.0
+    prices["AAA"] = 98.5                                                 # back over the 98 stop
+    em.run_once()
+    now[0] += 4.0
+    prices["AAA"] = 97.5                                                 # under it again, 12 s after the first cross
+    em.run_once()
+    assert ex.closed == []
+    now[0] += 10.0
+    em.run_once()
+    assert ex.closed == [("t1", "stop")]
+
+
+def test_with_no_stop_resting_at_the_broker_or_the_grace_off_a_stop_cross_exits_at_once():
+    trades = [_trade(), _trade(id="t2", symbol="BBB")]                   # both under their 98 stops
+    em, _, ex, _, _ = _ticking(trades, {"AAA": 97.5, "BBB": 97.5}, executor=_StopRests, broker_stop_grace_s=10)
+    em.run_once()
+    assert ex.closed == [("t2", "stop")]                                 # only t1's stop rests at the broker
+    em.cfg.broker_stop_grace_s = 0                                       # 0: the app's exit at once, as before
+    em.run_once()
+    assert ex.closed == [("t2", "stop"), ("t1", "stop")]
+
+
+def test_outside_the_regular_session_a_stop_cross_gets_no_grace_and_one_from_before_the_open_is_forgotten(monkeypatch):
+    from autotradebot.execution import exit_manager as module
+    from autotradebot.util import clock
+
+    now, session = [1_000.0], [clock.Session.REGULAR]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(ExitManager, "_session_now", staticmethod(lambda: session[0]))
+    em, _, ex, _, _ = _ticking([_trade(), _trade(id="t2", symbol="BBB")], {"AAA": 97.5, "BBB": 97.5},
+                               executor=_StopRests, broker_stop_grace_s=10)
+    ex.resting = {"t1", "t2"}
+    em._open_day = clock.session_date(clock.now_ny()) - dt.timedelta(days=1)    # yesterday's session last opened
+    em._stop_crossed["t2"] = now[0] - 60.0                                   # a cross remembered from before the open
+    em.run_once()                                                            # the open: both get their whole grace
+    assert ex.closed == []
+    session[0] = clock.Session.POST                                          # after the close the broker's stop
+    em.run_once()                                                            # can't fill: the app's exit goes at once
+    assert sorted(ex.closed) == [("t1", "stop"), ("t2", "stop")]
+
+
+
+# ---------------------------------------------------------------- the time exits read no price
+def _at(monkeypatch, *when):
+    """The clock the exit manager reads (clock.now_ny, behind every session helper) set to ``when`` in New York."""
+    from autotradebot.execution import exit_manager as module
+
+    at = dt.datetime(*when, tzinfo=module.clock.NY)
+    monkeypatch.setattr(module.clock, "now_ny", lambda: at)
+
+
+class _Sends(FakeExecutor):
+    """Keeps the price each exit was measured against."""
+
+    def __init__(self, repo):
+        super().__init__(repo)
+        self.seen = {}
+
+    def close_trade(self, tid, reason="manual", **kw):
+        self.seen[tid] = kw.get("decision_price")
+        return super().close_trade(tid, reason=reason, **kw)
+
+
+def _no_quote(symbol):
+    raise RuntimeError("no market data")
+
+
+def test_an_exit_decided_on_a_delayed_quote_is_measured_against_no_price():
+    # a delayed quote is minutes old: the fill against it would be how far the price moved since, not its slippage
+    for live, measured in ((True, 97.5), (False, None)):
+        repo = FakeRepo([_trade()])
+        ex = _Sends(repo)
+        em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=97.5, ask=97.5, last=97.5),   # under the stop
+                         cfg=_day_cfg(), bus=SimpleNamespace(publish=lambda *a, **k: None),
+                         quotes_live=lambda live=live: live)
+        em.run_once()
+        assert ex.closed == [("t1", "stop")] and ex.seen == {"t1": measured}, live
+
+
+def test_the_time_exits_go_out_on_a_pass_with_no_price(monkeypatch):
+    # a quote that doesn't come - no market data, or only a print from before the entry - mustn't hold a day trade past
+    # the flatten or its window, nor a swing trade past its last day: those exits read no price, and none is made up
+    _at(monkeypatch, 2026, 9, 17, 15, 55)                          # a Thursday, five minutes before the close
+    today = dict(timeframe="INTRADAY", entry_time="2026-09-17T14:00:00", session_date="2026-09-17")
+    trades = [_trade(id="t1", symbol="AAA", **today),                                       # the flatten is due
+              _trade(id="t2", symbol="BBB", time_status="overdue", **today),                # its window has passed
+              _trade(id="t3", symbol="CCC", entry_time="2026-09-03T13:40:00"),              # a swing on its 10th day
+              _trade(id="t4", symbol="DDD", entry_time="2026-09-10T13:40:00")]              # one on its 6th: held on
+    printed = dt.datetime(2026, 9, 1, 15, 0, tzinfo=dt.timezone.utc)                       # before every entry
+
+    def stale(symbol):                                              # under every stop - were it read
+        return Quote(symbol=symbol, bid=97.0, ask=97.0, last=97.0, ts=printed)
+
+    for quote_fn in (_no_quote, stale):
+        repo = FakeRepo(trades)
+        ex = _Sends(repo)
+        em = ExitManager(repo, ex, quote_fn=quote_fn,
+                         cfg=_day_cfg(flatten_intraday_before_close_min=10, max_swing_hold_days=10),
+                         bus=SimpleNamespace(publish=lambda *a, **k: None))
+        em.run_once(only={"AAA", "BBB", "CCC", "DDD"})              # a tick pass is about the price: nothing
+        assert ex.closed == []
+        em.run_once()
+        assert sorted(ex.closed) == [("t1", "eod-flatten"), ("t2", "time-stop"), ("t3", "time-stop")], quote_fn
+        assert ex.seen == {"t1": None, "t2": None, "t3": None}     # measured against no price
+
+
+def test_what_tick_passes_saw_is_written_before_an_exit_sent_with_no_price(monkeypatch):
+    # the trade gets no full pass once its exit is out: the high a tick pass saw and the stop it moved go on the
+    # record first, as before an exit a price set off
+    _at(monkeypatch, 2026, 9, 17, 15, 55)
+    trade = _trade(timeframe="INTRADAY", entry_time="2026-09-17T14:00:00", session_date="2026-09-17")
+    em, repo, ex, events, _ = _ticking([trade], {"AAA": 104.0})
+    em.run_once(only={"AAA"})                                       # +2R: the stop trails to 102, not yet told
+    em.quote_fn = _no_quote
+    em.run_once()
+    assert ex.closed == [("t1", "eod-flatten")]
+    assert [kw["note_append"] for _, kw in repo.writes if "note_append" in kw] == ["stop->102.00 @ 2.0R"]
+    assert [topic for topic, _ in events] == ["exit.stop_moved", "exit.triggered"]
+    assert repo._t["t1"]["mfe"] == 4.0 and repo._t["t1"]["hwm_price"] == 104.0
+
+
+def test_a_day_trade_left_open_from_an_earlier_session_is_flattened_at_the_next_regular_session(monkeypatch):
+    # the app was down at the flatten, or the exit didn't fill before the bell: the day trade goes at the first pass of
+    # the next regular session, as the flatten it missed - not held all day until the next one
+    base = dict(timeframe="INTRADAY", entry_time="2026-09-16T15:00:00", session_date="2026-09-16")
+    cfg = _day_cfg(flatten_intraday_before_close_min=10)
+    for when, want in (((2026, 9, 16, 19, 0), []),                 # that evening: nothing fills after the close
+                       ((2026, 9, 17, 8, 0), []),                  # the next morning, before the open
+                       ((2026, 9, 17, 9, 30), [("t1", "eod-flatten")])):   # the open
+        _at(monkeypatch, *when)
+        em, ex = _mk(FakeRepo([_trade(**base)]), price=100.5, cfg=cfg)
+        em.run_once()
+        assert ex.closed == want, when
+    _at(monkeypatch, 2026, 9, 21, 9, 45)                            # over a weekend too
+    em, ex = _mk(FakeRepo([_trade(**{**base, "entry_time": "2026-09-18T15:00:00", "session_date": "2026-09-18"})]),
+                 price=100.5, cfg=cfg)
+    em.run_once()
+    assert ex.closed == [("t1", "eod-flatten")]
+    _at(monkeypatch, 2026, 9, 17, 9, 30)
+    for trade, rules, want in (
+            (_trade(**{**base, "session_date": None}), cfg, [("t1", "eod-flatten")]),   # read off the entry time
+            (_trade(**base), _day_cfg(flatten_intraday_before_close_min=0), []),        # the flatten switched off
+            (_trade(**{**base, "managed_exit": False}), cfg, []),                       # exited by hand
+            (_trade(**{**base, "entry_time": "2026-09-17T12:00:00", "session_date": "2026-09-17"}), cfg, [])):  # today's
+        em, ex = _mk(FakeRepo([trade]), price=100.5, cfg=rules)
+        em.run_once()
+        assert ex.closed == want, (trade, rules)
+
+
+def test_the_swing_time_stop_counts_trading_days_as_the_replay_does(monkeypatch):
+    # entered on a Thursday morning, Labor Day and two weekends fall within its ten sessions, the entry's counted -
+    # the replay's ten daily candles. Calendar days would have closed it four sessions early
+    from autotradebot.execution.exit_manager import swing_time_stop_at
+    from autotradebot.util import clock
+
+    entry = "2026-09-03T13:40:00"                                   # 09:40 in New York, the record's naive UTC
+    assert swing_time_stop_at(entry, 10, 10) == dt.datetime(2026, 9, 17, 15, 50, tzinfo=clock.NY)
+    assert clock.last_n_sessions(dt.date(2026, 9, 17), 10)[0] == dt.date(2026, 9, 3)
+    assert swing_time_stop_at(entry, 10, 0) == dt.datetime(2026, 9, 18, 9, 30, tzinfo=clock.NY)    # no flatten
+    assert swing_time_stop_at(entry, 1, 10) == dt.datetime(2026, 9, 3, 15, 50, tzinfo=clock.NY)
+    assert swing_time_stop_at(entry, 0, 10) is None and swing_time_stop_at(None, 10, 10) is None
+    cfg = _day_cfg(flatten_intraday_before_close_min=10, max_swing_hold_days=10)
+    for when, closed in (((2026, 9, 14, 10, 0), False),            # eleven calendar days on: four sessions to go
+                         ((2026, 9, 17, 15, 49), False),           # its tenth session, a minute before the flatten
+                         ((2026, 9, 17, 15, 50), True),            # the flatten on its tenth
+                         ((2026, 9, 18, 8, 0), False),             # missed: not before the open...
+                         ((2026, 9, 18, 9, 30), True)):            # ...but at it
+        _at(monkeypatch, *when)
+        em, ex = _mk(FakeRepo([_trade(entry_time=entry)]), price=100.5, cfg=cfg)
+        em.run_once()
+        assert ex.closed == ([("t1", "time-stop")] if closed else []), when
+
+
+def test_the_swing_time_stop_falls_on_the_day_the_replay_closes_the_same_trade():
+    import pandas as pd
+
+    from autotradebot.core.enums import Side, StrategyKind, Timeframe
+    from autotradebot.execution.exit_manager import swing_time_stop_at
+    from autotradebot.research.replay import ReplaySettings, replay_swing
+    from autotradebot.scanner.noise import NoiseSettings
+    from autotradebot.strategies.base import Strategy
+    from autotradebot.util import clock
+
+    class _BuysOnce(Strategy):
+        """Buys at one session's close - the replay fills it at the next open - with a stop and target never hit."""
+        key, kind, timeframe, title, thesis = "buys_once", StrategyKind.TECHNICAL, Timeframe.SWING, "Test", "t"
+
+        def generate(self, ctx):
+            if ctx.daily.index[-1].date() != dt.date(2026, 9, 2):
+                return []
+            entry = float(ctx.daily["close"].iloc[-1])
+            play = self._mk_play(ctx, Side.LONG, entry, entry - 5.0, [entry + 10.0], 0.7, "r", "d", {}, tags=["swing"])
+            return [play] if play else []
+
+    days = [d for d in pd.date_range("2026-05-01", "2026-10-30").date if clock.is_trading_day(d)]
+    frame = pd.DataFrame({"open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 3e6},
+                         index=pd.DatetimeIndex([pd.Timestamp(d, tz=clock.NY) for d in days]))
+    settings = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, breakeven_at_r=0.0, trail_start_r=0.0,
+                              max_swing_hold_days=10)
+    [sim] = replay_swing([_BuysOnce()], "SWG", frame, settings, NoiseSettings(min_expected_r=-99.0),
+                         sessions=len(days))
+    assert sim.exit_reason == "time-stop" and sim.entered_at.startswith("2026-09-03")
+    due = swing_time_stop_at("2026-09-03T13:30:00", settings.max_swing_hold_days, 10)       # filled at the open
+    assert sim.exited_at[:10] == due.date().isoformat() == "2026-09-17"
+
+
+# ---------------------------------------------------------------- outside the regular session
+def _session(monkeypatch, start):
+    """The session the exit manager sees, as [the session] - change it between passes."""
+    from autotradebot.util import clock
+
+    session = [getattr(clock.Session, start)]
+    monkeypatch.setattr(ExitManager, "_session_now", staticmethod(lambda: session[0]))
+    return session
+
+
+@pytest.mark.parametrize("start", ["PRE", "POST", "CLOSED"])
+def test_a_print_outside_the_regular_session_moves_no_stop_but_still_marks_the_trade_and_trips_its_stop(monkeypatch,
+                                                                                                          start):
+    from autotradebot.util import clock
+
+    session = _session(monkeypatch, start)
+    prices = {"AAA": 106.0}                                              # +3R: the trail would take the stop to 103
+    em, repo, ex, events, _ = _ticking([_trade()], prices)
+    em.run_once()
+    assert repo._t["t1"]["stop_price"] == 98.0 and events == []          # a thin print doesn't ratchet it
+    assert repo._t["t1"]["mfe"] == 6.0 and repo._t["t1"]["hwm_price"] == 106.0     # but counts in the excursions
+    session[0] = clock.Session.REGULAR
+    em.run_once()
+    assert repo._t["t1"]["stop_price"] == 103.0                          # the same price in regular hours moves it
+    session[0] = getattr(clock.Session, start)
+    prices["AAA"] = 102.5                                                # and under the stop outside them, it trips
+    em.run_once()
+    assert ex.closed == [("t1", "trailing-stop")]
+
+
+def test_a_stop_a_tick_moved_in_regular_hours_is_told_by_the_first_pass_after_them(monkeypatch):
+    from autotradebot.util import clock
+
+    session = _session(monkeypatch, "REGULAR")
+    prices = {"AAA": 102.6}
+    em, repo, ex, events, _ = _ticking([_trade()], prices)
+    em.run_once(only={"AAA"})                                            # the stop to 100.65, not told yet
+    session[0], prices["AAA"] = clock.Session.POST, 106.0                # an after-hours print far above
+    em.run_once()
+    [(topic, moved)] = events
+    assert topic == "exit.stop_moved" and moved["new_stop"] == 100.65 and repo._t["t1"]["stop_price"] == 100.65
+
+
+class _ShutUntilOpen(FakeExecutor):
+    """Turns every exit away while ``answer`` is "closed" (the executor, the exchange closed at IBKR) or "refused"."""
+
+    def __init__(self, repo):
+        super().__init__(repo)
+        self.answer, self.asked = "closed", []
+
+    def close_trade(self, tid, reason="manual", **kw):
+        self.asked.append(tid)
+        if self.answer == "closed":
+            return {"ok": False, "market_closed": True, "reason": "The market is closed, so an exit can't fill now."}
+        if self.answer == "refused":
+            return {"ok": False, "reason": "refused"}
+        return super().close_trade(tid, reason=reason, **kw)
+
+
+def test_an_exit_the_closed_market_turns_away_is_no_failed_try(monkeypatch):
+    from autotradebot.execution import exit_manager as module
+
+    now = [1_000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    _session(monkeypatch, "POST")
+    em, repo, ex, events, _ = _ticking([_trade()], {"AAA": 97.5}, executor=_ShutUntilOpen)    # under the 98 stop
+    for _ in range(40):                                                  # a pass every 15 s for ten minutes
+        em.run_once()
+        now[0] += 15.0
+    assert len(ex.asked) == 600 / em.CLOSED_RETRY_S                      # asked now and then, no longer back-off
+    [told] = [p for topic, p in events if topic == "exit.failed"]        # told once: a wait for the open
+    assert told["market_closed"] and "market is closed" in told["reason"]
+    ex.answer = "refused"                                                # a real refusal after them is its first try
+    now[0] += em.CLOSED_RETRY_S
+    em.run_once()
+    failed = [p for topic, p in events if topic == "exit.failed"][-1]
+    assert failed["attempt"] == 1 and failed["retry_in_s"] == em.RETRY_DELAYS_S[0] and not failed.get("market_closed")
+
+
+def test_every_exit_starts_its_tries_afresh_at_the_open(monkeypatch):
+    from autotradebot.execution import exit_manager as module
+    from autotradebot.util import clock
+
+    now = [1_000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    session = _session(monkeypatch, "PRE")
+    _at(monkeypatch, 2026, 9, 17, 9, 0)                                  # a Thursday, before the open
+    em, repo, ex, events, _ = _ticking([_trade()], {"AAA": 97.5}, executor=_ShutUntilOpen)
+    ex.answer = "refused"
+    while len(ex.asked) < len(em.RETRY_DELAYS_S):                        # refused until the back-off is five minutes
+        em.run_once()
+        now[0] += 1.0
+    asked = len(ex.asked)
+    _at(monkeypatch, 2026, 9, 17, 9, 30)
+    session[0] = clock.Session.REGULAR
+    em.run_once()                                                        # the open, seconds after the last try
+    assert len(ex.asked) == asked + 1
+    failed = [p for topic, p in events if topic == "exit.failed"]
+    assert len(failed) == 2 and failed[-1]["attempt"] == 1               # its first try today, told again
+    now[0] += 1.0
+    em.run_once()                                                        # once a day: the back-off holds again
+    assert len(ex.asked) == asked + 1
+    ex.answer = "fill"
+    now[0] += em.RETRY_DELAYS_S[0]
+    em.run_once()
+    assert ex.closed == [("t1", "stop")]

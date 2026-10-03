@@ -213,6 +213,11 @@ function handle(topic, p) {
       toast("Auto-exit skipped: " + (p.reason || "the broker doesn't show that position"), "warn");
       break;
     case "exit.failed":
+      if (p.market_closed) {
+        // no failed try: the exit waits for the regular session and goes out at its first pass
+        toast("Auto-exit waits for the open: " + p.reason, "warn");
+        break;
+      }
       toast(`⚠ Auto-exit not sent (try ${p.attempt}, again in ${p.retry_in_s}s): ${p.reason}`, "bad");
       break;
     case "orders.updated":
@@ -227,9 +232,27 @@ function handle(topic, p) {
       toast("⚠ " + p.msg, "bad");
       loadOpen(); refreshState();
       break;
+    case "order.unbooked":
+      // a fill the trade log couldn't save yet: the order stays followed and the next pass saves it (said again
+      // every few minutes while it keeps failing)
+      toast("⚠ " + p.msg, "bad");
+      break;
+    case "order.unconfirmed":
+      // an order the broker didn't answer in time, looked for there before anything goes out in its place: said
+      // when an exit's goes unanswered, and every few minutes while one stays unfound. One that leaves a position
+      // with no stop at the broker stays up longer
+      toast("⚠ " + p.msg, "bad", p.bare ? 30000 : undefined);
+      break;
     case "positions.mismatch":
       (p.mismatches || []).forEach(m => toast("⚠ " + m.note, "bad"));
       refreshState();
+      break;
+    case "positions.drift":
+      // shares no open record explains, minutes into the regular session. An urgent one - short with nothing
+      // recorded, or the other way round from the record - stays up longer. The app never unwinds them: Open
+      // positions lists them with their own Exit
+      (p.alerts || []).forEach(a => a.urgent ? toast("⛔ " + a.note, "bad", 30000) : toast("⚠ " + a.note, "warn"));
+      loadOpen(); refreshState();
       break;
     case "stop.placed":
       toast(`${p.symbol}: stop order resting at the broker @ ${num(p.stop_price)} for ${num(p.qty, 0)} shares`, "good");
@@ -238,7 +261,7 @@ function handle(topic, p) {
       toast(`${p.symbol}: target order resting at the broker @ ${num(p.limit_price)} for ${num(p.qty, 0)} shares - one fill shrinks the other`, "good");
       break;
     case "stop.missing":
-      toast(`⚠ ${p.symbol} has had no stop at the broker for ${num(p.minutes, 1)} min - ${p.reason}. The app still exits it itself while it runs.`, "bad");
+      toast(`⚠ ${p.symbol} has had no stop at the broker for ${num(p.minutes, 1)} min - ${p.reason}. ${p.exit_held ? "Its exit waits too, until the broker's orders can be read." : "The app still exits it itself while it runs."}`, "bad");
       break;
     case "stop.lost":
       toast(`⚠ ${p.symbol}: the stop order at the broker is gone (${p.reason}) - placing it again`, "bad");
@@ -268,7 +291,10 @@ function handle(topic, p) {
       // the whole row, which says who sent it and when - an open detail panel follows it (plays.js followSelected)
       if (p.play) mergePlay(p.play);
       else if (p.decision === "rejected") mergePlay({ id: p.play_id, status: "REJECTED" });     // dismissed in another tab
-      if (p.decision === "approved" && p.result && !p.result.ok) toast("Order not sent: " + (p.result.reason || "rejected"), "bad");
+      if (p.decision === "approved" && p.result && !p.result.ok) {
+        if (p.result.sent_unknown) toast("⚠ Order not confirmed: " + (p.result.reason || "no answer from the broker in time"), "warn");
+        else toast("Order not sent: " + (p.result.reason || "rejected"), "bad");
+      }
       break;
 
     case "capital.updated":

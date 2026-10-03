@@ -18,8 +18,15 @@ from autotradebot.strategies.base import Strategy, StrategyContext
 
 NY = "America/New_York"
 DAY = dt.date(2026, 9, 10)                     # an ordinary full session
-EXACT = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, breakeven_at_r=0.0, trail_start_r=0.0)
+EXACT = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, commission_per_share=0.0, breakeven_at_r=0.0,
+                       trail_start_r=0.0)
 QUIET = NoiseSettings(min_expected_r=-99.0)
+
+
+def _closed_today(ctx):
+    """Today's closed candles: the newest one is still forming, as at the live candle-close check."""
+    today = ctx.today_intraday()
+    return None if today is None else today.iloc[:-1]
 
 
 class _LongAtBar(Strategy):
@@ -32,10 +39,10 @@ class _LongAtBar(Strategy):
         self.at_bar = at_bar
 
     def generate(self, ctx):
-        today = ctx.today_intraday()
-        if today is None or len(today) != self.at_bar + 1:
+        closed = _closed_today(ctx)
+        if closed is None or len(closed) != self.at_bar + 1:
             return []
-        entry = float(today["close"].iloc[-1])
+        entry = float(closed["close"].iloc[-1])
         play = self._mk_play(ctx, Side.LONG, entry, entry - 1.0, [entry + 2.0], 0.7, "r", "d", {}, tags=["intraday"])
         return [play] if play else []
 
@@ -46,10 +53,10 @@ class _LongTwoTargets(_LongAtBar):
     key = "long_two_targets"
 
     def generate(self, ctx):
-        today = ctx.today_intraday()
-        if today is None or len(today) != self.at_bar + 1:
+        closed = _closed_today(ctx)
+        if closed is None or len(closed) != self.at_bar + 1:
             return []
-        entry = float(today["close"].iloc[-1])
+        entry = float(closed["close"].iloc[-1])
         play = self._mk_play(ctx, Side.LONG, entry, entry - 1.0, [entry + 2.0, entry + 4.0], 0.7, "r", "d", {},
                              tags=["intraday"])
         return [play] if play else []
@@ -94,7 +101,8 @@ def test_half_comes_off_at_the_first_target_and_the_rest_runs_on():
     [t] = replay_intraday([_LongTwoTargets()], "RPL", bars, _daily(), EXACT, QUIET)
     assert (t.exit_reason, t.scaled, t.r) == ("trailing-stop", True, 1.0)
     # switched off, the position exits whole at the first target
-    whole = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, breakeven_at_r=0.0, trail_start_r=0.0, scale_out_pct=0.0)
+    whole = ReplaySettings(slippage_bps=0.0, commission_bps=0.0, commission_per_share=0.0, breakeven_at_r=0.0,
+                           trail_start_r=0.0, scale_out_pct=0.0)
     bars = _session(FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9), (102.0, 104.2, 101.9, 104.0)])
     [t] = replay_intraday([_LongTwoTargets()], "RPL", bars, _daily(), whole, QUIET)
     assert (t.exit_reason, t.scaled, t.r) == ("target", False, 2.0)
@@ -230,6 +238,73 @@ def test_series_shared_for_a_session_equal_the_ones_computed_per_bar():
     pd.testing.assert_series_equal(plain.vwap_series[today], ctx.vwap_series[today], check_names=False)
 
 
+class _ClosedBreakout(Strategy):
+    """Confirms on the last closed candle, the way the day setups do (technical._last_closed): the first
+    close above 100.5 makes a long at the price now. It notes the closed candle it fired on."""
+
+    key, kind, timeframe, title, thesis = "closed_breakout", StrategyKind.TECHNICAL, Timeframe.INTRADAY, "Test", "t"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fired_on: list = []
+
+    def generate(self, ctx):
+        from autotradebot.strategies.technical import _last_closed
+
+        today = ctx.today_intraday()
+        last = _last_closed(today)
+        if last is None or len(today) < 3 or float(last["close"]) <= 100.5 or float(today["close"].iloc[-3]) > 100.5:
+            return []
+        self.fired_on.append(last.name)
+        entry = ctx.price
+        play = self._mk_play(ctx, Side.LONG, entry, entry - 1.0, [entry + 2.0], 0.7, "r", "d", {}, tags=["intraday"])
+        return [play] if play else []
+
+
+def test_a_setup_confirming_on_the_closed_bar_fires_on_the_same_bar_in_the_replay_as_live():
+    from autotradebot.scanner.evaluator import with_today
+
+    # the 10:00 candle is the first to close above 100.5; the next one opens at 100.95
+    session = _session(FLAT + [(100.0, 101.0, 99.95, 100.9), (100.95, 101.1, 100.8, 101.0)])
+    replayed = _ClosedBreakout()
+    [t] = replay_intraday([replayed], "RPL", session, _daily(), EXACT, QUIET)
+    # live, seconds after the 10:05 close, IBKR's bars end in the candle that has just begun
+    begun = pd.DataFrame({"open": [100.95], "high": [100.97], "low": [100.94], "close": [100.96], "volume": [2e3]},
+                         index=session.index[7:8])
+    window = pd.concat([session.iloc[:7], begun])
+    live = _ClosedBreakout()
+    ctx = StrategyContext(symbol="RPL", intraday=window, daily=with_today(_daily(), window),
+                          quote=quote_from_price("RPL", 100.96),
+                          now=(session.index[7] + pd.Timedelta(seconds=2)).to_pydatetime())
+    assert live.generate(ctx)
+    assert replayed.fired_on == live.fired_on == [session.index[6]]                # the same closed candle
+    # ...and the replay fills at the open of the candle live saw begin, not a bar later
+    assert pd.Timestamp(t.entered_at) == session.index[7] and t.entry == pytest.approx(100.95)
+
+
+def test_the_candle_just_begun_shows_its_open_and_nothing_of_how_it_went_on():
+    import fakes
+    from autotradebot.indicators import ta
+
+    class _Reader(Strategy):
+        key, kind, timeframe, title, thesis = "reader", StrategyKind.TECHNICAL, Timeframe.INTRADAY, "Test", "t"
+        seen: list = []
+
+        def generate(self, ctx):
+            self.seen.append((ctx.intraday, ctx.price, ctx.vwap))
+            return []
+
+    bars = fakes.intraday_bars("BGN")
+    replay_intraday([_Reader()], "BGN", bars, fakes.daily_bars("BGN"), EXACT, QUIET, sessions=1)
+    assert len(_Reader.seen) > 50
+    for window, price, vwap in _Reader.seen:
+        begun, real = window.iloc[-1], bars.loc[window.index[-1]]
+        assert price == pytest.approx(real["open"], abs=1e-4) and begun["volume"] == 0.0     # the quote: 4 decimals
+        assert (begun["open"], begun["high"], begun["low"], begun["close"]) == (real["open"],) * 4
+        # the session VWAP stands where the closed candles left it: the real candle's volume isn't in it
+        assert vwap == pytest.approx(float(ta.session_vwap(window.iloc[:-1]).iloc[-1]))
+
+
 def test_the_replay_leaves_out_the_plays_the_board_would_never_show():
     import fakes
 
@@ -320,10 +395,10 @@ class _LongWhileQuiet(Strategy):
     key, kind, timeframe, title, thesis = "long_while_quiet", StrategyKind.TECHNICAL, Timeframe.INTRADAY, "Test", "t"
 
     def generate(self, ctx):
-        today = ctx.today_intraday()
-        if today is None or len(today) < 6:
+        closed = _closed_today(ctx)
+        if closed is None or len(closed) < 6:
             return []
-        entry = float(today["close"].iloc[-1])
+        entry = float(closed["close"].iloc[-1])
         play = self._mk_play(ctx, Side.LONG, entry, entry - 1.0, [entry + 2.0], 0.7, "r", "d", {}, tags=["intraday"])
         return [play] if play else []
 
@@ -343,6 +418,22 @@ def test_a_day_setup_is_also_entered_the_way_autopilot_enters_it_after_two_bars_
     assert [t.entry_rule for t in once] == ["first"]
 
 
+def test_a_day_setup_is_entered_on_sight_once_a_session_the_way_the_board_settles_it():
+    # the setup shows on every bar from the fifth on; its trade on sight hits the target at once and the setup
+    # goes on showing at the new price - the board wouldn't offer it again today, so it isn't a new trade
+    bars = FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9)]
+    today = _session(bars)
+    trades = replay_intraday([_LongWhileQuiet()], "RPL", today, _daily(), EXACT, QUIET)
+    first = [t for t in trades if t.entry_rule == "first"]
+    assert [(t.exit_reason, t.r) for t in first] == [("target", 2.0)]
+    # the next session it is a setup of its own again
+    tomorrow = today.copy()
+    tomorrow.index = tomorrow.index + pd.Timedelta(days=1)
+    trades = replay_intraday([_LongWhileQuiet()], "RPL", pd.concat([today, tomorrow]), _daily(), EXACT, QUIET)
+    days = [t.entered_at[:10] for t in trades if t.entry_rule == "first"]
+    assert days == [str(DAY), str(DAY + dt.timedelta(days=1))]
+
+
 def test_the_replay_runs_in_the_background_downloads_each_session_once_and_keeps_its_results(tmp_path):
     from types import SimpleNamespace
 
@@ -360,6 +451,9 @@ def test_the_replay_runs_in_the_background_downloads_each_session_once_and_keeps
     runner.wait(60)
     state = runner.state([], 1)
     assert started["ok"] and state["ran_at"] and not state["running"] and "noise" in state
+    # the costs the records are net of, the per-share commission and the nominal risk it is charged on too
+    assert state["costs"] == {"slippage_bps": 0.0, "commission_bps": 0.0, "commission_per_share": 0.0,
+                              "commission_min": 1.0, "commission_max_pct": 1.0, "nominal_risk_usd": 1000.0}
 
     asked = len(gateway.requests)
     history.load(gateway, ["RPA", "RPB"], 3)

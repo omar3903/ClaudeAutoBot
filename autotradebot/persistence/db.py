@@ -12,13 +12,24 @@ import logging
 from typing import Iterator, Optional
 
 from sqlalchemy import create_engine, event, literal
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import get_settings
 from .models_orm import Base
 
 log = logging.getLogger(__name__)
+
+# SQLite lets one connection write at a time; another that wants to write meanwhile waits this long for it before
+# giving up with "database is locked" - sqlite3's own wait is 5 s, short enough for another writer's long transaction
+# to turn a fill's booking away. The journal mode is left as it is: the database can sit in a synced folder
+# (OneDrive), where WAL's shared-memory file isn't safe
+SQLITE_BUSY_S = 30
+
+
+def _connect_args(url: str) -> dict:
+    """What a new connection to ``url`` is opened with: SQLite's wait for another writer, nothing for MySQL."""
+    return {"timeout": SQLITE_BUSY_S} if make_url(url).get_backend_name() == "sqlite" else {}
 
 
 class _DB:
@@ -37,7 +48,7 @@ class _DB:
         try:
             eng = create_engine(want, echo=echo, pool_pre_ping=True,
                                 pool_size=s.config.database.pool_size, max_overflow=10,
-                                future=True)
+                                future=True, connect_args=_connect_args(want))
             with eng.connect() as c:  # force a real connection
                 c.exec_driver_sql("SELECT 1")
             self.engine = eng
@@ -46,7 +57,7 @@ class _DB:
             if url is None and s.secrets.db_allow_sqlite_fallback:
                 fb = s.secrets.sqlite_fallback_url()
                 log.warning("MySQL unavailable (%s) - falling back to %s", e, fb)
-                self.engine = create_engine(fb, echo=echo, future=True)
+                self.engine = create_engine(fb, echo=echo, future=True, connect_args=_connect_args(fb))
                 self.url = fb
             else:
                 raise
@@ -56,6 +67,9 @@ class _DB:
             @event.listens_for(self.engine, "connect")
             def _fk(dbapi_con, _):  # noqa: ANN001
                 dbapi_con.execute("PRAGMA foreign_keys=ON")
+                # the same wait as the connect argument, set as SQLite's own setting on each new connection too,
+                # whatever the connection was opened with
+                dbapi_con.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_S * 1000}")
 
         self.SessionLocal = sessionmaker(bind=self.engine, expire_on_commit=False,
                                          class_=Session, future=True)

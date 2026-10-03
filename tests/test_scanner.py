@@ -5,7 +5,10 @@ them: heat, today's candle, the listings directory and SEC financials."""
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import math
+import time
+import types
 
 import numpy as np
 import pandas as pd
@@ -21,8 +24,9 @@ from autotradebot.data.market_data import MarketData
 from autotradebot.data.sec_edgar import SecEdgarFundamentals, annual_series, financials_from_facts, sec_ticker
 from autotradebot.data.sectors import SECTORS, sector_from_ibkr
 from autotradebot.data.symbols import SymbolMaster
-from autotradebot.scanner import schedule
-from autotradebot.scanner.evaluator import evaluate, median_volume, with_today
+from autotradebot.scanner import evaluator, schedule
+from autotradebot.scanner.evaluator import (evaluate, last_session, median_volume, prev_close_known, stale_daily,
+                                            with_today)
 from autotradebot.scanner.heat import daily_metrics, intraday_metrics, liquid, rank_by_daily_heat
 from autotradebot.scanner.scanner import BENCHMARK, Scanner
 from autotradebot.scanner.schedule import ScanSettings
@@ -118,6 +122,47 @@ def test_todays_movers_get_hot_list_slots_from_the_wide_scan(scanner, monkeypatc
     assert all(d.note for d in result.decisions if d.symbol in movers and d.action == "adopted")
 
 
+class _EveryStock:
+    """One day play on every stock it is shown, at its latest price."""
+    key, style, weight = "vwap_reclaim", "reversal", 1.0
+    kind, timeframe = StrategyKind.TECHNICAL, Timeframe.INTRADAY
+
+    def generate(self, ctx):
+        return [Play(symbol=ctx.symbol, side=Side.LONG, strategy=self.key, kind=StrategyKind.TECHNICAL,
+                     timeframe=Timeframe.INTRADAY, entry=ctx.price, stop=ctx.price * 0.99,
+                     targets=[ctx.price * 1.03])]
+
+
+def test_the_wide_scan_hands_the_thread_over_between_its_chunks_and_leaves_newer_reads_to_the_check(scanner,
+                                                                                                    monkeypatch):
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: True)
+    scanner.run_full(ScanSettings(hot_list_size=6, sector_queue_size=10))
+    ranked = scanner.watchlist.ranked
+    monkeypatch.setattr(scanner, "WIDE_CHUNK", 10)
+    scanner.set_strategies([_EveryStock()])
+    asked = len(scanner.md.source.requests)
+    pauses = []
+    skew = {"s": 0.0}
+    monotonic = time.monotonic
+    monkeypatch.setattr("autotradebot.scanner.scanner.time",
+                        types.SimpleNamespace(monotonic=lambda: monotonic() + skew["s"]))
+
+    def between():
+        pauses.append({r[0] for r in scanner.md.source.requests[asked:] if r[0] != BENCHMARK})
+        skew["s"] += 100.0                                         # each check stepped aside for takes 100 s
+        # the first pause's check reads the first stock, which the sweep has read, and the last, which it hasn't yet
+        return [ranked[0], ranked[-1]] if len(pauses) == 1 else []
+
+    result = scanner.run_wide(between=between)
+    chunks = math.ceil(len(ranked) / 10)
+    assert chunks >= 3 and pauses == [set(ranked[:10 * n]) for n in range(1, chunks)]     # between chunks only
+    assert result.scanned == len(ranked) and set(result.symbols) == set(ranked) - {ranked[0]}
+    assert {p.symbol for p in result.plays} == set(ranked) - {ranked[0]}           # the check's play on it stands
+    # the checks are timed apart from the sweep's own setups, not in them as well
+    assert result.timings["between_chunks"] == pytest.approx(100.0 * (chunks - 1), abs=1.0)
+    assert 0 < result.timings["setups"] < 100.0
+
+
 def test_the_gap_check_adopts_the_gappers_into_the_hot_list(scanner, monkeypatch):
     from autotradebot.analysis.levels import find_levels
     from autotradebot.scanner.heat import GapperMetrics, rank_gappers
@@ -203,13 +248,118 @@ def test_the_watch_tier_is_the_hot_list_then_kept_then_the_next_picks(scanner, m
 
 
 def test_todays_candle_is_built_from_the_intraday_bars():
-    daily = fakes.daily_bars("AAA").iloc[:-1]
     intraday = fakes.intraday_bars("AAA")
     today = intraday[intraday.index.date == intraday.index[-1].date()]
+    daily = fakes.daily_bars("AAA")
+    daily = daily[daily.index.date < today.index[0].date()]           # through the session before today's
     full = with_today(daily, intraday)
     assert len(full) == len(daily) + 1 and full.index[-1].date() == intraday.index[-1].date()
     assert full["high"].iloc[-1] == today["high"].max() and full["volume"].iloc[-1] == today["volume"].sum()
     assert with_today(full, intraday) is full and with_today(daily, None) is daily
+
+
+class _PriorClose:
+    """A swing play on every stock it is shown, carrying the close its setup read as the previous session's."""
+    key, style, weight = "prior_close", "momentum", 1.0
+    kind, timeframe = StrategyKind.TECHNICAL, Timeframe.SWING
+
+    def generate(self, ctx):
+        return [Play(symbol=ctx.symbol, side=Side.LONG, strategy=self.key, kind=self.kind, timeframe=self.timeframe,
+                     entry=ctx.price, stop=ctx.price * 0.99, targets=[ctx.price * 1.03],
+                     evidence={"prior_close": ctx.prev_close()})]
+
+
+def test_a_store_a_session_short_takes_yesterdays_candle_from_the_intraday_bars(scanner):
+    intraday = fakes.intraday_bars("T01")
+    day = intraday.index[-1].date()
+    prev = clock.prev_trading_day(day)
+    yesterday = intraday[intraday.index.date == prev]
+    stale = fakes.daily_bars("T01")
+    stale = stale[stale.index.date < prev]                          # the store ends the session before yesterday
+    full = with_today(stale, intraday)
+    assert [d.date() for d in full.index[-3:]] == [stale.index[-1].date(), prev, day]
+    assert full.iloc[-2].to_dict() == {"open": yesterday["open"].iloc[0], "high": yesterday["high"].max(),
+                                       "low": yesterday["low"].min(), "close": yesterday["close"].iloc[-1],
+                                       "volume": yesterday["volume"].sum()}
+    # bars that don't reach yesterday either: today's candle follows the store's last, as before
+    assert with_today(stale, intraday[intraday.index.date == day]).index[-2] == stale.index[-1]
+
+    # the scans read it so: the setups' prior close and the stock's move today are from yesterday's close
+    scanner.md.update_daily(["T01"], stale.index[-1].date())
+    scanner.set_strategies([_PriorClose()])
+    (play,) = scanner.run_close(["T01"], intraday.index[-1].to_pydatetime()).plays
+    assert play.evidence["prior_close"] == pytest.approx(yesterday["close"].iloc[-1])
+    moved = intraday_metrics("T01", intraday, full).change_pct
+    assert play.evidence["activity"]["change_pct"] == moved != intraday_metrics("T01", intraday, stale).change_pct
+
+
+class _Only:
+    """One play of ``timeframe`` on every stock it is shown."""
+    style, weight, kind = "momentum", 1.0, StrategyKind.TECHNICAL
+
+    def __init__(self, timeframe):
+        self.key, self.timeframe = f"only_{timeframe.value.lower()}", timeframe
+
+    def generate(self, ctx):
+        return [Play(symbol=ctx.symbol, side=Side.LONG, strategy=self.key, kind=self.kind, timeframe=self.timeframe,
+                     entry=ctx.price, stop=ctx.price * 0.99, targets=[ctx.price * 1.03])]
+
+
+def test_no_day_setups_run_when_neither_the_store_nor_the_bars_reach_the_last_session(monkeypatch, caplog):
+    monkeypatch.setattr(evaluator, "_failed_in", {})
+    intraday = fakes.intraday_bars("AAA")
+    day = intraday.index[-1].date()
+    prev = clock.prev_trading_day(day)
+    holey = intraday[intraday.index.date != prev]                   # the bars miss yesterday too
+    daily = fakes.daily_bars("AAA")
+    stale, current = daily[daily.index.date < prev], daily[daily.index.date < day]
+    # the S&P 500 ETF's closes as the scans pass them, today's included: the market traded yesterday
+    market = with_today(fakes.daily_bars(BENCHMARK), fakes.intraday_bars(BENCHMARK))["close"]
+    both = [_Only(Timeframe.INTRADAY), _Only(Timeframe.SWING)]
+
+    def timeframes(daily, intraday):
+        return [p.timeframe for p in evaluate("AAA", both, daily, intraday, run_id="r", equity=0.0, params={},
+                                              benchmark=market)]
+
+    with caplog.at_level(logging.DEBUG, logger="autotradebot.scanner.evaluator"):
+        assert timeframes(stale, holey) == [Timeframe.SWING]      # a gap read off an older close would be made up
+        assert not prev_close_known(stale, holey, day, market) and stale_daily(stale, day, holey, market)
+        assert stale_daily(stale, day)                            # the calendar says so too
+        # either one reaching yesterday is enough
+        assert timeframes(stale, intraday) == timeframes(current, holey) == [Timeframe.INTRADAY, Timeframe.SWING]
+        assert prev_close_known(stale, intraday, day, market) and prev_close_known(current, None, day, market)
+        assert timeframes(with_today(stale, holey), holey) == [Timeframe.SWING]   # the joined frame says the same
+        assert not stale_daily(with_today(stale, intraday), day)
+    # the session's first stock without them is an INFO line, so a session where none has them is seen
+    skipped = [r.levelno for r in caplog.records if "no day setups" in r.getMessage()]
+    assert skipped == [logging.INFO, logging.DEBUG]
+
+
+def test_a_weekday_the_market_was_shut_that_the_calendar_doesnt_list_isnt_taken_for_a_missed_session():
+    # the session after a closure the holiday calendar doesn't hold, as for a national day of mourning
+    day, shut, last = dt.date(2025, 1, 10), dt.date(2025, 1, 9), dt.date(2025, 1, 8)
+    assert clock.prev_trading_day(day) == shut
+    sessions = [dt.date(2025, 1, 6), dt.date(2025, 1, 7), last, day]                 # no bars on the day it was shut
+    index = pd.DatetimeIndex([t for d in sessions
+                              for t in pd.date_range(pd.Timestamp(f"{d} 09:30", tz=fakes.NY), periods=78, freq="5min")])
+    close = np.repeat([50.0, 51.0, 52.0, 53.0], 78)
+    intraday = pd.DataFrame({"open": close, "high": close + 0.1, "low": close - 0.1, "close": close,
+                             "volume": 1e4}, index=index)
+    daily = fakes.daily_bars("AAA", through=last)                   # current: it ends on the last session
+    spy = fakes.daily_bars(BENCHMARK, through=last)["close"]        # the S&P 500 ETF's closes, today's on the end
+    market = pd.concat([spy, pd.Series([spy.iloc[-1]], index=pd.DatetimeIndex([pd.Timestamp(day, tz=fakes.NY)]))])
+
+    assert stale_daily(daily, day)                                  # by the calendar alone it looks a session short
+    assert last_session(day, intraday) == last_session(day, intraday, market) == last_session(day, market) == last
+    assert not stale_daily(daily, day, intraday, market) and prev_close_known(daily, intraday, day, market)
+    assert prev_close_known(daily, None, day, market)               # the live scan's case: the market's candles only
+    full = with_today(daily, intraday)
+    assert [d.date() for d in full.index[-2:]] == [last, day] and full["close"].iloc[-2] == daily["close"].iloc[-1]
+    both = [_Only(Timeframe.INTRADAY), _Only(Timeframe.SWING)]
+    plays = evaluate("AAA", both, full, intraday, run_id="r", equity=0.0, params={}, benchmark=market)
+    assert [p.timeframe for p in plays] == [Timeframe.INTRADAY, Timeframe.SWING]
+    # candles that don't reach the day can't say: the calendar's yesterday stands
+    assert last_session(day, intraday[intraday.index.date < day]) == last_session(day) == shut
 
 
 def test_a_play_carries_the_stocks_median_volume_over_its_last_20_completed_sessions():
@@ -250,6 +400,54 @@ def test_a_day_play_carries_the_last_closed_candle_it_was_seen_on():
     assert "bar_at" not in swing.evidence                                 # swing plays count scans, as before
     no_candles, _ = evaluate("AAA", [_DayAndSwing()], daily, None, run_id="r", equity=0.0, params={})
     assert no_candles.is_day_trade and "bar_at" not in no_candles.evidence   # no candles, nothing to count by
+
+
+class _Broken:
+    """A setup with a bug: it raises on every stock it is shown."""
+    key, style, weight, kind = "broken", "momentum", 1.0, StrategyKind.TECHNICAL
+
+    def __init__(self, timeframe=Timeframe.INTRADAY):
+        self.timeframe = timeframe
+
+    def generate(self, ctx):
+        raise ZeroDivisionError("a bug in the setup")
+
+
+def test_a_setups_first_failure_in_a_session_is_a_warning_with_its_traceback_and_each_one_is_counted(monkeypatch,
+                                                                                                   caplog):
+    monkeypatch.setattr(evaluator, "_failed_in", {})
+    daily, intraday = fakes.daily_bars("AAA").iloc[:-1], fakes.intraday_bars("AAA")
+    failures = {}
+
+    def run(symbol, strategies):
+        return evaluate(symbol, strategies, daily, intraday, run_id="r", equity=0.0, params={}, failures=failures)
+
+    def logged():
+        return [(r.levelno, r.exc_info is not None) for r in caplog.records if "broken failed" in r.getMessage()]
+
+    with caplog.at_level(logging.DEBUG, logger="autotradebot.scanner.evaluator"):
+        plays = run("AAA", [_Broken(), _Only(Timeframe.INTRADAY)])
+        run("BBB", [_Broken()])
+        assert [p.strategy for p in plays] == ["only_intraday"]            # the other setups still run
+        assert failures == {"broken": 2}
+        assert logged() == [(logging.WARNING, True), (logging.DEBUG, False)]   # repeats stay quiet
+
+        caplog.clear()
+        tomorrow = clock.now_ny() + dt.timedelta(days=1)
+        monkeypatch.setattr(clock, "now_ny", lambda *a, **k: tomorrow)
+        run("AAA", [_Broken()])
+        assert logged() == [(logging.WARNING, True)] and failures == {"broken": 3}   # a new session warns afresh
+
+
+def test_a_scan_counts_each_setups_failures_in_its_summary(scanner, monkeypatch):
+    monkeypatch.setattr(clock, "is_market_open", lambda *a, **k: True)
+    monkeypatch.setattr(evaluator, "_failed_in", {})
+    scanner.set_strategies([_Broken(Timeframe.SWING)])
+    full = scanner.run_full(ScanSettings(hot_list_size=6, sector_queue_size=10))
+    assert full.symbols and full.strategy_errors == {"broken": len(full.symbols)} and not full.plays
+    cycle = scanner.run_cycle(fast=True)
+    assert cycle.scanned == 6 and cycle.summary()["strategy_errors"] == {"broken": 6}
+    assert scanner.run_cycle(fast=True).strategy_errors == {"broken": 6}          # counted per scan, not summed
 
 
 # ---------------------------------------------------------------- heat

@@ -25,20 +25,11 @@ import pandas as pd
 from ..core.enums import Side, StrategyKind, Timeframe
 from ..core.models import Play
 from ..indicators import ta
-from ..util import clock
-from .base import Strategy, StrategyContext
+from .base import Strategy, StrategyContext, completed_daily
 from .registry import register
 
 KELTNER_ATRS = 2.25                # Grimes's modified Keltner channel
 RAN_AWAY_ATRS = 1.0                # the price now, against the signal candle's close
-
-
-def completed_daily(ctx: StrategyContext) -> pd.DataFrame:
-    """The daily candles without the one still forming (it is there only in a live session)."""
-    d = ctx.daily
-    forming = (len(d) and ctx.intraday is not None and d.index[-1].date() == clock.session_date(ctx.now)
-               and 0 < ctx.minutes_since_open < 390)
-    return d.iloc[:-1] if forming else d
 
 
 def pivots(values: np.ndarray, span: int, lows: bool) -> List[int]:

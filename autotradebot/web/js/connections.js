@@ -26,7 +26,7 @@ function render(d) {
     <section class="conn">
       <h4>Where orders go</h4>
       <div class="conn-now">Right now <b>${v.mode === "live" ? "LIVE" : "paper"}</b> orders go to <b>${escapeHtml(v.trading_on_label)}</b>.
-        Live orders always go to your live IBKR account.</div>
+        ${v.trading_on !== "paper" && !v.connected ? "It isn't connected, so they're refused until it's back - none go to the simulator in its place. " : ""}Live orders always go to your live IBKR account.</div>
       <div class="lockable"><span class="group-label">Paper trades on</span>${platforms}</div>
       ${problems.length ? `<div class="reasons">⚠ ${problems.map(escapeHtml).join("<br>")}</div>` : ""}
       <div class="row-gap"><button class="ghost mini" id="conn-reconnect">Reconnect</button>

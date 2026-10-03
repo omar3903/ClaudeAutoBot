@@ -4,6 +4,10 @@ Exactly one Gateway connection at a time: the account the switches point at,
 for trading or read-only (see brokers/venues.py). It is also the price source
 for everything - scans, the simulator's fills, the automatic exits - so it is
 attached to :class:`MarketData` as soon as it connects.
+
+While the IBKR account orders go to can't be connected, :class:`Unreachable`
+stands in for it: orders stay pointed at that account and are refused until it
+answers - never sent to the simulator in its place.
 """
 
 from __future__ import annotations
@@ -16,9 +20,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .. import secrets_store
 from ..brokers import get_broker
-from ..brokers.base import BrokerAdapter, WrongAccount
+from ..brokers.base import AuthError, BrokerAdapter, WrongAccount
 from ..brokers.venues import VenuePlan
 from ..config import Settings
+from ..core.models import Account, Fill, OrderRequest, OrderResult, Quote
 from ..data.market_data import MarketData
 from ..util.net import port_is_open
 from .capital import in_account_currency, money
@@ -26,6 +31,61 @@ from .capital import in_account_currency, money
 log = logging.getLogger(__name__)
 
 BrokerFactory = Callable[..., BrokerAdapter]
+
+
+class Unreachable(BrokerAdapter):
+    """The IBKR account orders go to, while it can't be connected: every call is refused, as a dropped IBKR
+    connection refuses it (AuthError - its orders and executions are "not known", never "none"), so the venue stays
+    that account and no order goes anywhere else meanwhile. The engine swaps the real connection in once the
+    Gateway answers (TradingEngine._retry_connection)."""
+
+    name = "ibkr"
+    supports_native_stop = True
+
+    def __init__(self, account: str) -> None:
+        self.account = account
+        self.connected_since = 0.0
+
+    @property
+    def refusal(self) -> str:
+        return (f"Your IBKR {self.account} account isn't connected, so no order goes out until it's back "
+                "(none is sent to the simulator in its place)")
+
+    def connect(self) -> None:
+        raise AuthError(self.refusal)
+
+    @property
+    def is_connected(self) -> bool:
+        return False
+
+    def get_account(self) -> Account:
+        raise AuthError(self.refusal)
+
+    def get_quote(self, symbol: str) -> Quote:
+        raise AuthError(self.refusal)
+
+    def place_order(self, req: OrderRequest) -> OrderResult:
+        raise AuthError(self.refusal)
+
+    def place_bracket(self, entry: OrderRequest, take_profit: Optional[float],
+                      stop_loss: Optional[float]) -> OrderResult:
+        raise AuthError(self.refusal)
+
+    def cancel_order(self, order_id: str) -> None:
+        raise AuthError(self.refusal)
+
+    def modify_stop(self, order_id: str, stop_price: Optional[float] = None,
+                    quantity: Optional[float] = None) -> OrderResult:
+        raise AuthError(self.refusal)
+
+    def get_order(self, order_id: str) -> OrderResult:
+        raise AuthError(self.refusal)
+
+    def list_orders(self, status: Optional[str] = None) -> List[OrderResult]:
+        raise AuthError(self.refusal)
+
+    def get_fills(self, symbol: Optional[str] = None) -> List[Fill]:
+        raise AuthError(self.refusal)
 
 
 class Connections:
@@ -92,6 +152,10 @@ class Connections:
         self.md.attach(broker)
         log.info("connected to IBKR %s (%s)", plan.account, "trading" if plan.trade else "data only")
         return broker
+
+    def unreachable(self, plan: VenuePlan) -> BrokerAdapter:
+        """What orders go to while ``plan``'s account can't be connected: nowhere (:class:`Unreachable`)."""
+        return Unreachable(plan.account)
 
     def close(self) -> None:
         if self.ibkr is not None:

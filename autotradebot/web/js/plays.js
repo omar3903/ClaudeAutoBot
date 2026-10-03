@@ -452,7 +452,7 @@ function evidenceHTML(ev) {
   }
   const skip = new Set(["signal", "dcf", "football_field", "spark", "verdict", "peer_median", "target_multiples", "peers",
     "price_character", "vol_forecast", "market_regime", "evidence_weight", "at_entry", "hold_from_half_life",
-    "market_move", "next_earnings"]);
+    "market_move", "next_earnings", "as_confirmed", "last_look"]);
   const rest = Object.entries(ev).filter(([k]) => !skip.has(k));
   if (rest.length) {
     blocks.push(`<h4>Signal detail</h4><div class="kv">` +
@@ -488,9 +488,17 @@ async function approve(id) {
   pending.delete(id);
   if (r.ok) {
     const where = r.order_session === "EXTENDED" ? " (extended-hours limit)" : "";
-    toast(`Order sent for ${symbol}: ${r.order_type || ""} ${r.status || "ok"}${where}`, "good");
+    // the shares sent: the last look re-sizes an entry it re-prices off the quote, so they can differ from the preview
+    const shares = r.qty ? `${num(r.qty, 0)} shares, ` : "";
+    toast(`Order sent for ${symbol}: ${shares}${r.order_type || ""} ${r.status || "ok"}${where}`, "good");
     mergePlay({ id, status: r.status === "FILLED" ? "FILLED" : "SUBMITTED", trade_id: r.trade_id || null });
     if (S.selected === id) selectPlay(id);            // another play picked meanwhile stays shown
+    loadOpen();
+  } else if (r.sent_unknown) {
+    // IBKR didn't answer in time: the order may be working, and the app looks for it - the play counts as sent
+    toast(`Order for ${symbol} not confirmed: ` + (r.reason || "no answer from the broker in time"), "warn");
+    mergePlay({ id, status: "SUBMITTED", trade_id: null });
+    if (S.selected === id) selectPlay(id);
     loadOpen();
   } else {
     toast("Not sent: " + (r.reason || "rejected"), "bad");

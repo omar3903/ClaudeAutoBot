@@ -23,8 +23,23 @@ class CapitalOps:
     # ------------------------------------------------------------------ #
     #  Trading capital                                                   #
     # ------------------------------------------------------------------ #
-    def _invested_usd(self) -> float:
-        return capital.invested_usd(self._account, self._positions_here())
+    def _invested_usd(self, held: Dict[str, float]) -> float:
+        """What the positions on this account hold together, in US dollars - the room left for new ones is measured
+        from it. ``held`` is _held_by_kind's: the trade records plus the entries still working, all the day / swing
+        split counts. Cash only or with a set amount, the broker's own positions count as well (exposure_by_symbol,
+        the entries still working in it): shares the account holds with no trade record - bought by hand, or left
+        untracked - use the same money, and leaving them out would let new positions take the total past the
+        account's value or the amount. Per stock, whichever is more - a fill booked a moment ago may not be in the
+        last account read yet. With margin, the records' figure stays: the broker's buying power is already what's
+        left after everything the account holds."""
+        recorded = sum(held.values())
+        if not self.capital.get(self._venue) and self._capital_mode() == capital.MODE_MARGIN:
+            return recorded
+        mine = capital.invested_by_symbol(self._account, self._positions_here())
+        for w in self.working_entries():
+            mine[w["symbol"]] = mine.get(w["symbol"], 0.0) + float(w.get("notional") or 0.0)
+        broker = self.exposure_by_symbol()
+        return max(recorded, sum(max(broker.get(s, 0.0), mine.get(s, 0.0)) for s in {*broker, *mine}))
 
     def _held_by_kind(self) -> Dict[str, float]:
         """Dollars each kind of trade holds on this account: its open positions at the broker's marks and
@@ -44,7 +59,7 @@ class CapitalOps:
         if acc is None or (not limit and share >= 1.0 and mode == capital.MODE_MARGIN):
             return acc                      # the whole account with margin: the broker's buying power is the limit
         held = self._held_by_kind()
-        return capital.sizing_account(acc, limit, sum(held.values()), share=share, mode=mode,
+        return capital.sizing_account(acc, limit, self._invested_usd(held), share=share, mode=mode,
                                       invested_in_kind=held[capital.kind_of(timeframe)] if timeframe is not None else 0.0)
 
     def _capital_mode(self) -> str:
@@ -64,7 +79,7 @@ class CapitalOps:
             return None
         held = self._held_by_kind()
         state = capital.state(self._account, self._venue, venue_label(self._venue), self.capital.get(self._venue),
-                              sum(held.values()), self.effective_day_pct(), held, mode=self._capital_mode())
+                              self._invested_usd(held), self.effective_day_pct(), held, mode=self._capital_mode())
         state["split"].update(on=self._both_kinds(), set_pct=self.day_trade_pct)
         state["size_factor"] = self.size_factor
         state["max_position_pct"] = float(self.settings.config.risk.max_position_pct_of_equity)
@@ -203,12 +218,15 @@ class CapitalOps:
         self._publish_plays()
 
     def _size_plays(self, plays: Iterable[Play]) -> None:
-        """Suggested sizes for plays on the board, each against its own share of the trading capital."""
+        """Suggested sizes for plays on the board, each against its own share of the trading capital and what's left
+        under the open-risk ceiling after the trades and entries already at work - none, while the open trades
+        can't be read (_risk_used)."""
         accounts = {kind: self.sizing_account(kind) for kind in (capital.DAY, capital.SWING)}
         if accounts[capital.DAY] is None:
             return
-        exposure = self.exposure_by_symbol()
+        exposure, open_risk = self.exposure_by_symbol(), self.open_risk_usd()
         for p in plays:
-            size_play(p, accounts[capital.kind_of(p.timeframe)], self.settings.config.risk,
+            account = accounts[capital.kind_of(p.timeframe)]
+            size_play(p, account, self.settings.config.risk, open_risk_used=self._risk_used(open_risk, account),
                       symbol_notional=exposure.get(p.symbol, 0.0), risk_pct=self._play_risk_pct(p),
                       risk_why=self.strategy_risk_why(p.strategy), size_factor=self.size_factor)

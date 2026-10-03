@@ -13,6 +13,7 @@ Everything else imports from here, never from ``os.environ``.
 
 from __future__ import annotations
 
+import datetime as dt
 import functools
 import os
 from pathlib import Path
@@ -115,7 +116,8 @@ class AccountCfg(_Model):
 
 class RiskCfg(_Model):
     max_risk_per_trade_pct: float = 1.0
-    max_open_risk_pct: float = 4.0
+    max_open_risk_pct: float = 4.0             # all the risk at work: each open trade from its entry to the stop it
+                                               # opened with, plus entries working; a new trade gets what's left
     max_position_pct_of_equity: float = 12.0   # one trade's notional (or the dashboard's "Max % per position")
     max_symbol_pct_of_equity: float = 15.0     # everything in one stock: shares held + entries working + this trade
     max_adv_pct: float = 1.0                   # one order's shares, as % of the stock's median daily volume over its
@@ -134,9 +136,12 @@ class ScannerCfg(_Model):
     cycle_minutes: int = 5                # intraday rescan of the hot list + buffer (3-5)
     fast_cycle_seconds: int = 60          # hot list only, while Autopilot is day-trading
     plays_refresh_seconds: int = 15       # re-check the stocks with plays on the board (0 = off)
-    close_check: bool = True              # at each 5-minute candle close in regular hours, +2 s, check the watch
-                                          # tier's setups on IBKR's just-closed bars at once - it stands in for the
-                                          # fast cycle due then; false = off, the fast cycle as before
+    close_check: bool = True              # at each 5-minute candle close in regular hours, +close_grace_s, check the
+                                          # watch tier's setups on IBKR's just-closed bars at once - it stands in for
+                                          # the fast cycle due then; false = off, the fast cycle as before
+    close_grace_s: float = 8.0            # ...this many seconds after the close: IBKR prints a stock's new bar a few
+                                          # seconds on, and a check sooner finds few of them; the stocks still without
+                                          # one are asked once more about 15 s after it read (0-30)
     mover_atr: float = 1.0                # a watch stock whose streamed 1-minute candle spans at least this many of
                                           # its 5-minute ATRs, or makes a new high/low of the day on 3x its average
                                           # minute volume, is checked at once, at most once per 5 minutes (0-5; 0 = off)
@@ -161,9 +166,17 @@ class ScannerCfg(_Model):
     gapper_symbols: int = 400             # at most this many hot-list and buffer names get a pre-market request
     gapper_min_gap_pct: float = 2.0       # a pre-market move this big, either way, counts as a gap
     gapper_min_volume: float = 50_000     # ...on at least this many pre-market shares
+    gateway_alert_time: str = "07:45"     # ET - on a trading day, IB Gateway still not connected by then is said once
+                                          # on the dashboard and in the log, before the full scan needs it ("" = off)
     max_universe: int = 0                 # 0 = every listing (smoke tests cap it)
     sectors: list = Field(default_factory=list)
     prefilter: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("close_grace_s", mode="after")
+    @classmethod
+    def _within_the_grace(cls, value: float) -> float:
+        """A check later than 30 s, with its second ask after it, would near the minute a late check is dropped at."""
+        return max(0.0, min(30.0, value))
 
     @field_validator("mover_atr", mode="after")
     @classmethod
@@ -176,6 +189,15 @@ class ScannerCfg(_Model):
     def _within_the_live_slots(cls, value: int) -> int:
         """The live-scan names take watch-tier slots, which the hot list and the buffers need too."""
         return max(0, min(20, value))
+
+    @field_validator("gateway_alert_time", mode="after")
+    @classmethod
+    def _a_time_of_day_or_off(cls, value: str) -> str:
+        """A time like 07:45 - one that doesn't read as one is refused, never taken for off - or "" for off."""
+        value = (value or "").strip()
+        if value:
+            dt.time.fromisoformat(value)              # a ValueError here is the config's error, with the field named
+        return value
 
 
 class ValuationCfg(_Model):
@@ -213,7 +235,8 @@ class ExecutionCfg(_Model):
     max_chase_r: float = 0.25             # an entry is refused once the price has run past the play's entry by more
                                           # than this share of the distance to the stop - the reward:risk the play was
                                           # judged on is gone; within it a limit entry is priced off the live quote so
-                                          # it fills now (0 = off)
+                                          # it fills now, re-sized at that price and refused when its reward:risk to
+                                          # the first target falls under the floor (0 = off)
     stream_lines: int = 80                # on proven real-time data, hold IBKR streams for this many stocks - the
                                           # positions and working entries first, then the best plays, then the watch
                                           # tier - and price them off a stream that ticked in the last 2 s instead of
@@ -238,18 +261,25 @@ class ExecutionCfg(_Model):
 
 class ExitManagerCfg(_Model):
     enabled: bool = True
+    broker_stop_grace_s: float = 10.0     # a stop cross while the trade's stop rests at the broker: that stop gets this
+                                          # many seconds to fill before the app stands it down and sends its own exit
+                                          # - the broker fills it on real prices, a cancel and a market order cost a
+                                          # round trip and a worse fill (0 = the app's exit at once)
     breakeven_at_r: float = 1.3           # tighten the stop once the trade is +this R  (0 = off)
     breakeven_lock_r: float = 0.3         # ...to lock +this R of profit, not a pure scratch
     breakeven_buffer_bps: float = 5.0
     trail_start_r: float = 2.0            # begin trailing past this R  (0 = off)
     trail_lock_ratio: float = 0.5
-    flatten_intraday_before_close_min: int = 10
+    flatten_intraday_before_close_min: int = 10   # day trades go this many min before the close - and one left
+                                          # open from an earlier session at the next regular-session pass
     intraday_time_stop: bool = True       # a day trade past its setup's own window (the play's longest expected
                                           # hold) that isn't working - its stop not yet at break-even - is closed
                                           # then, not left to the close: its reason to be held has run out, and it
                                           # holds a slot and capital a fresh setup could use. One that is working
                                           # keeps its trailing stop until the flatten. The replay does the same
-    max_swing_hold_days: int = 10
+    max_swing_hold_days: int = 10         # a swing trade is closed once held this many trading days, its entry's
+                                          # counted: at the day trades' flatten on the last one, where the replay
+                                          # closes it at that day's close (0 = off)
     scale_out_pct: float = 50.0           # at the first target of a play with two, take this % off (0 = exit all there)
     scale_out_lock_r: float = 0.0         # ...and move the stop to the entry plus this R (Aziz: break-even)
 
@@ -307,7 +337,8 @@ class AutopilotCfg(_Model):
                                           # (Aronson's reality check on the replayed trades), is this or less; 0 = off
     cooldown_after_loss: bool = True
     max_daily_loss_pct: float = 2.0       # no new entries once today's closed trades have lost this % of equity (0 = off)
-    max_giveback_pct: float = 30.0        # ...or once the day's realized gain has given back this % of its peak (0 = off)
+    max_giveback_pct: float = 30.0        # ...or once the day trades' realized gain has given back this % of its peak
+                                          # (swing and pair trades don't count; 0 = off). Either stop holds all session
     giveback_floor_pct: float = 0.25      # the give-back rule only counts a peak gain of at least this % of equity
     require_catalyst: bool = False
     dry_run: bool = False
@@ -362,6 +393,13 @@ class ReplayCfg(_Model):
                                           # as the day's watchlist (0 = the watchlist only); costs no requests
     slippage_bps: float = 5.0             # on every market fill, each way
     commission_bps: float = 1.0           # on every fill
+    commission_per_share: float = 0.005   # IBKR's fixed commission on top, on every fill: this much a share...
+    commission_min: float = 1.0           # ...at least this much an order...
+    commission_max_pct: float = 1.0       # ...and at most this % of the order's value (0 = no cap)
+    nominal_risk_usd: float = 1000.0      # the replay counts in R and has no size, so the commission is charged on
+                                          # the shares a trade risking this much would buy (1% of a nominal $100k
+                                          # account). Only the minimum and the cap depend on it: $0.005 a share over
+                                          # the risk a share is the same R at any size
     held_out_fraction: float = 0.3334     # the latest sessions kept out of sample
     workers: int = 0                      # processes replaying stocks side by side; 0 = every core but two
     sessions_per_job: int = 10            # a day-trade job replays this many sessions of one stock, so the work spreads

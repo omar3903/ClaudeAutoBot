@@ -318,11 +318,15 @@ def involvement(m: Move, *, trades: Sequence[Mapping[str, Any]], plays: Sequence
         if went_out:
             senders.add(p.get("decided_by") or "")
         shadow = shadow_by_play.get(p.get("id")) or {}
+        # the review books an entry sent and never filled as no fill; taken as planned is what it would have
+        # made had it filled (reviews saved before kept that as its result)
+        planned = shadow.get("if_filled_r")
         play_rows.append({"side": p["side"], "strategy": p["strategy"], "seen_at": _utc_iso(p.get("created_at")),
                           "entry": p.get("entry"), "stop": p.get("stop"), "timeframe": p.get("timeframe"),
                           "status": p.get("status"), "with_move": p["side"] == direction,
                           "sent": went_out, "sent_at": _sent_at(p) if went_out else None,
-                          "shadow_r": shadow.get("r"), "shadow_filled": shadow.get("filled")})
+                          "shadow_r": shadow.get("r") if planned is None else planned,
+                          "shadow_filled": True if planned is not None else shadow.get("filled")})
     out: Dict[str, Any] = {"watched": watched, "trades": trade_rows, "plays": play_rows,
                            "rank": rank, "ranked": ranked}
     if trade_rows:

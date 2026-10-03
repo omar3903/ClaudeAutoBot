@@ -8,20 +8,38 @@ For each OPEN trade it:
   2. closes it at the working stop (cut losses) or target (take profit) - or, at the
      first target of a play that has a second, takes ``scale_out_pct`` of it off, moves
      the stop to break-even and lets the rest run to the second target (Aziz: sell
-     half at the target and bring the stop to the entry);
+     half at the target and bring the stop to the entry). A stop resting at the broker
+     gets ``broker_stop_grace_s`` from the first cross to fill before the app sends its
+     own exit, and nothing else is done for the trade meanwhile - when the price reaches
+     that stop where it rests, in the regular session, where it can fill;
   3. closes an INTRADAY trade that isn't working once its setup's own window has passed
      (``intraday_time_stop``: the play's longest expected hold, its stop not yet at break-even),
-     and flattens every INTRADAY trade a few minutes before the (holiday-aware) close;
-  4. closes SWING trades held longer than ``max_swing_hold_days``;
+     and flattens every INTRADAY trade a few minutes before the (holiday-aware) close - and
+     one still open from an earlier session (the app was down at the flatten, say) at the
+     first pass of the regular session, as ``eod-flatten`` too: the flatten it missed;
+  4. closes a SWING trade on its ``max_swing_hold_days``-th session, its entry's counted, at
+     the day trades' flatten - trading days, as the replay counts its daily candles and closes
+     it at that session's close (``swing_time_stop_at``);
   5. ratchets the protective stop:
         - to break-even (+ a small buffer) once the trade is +``breakeven_at_r`` R
         - then trails so the stop keeps ``trail_lock_ratio`` of the open R once
           the trade is past ``trail_start_r`` R
-     The stop only ever moves in your favour and never past the last price.
+     The stop only ever moves in your favour and never past the last price, and only in the
+     regular session: a pre-market or after-hours print still marks the excursions and trips
+     the stop and target, but doesn't move the stop.
+
+The time exits (3, 4) read no price, so a full pass with no quote for the stock - or only
+one from before the entry - still runs them; it only skips the rest.
 
 A trade whose close order is still working is left alone. An exit that can't
 be sent, or that the broker rejects or cancels, is sent again - waiting a
-little longer after each try (``RETRY_DELAYS_S``).
+little longer after each try (``RETRY_DELAYS_S``). One that only had to wait on
+the broker (a stop's cancel to confirm, its orders reloading after a connect) is
+no failed try: it goes again in ``WAIT_RETRY_S`` - and a wait that goes on past
+``WAIT_WARN_S`` is reported like a failed exit. Nor is one turned away because the
+market is closed (IBKR can't fill it then): it's asked again every ``CLOSED_RETRY_S``,
+and the regular session's first pass starts every exit's tries afresh, so each goes
+out at the open rather than minutes into the session.
 
 Between full passes, a streamed tick on a stock held runs a tick pass on just that
 stock (``run_once(only=...)``, engine._sync_loop): steps 1, 2 and 5 on the fresh
@@ -81,20 +99,57 @@ def stop_locked(side: str, stop: Any, entry: float) -> bool:
     return float(stop) >= entry if side == "LONG" else float(stop) <= entry
 
 
+def swing_time_stop_at(entry_time: Any, max_hold: int, lead_min: float) -> Optional[dt.datetime]:
+    """When a swing trade's time stop falls due: ``lead_min`` minutes (the day trades' flatten) before the close of
+    its ``max_hold``-th session, its entry's counted - trading days, holidays skipped, as the replay counts a swing
+    trade's daily candles and closes it at that session's close (research/replay.py). With no lead (the flatten
+    off) that close can't be aimed at, so it falls due at the next session's open. None with the rule off or no
+    entry time to count from. The exit manager closes the trade at its first regular-session pass from then on;
+    the Open positions tab shows the same moment (Engine.open_positions)."""
+    entered = _utc(entry_time)
+    if entered is None or max_hold <= 0:
+        return None
+    day = clock.session_date(entered)
+    for _ in range(max_hold - 1):
+        day = clock.next_trading_day(day)
+    if lead_min <= 0:
+        return dt.datetime.combine(clock.next_trading_day(day), clock.OPEN, tzinfo=clock.NY)
+    opens = dt.datetime.combine(day, clock.OPEN, tzinfo=clock.NY)
+    closes = dt.datetime.combine(day, clock.regular_close_time(day), tzinfo=clock.NY)
+    return max(opens, closes - dt.timedelta(minutes=lead_min))
+
+
 class ExitManager:
     #: seconds to wait before the next exit for a trade, after its 1st, 2nd, ... one
     RETRY_DELAYS_S = (5.0, 15.0, 30.0, 60.0, 120.0, 300.0)
+    #: seconds before an exit that waited on the broker is tried again - no longer after each wait
+    WAIT_RETRY_S = 5.0
+    #: seconds before an exit turned away because the market is closed is asked again - no failed try either; the
+    #: regular session's first pass lets every exit go at once (_tries_afresh_at_the_open)
+    CLOSED_RETRY_S = 60.0
+    #: an exit still waiting on the broker after this long - past the minute its orders take to reload after a
+    #: connect - is reported, and again every WAIT_REPEAT_S while it waits
+    WAIT_WARN_S, WAIT_REPEAT_S = 90.0, 300.0
 
     def __init__(self, repo, executor, quote_fn: Callable[[str], Any], cfg, bus=BUS,
-                 venue: Optional[str] = None) -> None:
+                 venue: Optional[str] = None, quotes_live: Optional[Callable[[], bool]] = None) -> None:
         self.repo = repo
         self.venue = venue                  # only manage trades held on this venue
         self.executor = executor
         self.quote_fn = quote_fn
+        # whether quote_fn's prices are real-time right now (the engine: the price source isn't on delayed data). An
+        # exit decided on a delayed quote keeps no decision price: its fill measured against a price minutes old would
+        # be the move since, not the slippage
+        self.quotes_live = quotes_live or (lambda: True)
         self.cfg = cfg
         self.bus = bus
         self._tries: Dict[str, Tuple[int, float]] = {}  # trade id -> (exits sent, monotonic time the next may go)
+        self._open_day: Optional[dt.date] = None        # the session whose regular hours last started the tries afresh
         self._last_failure: Dict[str, str] = {}         # trade id -> the failure last published
+        self._waiting: Dict[str, float] = {}                 # trade id -> when its exit began waiting on the broker
+        self._wait_warned: Dict[str, float] = {}             # trade id -> when that wait was last reported
+        self._stop_crossed: Dict[str, float] = {}            # trade id -> when the price first crossed its stop while
+                                                             # one rested at the broker (cleared back inside the stop)
         self._overdue_seen: set = set()     # trade ids we've already flagged as overdue
         self._not_held: set = set()         # trade ids whose position the broker doesn't show
         # this pass's quotes: each stock's price, and when the quote was printed
@@ -116,6 +171,7 @@ class ExitManager:
             return []
         if not full and not only:
             return []
+        self._tries_afresh_at_the_open()
         try:
             open_trades = self.repo.open_trades()
         except Exception:  # noqa: BLE001
@@ -147,6 +203,25 @@ class ExitManager:
             self._prices = {}
         return acted
 
+    @staticmethod
+    def _session_now() -> "clock.Session":
+        """The market's session now (the tests set it, as they do the executor's)."""
+        return clock.current_session()
+
+    def _tries_afresh_at_the_open(self) -> None:
+        """At the first pass of each day's regular session every exit's tries start afresh: an exit turned away since
+        the last one - the market closed, or a refusal whose back-off had stretched to minutes - goes out at the open,
+        not minutes into it. What was last reported about them goes too, so a refusal that comes back is told again -
+        and so does a stop cross remembered from before: a cross at the open gets the broker's stop its full grace."""
+        if self._session_now() is not clock.Session.REGULAR:
+            return
+        today = clock.session_date(clock.now_ny())
+        if self._open_day != today:
+            self._open_day = today
+            self._tries.clear()
+            self._last_failure.clear()
+            self._stop_crossed.clear()
+
     def _fetch_prices(self, symbols) -> Dict[str, Tuple[Optional[float], Optional[dt.datetime]]]:
         """One quote per symbol, fetched concurrently - with several positions a
         sequential pass would delay the last one's stop check by seconds."""
@@ -176,13 +251,13 @@ class ExitManager:
     def _close(self, tid: str, reason: str, qty: Optional[float] = None,
                after_fill: Optional[Dict[str, float]] = None, seen: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """Send the exit - the whole position, or with ``qty`` the part taken off at the first target.
-        ``seen``: the price that triggered it, which the fill is measured against."""
+        ``seen``: the price that triggered it, which the fill is measured against - when it was a live quote."""
         tries, next_at = self._tries.get(tid, (0, 0.0))
         now = time.monotonic()
         if now < next_at:
             return None                     # the last exit didn't take - wait before sending another
         extra = {"qty": qty, "after_fill": after_fill} if qty is not None else {}
-        if seen:
+        if seen and self.quotes_live():
             extra["decision_price"] = float(seen)
         out = self.executor.close_trade(tid, reason=reason, **extra) or {}
         if out.get("not_held"):
@@ -191,6 +266,26 @@ class ExitManager:
                 self._not_held.add(tid)
                 log.warning("AUTO-EXIT %s skipped: %s", tid, out.get("reason"))
                 self.bus.publish("exit.not_held", trade_id=tid, reason=out.get("reason"))
+            return None
+        if out.get("wait"):
+            # the broker has yet to answer (Executor.close_trade): no failed exit - tried again shortly, the
+            # back-off untouched, so it goes out within seconds of the answer, not minutes
+            self._tries[tid] = (tries, now + self.WAIT_RETRY_S)
+            why = out.get("reason") or "waiting on the broker"
+            self._note_wait(tid, reason, why, tries, now)
+            return None
+        self._waiting.pop(tid, None)
+        self._wait_warned.pop(tid, None)
+        if out.get("market_closed"):
+            # the exchange is closed and the exit can't fill (Executor._exchange_closed): no failed try, so no
+            # back-off - asked again now and then, and the open lets it go at once (_tries_afresh_at_the_open)
+            self._tries[tid] = (tries, now + self.CLOSED_RETRY_S)
+            why = out.get("reason") or "the market is closed"
+            if self._last_failure.get(tid) != why:
+                self._last_failure[tid] = why
+                log.info("AUTO-EXIT %s (%s) waits for the regular session: %s", tid, reason, why)
+                self.bus.publish("exit.failed", trade_id=tid, reason=why, attempt=tries + 1,
+                                 retry_in_s=round(self.CLOSED_RETRY_S), market_closed=True)
             return None
         tries += 1
         wait = self.RETRY_DELAYS_S[min(tries, len(self.RETRY_DELAYS_S)) - 1]
@@ -214,6 +309,116 @@ class ExitManager:
             self.bus.publish("exit.failed", trade_id=tid, reason=why, attempt=tries, retry_in_s=round(wait))
         return None
 
+    def _note_wait(self, tid: str, reason: str, why: str, tries: int, now: float) -> None:
+        """Log an exit's wait on the broker - and once it has gone on past WAIT_WARN_S, report it like a failed exit,
+        again every WAIT_REPEAT_S: a wait is no failed try, but one that doesn't end leaves the position without its
+        exit, and that must not go unseen. It ends when a full pass wants no exit for the trade (the price came back:
+        _manage) - never for the time between tries, which one waiting out an order list that times out stretches."""
+        since = self._waiting.setdefault(tid, now)
+        if self._last_failure.get(tid) != why:
+            self._last_failure[tid] = why
+            log.info("AUTO-EXIT %s (%s) waits - next try in %.0fs: %s", tid, reason, self.WAIT_RETRY_S, why)
+        waited = now - since
+        if waited < self.WAIT_WARN_S or now - self._wait_warned.get(tid, float("-inf")) < self.WAIT_REPEAT_S:
+            return
+        self._wait_warned[tid] = now
+        log.warning("AUTO-EXIT %s (%s) has waited on the broker for %.0fs and is still not sent: %s", tid, reason,
+                    waited, why)
+        self.bus.publish("exit.failed", trade_id=tid, reason=f"waiting on the broker for {waited:.0f}s - {why}",
+                         attempt=tries + 1, retry_in_s=round(self.WAIT_RETRY_S))
+
+    def _broker_stop_has_grace(self, tid: str, side: str, px: float, stop: float) -> bool:
+        """On a stop cross: whether the trade's stop resting at the broker still has time to fill before the app sends
+        an exit of its own - ``broker_stop_grace_s`` from the first cross. The broker fills its stop on real prices the
+        moment they cross it, and the order sync books the fill; standing it down for a market order instead (often
+        once it has begun filling) costs a cancel round trip and a worse price. With no stop resting, the broker
+        disconnected, or the grace 0, the exit goes at once, as it does once the grace is over - and so it does when
+        the price hasn't reached the stop where it rests (a ratchet the broker hasn't been sent yet: that stop can't
+        fill at this price), or outside the regular session, where the broker's stop can't fill either: the grace
+        starts with the first cross in the regular session, never used up before the open."""
+        grace = float(getattr(self.cfg, "broker_stop_grace_s", 10.0) or 0.0)
+        resting = getattr(self.executor, "stop_resting", None)
+        if (grace <= 0 or self._session_now() is not clock.Session.REGULAR
+                or not (callable(resting) and resting(tid, price=px, side=side))):
+            self._stop_crossed.pop(tid, None)
+            return False
+        now = time.monotonic()
+        first = self._stop_crossed.get(tid)
+        if first is None:
+            first = self._stop_crossed[tid] = now
+            log.info("AUTO-EXIT %s: %g crossed the stop at %g - the stop resting at the broker gets %.0fs to fill "
+                     "before the app sends its own exit", tid, px, stop, grace)
+        return now - first < grace
+
+    def _timing_out(self, t: Dict[str, Any]) -> bool:
+        """A day trade past its setup's window that isn't working - its stop not yet at break-even: the intraday time
+        stop closes it (``intraday_time_stop``), and its overdue note says so."""
+        stop = t.get("stop_price") or t.get("initial_stop_price")
+        return (t.get("time_status") == "overdue" and bool(t.get("managed_exit", True))
+                and t.get("timeframe") == "INTRADAY" and bool(getattr(self.cfg, "intraday_time_stop", False))
+                and not stop_locked(t["side"], stop, float(t["entry_price"] or 0.0)))
+
+    def _time_exit(self, t: Dict[str, Any]) -> Optional[str]:
+        """The time exit due for the trade now, if one is - step 2 of a full pass, which reads no price, so a pass
+        with none runs it too (_manage). The reason it goes out with, or None."""
+        if self._timing_out(t):
+            # Aziz: a day trade that hasn't moved in its time is wrong - its setup's window has passed, and
+            # it only holds a slot and capital a fresh setup could use. One that is working (its stop at
+            # break-even or better) keeps its trail until the flatten
+            return "time-stop"
+        managed = bool(t.get("managed_exit", True))
+        flat_min = float(getattr(self.cfg, "flatten_intraday_before_close_min", 10) or 0)
+        if managed and t.get("timeframe") == "INTRADAY" and flat_min > 0:
+            if clock.minutes_to_close() <= flat_min:
+                return "eod-flatten"
+            now = clock.now_ny()
+            opened = _session_of(t)
+            if (opened is not None and opened < clock.session_date(now)
+                    and clock.current_session(now) is clock.Session.REGULAR):
+                # a day trade still open from an earlier session - the app was down at the flatten, or its exit
+                # didn't fill before the bell: the flatten it missed goes at the first regular-session pass (before
+                # the open a market exit can't fill at IBKR, and the simulator would fill it on a thin pre-market print)
+                return "eod-flatten"
+        max_hold = int(getattr(self.cfg, "max_swing_hold_days", 0) or 0)
+        if managed and max_hold > 0 and t.get("timeframe") == "SWING":
+            due = swing_time_stop_at(t.get("entry_time"), max_hold, flat_min)
+            now = clock.now_ny()
+            if due is not None and now >= due and clock.current_session(now) is clock.Session.REGULAR:
+                return "time-stop"
+        return None
+
+    def _write_before_exit(self, t: Dict[str, Any], write: Dict[str, float]) -> None:
+        """What the record gets just before the trade's exit goes out. A trade whose exit goes out gets no next full
+        pass - it's left alone while the exit works, then closed - so what tick passes left for one is written now:
+        ``write`` (the excursions they kept in memory) and a stop move they made and didn't tell yet (still the
+        record's: see step 3), in one write. One that fails doesn't hold the exit up."""
+        try:
+            entry = float(t["entry_price"])
+            init_stop = t.get("initial_stop_price") or t.get("stop_price")
+            work_stop = t.get("stop_price") or init_stop
+            risk_ps = abs(entry - float(init_stop)) if init_stop else 0.0
+            told = self._unannounced.pop(t["id"], None)
+            if told is not None and risk_ps > 0 and work_stop and abs(told[0] - float(work_stop)) <= 0.01:
+                self._tell(t, risk_ps, *told, **write)
+            elif write:
+                self.repo.update_trade_risk(t["id"], **write)
+        except Exception:  # noqa: BLE001 - the exit goes out all the same
+            log.exception("exit manager: could not write %s before its exit", t["id"])
+
+    def _tell(self, t: Dict[str, Any], risk_ps: float, new_stop: float, r: float, **write: Any) -> None:
+        """The note on the record and the message for a stop the exit manager moved; ``r``: where the trade stood
+        when it moved, ``risk_ps``: its risk per share from the original stop."""
+        entry = float(t["entry_price"])
+        sign = 1.0 if t["side"] == "LONG" else -1.0
+        self.repo.update_trade_risk(t["id"], note_append=f"stop->{new_stop:.2f} @ {r:.1f}R", **write)
+        # what the stop now keeps if it's hit is not where the trade stands: a +1.4R trade whose
+        # stop goes to break-even locks about +0.3R. Send both (r stays, the same as r_now, for
+        # older readers)
+        kept_r = (round(new_stop, 4) - entry) * sign / risk_ps
+        self.bus.publish("exit.stop_moved", trade_id=t["id"], symbol=t["symbol"],
+                         new_stop=round(new_stop, 4), locked_r=round(kept_r, 2),
+                         r_now=round(r, 2), r=round(r, 2))
+
     def _scale_out(self, t: Dict[str, Any], managed: bool, entry: float, sign: float,
                    risk_ps: float) -> Optional[Tuple[float, Dict[str, float]]]:
         """At the first target of a play that has a second: the shares to take off and the stop
@@ -224,7 +429,8 @@ class ExitManager:
 
     def _forget_all_but(self, open_ids: set) -> None:
         """Drop what's remembered about trades that are no longer open."""
-        for book in (self._tries, self._last_failure, self._extreme, self._unannounced):
+        for book in (self._tries, self._last_failure, self._extreme, self._unannounced, self._waiting,
+                     self._wait_warned, self._stop_crossed):
             for tid in [k for k in book if k not in open_ids]:
                 del book[tid]
         self._not_held &= open_ids
@@ -239,15 +445,23 @@ class ExitManager:
         if entry <= 0:
             return None
         px, at = self._quote(sym)
-        if px is None:
-            return None
-        if not _since_entry(at, t.get("entry_time")):
+        if px is not None and not _since_entry(at, t.get("entry_time")):
             # a quote printed before the entry filled is a price the trade never saw - the first pass after a fill
             # can still get the last print from before it, from the quote cache or a snapshot's Ticker. Nothing is
             # read off it: not the excursions, not the stop or target, not the ratchet. The next quote is the trade's
             log.debug("exit manager: %s quote of %s is from before the entry at %s - skipped",
                       sym, at, t.get("entry_time"))
-            return None
+            px = None
+        if px is None:
+            # no price to read the stop, target or ratchet off - but the time exits read none: a missed flatten, a
+            # day trade left from an earlier session or a swing trade on its last session goes out all the same
+            # (full passes only, as in step 2), measured against no price
+            due = self._time_exit(t) if full else None
+            if due is None:
+                return None
+            seen = self._extreme.pop(t["id"], None)        # the low and high tick passes saw since the last full pass
+            self._write_before_exit(t, _changes(t, _excursions(t, entry, *seen)) if seen else {})
+            return self._close(t["id"], due)
 
         sign = 1.0 if side == "LONG" else -1.0
         init_stop = t.get("initial_stop_price") or t.get("stop_price")
@@ -262,45 +476,17 @@ class ExitManager:
         # position every second
         # (the exit fill joins the excursions when the trade closes: Repository.close_trade)
         fav = max(0.0, (px - entry) * sign)
-        adv = max(0.0, (entry - px) * sign)
         low, high = self._extreme.pop(t["id"], (px, px))
         low, high = min(low, px), max(high, px)
-        best, worst = (high, low) if side == "LONG" else (low, high)
-        mfe = max(float(t.get("mfe") or 0.0), fav, (best - entry) * sign)
-        mae = max(float(t.get("mae") or 0.0), adv, (entry - worst) * sign)
-        hwm = t.get("hwm_price") or entry
-        hwm = max(hwm, best) if side == "LONG" else min(hwm, best)
+        marks = _excursions(t, entry, low, high)
+        mfe = marks["mfe"]
 
         def excursions() -> Dict[str, float]:
-            if any(_changed(new, t.get(k)) for new, k in ((hwm, "hwm_price"), (mae, "mae"), (mfe, "mfe"))):
-                return dict(hwm_price=hwm, mae=mae, mfe=mfe)
-            return {}
-
-        def tell(new_stop: float, r: float, **write: Any) -> None:
-            """The note on the record and the message for a stop the exit manager moved; ``r``: where the
-            trade stood when it moved."""
-            self.repo.update_trade_risk(t["id"], note_append=f"stop->{new_stop:.2f} @ {r:.1f}R", **write)
-            # what the stop now keeps if it's hit is not where the trade stands: a +1.4R trade whose
-            # stop goes to break-even locks about +0.3R. Send both (r stays, the same as r_now, for
-            # older readers)
-            kept_r = (round(new_stop, 4) - entry) * sign / risk_ps
-            self.bus.publish("exit.stop_moved", trade_id=t["id"], symbol=sym,
-                             new_stop=round(new_stop, 4), locked_r=round(kept_r, 2),
-                             r_now=round(r, 2), r=round(r, 2))
+            return _changes(t, marks)
 
         def close(reason: str, **kw: Any) -> Optional[Dict[str, Any]]:
-            # a trade whose exit goes out gets no next full pass - it's left alone while the exit works,
-            # then closed - so the record gets what the tick passes saw first, as a full pass writes it: the
-            # excursions, and a stop move not yet told (still the record's: see step 3), in one write
-            try:
-                write = {} if full else excursions()
-                told = self._unannounced.pop(t["id"], None)
-                if told is not None and risk_ps > 0 and work_stop and abs(told[0] - float(work_stop)) <= 0.01:
-                    tell(*told, **write)
-                elif write:
-                    self.repo.update_trade_risk(t["id"], **write)
-            except Exception:  # noqa: BLE001 - the exit goes out all the same
-                log.exception("exit manager: could not write %s before its exit", t["id"])
+            # what the tick passes saw goes on the record first (a full pass has written its excursions already)
+            self._write_before_exit(t, {} if full else excursions())
             return self._close(t["id"], reason, seen=px, **kw)
 
         if full:
@@ -313,8 +499,7 @@ class ExitManager:
         managed = bool(t.get("managed_exit", True))
         overdue = t.get("time_status") == "overdue"
         # a day trade past its window that isn't working is closed below (2.); say so rather than "review it"
-        timing_out = (overdue and managed and t.get("timeframe") == "INTRADAY"
-                      and bool(getattr(self.cfg, "intraday_time_stop", False)) and not stop_locked(side, work_stop, entry))
+        timing_out = self._timing_out(t)
 
         # --- 0. expected-exit overwatch ------------------------------------ #
         if (full and overdue and not t.get("overdue_notified")
@@ -335,8 +520,11 @@ class ExitManager:
         # --- 1. hard exits ------------------------------------------- #
         if work_stop:
             if (side == "LONG" and px <= float(work_stop)) or (side == "SHORT" and px >= float(work_stop)):
+                if self._broker_stop_has_grace(t["id"], side, px, float(work_stop)):
+                    return None                 # the broker's stop is filling it - nor is the stop moved past the price
                 moved = init_stop is not None and abs(float(work_stop) - float(init_stop)) > 1e-6
                 return close("trailing-stop" if moved else "stop")
+            self._stop_crossed.pop(t["id"], None)     # back inside the stop: a cross later gets its grace afresh
         resting = getattr(self.executor, "target_resting", None)
         if target and not (callable(resting) and resting(t["id"])):
             # (a target order resting at the broker is the broker's to fill, on prices the app may see late)
@@ -347,34 +535,28 @@ class ExitManager:
                 return close("target")
 
         # --- 2. time / session exits ------------------------------- #
-        # (full passes only: a tick pass is about the price, and a time-stop goes out after the overdue note)
-        if full and timing_out:
-            # Aziz: a day trade that hasn't moved in its time is wrong - its setup's window has passed, and
-            # it only holds a slot and capital a fresh setup could use. One that is working (its stop at
-            # break-even or better) keeps its trail until the flatten
-            return close("time-stop")
-        flat_min = float(getattr(self.cfg, "flatten_intraday_before_close_min", 10) or 0)
-        if full and managed and t.get("timeframe") == "INTRADAY" and flat_min > 0:
-            if clock.minutes_to_close() <= flat_min:
-                return close("eod-flatten")
+        # (full passes only: a tick pass is about the price, and a time-stop goes out after the overdue note. With a
+        # price they come after the stop and target - a stop hit near the close is booked as the stop)
+        due = self._time_exit(t) if full else None
+        if due:
+            return close(due)
 
-        max_hold = int(getattr(self.cfg, "max_swing_hold_days", 0) or 0)
-        if full and managed and max_hold > 0 and t.get("timeframe") == "SWING" and t.get("entry_time"):
-            try:
-                et = dt.datetime.fromisoformat(t["entry_time"])
-                age_days = (dt.datetime.utcnow() - et.replace(tzinfo=None)).days
-                if age_days >= max_hold:
-                    return close("time-stop")
-            except Exception:  # noqa: BLE001
-                pass
+        if full:
+            # no exit wanted on a full pass: a wait its exit had on the broker is over - wanted again, it starts afresh
+            self._waiting.pop(t["id"], None)
+            self._wait_warned.pop(t["id"], None)
 
         # --- 3. move the protective stop in our favour ------------ #
         if not managed or risk_ps <= 0:
             return None
         new_stop = float(work_stop) if work_stop else float(init_stop)
+        # on regular-session prices only: a pre-market or after-hours print is thin - a few hundred shares can print far
+        # from where the stock trades at the open - and a stop ratcheted off one never comes back down. Those prints
+        # still mark the excursions and trip the stop and target (1.); a move a tick pass made is still told below
+        ratchet = self._session_now() is clock.Session.REGULAR
 
         be_r = float(getattr(self.cfg, "breakeven_at_r", 1.3) or 0.0)
-        if be_r > 0 and r_now >= be_r:
+        if ratchet and be_r > 0 and r_now >= be_r:
             # lock a small profit rather than a pure scratch - a +1.3R trade
             # that pulls back should still book something, not go to zero.
             lock_r = float(getattr(self.cfg, "breakeven_lock_r", 0.3) or 0.0)
@@ -384,7 +566,7 @@ class ExitManager:
 
         trail_start = float(getattr(self.cfg, "trail_start_r", 1.5) or 0.0)
         lock = float(getattr(self.cfg, "trail_lock_ratio", 0.5) or 0.0)
-        if trail_start > 0 and lock > 0 and r_now >= trail_start:
+        if ratchet and trail_start > 0 and lock > 0 and r_now >= trail_start:
             locked_r = (r_now * lock)
             trail = entry + sign * locked_r * risk_ps
             new_stop = max(new_stop, trail) if side == "LONG" else min(new_stop, trail)
@@ -404,12 +586,34 @@ class ExitManager:
                 self.repo.update_trade_risk(t["id"], stop_price=round(new_stop, 4))
                 self._unannounced[t["id"]] = (round(new_stop, 4), r_now)
                 return None
-            tell(new_stop, r_now, stop_price=round(new_stop, 4))
+            self._tell(t, risk_ps, new_stop, r_now, stop_price=round(new_stop, 4))
         elif told is not None and abs(told[0] - was) <= 0.01:
             # a move a tick pass made, still on the record, is told now. A stop something else set since (the
             # break-even after a part came off at the first target) isn't the exit manager's move to tell
-            tell(*told)
+            self._tell(t, risk_ps, *told)
         return None
+
+
+def _utc(value: Any) -> Optional[dt.datetime]:
+    """A stored time (ISO; the record keeps naive UTC) as an aware datetime - None when there isn't a usable one."""
+    if not value:
+        return None
+    try:
+        at = dt.datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return at.replace(tzinfo=dt.timezone.utc) if at.tzinfo is None else at
+
+
+def _session_of(t: Dict[str, Any]) -> Optional[dt.date]:
+    """The session a trade was opened in: its record's session_date, else its entry time's."""
+    try:
+        if t.get("session_date"):
+            return dt.date.fromisoformat(str(t["session_date"])[:10])
+    except ValueError:
+        pass
+    entered = _utc(t.get("entry_time"))
+    return clock.session_date(entered) if entered else None
 
 
 def _since_entry(at: Optional[dt.datetime], entry_time: Any) -> bool:
@@ -426,6 +630,23 @@ def _since_entry(at: Optional[dt.datetime], entry_time: Any) -> bool:
     if at.tzinfo is None:
         at = at.replace(tzinfo=dt.timezone.utc)
     return at >= entered
+
+
+def _excursions(t: Dict[str, Any], entry: float, low: float, high: float) -> Dict[str, float]:
+    """The record's high-water mark, MAE and MFE once the trade has traded between ``low`` and ``high`` - never
+    less than they were."""
+    long = t["side"] == "LONG"
+    sign = 1.0 if long else -1.0
+    best, worst = (high, low) if long else (low, high)
+    hwm = t.get("hwm_price") or entry
+    return {"hwm_price": max(hwm, best) if long else min(hwm, best),
+            "mae": max(float(t.get("mae") or 0.0), 0.0, (entry - worst) * sign),
+            "mfe": max(float(t.get("mfe") or 0.0), 0.0, (best - entry) * sign)}
+
+
+def _changes(t: Dict[str, Any], marks: Dict[str, float]) -> Dict[str, float]:
+    """``marks`` to write when any of them differs from the record's, else nothing."""
+    return dict(marks) if any(_changed(v, t.get(k)) for k, v in marks.items()) else {}
 
 
 def _changed(new: float, old: Any) -> bool:

@@ -198,7 +198,7 @@ class FakeGateway:
     def list_orders(self, status: Optional[str] = None) -> list:
         return []
 
-    def get_fills(self, symbol: Optional[str] = None) -> list:
+    def get_fills(self, symbol: Optional[str] = None, timeout: float = 15.0) -> list:
         return [f for f in self.fills if not symbol or f.symbol == symbol]
 
 
