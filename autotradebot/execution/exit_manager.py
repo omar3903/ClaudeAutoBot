@@ -10,7 +10,8 @@ For each OPEN trade it:
      the stop to break-even and lets the rest run to the second target (Aziz: sell
      half at the target and bring the stop to the entry). A stop resting at the broker
      gets ``broker_stop_grace_s`` from the first cross to fill before the app sends its
-     own exit, and nothing else is done for the trade meanwhile;
+     own exit, and nothing else is done for the trade meanwhile - when the price reaches
+     that stop where it rests, in the regular session, where it can fill;
   3. closes an INTRADAY trade that isn't working once its setup's own window has passed
      (``intraday_time_stop``: the play's longest expected hold, its stop not yet at break-even),
      and flattens every INTRADAY trade a few minutes before the (holiday-aware) close - and
@@ -206,7 +207,8 @@ class ExitManager:
     def _tries_afresh_at_the_open(self) -> None:
         """At the first pass of each day's regular session every exit's tries start afresh: an exit turned away since
         the last one - the market closed, or a refusal whose back-off had stretched to minutes - goes out at the open,
-        not minutes into it. What was last reported about them goes too, so a refusal that comes back is told again."""
+        not minutes into it. What was last reported about them goes too, so a refusal that comes back is told again -
+        and so does a stop cross remembered from before: a cross at the open gets the broker's stop its full grace."""
         if self._session_now() is not clock.Session.REGULAR:
             return
         today = clock.session_date(clock.now_ny())
@@ -214,6 +216,7 @@ class ExitManager:
             self._open_day = today
             self._tries.clear()
             self._last_failure.clear()
+            self._stop_crossed.clear()
 
     def _fetch_prices(self, symbols) -> Dict[str, Tuple[Optional[float], Optional[dt.datetime]]]:
         """One quote per symbol, fetched concurrently - with several positions a
@@ -320,15 +323,20 @@ class ExitManager:
         self.bus.publish("exit.failed", trade_id=tid, reason=f"waiting on the broker for {waited:.0f}s - {why}",
                          attempt=tries + 1, retry_in_s=round(self.WAIT_RETRY_S))
 
-    def _broker_stop_has_grace(self, tid: str, px: float, stop: float) -> bool:
+    def _broker_stop_has_grace(self, tid: str, side: str, px: float, stop: float) -> bool:
         """On a stop cross: whether the trade's stop resting at the broker still has time to fill before the app sends
         an exit of its own - ``broker_stop_grace_s`` from the first cross. The broker fills its stop on real prices the
         moment they cross it, and the order sync books the fill; standing it down for a market order instead (often
         once it has begun filling) costs a cancel round trip and a worse price. With no stop resting, the broker
-        disconnected, or the grace 0, the exit goes at once, as it does once the grace is over."""
+        disconnected, or the grace 0, the exit goes at once, as it does once the grace is over - and so it does when
+        the price hasn't reached the stop where it rests (a ratchet the broker hasn't been sent yet: that stop can't
+        fill at this price), or outside the regular session, where the broker's stop can't fill either: the grace
+        starts with the first cross in the regular session, never used up before the open."""
         grace = float(getattr(self.cfg, "broker_stop_grace_s", 10.0) or 0.0)
         resting = getattr(self.executor, "stop_resting", None)
-        if grace <= 0 or not (callable(resting) and resting(tid)):
+        if (grace <= 0 or self._session_now() is not clock.Session.REGULAR
+                or not (callable(resting) and resting(tid, price=px, side=side))):
+            self._stop_crossed.pop(tid, None)
             return False
         now = time.monotonic()
         first = self._stop_crossed.get(tid)
@@ -508,7 +516,7 @@ class ExitManager:
         # --- 1. hard exits ------------------------------------------- #
         if work_stop:
             if (side == "LONG" and px <= float(work_stop)) or (side == "SHORT" and px >= float(work_stop)):
-                if self._broker_stop_has_grace(t["id"], px, float(work_stop)):
+                if self._broker_stop_has_grace(t["id"], side, px, float(work_stop)):
                     return None                 # the broker's stop is filling it - nor is the stop moved past the price
                 moved = init_stop is not None and abs(float(work_stop) - float(init_stop)) > 1e-6
                 return close("trailing-stop" if moved else "stop")

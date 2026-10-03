@@ -1377,6 +1377,27 @@ def test_an_order_ibkr_doesnt_answer_in_time_is_never_reported_as_not_sent(threa
     assert real(lambda ib: len(ib.placed), timeout=5) == 3        # ...and never sent late
 
 
+def test_a_stop_move_the_loop_never_got_to_leaves_the_stop_reading_what_ibkr_still_holds(threaded):
+    session, real = threaded._session, threaded._session.call
+    stop = threaded.place_order(OrderRequest(symbol="AAA", side=Side.SHORT, quantity=10, order_type=OrderType.STOP,
+                                             stop_price=98.0, tif=TimeInForce.GTC, client_tag="stop:t1"))
+    placed = real(lambda ib: len(ib.placed), timeout=5)
+
+    def swamped(fn, timeout=15.0, order_ref=None):                # the loop swamped just as the move goes out
+        if order_ref is None:
+            return real(fn, timeout=timeout)
+        _hold_the_loop(session, 0.4)
+        return real(fn, timeout=0.05, order_ref=order_ref)
+
+    session.call = swamped
+    with pytest.raises(mod.OrderNotSent):
+        threaded.modify_stop(stop.order_id, stop_price=99.5, quantity=5)
+    session.call = real
+    assert real(lambda ib: len(ib.placed), timeout=5) == placed   # never sent, nor late
+    after = threaded.get_order(stop.order_id)
+    assert (after.stop_price, after.submitted_qty) == (98.0, 10)  # what IBKR holds - never read as moved
+
+
 # --------------------------------------------------------------------------- #
 #  real-time streams
 # --------------------------------------------------------------------------- #

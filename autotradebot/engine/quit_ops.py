@@ -75,6 +75,10 @@ class QuitOps:
                 kept, held = {t["id"] for t in self._positions_here()}, []
             if self.mode == "live" and held and not close_all:
                 return {"ok": False, "reason": "Quit cancelled - your live positions stay open and managed."}
+            # the sync loop checks the quit's progress as soon as it is set: with no retry time set yet it would send a
+            # second round of closes beside this one - while the working entries are cancelled, too. (Set again once
+            # the closes are out: the wait counts from then)
+            self._quit_retry_at = time.monotonic() + self.QUIT_RETRY_S
             self.quit_state = {"started_at": dt.datetime.now(dt.timezone.utc).isoformat(), "mode": self.mode,
                                "venue": self._venue, "by": operator, "reset_sim": self._venue == "paper",
                                "keeping": sorted(kept)}
@@ -84,9 +88,6 @@ class QuitOps:
             log.warning("quit by %s: closing %d position(s) on %s, cancelled %d working entr%s",
                         operator, len(held), self._venue, cancelled, "y" if cancelled == 1 else "ies")
             self._publish("quit.started", quit=self._quit_status())
-            # the sync loop checks the quit's progress meanwhile: with no retry time set yet it would send a second
-            # round of closes beside this one. (Set again once they are out: the wait counts from then)
-            self._quit_retry_at = time.monotonic() + self.QUIT_RETRY_S
             results = self._close_all(held, reason="quit")
             self._quit_retry_at = time.monotonic() + self.QUIT_RETRY_S
         self._check_quit_progress()

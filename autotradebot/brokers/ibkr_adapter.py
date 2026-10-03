@@ -1358,7 +1358,15 @@ class IbkrBroker(BrokerAdapter):
 
         quiet = getattr(trade.orderStatus, "status", "") == "PreSubmitted"     # IBKR takes a change to it silently
         wait = min(self.MODIFY_QUIET_S, self.MODIFY_ANSWER_S) if quiet else self.MODIFY_ANSWER_S
-        changed, at = self._session.call(_send, timeout=10, order_ref=getattr(order, "orderRef", "") or "")
+        try:
+            changed, at = self._session.call(_send, timeout=10, order_ref=getattr(order, "orderRef", "") or "")
+        except OrderOutcomeUnknown:
+            raise                                       # it may have gone out: the order says what was sent
+        except Exception:
+            # never sent - called off before the loop got to it (OrderNotSent), or turned away on the way out: the
+            # order goes back to what IBKR still holds, or it would read as moved (get_order) though it never was
+            order.auxPrice, order.totalQuantity = before
+            raise
         if at is not None:
             refused = self._modify_answer(changed, str(order_id), at, wait)
             if refused:

@@ -513,9 +513,10 @@ class _StopRests(FakeExecutor):
 
     def __init__(self, repo):
         super().__init__(repo)
-        self.resting = {"t1"}
+        self.resting, self.asked = {"t1"}, []
 
-    def stop_resting(self, tid):
+    def stop_resting(self, tid, price=None, side=None):
+        self.asked.append((tid, price, side))         # (whether the price reaches it is the executor's to say)
         return tid in self.resting
 
 
@@ -531,6 +532,7 @@ def test_a_stop_crossed_while_it_rests_at_the_broker_gets_its_grace_before_the_a
     monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
     em, repo, ex, _, _ = _ticking([_trade(**trade)], {"AAA": crossed}, executor=_StopRests, broker_stop_grace_s=10)
     em.run_once()                                                        # past the stop: the broker's to fill
+    assert ex.asked == [("t1", crossed, trade.get("side", "LONG"))]      # if this price reaches it where it rests
     now[0] += 6.0
     em.run_once(only={"AAA"})
     now[0] += 3.9
@@ -570,6 +572,25 @@ def test_with_no_stop_resting_at_the_broker_or_the_grace_off_a_stop_cross_exits_
     em.cfg.broker_stop_grace_s = 0                                       # 0: the app's exit at once, as before
     em.run_once()
     assert ex.closed == [("t2", "stop"), ("t1", "stop")]
+
+
+def test_outside_the_regular_session_a_stop_cross_gets_no_grace_and_one_from_before_the_open_is_forgotten(monkeypatch):
+    from autotradebot.execution import exit_manager as module
+    from autotradebot.util import clock
+
+    now, session = [1_000.0], [clock.Session.REGULAR]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(ExitManager, "_session_now", staticmethod(lambda: session[0]))
+    em, _, ex, _, _ = _ticking([_trade(), _trade(id="t2", symbol="BBB")], {"AAA": 97.5, "BBB": 97.5},
+                               executor=_StopRests, broker_stop_grace_s=10)
+    ex.resting = {"t1", "t2"}
+    em._open_day = clock.session_date(clock.now_ny()) - dt.timedelta(days=1)    # yesterday's session last opened
+    em._stop_crossed["t2"] = now[0] - 60.0                                   # a cross remembered from before the open
+    em.run_once()                                                            # the open: both get their whole grace
+    assert ex.closed == []
+    session[0] = clock.Session.POST                                          # after the close the broker's stop
+    em.run_once()                                                            # can't fill: the app's exit goes at once
+    assert sorted(ex.closed) == [("t1", "stop"), ("t2", "stop")]
 
 
 

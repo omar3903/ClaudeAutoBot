@@ -912,7 +912,9 @@ Two rules keep it safe:
   fill: IBKR fills it on real prices and the order sync books it, where cancelling it for a
   market order of the app's own costs a round trip and a worse fill, and may find it already
   filling. Back inside the stop, the next cross gets its 10 s afresh; past them, with no
-  stop resting or with IBKR disconnected, the app's exit goes as below (`0` = at once).
+  stop resting or with IBKR disconnected, the app's exit goes as below (`0` = at once). So
+  it does when the price hasn't reached the stop where it rests at IBKR (a ratchet not sent
+  yet) - and the grace counts only in the regular session, where IBKR's stop can fill.
   Before the app sends an exit of its own it
   cancels the stop and waits for IBKR to confirm; if the stop filled first, that
   fill is booked and nothing else is sent; if IBKR hasn't confirmed, the exit waits

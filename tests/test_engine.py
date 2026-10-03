@@ -872,6 +872,28 @@ def test_a_quit_sends_one_round_of_closes_while_the_sync_loop_checks_on_it(engin
     assert sent == [tid]                                                    # no second round beside the first
 
 
+def test_a_quit_check_while_the_working_entries_are_cancelled_sends_no_round_of_its_own(engine):
+    tid = _open(engine, "BBB")
+    sent, working = [], set()
+
+    def close(trade_id, reason="manual"):
+        sent.append(trade_id)
+        if trade_id in working:                                             # what the executor says of a second one
+            return {"ok": False, "reason": "An exit order for this BBB position is already working."}
+        working.add(trade_id)
+        return {"ok": True, "status": "WORKING", "order_id": f"o{len(sent)}"}
+
+    def cancel_pending_entries():                   # waiting on the executor's lock behind the loop's sync pass...
+        engine._check_quit_progress()               # ...whose quit check runs meanwhile
+        return 0
+
+    engine.executor.close_trade = close
+    engine.executor.cancel_pending_entries = cancel_pending_entries
+    out = engine.begin_quit()
+    assert sent == [tid] and engine._quit_rounds == 1                       # one round, the quit's own
+    assert out["note"].startswith("Exit sent for 1 position")
+
+
 def test_live_quit_can_be_cancelled_and_leaves_positions_alone(engine):
     _open(engine, "AAPL")
     closed = _closes_fill(engine)

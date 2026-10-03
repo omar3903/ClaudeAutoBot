@@ -33,8 +33,9 @@ Resting orders bring two dangers, and the rules here exist for them:
   nothing of an earlier run's for the trade (or this run opened it). A close that waited for a trade's
   orders while another caller had them reads the record and the exits working again first. While a
   target rests at the broker the exit manager leaves the target to it, and a part it would take off
-  beside one is never sent; a stop crossed while it rests (``stop_resting``) gets
-  ``broker_stop_grace_s`` to fill before the exit manager sends an exit of its own.
+  beside one is never sent; a stop crossed while it rests (``stop_resting``: the price reaching it
+  where it rests at the broker, in the regular session) gets ``broker_stop_grace_s`` to fill before
+  the exit manager sends an exit of its own.
 * **An order that outlives its position** would open a position the other way when it triggers.
   Orders are only placed while the broker shows the shares and its order list could be read for
   certain; every pass cancels a tracked order whose trade record is no longer open; and a sweep
@@ -248,12 +249,22 @@ class ProtectiveStops:
         """Whether the broker is working this trade's target - the exit manager then leaves it to it."""
         return trade_id in self._targets
 
-    def stop_resting(self, trade_id: str) -> bool:
+    def stop_resting(self, trade_id: str, price: Optional[float] = None, side: Optional[str] = None) -> bool:
         """Whether a stop rests at the broker for this trade, with the broker there to fill it: stops kept at the
-        broker, the broker connected, and a stop followed for the trade. On a stop cross the exit manager then gives
-        that stop a moment to fill before it sends an exit of its own (``broker_stop_grace_s``)."""
-        return (self.native_stops_on() and getattr(self.broker, "is_connected", True) is not False
-                and trade_id in self._stops)
+        broker, the broker connected, and a stop followed for the trade that is still working - no exit has asked for
+        its cancel, nor is a fill of it waiting to be saved. Given a ``price`` and the trade's ``side`` (LONG or
+        SHORT), also whether that price reaches the stop where it rests: one still at an older, looser trigger (a
+        ratchet not sent yet - a move goes at most every STOP_MOVE_S) can't fill there. On a stop cross the exit
+        manager gives a stop that would fill a moment to do so before it sends an exit of its own
+        (``broker_stop_grace_s``)."""
+        st = self._stops.get(trade_id)
+        if (st is None or st.unbooked or not self.native_stops_on()
+                or getattr(self.broker, "is_connected", True) is False or self._cancel_asked(trade_id)):
+            return False
+        if price is None:
+            return True
+        half = tick(st.price) / 2                        # (the trigger rests on the tick: less is the rounding)
+        return price <= st.price + half if side == "LONG" else price >= st.price - half
 
     def fill_unbooked(self, trade_id: str) -> bool:
         """Whether this trade's stop or target filled and the database refused the booking: it is followed again until
@@ -1055,9 +1066,20 @@ class ProtectiveStops:
             book.setdefault(o.trade_id, o)
             raise
 
+    def _record_to_book(self, book: Dict[str, _Stop], o: _Stop) -> Optional[Dict[str, Any]]:
+        """The record a resting order that is done books its fill on. The order is out of its book by now
+        (_take_resting), so a read the database refuses (busy, say) is handled as a booking it refuses (_book_resting):
+        the order goes back, marked ``unbooked``, and BookingFailed goes on - or nothing would ever book its fill."""
+        try:
+            return self.repo.get_trade(o.trade_id)
+        except Exception as e:  # noqa: BLE001
+            o.unbooked = True
+            book.setdefault(o.trade_id, o)
+            raise self._booking_failed(f"exit:{o.trade_id}", o.symbol, "exit", e) from e
+
     def _book_stop_fill(self, st: _Stop, res: OrderResult) -> None:
         self._stops.pop(st.trade_id, None)
-        t = self.repo.get_trade(st.trade_id)
+        t = self._record_to_book(self._stops, st)
         if not t or t.get("status") == "CLOSED":
             return
         price = float(res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0) or st.price)
@@ -1077,7 +1099,7 @@ class ProtectiveStops:
         record gets the stop and target the rest now has, and the pair is placed afresh for it -
         or the whole exit."""
         self._targets.pop(tg.trade_id, None)
-        t = self.repo.get_trade(tg.trade_id)
+        t = self._record_to_book(self._targets, tg)
         if not t or t.get("status") == "CLOSED":
             return
         price = float(res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0) or tg.price)
