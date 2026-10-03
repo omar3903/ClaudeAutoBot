@@ -34,7 +34,8 @@ BookingFailed once it has been logged and the dashboard told (order.unbooked, ag
 failing), and the order stays followed - in ``_pending``, ``_unknown`` or its stop's book - so the next order sync
 books it. Meanwhile it counts as working: an entry keeps Autopilot's slot, and no second exit goes out for the
 position. An entry's shares are no longer in flight though (``symbols_in_flight(unbooked=False)``): its order is done,
-and the checks on shares no record explains see them.
+and the checks on shares no record explains see them. Closing them as shares without a record (close_untracked) takes
+the entry off the books, so no record appears later for shares already sold; a quit's cancels leave it followed.
 
 The order audit (``order_audit``, :meth:`Executor._audit`) records what happened to each order: every order placed,
 with the broker's order id, status and message (PLACE); every cancel the app asks for, and why (CANCEL); every move of
@@ -181,11 +182,13 @@ class Executor(ProtectiveStops):
             self._init_stops()          # the other venue's stops stay where they are; found again by their tags
 
     def cancel_pending_entries(self) -> int:
-        """Cancel entry orders still working at the broker (used when quitting)."""
+        """Cancel entry orders still working at the broker (used when quitting). One that filled whose booking the
+        database has refused so far has nothing left to cancel: it stays followed, so the next pass books it - its
+        shares are held - and the quit waits for that record (QuitOps._unbooked_left) to close it like any other."""
         n = 0
         with self._lock:
             for oid, p in list(self._pending.items()):
-                if p.kind != "entry":
+                if p.kind != "entry" or self._entry_unbooked(p):
                     continue
                 self._cancel_quietly(oid, "cancelled when quitting", p)
                 self._pending.pop(oid, None)
@@ -195,10 +198,11 @@ class Executor(ProtectiveStops):
 
     def _call_off_unknown(self, which: Callable[[_Pending], bool], why: str) -> int:
         """Mark the entries whose send got no answer in time (``which`` of them) to be cancelled once they are found
-        working at the broker - followed then, so what they filled meanwhile is still booked. Returns how many."""
+        working at the broker - followed then, so what they filled meanwhile is still booked. (One found filled whose
+        booking the database refused is no order to call off.) Returns how many."""
         n = 0
         for p, _ in list(self._unknown.values()):
-            if p.kind == "entry" and which(p) and not p.expired:
+            if p.kind == "entry" and which(p) and not p.expired and not self._entry_unbooked(p):
                 p.expired = why
                 n += 1
         return n
@@ -209,17 +213,30 @@ class Executor(ProtectiveStops):
         return bool(self.close_untracked(symbol, position_side, qty).get("ok"))
 
     def close_untracked(self, symbol: str, position_side: str, qty: float) -> Dict[str, Any]:
-        """Send the market order that closes ``qty`` shares held without a record, and say how it went."""
-        req = build_exit_order(symbol, position_side, qty, cfg=self.cfg, tag=f"unwind:{symbol}")
+        """Send the market order that closes ``qty`` shares held without a record, and say how it went. The entries
+        among those shares whose fill the database refused to book so far are taken off the books in the same step
+        (_unwound): booked once it takes, each would open a record for shares already sold - or still being sold by
+        this order - and get a stop and an exit of its own beside it. Never more than the account holds beyond the
+        records, read again here: a booking that took since the shares were listed has a record, and a stop, of its
+        own."""
         with self._lock:                # not beside an order sync, nor an exit counting the shares held
+            beyond = self._held_beyond_records(symbol, position_side)
+            if beyond is not None and beyond < qty - 1e-9:
+                if beyond <= 1e-9:
+                    return {"ok": False, "reason": f"{venue_label(self.venue)} holds no {symbol} shares beyond the "
+                                                   f"trade records now - nothing sent."}
+                qty = beyond
+            req = build_exit_order(symbol, position_side, qty, cfg=self.cfg, tag=f"unwind:{symbol}")
             sent_at = dt.datetime.now(dt.timezone.utc)
             try:
                 res = self.broker.place_order(req)
             except OUTCOME_UNKNOWN as e:
                 # it may have reached the broker: another sent now could close the shares twice, and open a position
-                # the other way - the account says, once it shows whether these went
+                # the other way - the account says, once it shows whether these went. (An entry booked meanwhile could
+                # sell them twice as well; let go, its shares are listed again if these didn't go)
                 why = str(e) or "no answer from the broker in time"
                 self._audit("PLACE", req, {"error": why, "outcome": "unknown"}, ok=False, msg=why, ts=sent_at)
+                self._unwound(symbol, position_side)
                 log.error("the order closing %s %s shares without a trade record got no answer in time - it may have "
                           "reached the broker: %s", qty, symbol, why)
                 return {"ok": False, "sent_unknown": True,
@@ -229,9 +246,52 @@ class Executor(ProtectiveStops):
                 log.error("could not close %s %s shares that have no trade record: %s", qty, symbol, e)
                 return {"ok": False, "reason": str(e)}
             self._audit("PLACE", req, res, ok=True, msg="closing shares without a trade record", ts=sent_at)
+            self._unwound(symbol, position_side)
         log.warning("closing %s %s shares held without a trade record (order %s, %s)", qty, symbol, res.order_id,
                     res.status)
-        return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id}
+        return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id, "qty": qty}
+
+    def _held_beyond_records(self, symbol: str, position_side: str) -> Optional[float]:
+        """Shares of ``symbol`` the account holds on ``position_side`` beyond this venue's open records of that side
+        (negative when it holds fewer), or None when the account or the records can't be read."""
+        held = self._held_quantity(symbol)
+        if held is None:
+            return None
+        try:
+            trades = self.repo.open_trades()
+        except Exception:  # noqa: BLE001 - the database busy, say: not known
+            log.debug("could not read the open records before closing shares without one", exc_info=True)
+            return None
+        recorded = sum(abs(float(t.get("quantity") or 0.0)) for t in trades if t["symbol"] == symbol
+                       and t["side"] == position_side and (t.get("broker") or "paper") == self.venue)
+        return (held if position_side == "LONG" else -held) - recorded
+
+    def _unwound(self, symbol: str, position_side: str) -> List[str]:
+        """Take off the books the entries of ``symbol`` on ``position_side`` that filled and whose booking the database
+        has refused so far, once their shares are being closed as shares without a record (close_untracked): they are
+        followed no more, so no record is opened for them, and their plays are marked ERROR - never sent again, nor
+        booked from the broker's executions after a restart. Under the executor's lock. Returns their play ids."""
+        followed = [(self._pending, oid, p) for oid, p in self._pending.items()] + \
+            [(self._unknown, ref, p) for ref, (p, _) in self._unknown.items()]
+        out: List[str] = []
+        for book, key, p in followed:
+            if p.play.symbol != symbol or p.play.side.value != position_side or not self._entry_unbooked(p):
+                continue
+            del book[key]
+            self._let_go_unbooked(p)
+            self._note(p.play, PlayStatus.ERROR, {
+                "status": "UNWOUND", "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                "reason": "it filled, its booking couldn't be saved, and its shares were closed as shares without a "
+                          "record"})
+            log.warning("UNBOOKED ENTRY LET GO  %s (play %s): its shares are being closed as shares without a record - "
+                        "no record is opened for them", symbol, p.play.id)
+            out.append(p.play.id)
+        return out
+
+    def _let_go_unbooked(self, p: _Pending) -> None:
+        """Forget that the booking of an entry no longer followed keeps failing."""
+        self._unbooked.pop(f"entry:{p.play.id}", None)
+        self._unbooked_said.pop(f"entry:{p.play.id}", None)
 
     def forget_open(self, symbol: str) -> None:
         """Drop the note that ``symbol`` is held - its record was closed without an exit going through here."""
@@ -239,12 +299,21 @@ class Executor(ProtectiveStops):
         self._swept_at = 0.0            # ...so its stop at the broker goes on the very next pass
 
     def cancel_entries_for(self, play_id: str) -> int:
-        """Call off the entry orders still working for one play - a pair leg whose other leg failed."""
+        """Call off the entry orders still working for one play - a pair leg whose other leg failed. A leg that filled
+        whose booking the database refused so far has nothing to cancel, and is let go all the same: booked after the
+        desk has given up its pair, it would be a pair leg nothing manages - no stop, no exit. Its shares are listed
+        under Shares without a record, with their own Exit, and the check on shares no record explains says them (a leg
+        whose order failed half way the desk closes itself that way: _flatten)."""
         n = 0
         with self._lock:
             for oid, p in list(self._pending.items()):
                 if p.kind == "entry" and p.play.id == play_id:
-                    self._cancel_quietly(oid, "called off by the pairs desk", p)
+                    if self._entry_unbooked(p):
+                        self._let_go_unbooked(p)
+                        log.warning("UNBOOKED ENTRY LET GO  %s (play %s): the pairs desk called its pair off - its "
+                                    "shares are held without a record", p.play.symbol, play_id)
+                    else:
+                        self._cancel_quietly(oid, "called off by the pairs desk", p)
                     self._pending.pop(oid, None)
                     p.play.status = PlayStatus.CANCELED
                     n += 1
@@ -763,10 +832,8 @@ class Executor(ProtectiveStops):
                         "reason": f"{venue_label(held_on)} doesn't show a {t['side'].lower()} {t['symbol']} "
                                   f"position (closed or removed outside the app?) - no exit sent."}
             # never sell more than is there, counting exits already working on the same shares -
-            # the app's own, and any other closing orders at the broker
-            untracked = sum(_remaining(o) for o in working if o.order_id not in self._pending
-                            and o.symbol == t["symbol"] and o.side is _exit_side(t["side"]) and _may_close(o))
-            qty = min(qty, abs(held) - self._exiting_quantity(t["symbol"]) - untracked)
+            # the app's own, and any other closing orders at the broker (a close of shares without a record too)
+            qty = min(qty, abs(held) - self._closing_quantity(t["symbol"], _exit_side(t["side"]), working))
             if qty <= 0:
                 return {"ok": False, "reason": f"Exit orders already working cover all {abs(held):,.0f} "
                                                f"{t['symbol']} shares held - no exit sent."}
@@ -905,6 +972,13 @@ class Executor(ProtectiveStops):
     def _exiting_quantity(self, symbol: str) -> float:
         """Shares of ``symbol`` that exit orders still working are already selling (or covering)."""
         return sum(p.qty for p in list(self._pending.values()) if p.kind == "exit" and p.play.symbol == symbol)
+
+    def _closing_quantity(self, symbol: str, side: Side, working: List[OrderResult]) -> float:
+        """Shares of ``symbol`` already being sold (or bought back: ``side``) by closing orders - the exits followed
+        here, and the other orders in ``working`` that may be closing a position: an exit an earlier run left, the close
+        of shares without a record, one sent by hand. An exit is capped at the shares held less these, and a stop (sized
+        from its record) rests only where they still cover it (_place_stop)."""
+        return self._exiting_quantity(symbol) + _closing_left(working, symbol, side, skip=set(self._pending))
 
     # ------------------------------------------------------------------ #
     def sync_open_orders(self, wait: bool = True) -> bool:
@@ -1408,17 +1482,20 @@ class Executor(ProtectiveStops):
         return tid
 
     def _booking_failed(self, key: str, symbol: str, kind: str, e: BaseException) -> BookingFailed:
-        """A fill the database refused to book (busy with another writer, say), called from inside the ``except``:
-        logged with its traceback each time, and the dashboard told the first time (order.unbooked) - and again every
-        UNPROTECTED_REPEAT_S while it keeps failing (a full disk, a file another program holds): an entry's shares have
-        no record and no stop meanwhile, and a toast is soon gone. Returns the BookingFailed to raise - its caller keeps
-        the order followed, so the next pass books the fill again."""
+        """A fill the database refused to book (busy with another writer, say), called from inside the ``except``: the
+        dashboard told the first time (order.unbooked) - and again every UNPROTECTED_REPEAT_S while it keeps failing (a
+        full disk, a file another program holds): an entry's shares have no record and no stop meanwhile, and a toast
+        is soon gone. Logged with its traceback each time the dashboard is told, and as one line on the tries between
+        (one every order sync): a traceback a pass for hours would rotate the log's history away. Returns the
+        BookingFailed to raise - its caller keeps the order followed, so the next pass books the fill again."""
         tries = self._unbooked[key] = self._unbooked.get(key, 0) + 1
         why = (str(e).strip().splitlines() or [type(e).__name__])[0][:200]    # the database's first line, not its SQL
-        log.exception("BOOKING FAILED  the %s %s fill couldn't be saved (try %d) - its order stays followed and the "
-                      "booking is tried again shortly", symbol, kind, tries)
         now = time.monotonic()
-        if now - self._unbooked_said.get(key, float("-inf")) >= self.UNPROTECTED_REPEAT_S:
+        if now - self._unbooked_said.get(key, float("-inf")) < self.UNPROTECTED_REPEAT_S:
+            log.warning("BOOKING FAILED  the %s %s fill still couldn't be saved (try %d): %s", symbol, kind, tries, why)
+        else:
+            log.exception("BOOKING FAILED  the %s %s fill couldn't be saved (try %d) - its order stays followed and "
+                          "the booking is tried again shortly", symbol, kind, tries)
             self._unbooked_said[key] = now
             after = ("until then its shares have no trade record, nor a stop at the broker" if kind == "entry"
                      else "no other exit goes out for the position meanwhile")
@@ -1530,10 +1607,18 @@ def _exit_side(position_side: str) -> Side:
 
 
 def _may_close(o: OrderResult) -> bool:
-    """An order that may be closing a position: one the app tagged as an exit, or an
-    untagged one (sent by hand, or before orders were tagged). Never a bracket's
-    target or stop child - that belongs to its entry."""
-    return o.tag.startswith("exit:") or (not o.tag and not (o.raw or {}).get("parent_id"))
+    """An order that may be closing a position: one the app tagged as an exit, or as the close
+    of shares without a record (``unwind:`` - they may be a record's by the time it fills), or an
+    untagged one (sent by hand, or before orders were tagged). Never a bracket's target or stop
+    child - that belongs to its entry."""
+    return o.tag.startswith(("exit:", "unwind:")) or (not o.tag and not (o.raw or {}).get("parent_id"))
+
+
+def _closing_left(working: List[OrderResult], symbol: str, side: Side, skip: Optional[set] = None) -> float:
+    """Shares of ``symbol`` the orders in ``working`` that may be closing a position (_may_close) on ``side`` still
+    have to sell (or buy back) - leaving out the ids in ``skip``."""
+    return sum(_remaining(o) for o in working if o.symbol == symbol and o.side is side and _may_close(o)
+               and o.order_id not in (skip or ()))
 
 
 def _match_exit(t: dict, orders: List[OrderResult], taken: set) -> Optional[OrderResult]:

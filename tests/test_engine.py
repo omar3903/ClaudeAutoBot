@@ -894,6 +894,34 @@ def test_a_quit_check_while_the_working_entries_are_cancelled_sends_no_round_of_
     assert out["note"].startswith("Exit sent for 1 position")
 
 
+def test_a_quit_waits_for_the_record_of_an_entry_whose_fill_waits_to_be_saved_and_closes_it(engine):
+    from autotradebot.execution.executor import _Pending
+
+    engine._venue = "ibkr-paper"
+    play = _play("AAA")
+    engine.executor._pending["9"] = _Pending("9", play, "entry", qty=10)    # filled at the broker...
+    engine.executor._unbooked[f"entry:{play.id}"] = 2                       # ...and the database refuses to book it
+    closed = _closes_fill(engine)
+    done = threading.Event()
+    engine.on_shutdown = done.set
+
+    out = engine.begin_quit()
+    assert out["ok"] and "AAA entry fill couldn't be saved yet" in out["note"]
+    # its shares are held: the quit neither cancels it nor shuts down without them
+    assert "9" in engine.executor._pending and engine.quit_state is not None
+    status = engine.snapshot()["quit"]
+    assert (status["left"], status["symbols"]) == (1, ["AAA"]) and "couldn't be saved" in status["waiting"]
+    engine._quit_retry_at = 0.0
+    engine._check_quit_progress()
+    assert engine.quit_state is not None and not done.is_set() and closed == []
+
+    del engine.executor._pending["9"], engine.executor._unbooked[f"entry:{play.id}"]   # the booking takes...
+    _open(engine, "AAA", venue="ibkr-paper", qty=10)
+    engine._quit_retry_at = 0.0
+    engine._check_quit_progress()
+    assert closed == ["AAA"] and engine.quit_state is None and done.wait(3)   # ...and the quit closes it
+
+
 def test_live_quit_can_be_cancelled_and_leaves_positions_alone(engine):
     _open(engine, "AAPL")
     closed = _closes_fill(engine)

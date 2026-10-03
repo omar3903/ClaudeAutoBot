@@ -1058,6 +1058,74 @@ def test_orders_that_fill_at_once_whose_booking_fails_are_followed_and_booked_on
     assert len(broker.orders) == 2
 
 
+def _unbooked_entry(broker, repo, bus=SILENT):
+    """An executor whose day-trade entry for 10 AAA filled at the broker (order 1) while the database refuses to book
+    it. Returns the executor, the play, and the call that lets the database take bookings again."""
+    ex = _executor(broker, repo, bus=bus)
+    ex.STAND_DOWN_S = ex.STAND_DOWN_POLL_S = 0.0
+    real_open = repo.open_trade
+
+    def refuse(*a, **k):
+        raise RuntimeError("database is locked")
+
+    repo.open_trade = refuse
+    play = _day_play()
+    assert ex.execute_play(play, Account(account_id="DU"), plan=PLAN)["ok"]
+    broker.reports["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                      avg_fill_price=100.0)
+    ex.sync_open_orders()
+    assert [(w["symbol"], w["unbooked"]) for w in ex.working_entries()] == [("AAA", True)]
+
+    def allow():
+        repo.open_trade = real_open
+
+    return ex, play, allow
+
+
+def test_a_quit_leaves_an_entry_whose_fill_waits_to_be_saved_followed_and_the_next_sync_books_it():
+    broker, repo = _Broker({"AAA": 10}), _Repo([])
+    ex, play, allow = _unbooked_entry(broker, repo)
+    assert ex.cancel_pending_entries() == 0                                # a quit: nothing to cancel...
+    assert broker.cancelled == [] and [w["unbooked"] for w in ex.working_entries()] == [True]   # ...still followed
+    allow()                                                                # the database takes it again
+    ex.sync_open_orders()
+    [t] = repo.open_trades()                                               # booked: the quit closes it like any other
+    assert t["quantity"] == 10 and ex.working_entries() == [] and play.status is PlayStatus.FILLED
+
+
+def test_the_pairs_desk_lets_a_leg_whose_fill_waits_to_be_saved_go_without_cancelling_a_filled_order():
+    broker, repo = _Broker({"AAA": 10}), _Repo([])
+    ex, play, allow = _unbooked_entry(broker, repo)
+    assert ex.cancel_entries_for(play.id) == 1
+    # booked after the desk gave its pair up, it would be a pair leg nothing manages: its shares are held without a
+    # record instead (listed, with their own Exit) - and nothing is asked of an order that has filled
+    assert broker.cancelled == [] and ex.working_entries() == [] and ex._unbooked == {} and ex._unbooked_said == {}
+    allow()
+    ex.sync_open_orders()
+    assert repo.open_trades() == []
+
+
+def test_a_booking_that_keeps_failing_logs_its_traceback_when_the_dashboard_is_told_and_one_line_between(
+        monkeypatch, caplog):
+    from autotradebot.execution import executor as executor_module
+
+    now = [1000.0]
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: now[0])
+    heard = []
+    with caplog.at_level(logging.WARNING, logger=executor_module.__name__):
+        ex, _, _ = _unbooked_entry(_Broker({"AAA": 10}), _Repo([]),
+                                   bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+        for _ in range(3):                                                 # the next order syncs, 4 s apart
+            now[0] += 4.0
+            ex.sync_open_orders()
+        now[0] += ex.UNPROTECTED_REPEAT_S
+        ex.sync_open_orders()                                              # told again five minutes on
+    failed = [r for r in caplog.records if "BOOKING FAILED" in r.getMessage()]
+    assert [bool(r.exc_info) for r in failed] == [True, False, False, False, True]
+    assert all("database is locked" in r.getMessage() for r in failed if not r.exc_info)   # its first line, in one
+    assert [p["tries"] for topic, p in heard if topic == "order.unbooked"] == [1, 5]
+
+
 def test_the_order_sync_skips_an_order_the_broker_cant_read_but_logs_any_other_fault(caplog):
     broker, repo = _Broker({"AAA": 10}), _Repo([_trade()])
     ex = _executor(broker, repo)

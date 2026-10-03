@@ -550,16 +550,21 @@ class ProtectiveStops:
             return
         held = self._held_quantity(symbol)
         long = t["side"] == "LONG"
-        if held is not None and ((held > 0) != long or abs(held) < qty - 1e-9):
+        exit_side = Side.SHORT if long else Side.LONG
+        # shares other closing orders are selling this moment - the close of shares without a record, an exit of
+        # another record or one sent by hand - are no cover: a stop beside them could sell the same shares twice
+        selling = self._closing_quantity(symbol, exit_side, working) if held is not None else 0.0
+        if held is not None and ((held > 0) != long or abs(held) - selling < qty - 1e-9):
             # never rest an order the account can't cover - triggered, it would open a position the other way
-            self._note_once(tid, f"{symbol}: no stop placed - the broker shows {held:,.0f} shares, the record {qty:,.0f}")
+            self._note_once(tid, f"{symbol}: no stop placed - the broker shows {held:,.0f} shares"
+                                 + (f", {selling:,.0f} of them being sold by orders working there" if selling else "")
+                                 + f", the record {qty:,.0f}")
             arriving = (held > 0) == long and abs(held) > 0            # a fill still landing in pieces: look again soon
             self._stop_retry[tid] = time.monotonic() + (self.SHARES_RETRY_S if arriving else self.STOP_RETRY_S)
             return
         plan = self._target_plan(t)
         self._group_seq += 1                             # a group's name is never used twice: a finished one can't take orders
         group = f"oca:{tid}:{int(time.time())}:{self._group_seq}" if plan else ""
-        exit_side = Side.SHORT if long else Side.LONG
         req = OrderRequest(symbol=symbol, side=exit_side, quantity=qty, order_type=OrderType.STOP, stop_price=price,
                            tif=TimeInForce.GTC, is_entry=False, client_tag=stop_tag(tid), oca_group=group,
                            oca_type=OCA_REDUCE if group else 0)

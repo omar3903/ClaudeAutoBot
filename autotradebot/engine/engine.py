@@ -1968,7 +1968,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if out.get("ok"):
             status = str(out.get("status") or "")
             tail = "" if status == "FILLED" else f" ({status.lower()})"
-            out["note"] = f"Exit sent for {row['qty']:,.0f} {symbol} shares that had no record{tail}."
+            out["note"] = f"Exit sent for {out.get('qty', row['qty']):,.0f} {symbol} shares that had no record{tail}."
         return out
 
     # ------------------------------------------------------------------ #

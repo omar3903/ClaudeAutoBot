@@ -11,7 +11,7 @@ import pytest
 
 from test_order_follow_up import VENUE, _AuditedRepo, _Broker, _executor, _refuses_once, _Repo, _trade
 from autotradebot.brokers.base import BrokerError
-from autotradebot.core.enums import OrderType, Side, TimeInForce
+from autotradebot.core.enums import OrderType, PlayStatus, Side, TimeInForce
 from autotradebot.core.models import Fill, OrderResult
 
 
@@ -1436,6 +1436,62 @@ def test_an_unanswered_exit_whose_stop_stood_down_is_said_at_once_and_every_few_
     ex.sync_open_orders()
     assert ex.pending_exit_trade_ids() == set() and "order.failed" in [topic for topic, _ in heard]
     assert ex._unknown_said == {}
+
+
+# ---------------------------------------------------------------- shares closed without a record
+def test_closing_an_unbooked_entrys_shares_without_a_record_settles_it_so_no_record_stop_or_exit_follows():
+    from test_order_follow_up import _unbooked_entry
+
+    broker, repo = _StopBroker({"AAA": 10}), _Repo([])
+    ex, play, allow = _unbooked_entry(broker, repo)
+    out = ex.close_untracked("AAA", "LONG", 10)                                # the Exit under Shares without a record
+    unwind = broker.orders[-1]
+    assert out["ok"] and (unwind.client_tag, unwind.side, unwind.quantity) == ("unwind:AAA", Side.SHORT, 10)
+    # the entry is off the books in the same step: its play is never sent again, nor booked after a restart
+    assert ex.working_entries() == [] and ex._unbooked == {} and play.status is PlayStatus.ERROR
+    assert repo.settled[-1][:2] == (play.id, "ERROR") and repo.settled[-1][2]["status"] == "UNWOUND"
+    # the close works at the broker (held for the open, say) when the database takes bookings again
+    broker.working.append(OrderResult(order_id=out["order_id"], status="SUBMITTED", symbol="AAA", submitted_qty=10,
+                                      side=Side.SHORT, tag="unwind:AAA", raw={"mine": True}))
+    allow()
+    ex.sync_open_orders()
+    # no record for shares being sold - so no stop beside the close, and no exit of the record's own after it
+    assert repo.open_trades() == [] and broker.stops() == [] and len(broker.orders) == 2
+
+
+def test_shares_booked_since_they_were_listed_without_a_record_are_not_closed_again_by_that_exit():
+    from test_order_follow_up import _unbooked_entry
+
+    broker, repo = _StopBroker({"AAA": 10}), _Repo([])
+    ex, _, allow = _unbooked_entry(broker, repo)                               # listed under Shares without a record...
+    allow()
+    ex.sync_open_orders()                                                      # ...booked, with its stop, just before
+    [t] = repo.open_trades()                                                   # the Exit reaches the executor
+    out = ex.close_untracked("AAA", "LONG", 10)
+    assert not out["ok"] and "no AAA shares beyond the trade records" in out["reason"]
+    assert [o.client_tag for o in broker.orders if o.client_tag.startswith("unwind:")] == []
+    broker.positions["AAA"] = 15                                               # five more bought outside the app
+    out = ex.close_untracked("AAA", "LONG", 15)
+    assert out["ok"] and out["qty"] == 5 and broker.orders[-1].quantity == 5   # only those
+    assert repo.get_trade(t["id"])["status"] == "OPEN"
+
+
+def test_a_closing_order_working_at_the_broker_is_no_cover_for_a_stop_nor_room_for_an_exit():
+    # a close of shares without a record still working when a record for those shares appears
+    unwind = OrderResult(order_id="u1", status="SUBMITTED", symbol="AAA", submitted_qty=10, side=Side.SHORT,
+                         tag="unwind:AAA", raw={"mine": True})
+    broker, repo, ex, heard = _setup(working=[unwind])
+    ex.sync_open_orders()
+    assert broker.stops() == []                                                # it would sell the same shares twice
+    [why] = [p["reason"] for topic, p in heard if topic == "stop.failed"]
+    assert "10 of them being sold by orders working there" in why
+    out = ex.close_trade("t1", reason="stop")
+    assert not out["ok"] and "already working cover all" in out["reason"] and broker.exits() == []
+
+    broker.working.clear()                                                     # it went (or was called off)
+    ex._stop_retry.clear()
+    ex.sync_open_orders()
+    assert [(s.client_tag, s.quantity) for s in broker.stops()] == [("stop:t1", 10)]
 
 
 # ---------------------------------------------------------------- one caller at a time: threads side by side
