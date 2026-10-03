@@ -7,6 +7,8 @@ can't do raises :class:`NotSupported` rather than silently doing nothing.
 from __future__ import annotations
 
 import abc
+import asyncio
+from concurrent.futures import TimeoutError as FutureTimeout
 from typing import List, Optional
 
 from ..core.models import Account, Fill, OrderRequest, OrderResult, Quote
@@ -36,6 +38,26 @@ class OrderInDoubt(OrderRejected):
 
 class AuthError(BrokerError):
     pass
+
+
+class OrderOutcomeUnknown(BrokerError):
+    """An order call that ran out of time after it had started: the order may have reached the broker, or not. It is
+    never taken for "not sent" - it is looked for at the broker by its tag (``order_ref``, IBKR's orderRef) before
+    anything is sent in its place."""
+
+    def __init__(self, msg: str, order_ref: Optional[str] = None) -> None:
+        super().__init__(msg)
+        self.order_ref = order_ref
+
+
+class OrderNotSent(BrokerError):
+    """An order call that ran out of time before it started: it was called off unsent, so the order is certainly not
+    at the broker and may be sent again."""
+
+
+#: what an order call raises when whether the order went out isn't known: OrderOutcomeUnknown, or the bare timeout
+#: of an adapter that doesn't translate it (concurrent.futures' and asyncio's are TimeoutError's own only from 3.11)
+OUTCOME_UNKNOWN = (OrderOutcomeUnknown, TimeoutError, FutureTimeout, asyncio.TimeoutError)
 
 
 class BrokerAdapter(abc.ABC):

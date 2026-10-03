@@ -18,6 +18,13 @@ The sync loop, the dashboard's buttons, a quit's closes and Autopilot call in fr
 threads of their own. They take turns: the order sync, an entry being placed, a
 take-over, a cancel and an exit each run under the executor's lock (``_lock``), so
 an order is always followed before anything else looks for it.
+
+An order the broker doesn't answer in time (OrderOutcomeUnknown) is never taken for
+one not sent: it may be working, or have filled. The next order syncs look for it at
+the broker by its tag (:meth:`Executor._look_for_unknown`) - it is followed if it
+works, booked if it filled, and taken as never sent only once the broker shows it
+neither working nor filled. Nothing is sent in its place meanwhile: an entry's play
+stays sent (Autopilot keeps its slot) and the position's exit waits.
 """
 
 from __future__ import annotations
@@ -29,7 +36,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ..brokers.base import DONE_STATUSES, BrokerAdapter, BrokerError
+from ..brokers.base import OUTCOME_UNKNOWN, DONE_STATUSES, BrokerAdapter, BrokerError
 from ..brokers.venues import venue_label
 from ..core.enums import PlayStatus, Side, StrategyKind, Timeframe
 from ..core.eventbus import BUS
@@ -78,6 +85,13 @@ class Executor(ProtectiveStops):
     ENTRY_LOOKBACK_H = 24.0
     #: seconds before that look is tried again, when the broker's orders, executions or account couldn't be read
     ENTRY_LOOK_RETRY_S = 30.0
+    #: seconds after an order call ran out of time (OrderOutcomeUnknown) before an order the broker shows neither
+    #: working nor filled is taken as never sent - IBKR lists an order it has taken within a moment
+    UNKNOWN_GIVE_UP_S = 30.0
+    #: seconds an exit's executions may read as earlier than the send they belong to - the broker's clock and this
+    #: computer's differ a little. (An exit's tag is shared by every exit its trade has had: the earlier ones' fills,
+    #: booked before this one went out, are left out by their time)
+    CLOCK_SLACK_S = 2.0
 
     def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS,
                  venue: Optional[str] = None) -> None:
@@ -98,6 +112,10 @@ class Executor(ProtectiveStops):
         #: back at once instead of queueing behind the first, whose outcome settles it
         self._sending: Dict[str, int] = {}
         self._pending: Dict[str, _Pending] = {}
+        #: orders whose send ran out of time with the outcome unknown (OrderOutcomeUnknown), by their tag -> what they
+        #: were sent for (no order id yet) and when (monotonic) the call gave up: looked for at the broker by the order
+        #: syncs (_look_for_unknown), and nothing is sent in their place meanwhile
+        self._unknown: Dict[str, Tuple[_Pending, float]] = {}
         self._open_by_symbol: Dict[str, str] = {}   # symbol -> trade_id
         #: the exit manager takes part of a position off at the first target, so a native bracket
         #: (the simulator's) carries the stop only - a take-profit child would close all of it there
@@ -126,6 +144,7 @@ class Executor(ProtectiveStops):
             self.broker = broker
             self.venue = venue or broker.name
             self._pending.clear()
+            self._unknown.clear()       # an entry's play stays sent: the look for entries sent before finds it
             self._open_by_symbol.clear()
             self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
             self._entries_retry_at = 0.0
@@ -141,6 +160,17 @@ class Executor(ProtectiveStops):
                 self._cancel_quietly(oid)
                 self._pending.pop(oid, None)
                 n += 1
+            n += self._call_off_unknown(lambda p: True, "cancelled when quitting")
+        return n
+
+    def _call_off_unknown(self, which: Callable[[_Pending], bool], why: str) -> int:
+        """Mark the entries whose send got no answer in time (``which`` of them) to be cancelled once they are found
+        working at the broker - followed then, so what they filled meanwhile is still booked. Returns how many."""
+        n = 0
+        for p, _ in list(self._unknown.values()):
+            if p.kind == "entry" and which(p) and not p.expired:
+                p.expired = why
+                n += 1
         return n
 
     def flatten_untracked(self, symbol: str, position_side: str, qty: float) -> bool:
@@ -154,6 +184,15 @@ class Executor(ProtectiveStops):
         with self._lock:                # not beside an order sync, nor an exit counting the shares held
             try:
                 res = self.broker.place_order(req)
+            except OUTCOME_UNKNOWN as e:
+                # it may have reached the broker: another sent now could close the shares twice, and open a position
+                # the other way - the account says, once it shows whether these went
+                why = str(e) or "no answer from the broker in time"
+                self._audit("PLACE", req, {"error": why, "outcome": "unknown"}, ok=False, msg=why)
+                log.error("the order closing %s %s shares without a trade record got no answer in time - it may have "
+                          "reached the broker: %s", qty, symbol, why)
+                return {"ok": False, "sent_unknown": True,
+                        "reason": f"{why}. Check the {symbol} position before closing it again."}
             except BrokerError as e:
                 self._audit("PLACE", req, {"error": str(e)}, ok=False, msg=str(e))
                 log.error("could not close %s %s shares that have no trade record: %s", qty, symbol, e)
@@ -179,24 +218,31 @@ class Executor(ProtectiveStops):
                     self._pending.pop(oid, None)
                     p.play.status = PlayStatus.CANCELED
                     n += 1
+            n += self._call_off_unknown(lambda p: p.play.id == play_id, "called off by the pairs desk")
         return n
 
+    def _sent(self) -> List[_Pending]:
+        """Every order sent and not finished: the ones followed, and the ones whose send got no answer in time, which
+        may be working too (_unknown)."""
+        return list(self._pending.values()) + [p for p, _ in list(self._unknown.values())]
+
     def pending_exit_trade_ids(self) -> set:
-        """Trades whose close order is still working at the broker."""
-        return {p.trade_id for p in list(self._pending.values()) if p.kind == "exit" and p.trade_id}
+        """Trades whose close order is still working at the broker - or may be: one whose send got no answer in time
+        is looked for there before anything else goes out for the trade."""
+        return {p.trade_id for p in self._sent() if p.kind == "exit" and p.trade_id}
 
     def working_entries(self) -> List[Dict[str, Any]]:
-        """Entry orders sent but not filled yet. Anything that limits positions has
-        to count these too, or a slow fill gets doubled up."""
-        return [{"order_id": oid, "play_id": p.play.id, "symbol": p.play.symbol,
+        """Entry orders sent but not filled yet - one whose send got no answer in time too (no order id yet).
+        Anything that limits positions has to count these too, or a slow fill gets doubled up."""
+        return [{"order_id": p.order_id, "play_id": p.play.id, "symbol": p.play.symbol,
                  "strategy": p.play.strategy, "timeframe": p.play.timeframe.value,
                  "qty": p.qty, "notional": p.play.entry * p.qty,
                  "risk": abs(p.play.entry - p.play.stop) * p.qty}
-                for oid, p in list(self._pending.items()) if p.kind == "entry"]
+                for p in self._sent() if p.kind == "entry"]
 
     def symbols_in_flight(self) -> set:
         """Symbols with an order still working - their share counts are about to change."""
-        return {p.play.symbol for p in list(self._pending.values())}
+        return {p.play.symbol for p in self._sent()}
 
     def active_orders(self) -> List[Dict[str, Any]]:
         """Every order still working at the broker and what it is for: an entry, an exit,
@@ -282,7 +328,9 @@ class Executor(ProtectiveStops):
                     adopted.append({"kind": "exit", "symbol": t["symbol"], "order_id": order.order_id,
                                     "trade_id": t["id"], "qty": _remaining(order)})
             for order in working:
-                play = self._play_for(order) if order.order_id not in self._pending else None
+                # (one whose send got no answer in time is the order syncs' to find: _look_for_unknown)
+                play = self._play_for(order) if order.order_id not in self._pending and \
+                    order.tag not in self._unknown else None
                 if play is not None:
                     # its clock starts again from here: a day-trade entry gets entry_timeout_min more minutes
                     self._pending[order.order_id] = _Pending(order.order_id, play, "entry", qty=_remaining(order),
@@ -362,7 +410,7 @@ class Executor(ProtectiveStops):
             log.debug("could not read the plays sent before the start", exc_info=True)
             self._entries_retry_at = time.monotonic() + self.ENTRY_LOOK_RETRY_S
             return []
-        followed = {p.play.id for p in list(self._pending.values()) if p.kind == "entry"}
+        followed = {p.play.id for p in self._sent() if p.kind == "entry"}
         rows = [r for r in rows if r["id"] not in followed and "pair-leg" not in (r.get("tags") or [])]
         working = self._working_or_none() if rows else []
         fills = self._executions(None) if rows else []
@@ -429,7 +477,8 @@ class Executor(ProtectiveStops):
         extra: List[OrderResult] = []
         for o in working:
             mine = o.tag.startswith("exit:") or (o.raw or {}).get("mine")
-            if o.order_id in self._pending or o.symbol not in recorded or o.side is not sides[o.symbol] or not mine:
+            if (o.order_id in self._pending or o.tag in self._unknown or o.symbol not in recorded
+                    or o.side is not sides[o.symbol] or not mine):
                 continue
             if o.tag.startswith((STOP_TAG, TARGET_TAG)):
                 continue                                 # a resting stop or target is not an exit; protective_stops.py owns it
@@ -459,6 +508,7 @@ class Executor(ProtectiveStops):
         native_bracket = plan.get("bracket_mode") == "native" and (
             self.broker.supports_bracket_native or self.broker.paper
         )
+        ot, osess = plan.get("order_type", "LIMIT"), plan.get("order_session", "REGULAR")
         # placed and followed (or booked) in one go: an order sync or a take-over never finds the order at the
         # broker before it is followed here, and never books its fill beside this
         with self._lock:
@@ -468,6 +518,8 @@ class Executor(ProtectiveStops):
                     res = self.broker.place_bracket(entry, None if self.scale_out else play.primary_target, play.stop)
                 else:
                     res = self.broker.place_order(entry)      # exit manager will protect it
+            except OUTCOME_UNKNOWN as e:
+                return self._entry_unknown(play, entry, qty, ot, osess, context, submitted_at, decision, e)
             except BrokerError as e:
                 self._audit("PLACE", entry, {"error": str(e)}, ok=False, play_id=play.id, msg=str(e))
                 play.status = PlayStatus.ERROR
@@ -476,7 +528,6 @@ class Executor(ProtectiveStops):
             self._audit("PLACE", entry, res.raw or {"status": res.status}, ok=True,
                         play_id=play.id, msg=res.message)
             play.status = PlayStatus.SUBMITTED
-            ot, osess = plan.get("order_type", "LIMIT"), plan.get("order_session", "REGULAR")
 
             # immediate fill (paper / marketable) -> open the trade now
             if res.status in ("FILLED",) or res.filled_qty >= qty > 0:
@@ -499,6 +550,24 @@ class Executor(ProtectiveStops):
                     "order_type": ot, "order_session": osess,
                     "note": "order working - will confirm on fill"}
 
+    def _entry_unknown(self, play: Play, entry: OrderRequest, qty: int, ot: str, osess: str,
+                       context: Optional[Dict[str, Any]], submitted_at: dt.datetime,
+                       decision: Optional[Dict[str, Any]], e: BaseException) -> Dict[str, Any]:
+        """An entry the broker didn't answer in time: it may be working, or have filled. The play log says it was sent
+        first - so a restart looks for it too - and the next order syncs look for it at the broker by its tag (the
+        play's id): followed if it works, booked if it filled (_look_for_unknown). Under the executor's lock."""
+        why = str(e) or "no answer from the broker in time"
+        self._audit("PLACE", entry, {"error": why, "outcome": "unknown"}, ok=False, play_id=play.id, msg=why)
+        p = _Pending("", play, "entry", qty=qty, order_type=ot, order_session=osess, context=context,
+                     submitted_at=submitted_at, decision=decision)
+        self._note(play, PlayStatus.SUBMITTED)
+        self._unknown[entry.client_tag or play.id] = (p, time.monotonic())
+        log.warning("ENTRY NOT CONFIRMED  %s %s x%s (play %s): %s - looked for at %s by its tag before anything else "
+                    "is sent", play.symbol, play.side.value, qty, play.id, why, venue_label(self.venue))
+        return {"ok": False, "sent_unknown": True, "order_type": ot, "order_session": osess,
+                "reason": f"{why}. The order may be working - the app looks for it at the broker and follows it "
+                          f"if it is there."}
+
     # ------------------------------------------------------------------ #
     def close_trade(self, trade_id: str, reason: str = "manual", limit_price: Optional[float] = None,
                     qty: Optional[float] = None, after_fill: Optional[Dict[str, float]] = None,
@@ -509,7 +578,9 @@ class Executor(ProtectiveStops):
         resting at the broker are stood down first - one an earlier run left too, before this run's first
         pass has taken it over (_take_over_for_exit). An exit that must wait on the broker for that (a cancel
         to confirm, its orders reloading after a connect) comes back ``wait``: not a failed exit, one to try
-        again in seconds.
+        again in seconds. So does one the broker didn't answer in time (``sent_unknown`` too): it may be working,
+        or have filled, and no other exit goes out for the trade until the order syncs have looked for it at the
+        broker by its tag (_look_for_unknown).
 
         One exit per trade at a time: a close for a trade whose exit another thread is sending this moment comes
         back at once, ``wait`` too - that one's outcome settles it, and one queued behind it would only find its exit
@@ -540,6 +611,12 @@ class Executor(ProtectiveStops):
             # never send an exit to an account that doesn't hold the position
             return {"ok": False, "reason": f"This position is on {venue_label(held_on)} - "
                                            f"switch back to that platform to close it."}
+        if exit_tag(trade_id) in self._unknown:
+            # the last exit got no answer in time: it may be working, or have filled - nothing more goes out until the
+            # order syncs have looked for it at the broker (_look_for_unknown)
+            return {"ok": False, "wait": True, "sent_unknown": True,
+                    "reason": f"The last exit for this {t['symbol']} position got no answer from the broker in time - "
+                              f"it is being looked for there before another is sent."}
         if trade_id in self.pending_exit_trade_ids():
             return {"ok": False, "reason": f"An exit order for this {t['symbol']} position is already working."}
         closed = self._exchange_closed()
@@ -635,10 +712,25 @@ class Executor(ProtectiveStops):
                 return {"ok": False, "reason": f"Exit orders already working cover all {abs(held):,.0f} "
                                                f"{t['symbol']} shares held - no exit sent."}
         req = build_exit_order(t["symbol"], t["side"], qty,
-                               limit_price=limit_price, cfg=self.cfg, tag=f"exit:{trade_id}")
+                               limit_price=limit_price, cfg=self.cfg, tag=exit_tag(trade_id))
         sent_at = dt.datetime.now(dt.timezone.utc)
         try:
             res = self.broker.place_order(req)
+        except OUTCOME_UNKNOWN as e:
+            # it may be working, or have filled: nothing is followed for it (there is no order id) and nothing more
+            # goes out for the trade until the order syncs have looked for it at the broker by its tag - the exit
+            # manager waits meanwhile (a wait, not a failed try)
+            why = str(e) or "no answer from the broker in time"
+            self._audit("PLACE", req, {"error": why, "outcome": "unknown"}, ok=False, trade_id=trade_id, msg=why)
+            self._unknown[req.client_tag or exit_tag(trade_id)] = (
+                _Pending("", Play(**_min_play(t)), "exit", trade_id=trade_id, qty=qty, reason=reason,
+                         partial=partial, after_fill=after_fill, decision_price=decision_price, submitted_at=sent_at),
+                time.monotonic())
+            log.warning("EXIT NOT CONFIRMED  %s %s x%s (%s): %s - looked for at %s by its tag before another is sent",
+                        t["symbol"], trade_id, qty, reason, why, venue_label(held_on))
+            return {"ok": False, "wait": True, "sent_unknown": True,
+                    "reason": f"{why}. The exit may be working - the app looks for it at the broker before sending "
+                              f"another."}
         except BrokerError as e:
             self._audit("PLACE", req, {"error": str(e)}, ok=False, trade_id=trade_id, msg=str(e))
             return {"ok": False, "reason": str(e)}
@@ -766,6 +858,12 @@ class Executor(ProtectiveStops):
                 self._book_entries_filled_while_off()
             except Exception:  # noqa: BLE001
                 log.exception("looking for the entries that filled while the app was off failed")
+        # ...and look for the orders whose send got no answer in time: followed from here on if they work
+        if self._unknown:
+            try:
+                self._look_for_unknown()
+            except Exception:  # noqa: BLE001
+                log.exception("looking for the orders the broker didn't answer in time failed")
 
         # 1) advance the simulator
         if hasattr(self.broker, "poll"):
@@ -801,6 +899,94 @@ class Executor(ProtectiveStops):
                 self._maybe_close_from_bracket(o)
         except Exception:  # noqa: BLE001
             pass
+
+    def _look_for_unknown(self) -> List[str]:
+        """Look for the orders whose send got no answer in time (OrderOutcomeUnknown) at the broker, by their tag. One
+        working is followed from here like any other (one called off meanwhile - a quit, the pairs desk - is cancelled
+        as it is found); one whose executions show it filled is booked as that fill; one the broker shows neither
+        working nor filled UNKNOWN_GIVE_UP_S after the call is taken as never sent: an entry's play is marked ERROR and
+        Autopilot's slot handed back, and the trade's exit may go out again. Nothing is decided while the broker's
+        orders or executions can't be read, nor while it is still reloading its orders after a connect. Under the
+        executor's lock (the order sync). Returns the tags settled."""
+        if getattr(self.broker, "is_connected", True) is False or self._broker_resyncing():
+            return []
+        working = self._working_or_none()
+        if working is None:
+            return []
+        settled: List[str] = []
+        for ref, (p, at) in list(self._unknown.items()):
+            side = p.play.side if p.kind == "entry" else _exit_side(p.play.side.value)
+            order = next((o for o in working if o.tag == ref and o.side is side), None)
+            if order is not None:
+                del self._unknown[ref]
+                settled.append(ref)
+                if order.order_id not in self._pending:
+                    p.order_id = order.order_id
+                    self._pending[order.order_id] = p
+                    if p.expired:
+                        p.cancel_at = time.monotonic()
+                        self._cancel_quietly(order.order_id)      # its answer books whatever part filled
+                    self._found_unknown(p, f"is working at {venue_label(self.venue)} after all (order "
+                                           f"{order.order_id}) - followed" + (", and cancelled" if p.expired else ""))
+                continue
+            fills = self._executions(p.play.symbol)
+            if fills is None:
+                continue                                        # not known: looked for again next pass
+            mine = [f for f in fills if (getattr(f, "tag", "") or "") == ref and f.side is side
+                    and (p.kind == "entry" or self._filled_since(f, p.submitted_at))]
+            got, price = shares_and_price(mine)
+            if got <= 1e-9 and time.monotonic() - at < self.UNKNOWN_GIVE_UP_S:
+                continue                                        # not seen yet: looked for again next pass
+            del self._unknown[ref]
+            settled.append(ref)
+            if got <= 1e-9:
+                self._unknown_not_sent(p)
+                continue
+            p.order_id = str(mine[-1].order_id)
+            done = got >= p.qty - 1e-9
+            self._found_unknown(p, f"filled at {venue_label(self.venue)} after all (order {p.order_id}): {got:,.0f} "
+                                   f"of {p.qty:,.0f} shares @ {price:.4f} - booked")
+            res = OrderResult(order_id=p.order_id, status="FILLED" if done else "CANCELED", symbol=p.play.symbol,
+                              submitted_qty=p.qty, filled_qty=got, avg_fill_price=price,
+                              message="" if done else "it ended with only part of it filled")
+            if done:
+                self._on_filled(p, res)
+            else:
+                self._on_unfilled(p, res)
+        return settled
+
+    def _filled_since(self, f: Any, sent_at: Optional[dt.datetime]) -> bool:
+        """Whether an execution came after an exit was sent (CLOCK_SLACK_S allowed for the two clocks)."""
+        ts = getattr(f, "ts", None)
+        if sent_at is None or not isinstance(ts, dt.datetime):
+            return True
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=dt.timezone.utc)
+        return ts >= sent_at - dt.timedelta(seconds=self.CLOCK_SLACK_S)
+
+    def _found_unknown(self, p: _Pending, what: str) -> None:
+        msg = f"The {p.play.symbol} {p.kind} order that got no answer in time {what}."
+        log.warning("ORDER FOUND  %s", msg)
+        self.bus.publish("orders.adopted", adopted=[{"kind": p.kind, "symbol": p.play.symbol, "order_id": p.order_id,
+                                                     "trade_id": p.trade_id, "qty": p.qty,
+                                                     "play_id": p.play.id if p.kind == "entry" else None}],
+                         cancelled=[], msg=msg)
+
+    def _unknown_not_sent(self, p: _Pending) -> None:
+        """An order whose send got no answer in time that the broker shows neither working nor filled: it never went
+        out (or went and was refused, with nothing filled). An entry bought nothing for certain - its play is marked
+        ERROR and Autopilot's slot handed back; the trade's exit may go out again."""
+        reason = ("the broker didn't answer the order in time, and shows it neither working nor filled - taken as not "
+                  "sent")
+        if p.kind == "entry":
+            self._note(p.play, PlayStatus.ERROR, {"status": "NOT_SENT", "reason": reason,
+                                                  "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")})
+            self._entry_unfilled(p.play.id)
+        msg = f"{p.play.symbol} {p.kind} order: {reason}" + (" - the exit goes out again" if p.kind == "exit" else "")
+        log.warning("ORDER NOT FILLED  %s", msg)
+        self.bus.publish("order.failed", kind=p.kind, order_id="", status="NOT_SENT", symbol=p.play.symbol,
+                         trade_id=p.trade_id, play_id=p.play.id if p.kind == "entry" else None, filled_qty=0.0,
+                         reason=reason, msg=msg)
 
     def expire_entries(self, now: Optional[dt.datetime] = None, mono: Optional[float] = None) -> List[str]:
         """Call off the entry orders that shouldn't keep working:
@@ -1060,6 +1246,11 @@ def _pair_leg(play: Play) -> bool:
 
 def _remaining(o: OrderResult) -> float:
     return max(0.0, float(o.submitted_qty or 0.0) - float(o.filled_qty or 0.0))
+
+
+def exit_tag(trade_id: str) -> str:
+    """The tag (IBKR's orderRef) on every exit the app sends for a trade."""
+    return f"exit:{trade_id}"
 
 
 def _exit_side(position_side: str) -> Side:

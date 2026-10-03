@@ -2281,9 +2281,11 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 log.exception("execute_play crashed")
                 self._publish("play.decided", play_id=p.id, decision="error", result={"reason": str(e)})
                 return {"ok": False, "reason": f"execution error: {e}"}
-            if not out.get("ok"):
+            if not out.get("ok") and not out.get("sent_unknown"):
                 p.status = PlayStatus.PROPOSED            # let them try again once the reason clears
                 self.repo.set_play_status(p.id, p.status.value, operator)
+            # (one the broker didn't answer in time may be working: it stays SUBMITTED, as the executor saved it, and
+            # is never offered again - the order syncs look for it at the broker)
             # sent: the executor has saved it SUBMITTED (or the fill FILLED) - and the sync loop may already
             # have saved how it ended, which a write here would overwrite
             self._publish("play.decided", play_id=p.id, decision="approved", result=out, play=self._decorate(p))

@@ -55,7 +55,10 @@ where one belongs, a target for the wrong shares or price, the scale-out just ta
 stood down and placed afresh in a new group, because an order can't change its group (only once the
 broker's orders have been read: never a stop cancelled that can't be replaced). A broker that refuses
 the pair gets a plain stop, and the app works the target itself as before. A move the broker can't
-make until it says what became of the stop (OrderInDoubt) leaves the stop resting where it is.
+make until it says what became of the stop (OrderInDoubt) leaves the stop resting where it is. A stop,
+target or move the broker doesn't answer in time is no refusal either: the order may rest all the same,
+so it is looked for among the broker's orders by its tag before another is placed, and taken over if
+it is there.
 """
 
 from __future__ import annotations
@@ -67,7 +70,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..brokers.base import DONE_STATUSES, BrokerError, OrderInDoubt
+from ..brokers.base import OUTCOME_UNKNOWN, DONE_STATUSES, BrokerError, OrderInDoubt, OrderNotSent
 from ..core.enums import OrderType, Side, TimeInForce
 from ..core.models import OrderRequest, OrderResult
 from .exit_manager import scale_out_plan
@@ -172,6 +175,9 @@ class ProtectiveStops:
         self._bare_since: Dict[str, float] = {}      # when each position was first seen with no stop at the broker
         self._bare_warned: Dict[str, float] = {}
         self._plain: set = set()          # trades whose one-cancels-all pair the broker refused: a stop alone
+        #: trades whose target got no answer in time (OrderOutcomeUnknown) -> the group it was sent in: looked for at
+        #: the broker before the pair is placed afresh (_adopt_unknown_target)
+        self._targets_unknown: Dict[str, str] = {}
         self._group_seq = getattr(self, "_group_seq", 0)
         self._swept_at = 0.0
         self._cancels_sent: Dict[str, float] = {}   # order id -> when a stand-down first asked the broker to cancel it
@@ -369,6 +375,8 @@ class ProtectiveStops:
                     unreadable = working is None
                 if unreadable:
                     continue
+                if self._adopt_unknown_target(t, working):
+                    continue                             # the target that got no answer rests after all: followed
                 self._target_retry[tid] = now + self.TARGET_RETRY_S     # one try per while, whatever comes of it
                 placed = self._rebuild(t, working) or placed             # (it holds the trade's orders itself)
                 continue
@@ -516,6 +524,15 @@ class ProtectiveStops:
                            oca_type=OCA_REDUCE if group else 0)
         try:
             res = self.broker.place_order(req)
+        except (OrderNotSent,) + OUTCOME_UNKNOWN as e:
+            # no refusal: it never went out, or may rest at the broker all the same - the next try, in a few seconds,
+            # first looks for it among the broker's orders by its tag and takes it over (_follow_left), never doubles it
+            self._audit("PLACE", req, {"error": str(e), "outcome": "not sent" if isinstance(e, OrderNotSent)
+                                       else "unknown"}, ok=False, trade_id=tid, msg=str(e))
+            self._stop_retry[tid] = time.monotonic() + self.SHARES_RETRY_S
+            log.warning("PROTECTIVE STOP  %s: the stop got no answer from the broker in time (%s) - looked for there "
+                        "before another is placed", symbol, e)
+            return
         except BrokerError as e:
             self._audit("PLACE", req, {"error": str(e)}, ok=False, trade_id=tid, msg=str(e))
             self._stop_retry[tid] = time.monotonic() + self.STOP_RETRY_S
@@ -620,6 +637,18 @@ class ProtectiveStops:
                            oca_type=OCA_REDUCE)
         try:
             res = self.broker.place_order(req)
+        except (OrderNotSent,) + OUTCOME_UNKNOWN as e:
+            # no refusal: it never went out, or may rest at the broker in the stop's group - the next pass looks for it
+            # there by its tag before the pair is placed afresh (_adopt_unknown_target)
+            unknown = not isinstance(e, OrderNotSent)
+            self._audit("PLACE", req, {"error": str(e), "outcome": "unknown" if unknown else "not sent"}, ok=False,
+                        trade_id=tid, msg=str(e))
+            if unknown:
+                self._targets_unknown[tid] = group
+            self._target_retry[tid] = time.monotonic() + self.SHARES_RETRY_S
+            log.warning("TARGET AT BROKER  %s: the target got no answer from the broker in time (%s) - looked for "
+                        "there before another is placed", symbol, e)
+            return
         except BrokerError as e:
             self._audit("PLACE", req, {"error": str(e)}, ok=False, trade_id=tid, msg=str(e))
             self._target_retry[tid] = time.monotonic() + self.TARGET_RETRY_S
@@ -630,6 +659,24 @@ class ProtectiveStops:
         log.info("TARGET AT BROKER  %s %s x%s @ %.2f (order %s, one-cancels-all with the stop)", symbol,
                  "sell" if exit_side is Side.SHORT else "buy", qty, price, res.order_id)
         self.bus.publish("target.placed", trade_id=tid, symbol=symbol, qty=qty, limit_price=price, order_id=res.order_id)
+
+    def _adopt_unknown_target(self, t: Dict[str, Any], working: List[OrderResult]) -> bool:
+        """A target whose placing got no answer in time (OrderOutcomeUnknown), found resting at the broker after all -
+        in the group of the stop it went out with, which still rests: followed from here, never doubled by a fresh
+        pair. Looked for once; not found, the pair is placed afresh as for any missing target."""
+        tid = t["id"]
+        group = self._targets_unknown.pop(tid, None)
+        st = self._stops.get(tid)
+        if group is None or st is None or not group or st.group != group or tid in self._targets:
+            return False
+        found = next((o for o in working if o.tag == target_tag(tid) and o.status not in DONE_STATUSES), None)
+        if found is None:
+            return False
+        self._targets[tid] = _Stop(found.order_id, tid, t["symbol"], float(found.submitted_qty or 0.0),
+                                   float(found.limit_price or 0.0), moved_at=time.monotonic(), group=group)
+        log.info("the target for %s that got no answer in time rests at the broker after all (order %s) - followed",
+                 tid, found.order_id)
+        return True
 
     def _rebuild(self, t: Dict[str, Any], working: List[OrderResult]) -> bool:
         """Stand down what rests for a trade and place the pair afresh, in a new group - an order
@@ -663,10 +710,11 @@ class ProtectiveStops:
         modify an order, or refuses the change, has it cancelled; the next pass places a fresh one. One that
         can't change it until it says what became of it (OrderInDoubt: a change it refused a moment after
         seeming to take it, say) leaves it resting where it is - it may well still protect the position - and
-        its full order list, which settles it, is read on this pass: the move goes again after STOP_MOVE_S."""
+        its full order list, which settles it, is read on this pass: the move goes again after STOP_MOVE_S. So does a
+        move the broker didn't answer in time: the stop rests, moved or not, and the next pass reads where."""
         try:
             res = self.broker.modify_stop(st.order_id, stop_price=price, quantity=qty)
-        except OrderInDoubt as e:
+        except (OrderInDoubt, OrderNotSent) + OUTCOME_UNKNOWN as e:
             log.info("the stop for %s isn't moved yet (%s) - it rests where it is meanwhile", st.trade_id, e)
             st.moved_at = time.monotonic()
             self._swept_at = 0.0

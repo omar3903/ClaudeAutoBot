@@ -34,7 +34,8 @@ from ..config import get_settings
 from ..core.enums import OrderType, Side, TimeInForce
 from ..core.models import Account, Fill, OrderRequest, OrderResult, Position, Quote
 from ..util.net import port_is_open
-from .base import DONE_STATUSES, AuthError, BrokerAdapter, BrokerError, OrderInDoubt, OrderRejected
+from .base import (DONE_STATUSES, AuthError, BrokerAdapter, BrokerError, OrderInDoubt, OrderNotSent,
+                   OrderOutcomeUnknown, OrderRejected)
 
 log = logging.getLogger(__name__)
 
@@ -138,18 +139,39 @@ class _IBSession:
             fut.cancel()
             raise
 
-    def call(self, fn: Callable[[Any], Any], timeout: float = 15.0):
-        """``fn(ib)`` is a plain call run on the loop thread."""
+    def call(self, fn: Callable[[Any], Any], timeout: float = 15.0, order_ref: Optional[str] = None):
+        """``fn(ib)`` is a plain call run on the loop thread.
+
+        One not answered within ``timeout`` is abandoned: if the loop hasn't started it yet, it never will. For a
+        call that sends an order (``order_ref``: the order's tag, "" for none) that tells "not sent" from "not
+        known": one called off before it started raises OrderNotSent, one that had started raises
+        OrderOutcomeUnknown - the order may have reached IBKR, and is looked for there before another goes out.
+        Any other call raises the timeout."""
         done: Future = Future()
 
         def _run() -> None:
+            if not done.set_running_or_notify_cancel():
+                return                  # its caller gave up waiting before the loop got to it: never run late
             try:
                 done.set_result(fn(self.ib))
             except Exception as e:  # noqa: BLE001
                 done.set_exception(e)
 
         self._loop.call_soon_threadsafe(_run)
-        return done.result(timeout=timeout)
+        try:
+            return done.result(timeout=timeout)
+        except FutureTimeout:
+            if done.cancel():           # not started: called off, so it never runs
+                if order_ref is None:
+                    raise
+                raise OrderNotSent(f"IBKR's connection didn't get to the order within {timeout:g} s - it was not "
+                                   "sent") from None
+            if done.done():
+                return done.result()    # it finished just as the wait ran out
+            if order_ref is None:
+                raise
+            raise OrderOutcomeUnknown(f"IBKR didn't answer the order within {timeout:g} s - it may have reached "
+                                      "IBKR all the same", order_ref=order_ref) from None
 
     def stop(self) -> None:
         try:
@@ -1210,7 +1232,9 @@ class IbkrBroker(BrokerAdapter):
             order.ocaGroup, order.ocaType = req.oca_group, int(req.oca_type or 3)
         if self.account_id:
             order.account = self.account_id
-        trade = self._session.call(lambda ib: ib.placeOrder(contract, order), timeout=10)
+        # an order IBKR doesn't answer in time may still have reached it: OrderOutcomeUnknown, never "not sent"
+        trade = self._session.call(lambda ib: ib.placeOrder(contract, order), timeout=10,
+                                   order_ref=req.client_tag or "")
         oid = str(getattr(trade.order, "orderId", "") or getattr(trade.order, "permId", ""))
         self._note_perm(oid, trade)                    # IBKR gives the permId a moment later: a read notes it then
         status = getattr(trade.orderStatus, "status", "") or "Submitted"
@@ -1272,7 +1296,7 @@ class IbkrBroker(BrokerAdapter):
 
         quiet = getattr(trade.orderStatus, "status", "") == "PreSubmitted"     # IBKR takes a change to it silently
         wait = min(self.MODIFY_QUIET_S, self.MODIFY_ANSWER_S) if quiet else self.MODIFY_ANSWER_S
-        changed, at = self._session.call(_send, timeout=10)
+        changed, at = self._session.call(_send, timeout=10, order_ref=getattr(order, "orderRef", "") or "")
         if at is not None:
             refused = self._modify_answer(changed, str(order_id), at, wait)
             if refused:
@@ -1329,7 +1353,8 @@ class IbkrBroker(BrokerAdapter):
         if not int(getattr(trade.order, "orderId", 0) or 0):
             # rebuilt from IBKR's list of finished orders: a cancel would go out for order 0
             raise OrderRejected(f"IBKR: order {order_id} is finished - nothing to cancel")
-        self._session.call(lambda ib: ib.cancelOrder(trade.order), timeout=8)
+        self._session.call(lambda ib: ib.cancelOrder(trade.order), timeout=8,
+                           order_ref=getattr(trade.order, "orderRef", "") or "")
 
     def get_order(self, order_id: str) -> OrderResult:
         if not self.is_connected:

@@ -544,6 +544,13 @@ The app is built to be left running:
   IBKR hasn't answered within 10 s is called off and counts as *unknown* - no stop is placed beside
   one that may be resting, an exit still goes out capped by the shares held, and the orders an earlier
   run left working are taken over by the next order sync that can list them.
+* **An order IBKR doesn't answer in time is never taken as not sent.** One the Gateway's connection
+  hadn't got to when the wait ran out is called off unsent. One it had started may have reached IBKR, so
+  the next order syncs look for it there by its tag: it is followed if it is working, booked if IBKR's
+  executions show it filled, and taken as never sent only once IBKR shows it neither, half a minute on.
+  Nothing goes out in its place meanwhile: an entry's play stays sent and Autopilot keeps its slot
+  (handed back if the order never went out), a position's exit waits, and a stop or target found resting
+  is taken over rather than placed twice.
 * **A restart picks the day up where it left off.** The plays on the board, the setups already traded
   or dismissed this session, the pre-market levels the gap check read and the time of the last wide
   scan are saved as the day goes (`data/day_state.bin`: after a scan at most every two minutes, at once
@@ -1015,7 +1022,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | minimum strategy confidence, swing trades | 0.5 | `min_swing_confidence` (the swing setups state flat 0.55–0.58 confidences; the replay's proof is their real gate) |
 | minimum reward : risk | 2.0 | `min_reward_risk` (Aziz Rule 5) |
 | concurrent open auto positions | 2 | `max_auto_positions` - divided between day and swing trades by the day / swing split of the trading capital; Autopilot counts the positions it opened before a restart too |
-| auto trades per session | 3 | `max_auto_trades_per_day` - an entry that ends with nothing bought (timed out, cancelled, refused) hands its slot back, once; one the broker lost keeps it, as it may have filled. The setup itself isn't offered again that day. No more than twice this many entry orders go out in a day, whatever happened to them (the play's bar turns amber and says so; the Autopilot button's tooltip shows the orders sent) |
+| auto trades per session | 3 | `max_auto_trades_per_day` - an entry that ends with nothing bought (timed out, cancelled, refused) hands its slot back, once; one the broker lost keeps it, as it may have filled, and so does one IBKR didn't answer in time until IBKR shows it never went out. The setup itself isn't offered again that day. No more than twice this many entry orders go out in a day, whatever happened to them (the play's bar turns amber and says so; the Autopilot button's tooltip shows the orders sent) |
 | aggregate open auto $-risk | 4 % of equity | `max_open_risk_pct` |
 | concurrent auto trades from **one** strategy | 2 | `max_per_strategy` |
 | new auto entries **per scan cycle** | 1 | `max_new_per_cycle` - a cycle is a scan of the market (5 minutes for swing trades, the 60-second fast cycle for day trades), not the 15-second re-check of the board |

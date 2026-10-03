@@ -268,7 +268,10 @@ function handle(topic, p) {
       // the whole row, which says who sent it and when - an open detail panel follows it (plays.js followSelected)
       if (p.play) mergePlay(p.play);
       else if (p.decision === "rejected") mergePlay({ id: p.play_id, status: "REJECTED" });     // dismissed in another tab
-      if (p.decision === "approved" && p.result && !p.result.ok) toast("Order not sent: " + (p.result.reason || "rejected"), "bad");
+      if (p.decision === "approved" && p.result && !p.result.ok) {
+        if (p.result.sent_unknown) toast("⚠ Order not confirmed: " + (p.result.reason || "no answer from the broker in time"), "warn");
+        else toast("Order not sent: " + (p.result.reason || "rejected"), "bad");
+      }
       break;
 
     case "capital.updated":

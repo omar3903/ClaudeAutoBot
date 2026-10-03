@@ -305,7 +305,7 @@ class FakeSession:
             raise TypeError("A coroutine object is required")
         return asyncio.new_event_loop().run_until_complete(coro)
 
-    def call(self, fn, timeout=15.0):
+    def call(self, fn, timeout=15.0, order_ref=None):
         return fn(self.ib)
 
     def stop(self):
@@ -1273,6 +1273,73 @@ def test_a_request_that_outlasts_its_wait_is_cancelled_on_the_loop():
         assert cancelled.wait(timeout=5)
     finally:
         session.stop()
+
+
+def _hold_the_loop(session, seconds):
+    """Keep the session's loop busy for a while (the Gateway's connection swamped, say) - set once it has begun."""
+    busy = threading.Event()
+
+    def hold():
+        busy.set()
+        time.sleep(seconds)
+
+    session._loop.call_soon_threadsafe(hold)
+    assert busy.wait(timeout=5)
+
+
+def test_a_call_the_loop_never_got_to_is_called_off_and_an_order_call_says_it_was_not_sent():
+    session = ThreadedSession()
+    session.start()
+    ran = []
+    try:
+        _hold_the_loop(session, 0.4)
+        with pytest.raises(FutureTimeout):                       # any other call: the timeout, as before
+            session.call(lambda ib: ran.append("read"), timeout=0.05)
+        with pytest.raises(mod.OrderNotSent, match="not sent"):
+            session.call(lambda ib: ran.append("order"), timeout=0.05, order_ref="play_1")
+        assert session.call(lambda ib: "free again", timeout=5) == "free again"
+        assert ran == []                                          # neither ran once the loop got to them
+    finally:
+        session.stop()
+
+
+def test_an_order_call_that_started_but_got_no_answer_in_time_is_outcome_unknown_with_its_tag():
+    from autotradebot.brokers.base import OUTCOME_UNKNOWN, OrderOutcomeUnknown
+
+    session = ThreadedSession()
+    session.start()
+    try:
+        with pytest.raises(OrderOutcomeUnknown) as caught:
+            session.call(lambda ib: time.sleep(0.3), timeout=0.05, order_ref="exit:t1")
+        assert caught.value.order_ref == "exit:t1" and isinstance(caught.value, BrokerError)
+        assert isinstance(caught.value, OUTCOME_UNKNOWN)
+        with pytest.raises(FutureTimeout):                       # a read that started: still the plain timeout
+            session.call(lambda ib: time.sleep(0.3), timeout=0.05)
+    finally:
+        session.stop()
+
+
+def test_an_order_ibkr_doesnt_answer_in_time_is_never_reported_as_not_sent(threaded):
+    from autotradebot.brokers.base import OrderOutcomeUnknown
+
+    session, real = threaded._session, threaded._session.call
+    session.call = lambda fn, timeout=15.0, order_ref=None: real(fn, timeout=min(timeout, 0.05), order_ref=order_ref)
+    ib, place = session.ib, session.ib.placeOrder
+    ib.placeOrder = lambda contract, order: (time.sleep(0.3), place(contract, order))[1]
+    req = OrderRequest(symbol="AAA", side=Side.LONG, quantity=5, order_type=OrderType.LIMIT, limit_price=10.0,
+                       client_tag="play_1")
+    with pytest.raises(OrderOutcomeUnknown) as caught:            # it started: it may well be at IBKR
+        threaded.place_order(req)
+    assert caught.value.order_ref == "play_1"
+    _wait_for(lambda: len(ib.placed) == 3)                        # (it reached IBKR, as it happens)
+
+    ib.placeOrder = place
+    _hold_the_loop(session, 0.4)
+    with pytest.raises(mod.OrderNotSent):                         # never started: certainly not sent...
+        threaded.place_order(OrderRequest(symbol="BBB", side=Side.LONG, quantity=5, order_type=OrderType.LIMIT,
+                                          limit_price=10.0, client_tag="play_2"))
+    session.call = real
+    assert real(lambda ib: len(ib.placed), timeout=5) == 3        # ...and never sent late
 
 
 # --------------------------------------------------------------------------- #

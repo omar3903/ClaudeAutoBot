@@ -1742,6 +1742,27 @@ def test_the_streams_go_to_the_positions_first_then_the_plays_still_on_offer(eng
     assert engine._resync_streams() == [] and gateway.streams == []
 
 
+def test_an_approval_the_broker_didnt_answer_in_time_stays_sent_and_is_never_sent_again(engine, monkeypatch):
+    from autotradebot.core.enums import PlayStatus
+
+    p = _play("T06")
+    engine.board.replace([p])
+    monkeypatch.setattr(engine, "assess_play",
+                        lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
+    monkeypatch.setattr(engine, "_chase_check", lambda p, plan, seen: None)
+
+    def unanswered(play, account, **kw):                                    # as the executor answers it
+        engine.executor._note(play, PlayStatus.SUBMITTED)
+        return {"ok": False, "sent_unknown": True, "reason": "IBKR didn't answer the order in time"}
+
+    monkeypatch.setattr(engine.executor, "execute_play", unanswered)
+    out = engine.approve_play(p.id)
+    assert not out["ok"] and out["sent_unknown"]
+    assert p.status is PlayStatus.SUBMITTED and engine.repo.get_play(p.id)["status"] == "SUBMITTED"   # not offered again
+    again = engine.approve_play(p.id)
+    assert not again["ok"] and again["already_executed"]
+
+
 def test_new_plays_and_an_approval_wake_the_stream_loop_and_stopping_ends_it(engine, monkeypatch):
     engine._stream_wake.clear()
     engine._publish_plays()

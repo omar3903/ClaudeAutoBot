@@ -144,6 +144,43 @@ def test_a_venue_that_cannot_modify_has_the_stop_replaced():
     assert [s.stop_price for s in broker.stops()] == [98.0, 100.35]
 
 
+def test_a_stop_the_broker_didnt_answer_in_time_is_no_refusal_and_is_taken_over_never_doubled():
+    from autotradebot.brokers.base import OrderOutcomeUnknown
+
+    broker, repo, ex, heard = _setup()
+    place = broker.place_order
+
+    def unanswered(req):                                                       # it reaches the broker; the answer doesn't
+        place(req)
+        raise OrderOutcomeUnknown("IBKR didn't answer the order within 10 s", order_ref=req.client_tag)
+
+    broker.place_order = unanswered
+    ex.sync_open_orders()
+    assert len(broker.stops()) == 1 and ex.protective_stops() == [] and "stop.failed" not in [t for t, _ in heard]
+    broker.place_order = place
+    ex.sync_open_orders()                                                      # a few seconds' wait first
+    assert len(broker.stops()) == 1
+    ex._stop_retry.clear()
+    ex.sync_open_orders()
+    assert len(broker.stops()) == 1 and ex.protective_stops()[0]["order_id"] == "1"   # taken over, not placed again
+
+
+def test_a_stop_move_the_broker_didnt_answer_in_time_leaves_the_stop_resting_never_replaced():
+    from autotradebot.brokers.base import OrderOutcomeUnknown
+
+    broker, repo, ex, _ = _setup()
+    ex.STOP_MOVE_S = 0.0
+    ex.sync_open_orders()
+
+    def unanswered(order_id, stop_price=None, quantity=None):
+        raise OrderOutcomeUnknown("IBKR didn't answer the order within 10 s", order_ref="stop:t1")
+
+    broker.modify_stop = unanswered
+    repo.update_trade_risk("t1", stop_price=100.35)
+    ex.sync_open_orders()
+    assert broker.cancelled == [] and len(broker.stops()) == 1 and ex.protective_stops()[0]["order_id"] == "1"
+
+
 def test_the_stop_stands_down_before_the_apps_own_exit_goes_out():
     broker, _, ex, _ = _setup()
     ex.sync_open_orders()

@@ -773,7 +773,9 @@ class AutoPilot:
                 self._auto_play_ids.add(p.id)
                 self._persist()
                 raise
-            if out.get("ok"):
+            # an entry the broker didn't answer in time (sent_unknown) may be working: counted like one sent, its slot
+            # kept - the order syncs look for it, and hand the slot back if it never went out (entry_unfilled)
+            if out.get("ok") or out.get("sent_unknown"):
                 self._sent_today += 1
                 taken += 1
                 self._entries_at.append(time.monotonic())
