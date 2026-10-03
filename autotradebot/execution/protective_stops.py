@@ -287,6 +287,11 @@ class ProtectiveStops:
                 return None
         return filled
 
+    def resting_order_ids(self, trade_id: str) -> set:
+        """The broker's ids of the stop and target this run follows for a trade - one done whose fill waits to be saved
+        too. The order sync books what each filled when it finishes, so nothing else may book its executions."""
+        return {o.order_id for o in (self._stops.get(trade_id), self._targets.get(trade_id)) if o is not None}
+
     # ------------------------------------------------------------------ #
     #  Each sync pass                                                    #
     # ------------------------------------------------------------------ #

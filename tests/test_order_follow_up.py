@@ -398,6 +398,53 @@ def test_a_partial_exit_reduces_the_record_when_it_fills():
     assert (t["stop_price"], t["target_price"]) == (100.05, 120.0) and not ex.pending_exit_trade_ids()
 
 
+def test_an_exit_that_filled_in_part_and_died_books_that_part_and_the_next_exit_sells_the_rest():
+    heard = []
+    broker, repo = _Broker({"AAA": 10}), _Repo([_trade()])                 # 10 shares entered at 100
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    assert ex.close_trade("t1", reason="stop", decision_price=97.9)["ok"]
+    broker.reports["1"] = OrderResult(order_id="1", status="CANCELED", symbol="AAA", submitted_qty=10, filled_qty=4,
+                                      avg_fill_price=97.5, commission=0.4, message="cancelled by the exchange")
+    ex.sync_open_orders()
+    t = repo.get_trade("t1")                                               # the part it sold, at its own price
+    assert (t["status"], t["quantity"], t["banked_pl"]) == ("OPEN", 6, pytest.approx(4 * -2.5))
+    assert ("t1", "EXIT", "1", 0.4) in repo.paid and not ex.pending_exit_trade_ids()
+    [failed] = [p for topic, p in heard if topic == "order.failed"]
+    assert failed["filled_qty"] == 4 and "after 4 of 10 shares filled" in failed["msg"]
+
+    broker.positions["AAA"] = 6
+    assert ex.close_trade("t1", reason="stop")["ok"] and broker.orders[-1].quantity == 6   # the try again: the rest
+    broker.reports["2"] = OrderResult(order_id="2", status="FILLED", symbol="AAA", submitted_qty=6, filled_qty=6,
+                                      avg_fill_price=97.0)
+    ex.sync_open_orders()
+    assert (repo.get_trade("t1")["status"], repo.get_trade("t1")["exit_price"]) == ("CLOSED", 97.0)
+
+
+def test_a_scale_out_that_filled_in_part_and_died_gives_the_rest_its_new_stop_and_target():
+    repo = _Repo([_trade(quantity=10, initial_quantity=10, target2_price=120.0)])
+    broker = _Broker(positions={"AAA": 10})
+    ex = _executor(broker, repo)
+    ex.close_trade("t1", reason="target-1", qty=4, after_fill={"stop_price": 100.05, "target_price": 120.0})
+    broker.reports["1"] = OrderResult(order_id="1", status="EXPIRED", symbol="AAA", submitted_qty=4, filled_qty=1,
+                                      avg_fill_price=110.0)
+    ex.sync_open_orders()
+    t = repo.get_trade("t1")
+    assert (t["quantity"], t["banked_pl"], t["stop_price"], t["target_price"]) == (9, 10.0, 100.05, 120.0)
+
+
+def test_an_exit_capped_by_the_shares_held_books_only_what_it_sells_and_leaves_the_rest_on_the_record(caplog):
+    broker, repo = _Broker({"AAA": 4}), _Repo([_trade()])                 # the record says 10: 6 went unbooked
+    ex = _executor(broker, repo)
+    with caplog.at_level(logging.WARNING, logger="autotradebot.execution.executor"):
+        assert ex.close_trade("t1", reason="stop")["ok"]
+    assert broker.orders[-1].quantity == 4 and "only 4 of the 10 shares on record" in caplog.text
+    broker.reports["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=4, filled_qty=4,
+                                      avg_fill_price=97.0)
+    ex.sync_open_orders()
+    t = repo.get_trade("t1")                                               # never the whole record at that price
+    assert (t["status"], t["quantity"], t["banked_pl"]) == ("OPEN", 6, pytest.approx(4 * -3.0))
+
+
 def test_how_long_each_order_took_to_fill_is_kept(repo):
     """Entry and exit both: from the order going out to the fill coming back. A stop or target
     resting at the broker has none - it waits for the price, not for the broker."""
@@ -907,6 +954,20 @@ def test_an_exit_the_broker_didnt_answer_that_filled_is_booked_from_its_own_exec
     assert ex.pending_exit_trade_ids() == set() and len(broker.orders) == 1
 
 
+def test_an_exit_the_broker_didnt_answer_that_filled_in_part_is_booked_for_that_part():
+    import datetime as dt
+
+    broker, repo = _Unanswered({"AAA": 10}, lands=""), _Repo([_trade()])
+    ex = _executor(broker, repo)
+    assert ex.close_trade("t1", reason="stop")["sent_unknown"]
+    broker.fills.append(Fill(order_id="1", symbol="AAA", side=Side.SHORT, quantity=3, price=97.0,
+                             ts=dt.datetime.now(dt.timezone.utc), commission=0.3, tag="exit:t1"))
+    ex.sync_open_orders()
+    t = repo.get_trade("t1")                                               # 3 of the 10 sold, then it ended
+    assert (t["status"], t["quantity"], t["banked_pl"]) == ("OPEN", 7, pytest.approx(3 * -3.0))
+    assert ("t1", "EXIT", "1", 0.3) in repo.paid and ex.pending_exit_trade_ids() == set()
+
+
 def test_an_exit_the_broker_shows_neither_working_nor_filled_goes_out_again_once_looked_for(monkeypatch):
     from autotradebot.execution import executor as executor_module
 
@@ -961,6 +1022,22 @@ def test_an_exit_fill_whose_booking_fails_is_booked_on_the_next_sync_and_no_seco
     assert ex.pending_exit_trade_ids() == set() and len(calls) == 2 and len(broker.orders) == 1
     topics = [topic for topic, _ in heard]
     assert topics.count("order.unbooked") == 1 and topics.count("trade.closed") == 1
+
+
+def test_the_part_of_a_dead_exit_whose_booking_fails_is_booked_once_on_the_next_sync():
+    heard = []
+    broker, repo = _Broker({"AAA": 10}), _Repo([_trade()])
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    calls = _refuses_once(repo, "reduce_trade")
+    assert ex.close_trade("t1", reason="stop")["ok"]
+    broker.reports["1"] = OrderResult(order_id="1", status="CANCELED", symbol="AAA", submitted_qty=10, filled_qty=4,
+                                      avg_fill_price=97.5)
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["quantity"] == 10 and ex.pending_exit_trade_ids() == {"t1"}   # still followed
+    assert not ex.close_trade("t1", reason="stop")["ok"] and len(broker.orders) == 1        # no second exit meanwhile
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["quantity"] == 6 and len(calls) == 2 and ex.pending_exit_trade_ids() == set()
+    assert [topic for topic, _ in heard].count("order.failed") == 1                       # said once, once booked
 
 
 def test_an_entry_fill_whose_booking_fails_keeps_counting_as_working_and_is_booked_once_on_the_next_sync():

@@ -361,6 +361,13 @@ class Executor(ProtectiveStops):
                 sent.append(p)
         return sent
 
+    @property
+    def lock(self) -> "threading.RLock":
+        """The executor's lock, for a caller elsewhere that books a fill the order sync may be booking this moment (the
+        engine's position check, from the broker's executions): while it holds it, no order is followed or booked here,
+        so what it reads of the records and the orders followed stays true until its booking is done."""
+        return self._lock
+
     def pending_exit_trade_ids(self) -> set:
         """Trades whose close order is still working at the broker - or may be: one whose send got no answer in time
         is looked for there before anything else goes out for the trade."""
@@ -741,7 +748,9 @@ class Executor(ProtectiveStops):
         to confirm, its orders reloading after a connect) comes back ``wait``: not a failed exit, one to try
         again in seconds. So does one the broker didn't answer in time (``sent_unknown`` too): it may be working,
         or have filled, and no other exit goes out for the trade until the order syncs have looked for it at the
-        broker by its tag (_look_for_unknown).
+        broker by its tag (_look_for_unknown). An exit never sells more than the account holds, less what other exits
+        are selling: capped below the record that way, it books only what it sells, and the shares the record holds
+        beyond the account are left to the position check (the engine's _settle_short / _settle_gone).
 
         One exit per trade at a time: a close for a trade whose exit another thread is sending this moment comes
         back at once, ``wait`` too - that one's outcome settles it, and one queued behind it would only find its exit
@@ -884,6 +893,14 @@ class Executor(ProtectiveStops):
             if qty <= 0:
                 return {"ok": False, "reason": f"Exit orders already working cover all {abs(held):,.0f} "
                                                f"{t['symbol']} shares held - no exit sent."}
+            if not partial and qty < wanted - 1e-9:
+                # fewer shares to sell than the record holds - some went without the record hearing (a stop that filled
+                # while the app was off, say), or another exit is selling them: the exit books what it sells, never the
+                # whole record at its price, and the rest is the position check's to book from the broker's fills
+                partial = True
+                log.warning("EXIT SHORT OF THE RECORD  %s %s: only %s of the %s shares on record can be sold at %s - "
+                            "those are booked off it when they fill, and the position check books the rest",
+                            t["symbol"], trade_id, f"{qty:,.0f}", f"{wanted:,.0f}", venue_label(held_on))
         req = build_exit_order(t["symbol"], t["side"], qty,
                                limit_price=limit_price, cfg=self.cfg, tag=exit_tag(trade_id))
         sent_at = dt.datetime.now(dt.timezone.utc)
@@ -1420,8 +1437,11 @@ class Executor(ProtectiveStops):
 
     def _on_unfilled(self, p: _Pending, res) -> None:
         """The broker finished an order without filling all of it - rejected,
-        cancelled, expired - or no longer knows it. What did fill is booked and the
-        reason is published; the exit manager sends an exit again."""
+        cancelled, expired - or no longer knows it. What did fill is booked - an entry's
+        shares get their record, an exit's part comes off its record at its own price -
+        and the reason is published; the exit manager sends an exit again, for what the
+        record then holds. A booking the database refuses raises BookingFailed before
+        anything is published: the order stays followed, and all of it happens on the next pass."""
         filled = float(res.filled_qty or 0.0)
         reason = p.expired or res.message or "no reason given"
         if p.kind == "entry" and res.status == "UNKNOWN" and p.filled_seen > filled and not _pair_leg(p.play):
@@ -1440,6 +1460,20 @@ class Executor(ProtectiveStops):
                 # (UNKNOWN) may have filled while the app wasn't looking, so it keeps its slot
                 if res.status in ("CANCELED", "EXPIRED", "REJECTED") and not res.fills:
                     self._entry_unfilled(p.play.id)
+        elif filled > 0:
+            # an exit that sold part of what it was sent for before it died: that part is out of the account, and
+            # comes off the record now - left on it, the next exit would close the whole record at its own price.
+            # (A scale-out's part gets the stop and target the rest was to have, as a resting target's part does)
+            px = (res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0)
+                  or (self._executed(p, res.order_id) or (0.0, 0.0))[1])
+            if px:
+                self._book_exit(res.symbol or p.play.symbol, p.trade_id, float(px), filled, p.reason or "order", True,
+                                p.after_fill if p.partial else None, p.decision_price, submitted_at=p.submitted_at,
+                                commission=order_fees(res), order_id=res.order_id)
+            else:
+                log.warning("the %s shares the %s exit order %s sold before it ended have no price on the broker's "
+                            "report or in its executions - they are left to the position check",
+                            f"{filled:,.0f}", p.play.symbol, res.order_id)
         if res.status == "REJECTED":
             self._cancel_quietly(res.order_id, "rejected - an inactive order must stay dead", p)
         what = "is no longer known to the broker" if res.status == "UNKNOWN" else f"was {res.status.lower()}"

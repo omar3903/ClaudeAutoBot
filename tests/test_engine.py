@@ -1130,6 +1130,75 @@ def test_an_exit_called_off_after_filling_in_part_is_booked_from_its_tagged_fill
     assert engine.repo.get_trade(tid)["quantity"] == 6                      # booked once: the counts agree now
 
 
+@pytest.mark.parametrize("order_id", ["g1", ""])                            # the part booked with its order's id, or not
+def test_a_position_closed_outside_is_booked_at_its_own_fills_past_the_parts_already_booked(engine, order_id):
+    tid = _open(engine, "AAA", qty=10)                                      # entered at 100
+    engine.repo.reduce_trade(tid, 4, 110.0, exit_reason="target-1", broker_order_id=order_id)   # its target part
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="g1", symbol="AAA", side=Side.SHORT, quantity=4, price=110.0, ts=now, tag=f"tgt:{tid}"),
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=6, price=95.0, ts=now + dt.timedelta(seconds=1),
+             commission=0.6, tag=f"stop:{tid}"),
+        Fill(order_id="x9", symbol="AAA", side=Side.SHORT, quantity=3, price=80.0, ts=now + dt.timedelta(seconds=2),
+             tag="exit:trd_other"),                                         # another trade's exit
+        Fill(order_id="tws", symbol="AAA", side=Side.SHORT, quantity=5, price=90.0, ts=now + dt.timedelta(seconds=3))]
+    engine._reconcile_open_trades()
+    [settled] = engine._reconcile_open_trades()
+    t = engine.repo.get_trade(tid)                                          # the 6 it held, at the stop's own fill
+    assert (t["status"], t["exit_reason"], t["exit_price"], settled["fills"]) == ("CLOSED", "closed-outside", 95.0, 1)
+    assert t["realized_pl"] == pytest.approx(4 * 10.0 + 6 * -5.0 - 0.6)
+    exits = [f for f in engine.repo.trade_record(tid)["fills"] if f["leg"] == "EXIT"]
+    assert [(f["quantity"], f["broker_order_id"], f["commission"]) for f in exits][-1] == (6, "s1", 0.6)
+
+
+def test_a_record_over_the_account_books_its_own_stop_that_filled_unseen_never_past_what_it_is_over_by(engine):
+    tid = _open(engine, "AAA", qty=10)                                      # entered at 100, stop 95
+    engine.repo.reduce_trade(tid, 2, 110.0, exit_reason="target-1", broker_order_id="g1")   # booked when it filled
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAA", quantity=3, avg_price=100.0, market_price=96.0)]
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="g1", symbol="AAA", side=Side.SHORT, quantity=2, price=110.0, ts=now, tag=f"tgt:{tid}"),
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=6, price=95.0, ts=now + dt.timedelta(seconds=1),
+             commission=0.6, tag=f"stop:{tid}"),
+        Fill(order_id="e1", symbol="AAA", side=Side.SHORT, quantity=4, price=90.0, ts=now + dt.timedelta(seconds=2),
+             tag=f"exit:{tid}")]
+    booked = engine._settle_short(engine.repo.open_trades(), {"AAA": 3.0})
+    assert [(b["qty"], b["price"], b["reason"]) for b in booked] == [(5, 95.0, "stop")]   # over by 5, oldest first
+    t = engine.repo.get_trade(tid)
+    assert (t["status"], t["quantity"]) == ("OPEN", 3) and "took 5 off at 95.00 (stop)" in t["notes"]
+    assert t["banked_pl"] == pytest.approx(2 * 10.0 + 5 * -5.0 - 0.5)       # its own share of the stop's fee
+    engine._short_checked.clear()
+    assert engine._settle_short(engine.repo.open_trades(), {"AAA": 3.0}) == []   # booked once: the counts agree
+
+
+def test_a_record_over_the_account_books_its_target_that_filled_unseen_as_the_first_target(engine):
+    tid = _open(engine, "AAA", qty=10)
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="g1", symbol="AAA", side=Side.SHORT, quantity=4, price=110.0, ts=now, tag=f"tgt:{tid}")]
+    [b] = engine._settle_short(engine.repo.open_trades(), {"AAA": 6.0})
+    t = engine.repo.get_trade(tid)
+    assert (b["reason"], t["quantity"], t["banked_pl"]) == ("target-1", 6, pytest.approx(40.0))
+
+
+def test_a_stop_or_target_the_order_sync_follows_is_left_to_it_and_its_fills_are_no_room_for_others(engine):
+    from autotradebot.execution.protective_stops import _Stop
+
+    tid = _open(engine, "AAA", qty=10)
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=6, price=95.0, ts=now, tag=f"stop:{tid}"),
+        Fill(order_id="e1", symbol="AAA", side=Side.SHORT, quantity=4, price=90.0, ts=now + dt.timedelta(seconds=1),
+             tag=f"exit:{tid}")]
+    engine.executor._stops[tid] = _Stop("s1", tid, "AAA", 10, 95.0)         # still working: it books its fills itself
+    assert engine._settle_short(engine.repo.open_trades(), {"AAA": 4.0}) == []
+    assert engine.repo.get_trade(tid)["quantity"] == 10
+
+
 def test_a_record_over_the_broker_for_a_reason_its_own_fills_dont_explain_is_left_alone(engine):
     import datetime as dt
 

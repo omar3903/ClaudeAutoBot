@@ -1469,8 +1469,10 @@ def build() -> str:
          "it); the ids that can come back persist as counted_today; at most twice the cap in orders a day"),
         ("execution/exit_manager.py", "stop_locked(), intraday_time_stop", "a day trade past its setup's window whose "
          "stop isn't at break-even is closed (time-stop); the replay's _step does the same"),
-        ("engine/engine.py", "_settle_short()", "a record over the broker's count because an app exit filled in part "
-         "before it was called off: booked from the fills tagged exit:<trade>, capped at the difference"),
+        ("engine/engine.py", "_settle_short()", "a record over the broker's count because one of its own orders sold "
+         "shares it never booked (an exit called off part-filled; its stop or target filling while the app wasn't "
+         "following it): booked from the fills tagged exit:/stop:/tgt:<trade>, each order at its own price and "
+         "reason, past what the record booked, capped at the difference"),
         ("execution/protective_stops.py", "_watch_unprotected(), unprotected()", "a position with no stop at the broker "
          "for 90 s is reported with the reason, and again every 5 minutes; it places nothing"),
         ("engine/engine.py", "_replay_after_full_scan()", "the morning full scan finishing starts the day's replay "

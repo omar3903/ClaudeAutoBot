@@ -674,14 +674,17 @@ never written into it.
 An open-trade record whose position no longer exists where it was opened —
 closed in the broker's own app, or by an exit that filled while the app was down
 — is **closed from the broker's fills**: the exit-side fills of the stock since
-the entry give the exit price and time, so the trade's outcome reaches the
-history, the journal and the strategy records (exit reason `closed-outside`).
-When the broker reports no such fill (IBKR keeps only the current session's) the
-record is **deleted** instead, as after **Reset paper** — but only once the broker
-has answered: when its fills can't be read (the connection dropped, no answer in
-time) the record is kept and looked at again on a later check, never deleted for
-a fill the app couldn't see. A wrong deletion would orphan a real position, so
-the check is strict: it only acts on a connected
+the entry (its own orders' and ones placed outside the app, never another
+trade's), oldest first, give the exit price and time of the shares it still
+holds, so the trade's outcome reaches the history, the journal and the strategy
+records (exit reason `closed-outside`). Fills the record has booked already — a
+part taken off earlier, known by its order id — are skipped, and only those
+fills' fees come off. When the broker reports no such fill (IBKR keeps only the
+current session's) the record is **deleted** instead, as after **Reset paper** —
+but only once the broker has answered: when its fills can't be read (the
+connection dropped, no answer in time) the record is kept and looked at again on
+a later check, never deleted for a fill the app couldn't see. A wrong deletion
+would orphan a real position, so the check is strict: it only acts on a connected
 broker's fresh account snapshot, after the connection has been up a minute, for
 trades older than 90 s whose close isn't in flight, and after two misses in a
 row. Closed trades are never deleted, and the broker order audit log is always
@@ -1035,12 +1038,19 @@ so, with the reason, and again every five minutes until it's fixed.
 
 **An exit called off after filling in part is booked.** Quitting and then pressing *Stop quitting*, or
 cancelling an exit, can call off an exit order that has already sold part of the position. The app books
-that part when the broker reports the cancelled order - unless it stops first. So the position check also
-books it from the broker's executions: when a record holds more shares than the broker, the same way round,
-the fills tagged with that trade's own exit orders (`exit:<trade>`) are booked at their prices - never more
-than the record is over by, never while an exit for it is still working, only for a symbol with one record.
-The counts then agree, and the stop and target go back at the broker for what's left. A difference its own
-fills don't explain (shares sold by hand in TWS) is left alone and reported, as before.
+that part off the record at its own price when the broker reports the order ended (rejected, cancelled,
+expired, or found in the executions after an order the broker didn't answer in time), and the next exit
+sells what the record then holds - unless it stops first. An exit capped by the shares the account holds
+(fewer than the record: some went without the record hearing) books only what it sells, never the whole
+record at its price. So the position check also books from the broker's executions: when a record holds
+more shares than the broker, the same way round, the fills of that trade's own orders - its exits
+(`exit:<trade>`), and its stop (`stop:<trade>`) or target (`tgt:<trade>`) that filled while the app wasn't
+following them (a restart) - are booked oldest first, each order at its own price and with its own reason
+(`exit`, `stop` / `trailing-stop`, `target-1`), past the shares the record has booked already and never
+more than it is over by. Never while an exit for it is still working, never from a stop or target the app
+follows (it books those when they finish), only for a symbol with one record. The counts then agree, and
+the stop and target go back at the broker for what's left. A difference its own fills don't explain
+(shares sold by hand in TWS) is left alone and reported, as before.
 
 **A share count that disagrees can be fixed from its warning.** Each yellow share-count warning has a
 **Fix…** button. It reads the account again and shows what the record and the account hold, the broker's

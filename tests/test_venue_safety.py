@@ -85,6 +85,11 @@ class _ClosingRepo(_Repo):
         self.t[tid].update(status="CLOSED", exit_price=exit_price, exit_reason=exit_reason)
         return dict(self.t[tid])
 
+    def reduce_trade(self, tid, exit_qty, exit_price, exit_reason="", commission=0.0, stop_price=None,
+                     target_price=None, broker_order_id=""):
+        self.t[tid]["quantity"] -= exit_qty
+        return dict(self.t[tid])
+
 
 class _HoldingBroker(_Broker):
     name = "paper"
@@ -112,8 +117,11 @@ def test_no_exit_is_sent_for_shares_the_broker_does_not_hold():
 
 def test_an_exit_never_sells_more_than_the_broker_holds():
     broker = _HoldingBroker({"AAA": 4})          # 6 of the 10 were sold elsewhere
-    r = _executor(broker).close_trade("t1")
+    ex = _executor(broker)
+    r = ex.close_trade("t1")
     assert r["ok"] and [o.quantity for o in broker.orders] == [4]
+    t = ex.repo.get_trade("t1")                  # only what it sold comes off: the rest is the position check's
+    assert (t["status"], t["quantity"]) == ("OPEN", 6)
 
 
 def test_the_exit_still_goes_out_when_the_broker_cant_say():
