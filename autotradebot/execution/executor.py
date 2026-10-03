@@ -335,11 +335,13 @@ class Executor(ProtectiveStops):
     def working_entries(self) -> List[Dict[str, Any]]:
         """Entry orders sent but not filled yet - one whose send got no answer in time too (no order id yet), and one
         that filled whose booking the database refused so far (``unbooked``: its shares are at the broker, with no
-        record yet). Anything that limits positions has to count these too, or a slow fill gets doubled up."""
+        record yet). Anything that limits positions has to count these too, or a slow fill gets doubled up.
+        ``pair_leg``: one leg of a pair trade, whose stop - and so its ``risk`` - is a placeholder."""
         return [{"order_id": p.order_id, "play_id": p.play.id, "symbol": p.play.symbol,
                  "strategy": p.play.strategy, "timeframe": p.play.timeframe.value,
                  "qty": p.qty, "notional": p.play.entry * p.qty,
-                 "risk": abs(p.play.entry - p.play.stop) * p.qty, "unbooked": self._entry_unbooked(p)}
+                 "risk": abs(p.play.entry - p.play.stop) * p.qty, "unbooked": self._entry_unbooked(p),
+                 "pair_leg": _pair_leg(p.play)}
                 for p in self._sent() if p.kind == "entry"]
 
     def symbols_in_flight(self, unbooked: bool = True) -> set:

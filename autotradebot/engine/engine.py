@@ -614,6 +614,23 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def gross_exposure(self) -> float:
         return sum(self.exposure_by_symbol().values())
 
+    def open_risk_usd(self) -> float:
+        """The risk already at work on the account orders go to, in US dollars - what risk.max_open_risk_pct caps,
+        so sizing (size_play's open_risk_used) gives a new trade only what's left under that ceiling. An open trade
+        risks the distance from its entry to the stop it was opened with, times its shares - a stop moved since
+        doesn't hand its risk back; an entry order still working risks what it was sized for. Pair legs are left
+        out: their stops are placeholders, the desk closes the legs together. A trade's prices are dollars and so
+        is the account sizing sees (Account: US stocks are sized in dollars), so nothing needs converting."""
+        total = 0.0
+        for t in self._positions_here():
+            if t.get("pair_id"):
+                continue
+            entry = float(t.get("entry_price") or 0.0)
+            stop = float(t.get("initial_stop_price") or t.get("stop_price") or 0.0)
+            if entry and stop:
+                total += abs(entry - stop) * abs(float(t.get("quantity") or 0.0))
+        return total + sum(float(w.get("risk") or 0.0) for w in self.working_entries() if not w.get("pair_leg"))
+
     def active_orders(self, max_age_s: Optional[float] = None) -> Dict[str, Any]:
         """The orders still working at the broker orders go to, and what each is for (see
         Executor.active_orders). The broker is asked again when the last answer is older
@@ -2259,8 +2276,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if acc is None:
             return {"ok": False, "reason": "no account data"}
         cfg = self.settings.config
-        # sized against the trading capital; the PDT rule and the floor see the real account
-        sizing = size_play(p, self.sizing_account(p.timeframe) or acc, cfg.risk,
+        # sized against the trading capital, less the risk already at work; the PDT rule and the floor see the
+        # real account
+        sized_on, open_risk = self.sizing_account(p.timeframe) or acc, self.open_risk_usd()
+        sizing = size_play(p, sized_on, cfg.risk, open_risk_used=open_risk,
                            symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0),
                            risk_pct=self._play_risk_pct(p), risk_why=self.strategy_risk_why(p.strategy),
                            size_factor=self.size_factor)
@@ -2290,6 +2309,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                            "allowed in one stock" if "max exposure per stock" in sizing.caps_hit
                            else self._too_thin_reason(p, cfg.risk) if liquidity_cap(p, cfg.risk) == 0
                            else self._no_room_reason(p) if "trading capital" in sizing.caps_hit
+                           else self._open_risk_full_reason(open_risk, sized_on.equity, cfg.risk)
+                           if "portfolio open-risk ceiling" in sizing.caps_hit
+                           and "risk budget too small for one share" in sizing.caps_hit
                            else "position size rounds to zero for this risk budget")
         if p.reward_risk < cfg.risk.min_reward_risk and p.kind.value != "FUNDAMENTAL":
             reasons.append(f"reward:risk {p.reward_risk:.1f} below minimum")
@@ -2379,6 +2401,15 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         return (f"{p.symbol} is too thin to trade: it usually trades {float(p.evidence['adv_shares']):,.0f} "
                 f"shares a day, and the liquidity cap of {float(risk.max_adv_pct):g}% of that "
                 "(risk.max_adv_pct) is less than one share")
+
+    @staticmethod
+    def _open_risk_full_reason(open_risk: float, equity: float, risk) -> str:
+        """Why a play sized to nothing under the open-risk ceiling: the trades and entries already at work risk
+        (nearly) all it allows."""
+        pct = float(risk.max_open_risk_pct)
+        return (f"the open trades and working entries already risk ${open_risk:,.0f} of the "
+                f"${equity * pct / 100.0:,.0f} the open-risk ceiling allows ({pct:g}% of the trading capital, "
+                "risk.max_open_risk_pct) - too little is left for one share")
 
     def _no_room_reason(self, p: Play) -> str:
         """Why a play sized to nothing under the trading capital: its kind's share is full, or all of it is."""

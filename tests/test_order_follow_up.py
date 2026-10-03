@@ -547,6 +547,8 @@ def test_a_part_filled_entry_that_stalls_has_the_rest_cancelled_so_its_shares_ar
     ex = _executor(broker, repo)
     swing = _entry(ex, timeframe=Timeframe.SWING)                           # a swing entry too: no time-out of its own
     leg = _entry(ex, "BBB", tags=["pair-leg"])                             # the pairs desk works its own legs
+    # a leg's stop is a placeholder, so its risk is left out of the open risk (TradingEngine.open_risk_usd)
+    assert [(w["symbol"], w["pair_leg"]) for w in ex.working_entries()] == [("AAA", False), ("BBB", True)]
     for oid, sym in (("1", "AAA"), ("2", "BBB")):
         broker.reports[oid] = OrderResult(order_id=oid, status="WORKING", symbol=sym, submitted_qty=10,
                                           filled_qty=4, avg_fill_price=100.01)

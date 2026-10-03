@@ -101,7 +101,8 @@ class AccountCfg(_Model):
 
 class RiskCfg(_Model):
     max_risk_per_trade_pct: float = 1.0
-    max_open_risk_pct: float = 4.0
+    max_open_risk_pct: float = 4.0             # all the risk at work: each open trade from its entry to the stop it
+                                               # opened with, plus entries working; a new trade gets what's left
     max_position_pct_of_equity: float = 12.0   # one trade's notional (or the dashboard's "Max % per position")
     max_symbol_pct_of_equity: float = 15.0     # everything in one stock: shares held + entries working + this trade
     max_adv_pct: float = 1.0                   # one order's shares, as % of the stock's median daily volume over its

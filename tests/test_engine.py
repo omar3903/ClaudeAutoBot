@@ -1415,6 +1415,58 @@ def test_an_order_is_capped_at_a_slice_of_the_stocks_usual_volume_and_a_too_thin
     assert "risk budget too small for one share" not in pre["order_preview"]["caps"]   # the cap did it, not the budget
 
 
+# ---------------------------------------------------------------- the risk already open
+def _wide_play(symbol, stop=80.0, timeframe=Timeframe.SWING):
+    return Play(symbol=symbol, side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=timeframe, entry=100.0, stop=stop, targets=[140.0])
+
+
+def _hold(engine, play, qty, venue="paper"):
+    engine.repo.record_play(play)
+    return engine.repo.open_trade(play, 100.0, qty, venue)
+
+
+def test_the_open_risk_counts_this_venues_trades_at_their_opening_stop_and_the_entries_still_working(
+        engine, monkeypatch):
+    moved = _hold(engine, _wide_play("AAA", stop=95.0), 10)                    # $50 at risk when it opened
+    engine.repo.update_trade_risk(moved, stop_price=100.0)                     # trailed to break-even since
+    _hold(engine, _wide_play("BBB", stop=90.0), 4)                             # $40
+    _hold(engine, _wide_play("CCC", stop=90.0), 50, venue="ibkr-paper")        # parked on another venue
+    leg = _wide_play("DDD", stop=50.0)
+    leg.pair_id = "pair1"                                                      # a pair leg: no stop of its own
+    _hold(engine, leg, 30)
+    monkeypatch.setattr(engine, "working_entries", lambda: [
+        {"symbol": "EEE", "timeframe": "INTRADAY", "qty": 5, "notional": 500.0, "risk": 15.0, "pair_leg": False},
+        {"symbol": "FFF", "timeframe": "SWING", "qty": 9, "notional": 900.0, "risk": 450.0, "pair_leg": True}])
+    assert engine.open_risk_usd() == pytest.approx(50.0 + 40.0 + 15.0)
+
+
+def test_a_new_play_is_sized_down_then_refused_as_the_open_risk_nears_its_ceiling(engine, monkeypatch):
+    engine._refresh_account()
+    risk = engine.settings.config.risk
+    for name, value in (("max_risk_per_trade_pct", 1.0), ("max_open_risk_pct", 4.0),
+                        ("max_position_pct_of_equity", 12.0)):
+        monkeypatch.setattr(risk, name, value)
+    monkeypatch.setattr(engine, "_play_risk_pct", lambda p: None)              # the configured 1%, not practice size
+    assert engine.set_capital(20_000)["ok"]                                    # $200 a trade, $800 open at most
+    play = _wide_play("AAA")                                                   # $20 a share at risk
+    engine.board.replace([play], None)
+    assert engine.assess_play(play.id)["order_preview"]["qty"] == 10           # nothing open: the risk budget decides
+
+    _hold(engine, _wide_play("BBB", stop=50.0), 15)                            # $750 at risk: $50 left
+    pre = engine.assess_play(play.id)
+    assert pre["order_preview"]["qty"] == 2 and pre["order_preview"]["est_risk"] == 40.0
+    assert "portfolio open-risk ceiling" in pre["order_preview"]["caps"]
+    engine._size_plays([play])
+    assert play.suggested_qty == 2                                             # the board's suggested size too
+
+    monkeypatch.setattr(engine, "working_entries", lambda: [                   # an entry sent a moment ago: $10 left
+        {"symbol": "CCC", "timeframe": "SWING", "qty": 2, "notional": 200.0, "risk": 40.0, "pair_leg": False}])
+    pre = engine.assess_play(play.id)
+    assert not pre["can_execute"] and pre["order_preview"]["qty"] == 0
+    assert any(r.startswith("the open trades and working entries already risk $790 of the $800") for r in pre["reasons"])
+
+
 def test_trading_capital_is_split_between_day_trades_and_swing_trades(engine):
     engine._refresh_account()
     risk = engine.settings.config.risk

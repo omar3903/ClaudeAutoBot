@@ -789,6 +789,11 @@ Either way:
   measured against the **account's value** (or the set amount), never against
   margin: margin only lets more positions be open at once. New positions only use
   what's left of the trading capital after the bot's open positions.
+- The open-risk ceiling (`risk.max_open_risk_pct`, 4%) counts the risk already at
+  work on the account: each open trade from its entry to the stop it opened with,
+  times its shares, plus the entries still working (pair legs aside). A new
+  position is sized with only what's left under it - and is refused when that
+  isn't enough for one share.
 - Two sliders over the plays tune position size for you and Autopilot alike:
   the **Position Size factor** (0-5, every new position's risk times this) and
   **Max % per position** (1-100, the most one position may hold, as a share of

@@ -22,7 +22,8 @@ account:
 
 risk:
   max_risk_per_trade_pct: 1.0          # % of equity risked between entry and stop
-  max_open_risk_pct: 4.0               # sum of open-trade risk not allowed to exceed this
+  max_open_risk_pct: 4.0               # all the risk at work: each open trade from its entry to the stop it
+                                       # opened with, plus entries working; a new trade gets what's left
   max_position_pct_of_equity: 12.0     # notional cap per trade (the dashboard's "Max % per position" replaces it once moved)
   max_symbol_pct_of_equity: 15.0       # cap per stock: shares already held + entries working + the new trade
   max_adv_pct: 1.0                     # one order's shares, as % of the stock's median daily volume over its
