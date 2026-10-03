@@ -150,10 +150,11 @@ def test_orders_held_for_the_gateway_go_to_it_once_it_answers(engine, port, gate
 
 
 def test_live_stays_on_the_live_account_while_its_gateway_is_down_and_reconnects_by_itself(
-        engine, tmp_path, gateway, port):
+        engine, tmp_path, gateway, port, monkeypatch):
     import json
 
     engine.stop()
+    _allow_live(engine, monkeypatch)                                      # config.yaml allows Live
     (tmp_path / "runtime.json").write_text(json.dumps({"mode": "live", "paper_platform": "simulator"}))
     live = _started_again(tmp_path, gateway, port)                        # the app restarts with the Gateway down
     try:
