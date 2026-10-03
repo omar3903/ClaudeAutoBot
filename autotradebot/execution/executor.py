@@ -40,6 +40,11 @@ longer in flight though (``symbols_in_flight(unbooked=False)``): its order is do
 explains see them. Closing them as shares without a record (close_untracked) takes the entry off the books, so no
 record appears later for shares already sold; a quit's cancels leave it followed.
 
+Each fill is booked with the fees the broker has reported for it (OrderResult.commission, or its fills') and the id of
+the order that filled. IBKR's commission report comes a moment after each execution, so the order sync adds what it
+reports later to the day's fills booked before it had all come in (:meth:`Executor._top_up_fees`): a closed trade's
+P/L and R are after every fee.
+
 The order audit (``order_audit``, :meth:`Executor._audit`) records what happened to each order: every order placed,
 with the broker's order id, status and message (PLACE); every cancel the app asks for, and why (CANCEL); every move of
 a stop resting at the broker (MODIFY, protective_stops.py); and every error the broker sends about one of the app's
@@ -66,7 +71,8 @@ from ..core.eventbus import BUS
 from ..core.models import Account, OrderRequest, OrderResult, Play
 from ..util import clock
 from .order_builder import build_entry_order, build_exit_order, plan_order
-from .protective_stops import TAG as STOP_TAG, TARGET_TAG, BookingFailed, ProtectiveStops, shares_and_price
+from .protective_stops import (TAG as STOP_TAG, TARGET_TAG, BookingFailed, ProtectiveStops, fees_of, order_fees,
+                               shares_and_price)
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +125,12 @@ class Executor(ProtectiveStops):
     #: computer's differ a little. (An exit's tag is shared by every exit its trade has had: the earlier ones' fills,
     #: booked before this one went out, are left out by their time)
     CLOCK_SLACK_S = 2.0
+    #: seconds between looks in IBKR's executions for the fees of the day's fills booked before all of them were
+    #: reported (its commission report comes a moment after each execution)
+    FEES_CHECK_S = 60.0
+    #: seconds after its booking that a fill's fee is settled: every report is in by then, and the fill is looked up
+    #: no more (an account charged nothing has none to send)
+    FEES_WAIT_S = 900.0
 
     def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS,
                  venue: Optional[str] = None) -> None:
@@ -171,6 +183,9 @@ class Executor(ProtectiveStops):
         #: looked for in the broker's executions (_book_entries_filled_while_off)
         self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
         self._entries_retry_at = 0.0
+        #: when (monotonic) the day's fills are next looked up in the broker's executions for fees reported after their
+        #: booking, and the fills (row ids) whose fees are settled - looked up FEES_WAIT_S after it (_top_up_fees)
+        self._fees_due_at, self._fees_settled = 0.0, set()
         self._init_stops()
 
     def rebind(self, broker: BrokerAdapter, venue: Optional[str] = None) -> None:
@@ -189,6 +204,7 @@ class Executor(ProtectiveStops):
             self._open_by_symbol.clear()
             self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
             self._entries_retry_at = 0.0
+            self._fees_due_at = 0.0     # the new venue's fills are looked up on the next pass
             self._init_stops()          # the other venue's stops stay where they are; found again by their tags
 
     def cancel_pending_entries(self) -> int:
@@ -563,12 +579,12 @@ class Executor(ProtectiveStops):
                     and f.symbol == row["symbol"]]
             qty, price = shares_and_price(mine)
             if qty > 1e-9:
-                found.append((row, side, qty, price, str(mine[-1].order_id)))
+                found.append((row, side, qty, price, str(mine[-1].order_id), fees_of(mine)))
         self._entries_due = False
         booked: List[str] = []
-        for row, side, qty, price, order_id in found:
+        for row, side, qty, price, order_id, fee in found:
             try:
-                tid = self._book_entry_filled_while_off(row, side, qty, price, order_id)
+                tid = self._book_entry_filled_while_off(row, side, qty, price, order_id, fee)
             except BookingFailed:
                 tid = None                              # (said as it failed) looked for again shortly
             except Exception:  # noqa: BLE001 - the database busy, say: this one is looked for again, the rest go on
@@ -585,9 +601,10 @@ class Executor(ProtectiveStops):
         return booked
 
     def _book_entry_filled_while_off(self, row: Dict[str, Any], side: Side, qty: float, price: float,
-                                     order_id: str) -> Optional[str]:
-        """Book one entry found filled while the app was off. Returns its trade id, "" when the account holds none
-        of its shares beyond the records (nothing booked), None when the account couldn't be read."""
+                                     order_id: str, commission: float = 0.0) -> Optional[str]:
+        """Book one entry found filled while the app was off (``commission``: what its executions paid). Returns its
+        trade id, "" when the account holds none of its shares beyond the records (nothing booked), None when the
+        account couldn't be read."""
         # never more than the account holds beyond the records: shares sold by hand meanwhile get no record,
         # and the record that is booked matches the account, so its stop can go on
         held = self._held_quantity(row["symbol"])
@@ -601,7 +618,7 @@ class Executor(ProtectiveStops):
             log.warning("an entry for %s (play %s) filled while the app was off, but the account holds none of "
                         "its shares beyond the records - not booked", row["symbol"], row["id"])
             return ""
-        tid = self._open_trade(_play_from_row(row), price, take, order_id)
+        tid = self._open_trade(_play_from_row(row), price, take, order_id, commission=commission * take / qty)
         log.warning("ENTRY FILLED WHILE THE APP WAS OFF  %s %s x%s @ %.4f (play %s) - booked from the broker's "
                     "executions", row["symbol"], side.value, take, price, row["id"])
         return tid
@@ -671,7 +688,8 @@ class Executor(ProtectiveStops):
                 fill_price = res.avg_fill_price or (res.fills[-1].price if res.fills else play.entry)
                 try:
                     tid = self._open_trade(play, fill_price, res.filled_qty or qty, res.order_id, ot, osess,
-                                           context=context, submitted_at=submitted_at, decision=decision)
+                                           context=context, submitted_at=submitted_at, decision=decision,
+                                           commission=order_fees(res))
                 except BookingFailed:
                     pass        # followed below instead: the next order sync reads the fill and books it then
                 else:
@@ -904,7 +922,8 @@ class Executor(ProtectiveStops):
             px = res.avg_fill_price or (res.fills[-1].price if res.fills else limit_price)
             try:
                 out, closed = self._book_exit(t["symbol"], trade_id, float(px), res.filled_qty or qty, reason,
-                                              partial, after_fill, decision_price, submitted_at=sent_at)
+                                              partial, after_fill, decision_price, submitted_at=sent_at,
+                                              commission=order_fees(res), order_id=res.order_id)
             except BookingFailed:
                 pass            # followed below instead: the next order sync reads the fill and books it then
             else:
@@ -922,20 +941,24 @@ class Executor(ProtectiveStops):
 
     def _book_exit(self, symbol: str, trade_id: str, price: float, qty: float, reason: str,
                    partial: bool = False, after_fill: Optional[Dict[str, float]] = None,
-                   decision_price: Optional[float] = None, submitted_at: Optional[dt.datetime] = None):
+                   decision_price: Optional[float] = None, submitted_at: Optional[dt.datetime] = None,
+                   commission: float = 0.0, order_id: str = ""):
         """Book an exit fill: the whole position closes the record, part of it (the scale-out)
-        reduces it. Returns (the record, whether it is now closed). Raises BookingFailed when the
-        database refuses it - the caller keeps the order followed, and books it again on the next pass."""
+        reduces it. ``commission``: the fees the broker has reported for it so far; ``order_id``: the order
+        that filled, which a fee reported later is put down to (_top_up_fees). Returns (the record, whether
+        it is now closed). Raises BookingFailed when the database refuses it - the caller keeps the order
+        followed, and books it again on the next pass."""
         key = f"exit:{trade_id}"
+        paid = {"commission": float(commission or 0.0), "broker_order_id": str(order_id or "")}
         try:
             if partial:
                 out = self.repo.reduce_trade(trade_id, float(qty), float(price), exit_reason=reason,
-                                             **(after_fill or {}))
+                                             **(after_fill or {}), **paid)
             else:
                 seen = {"decision_price": float(decision_price)} if decision_price else {}
                 if submitted_at is not None:
                     seen["submitted_at"] = submitted_at          # an exit the app sent: how long it took to fill
-                out = self.repo.close_trade(trade_id, float(price), exit_reason=reason, **seen)
+                out = self.repo.close_trade(trade_id, float(price), exit_reason=reason, **seen, **paid)
         except Exception as e:  # noqa: BLE001 - the database busy, say
             raise self._booking_failed(key, symbol, "exit", e) from e
         self._booked(key, symbol, "exit")
@@ -1107,6 +1130,12 @@ class Executor(ProtectiveStops):
         # 6) what the broker has said went wrong with the app's orders since the last pass, into the order audit
         self._audit_order_errors()
 
+        # 7) the fees IBKR reported after the fills were booked, onto their records
+        try:
+            self._top_up_fees()
+        except Exception:  # noqa: BLE001
+            log.exception("adding the fees the broker reported to the day's fills failed")
+
     def _look_for_unknown(self) -> List[str]:
         """Look for the orders whose send got no answer in time (OrderOutcomeUnknown) at the broker, by their tag. One
         working is followed from here like any other (one called off meanwhile - a quit, the pairs desk - is cancelled
@@ -1153,7 +1182,7 @@ class Executor(ProtectiveStops):
             p.order_id = str(mine[-1].order_id)
             done = got >= p.qty - 1e-9
             res = OrderResult(order_id=p.order_id, status="FILLED" if done else "CANCELED", symbol=p.play.symbol,
-                              submitted_qty=p.qty, filled_qty=got, avg_fill_price=price,
+                              submitted_qty=p.qty, filled_qty=got, avg_fill_price=price, commission=fees_of(mine),
                               message="" if done else "it ended with only part of it filled")
             if p.kind == "entry":
                 self._booking[id(p)] = p        # listed while it is booked, like a fill heard live (_on_order_update)
@@ -1344,28 +1373,33 @@ class Executor(ProtectiveStops):
         - it may have filled while the app wasn't following it (the connection was down when it finished, say).
         All of it reads as filled, part of it as the order ended with that part filled. None when the executions
         couldn't be read: the entry isn't given up on that."""
-        executed = self._executed(p, res.order_id)
-        if executed is None:
+        mine = self._executions_of(p, res.order_id)
+        if mine is None:
             return None
-        got, price = executed
+        got, price = shares_and_price(mine)
         if got <= float(res.filled_qty or 0.0) + 1e-9:
             return res
         log.warning("ENTRY FOUND IN THE EXECUTIONS  %s order %s is no longer known to the broker, but its executions "
                     "show %s of %s shares bought @ %.4f - booked", p.play.symbol, res.order_id, got, p.qty, price)
-        return replace(res, symbol=p.play.symbol, filled_qty=got, avg_fill_price=price,
+        return replace(res, symbol=p.play.symbol, filled_qty=got, avg_fill_price=price, commission=fees_of(mine),
                        status="FILLED" if got >= p.qty - 1e-9 else res.status)
 
     def _executed(self, p: _Pending, order_id: str) -> Optional[Tuple[float, float]]:
         """The shares, and their average price, the broker's executions show for order ``order_id`` - and, for an
         entry, for any order tagged with its play's id (an entry's tag; an exit's is shared by every exit its trade
         has had). (0, 0) when they show none; None when they can't be read."""
+        mine = self._executions_of(p, order_id)
+        return None if mine is None else shares_and_price(mine)
+
+    def _executions_of(self, p: _Pending, order_id: str) -> Optional[List[Any]]:
+        """The broker's executions _executed adds up; None when they can't be read."""
         fills = self._executions(p.play.symbol)
         if fills is None:
             return None
         side = p.play.side if p.kind == "entry" else _exit_side(p.play.side.value)
         tag = p.play.id if p.kind == "entry" else ""
-        return shares_and_price([f for f in fills if f.side is side
-                                 and (str(f.order_id) == str(order_id) or (tag and getattr(f, "tag", "") == tag))])
+        return [f for f in fills if f.side is side
+                and (str(f.order_id) == str(order_id) or (tag and getattr(f, "tag", "") == tag))]
 
     def _on_filled(self, p: _Pending, res) -> None:
         px = res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0)
@@ -1377,10 +1411,12 @@ class Executor(ProtectiveStops):
             # an adopted entry's clock restarted at the restart (for its time-out) - it isn't when it went out
             self._open_trade(p.play, px, res.filled_qty or p.qty, res.order_id,
                              p.order_type, p.order_session, context=p.context,
-                             submitted_at=None if p.adopted else p.submitted_at, decision=p.decision)
+                             submitted_at=None if p.adopted else p.submitted_at, decision=p.decision,
+                             commission=order_fees(res))
         else:
             self._book_exit(res.symbol, p.trade_id, float(px), res.filled_qty or p.qty, p.reason or "order",
-                            p.partial, p.after_fill, p.decision_price, submitted_at=p.submitted_at)
+                            p.partial, p.after_fill, p.decision_price, submitted_at=p.submitted_at,
+                            commission=order_fees(res), order_id=res.order_id)
 
     def _on_unfilled(self, p: _Pending, res) -> None:
         """The broker finished an order without filling all of it - rejected,
@@ -1394,7 +1430,8 @@ class Executor(ProtectiveStops):
             if filled > 0:
                 px = res.avg_fill_price or (res.fills[-1].price if res.fills else (p.avg_seen or p.play.entry))
                 self._open_trade(p.play, px, filled, res.order_id, p.order_type, p.order_session,
-                                 context=p.context, submitted_at=p.submitted_at, decision=p.decision)
+                                 context=p.context, submitted_at=p.submitted_at, decision=p.decision,
+                                 commission=order_fees(res))
             else:
                 self._note(p.play, PlayStatus.CANCELED if res.status in ("CANCELED", "EXPIRED") else PlayStatus.ERROR,
                            {"status": res.status, "reason": reason,
@@ -1501,6 +1538,55 @@ class Executor(ProtectiveStops):
                         ts=at if isinstance(at, dt.datetime) else None)
         return len(errors)
 
+    def _top_up_fees(self, now: Optional[float] = None) -> List[str]:
+        """Put the fees IBKR reports on the day's fills booked before it had reported all of them: its commission
+        report for each execution comes a moment after it, so a fill is mostly booked with no fee, or part of it. What
+        each fill's order has paid by now, by the broker's executions - shared by shares among the fills booked from
+        that order - beyond what the fill was booked with goes on the record (add_fill_fees: the fill, the trade's
+        fees, and a closed trade's P/L, % and R). Every FEES_CHECK_S on an IBKR venue, while the day has fills not yet
+        settled: a fill is settled at the first look FEES_WAIT_S or more after its booking (every report is in by then;
+        an account charged nothing has none to send). A read that failed is tried again on the next look. Under the
+        executor's lock (the order sync), so nothing is booked meanwhile. Returns the trades whose fees changed."""
+        now = time.monotonic() if now is None else now
+        if (not str(self.venue).startswith("ibkr") or getattr(self.broker, "is_connected", True) is False
+                or now < self._fees_due_at):
+            return []
+        find, add = getattr(self.repo, "fills_on", None), getattr(self.repo, "add_fill_fees", None)
+        if not (callable(find) and callable(add)):
+            return []
+        self._fees_due_at = now + self.FEES_CHECK_S
+        rows = [r for r in find(self.venue, clock.now_ny().date()) if r["fill_id"] not in self._fees_settled]
+        if not rows:
+            return []
+        executions = self._executions(None)
+        if executions is None:
+            return []
+        reported: Dict[Tuple[str, str], List[Any]] = {}
+        for f in executions:
+            reported.setdefault((str(f.order_id), f.symbol), []).append(f)
+        booked: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for r in rows:
+            booked.setdefault((str(r["order_id"]), r["symbol"]), []).append(r)
+        settled = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - dt.timedelta(seconds=self.FEES_WAIT_S)
+        fees: Dict[int, float] = {}
+        for key, fills in booked.items():
+            mine = reported.get(key, [])
+            if mine:
+                # what the order has paid, by the shares each fill booked from it holds - never more than all of it.
+                # A fee only grows: an order the executions show in part never takes back what was booked
+                total = fees_of(mine)
+                shares = max(sum(float(f.quantity) for f in mine), sum(r["quantity"] for r in fills))
+                for r in fills:
+                    more = round(total * r["quantity"] / shares - r["commission"], 6)
+                    if more > 1e-6:
+                        fees[r["fill_id"]] = more
+            self._fees_settled.update(r["fill_id"] for r in fills if r["ts"] is not None and r["ts"] < settled)
+        changed = add(fees) if fees else []
+        if changed:
+            log.info("the fees %s reported added to %d fill(s) of %s", venue_label(self.venue), len(fees),
+                     ", ".join(sorted(set(changed))))
+        return changed
+
     def _maybe_close_from_bracket(self, o) -> None:
         sym = o.symbol
         tid = self._open_by_symbol.get(sym)
@@ -1511,7 +1597,8 @@ class Executor(ProtectiveStops):
             reason = "target" if ":TP" in tag else "stop"
             px = o.avg_fill_price or (o.fills[-1].price if o.fills else 0.0)
             if px:
-                out = self.repo.close_trade(tid, float(px), exit_reason=reason)
+                out = self.repo.close_trade(tid, float(px), exit_reason=reason, commission=order_fees(o),
+                                            broker_order_id=str(o.order_id or ""))
                 self._open_by_symbol.pop(sym, None)
                 self.bus.publish("trade.closed", trade=out, reason=reason)
 
@@ -1520,13 +1607,15 @@ class Executor(ProtectiveStops):
                     order_type: str = "LIMIT", order_session: str = "REGULAR",
                     context: Optional[Dict[str, Any]] = None,
                     submitted_at: Optional[dt.datetime] = None,
-                    decision: Optional[Dict[str, Any]] = None) -> str:
-        """Book an entry fill as an open trade. Raises BookingFailed when the database refuses it - the caller
+                    decision: Optional[Dict[str, Any]] = None, commission: float = 0.0) -> str:
+        """Book an entry fill as an open trade (``commission``: the fees the broker has reported for it so far - one
+        reported later is added by _top_up_fees). Raises BookingFailed when the database refuses it - the caller
         keeps the order followed, and books it again on the next pass."""
         seen = {"decision": decision} if decision else {}
         key = f"entry:{play.id}"
         try:
             tid = self.repo.open_trade(play, float(price), float(qty), self.venue, order_id,
+                                       commission=float(commission or 0.0),
                                        order_type=order_type, order_session=order_session,
                                        entry_context=context, submitted_at=submitted_at, **seen)
         except Exception as e:  # noqa: BLE001 - the database busy, say

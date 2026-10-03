@@ -35,6 +35,7 @@ class _Repo:
     def __init__(self, trades):
         self.t = {x["id"]: dict(x) for x in trades}
         self.settled = []                        # (play id, status, outcome) - what became of each sent play
+        self.paid = []                           # (trade id, ENTRY | EXIT, broker order id, commission) per booking
 
     def settle_play(self, play_id, status, outcome=None):
         self.settled.append((play_id, status, outcome))
@@ -49,21 +50,25 @@ class _Repo:
     def update_trade_risk(self, tid, **kw):
         self.t[tid].update({k: v for k, v in kw.items() if v is not None})
 
-    def open_trade(self, play, price, qty, venue, order_id, order_type="LIMIT", order_session="REGULAR",
-                   entry_context=None, submitted_at=None, decision=None):
+    def open_trade(self, play, price, qty, venue, order_id, commission=0.0, order_type="LIMIT",
+                   order_session="REGULAR", entry_context=None, submitted_at=None, decision=None):
         tid = f"t{len(self.t) + 1}"
         self.t[tid] = _trade(id=tid, symbol=play.symbol, entry_price=price, quantity=qty, broker=venue)
         self.t[tid]["entry_context"], self.t[tid]["submitted_at"] = entry_context, submitted_at
         self.t[tid]["decision"] = decision
+        self.paid.append((tid, "ENTRY", order_id, commission))
         return tid
 
-    def close_trade(self, tid, exit_price, exit_reason="", decision_price=None, submitted_at=None):
+    def close_trade(self, tid, exit_price, exit_reason="", decision_price=None, submitted_at=None, commission=0.0,
+                    broker_order_id=""):
         self.t[tid].update(status="CLOSED", exit_price=exit_price, exit_reason=exit_reason,
                            exit_decision_price=decision_price, exit_submitted_at=submitted_at)
+        self.paid.append((tid, "EXIT", broker_order_id, commission))
         return dict(self.t[tid])
 
     def reduce_trade(self, tid, exit_qty, exit_price, exit_reason="", commission=0.0, stop_price=None,
-                     target_price=None):
+                     target_price=None, broker_order_id=""):
+        self.paid.append((tid, "EXIT", broker_order_id, commission))
         t = self.t[tid]
         t["quantity"] -= exit_qty
         t["banked_pl"] = t.get("banked_pl", 0.0) + (exit_price - t["entry_price"]) * exit_qty
@@ -1264,3 +1269,86 @@ def test_every_cancel_the_app_asks_for_is_audited_with_why_and_one_the_broker_re
     # the broker's words are kept, the account number isn't
     assert called_off["message"] == "called off by the pairs desk: account <account>: order 2 can't be cancelled now"
     assert "DU1234567" not in str(repo.audit)
+
+
+# ---------------------------------------------------------------- fees
+def test_an_orders_fees_are_booked_with_its_fill_and_the_order_that_paid_them():
+    broker, repo = _Broker({"AAA": 10}), _Repo([])
+    ex = _executor(broker, repo)
+    _entry(ex)
+    # the entry's fees are on its fills only; the exit's the broker gives for the whole order
+    broker.reports["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                      avg_fill_price=100.0,
+                                      fills=[Fill(order_id="1", symbol="AAA", side=Side.LONG, quantity=6, price=100.0,
+                                                  commission=0.6),
+                                             Fill(order_id="1", symbol="AAA", side=Side.LONG, quantity=4, price=100.0,
+                                                  commission=0.4)])
+    ex.sync_open_orders()
+    [tid] = [t["id"] for t in repo.open_trades()]
+    assert ex.close_trade(tid)["ok"]
+    broker.reports["2"] = OrderResult(order_id="2", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                      avg_fill_price=101.0, commission=1.25)
+    ex.sync_open_orders()
+    assert repo.paid == [(tid, "ENTRY", "1", pytest.approx(1.0)), (tid, "EXIT", "2", 1.25)]
+
+
+class _Reporting(_Broker):
+    """An IBKR account whose executions carry the commission reports in ``reported`` - none yet, to begin with."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.reported, self.asked = [], 0
+
+    def get_fills(self, symbol=None, strict=False):
+        self.asked += 1
+        return list(self.reported)
+
+
+def _booked_round_trip(repo, symbol, entry_id, exit_id, entry_fee=0.0):
+    play = Play(symbol=symbol, side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=100.0, stop=98.0, targets=[104.0])
+    repo.record_play(play)
+    tid = repo.open_trade(play, 100.0, 10, VENUE, entry_id, commission=entry_fee)
+    repo.close_trade(tid, 104.0, exit_reason="target", broker_order_id=exit_id)
+    return tid
+
+
+def test_the_fees_ibkr_reports_after_the_fills_were_booked_are_added_to_the_days_records(repo):
+    tid = _booked_round_trip(repo, "FEE1", "501", "502", entry_fee=0.6)      # the entry's first report only
+    assert repo.get_trade(tid)["realized_pl"] == pytest.approx(39.4)
+    broker = _Reporting()
+    ex = _executor(broker, repo)
+
+    def entry(qty, fee):
+        return Fill(order_id="501", symbol="FEE1", side=Side.LONG, quantity=qty, price=100.0, commission=fee)
+
+    broker.reported = [entry(6, 0.6), entry(4, 0.0),
+                       Fill(order_id="502", symbol="FEE1", side=Side.SHORT, quantity=10, price=104.0)]
+    assert ex._top_up_fees(now=1000.0) == [] and broker.asked == 1           # nothing more reported yet
+    broker.reported = [entry(6, 0.6), entry(4, 0.4),
+                       Fill(order_id="502", symbol="FEE1", side=Side.SHORT, quantity=10, price=104.0, commission=1.0)]
+    assert ex._top_up_fees(now=1030.0) == [] and broker.asked == 1           # looked at again only a minute on
+    assert set(ex._top_up_fees(now=1060.0)) == {tid}
+    t = repo.get_trade(tid)
+    assert (t["fees"], t["realized_pl"], t["r_multiple"]) == (pytest.approx(2.0), pytest.approx(38.0),
+                                                              pytest.approx(1.9))
+    ex._top_up_fees(now=1120.0)
+    assert repo.get_trade(tid)["realized_pl"] == pytest.approx(38.0)        # once
+
+
+def test_a_fills_fee_is_settled_a_while_after_its_booking_and_the_simulator_is_never_asked(repo):
+    from autotradebot.util import clock
+
+    tid = _booked_round_trip(repo, "FEE2", "601", "602")
+    broker = _Reporting()
+    broker.reported = [Fill(order_id="601", symbol="FEE2", side=Side.LONG, quantity=10, price=100.0)]
+    ex = _executor(broker, repo)
+    ex.FEES_WAIT_S = 0.0                                                       # (fifteen minutes on, in the app)
+    assert ex._top_up_fees(now=1000.0) == [] and broker.asked == 1           # an account charged nothing
+    mine = {r["fill_id"] for r in repo.fills_on(VENUE, clock.now_ny().date()) if r["trade_id"] == tid}
+    assert len(mine) == 2 and mine <= ex._fees_settled
+    ex._top_up_fees(now=1060.0)
+    assert broker.asked == 1                                                   # every fill of the day settled
+    simulator = _Reporting()
+    Executor(simulator, repo, cfg=get_settings().config.execution, bus=SILENT, venue="paper")._top_up_fees(now=1000.0)
+    assert simulator.asked == 0

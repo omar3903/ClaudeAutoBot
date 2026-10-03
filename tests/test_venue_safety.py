@@ -80,7 +80,8 @@ from autotradebot.core.models import Account, Position  # noqa: E402
 
 
 class _ClosingRepo(_Repo):
-    def close_trade(self, tid, exit_price, exit_reason="", decision_price=None, submitted_at=None):
+    def close_trade(self, tid, exit_price, exit_reason="", decision_price=None, submitted_at=None, commission=0.0,
+                    broker_order_id=""):
         self.t[tid].update(status="CLOSED", exit_price=exit_price, exit_reason=exit_reason)
         return dict(self.t[tid])
 

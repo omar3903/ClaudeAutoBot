@@ -684,6 +684,17 @@ trades older than 90 s whose close isn't in flight, and after two misses in a
 row. Closed trades are never deleted, and the broker order audit log is always
 kept.
 
+**Fees** are booked with each fill — the entry's, every part taken off and the
+exit's — and a trade's realised P/L, % and R are after all of them (a part taken
+off banks what it made after its own fee). IBKR sends its commission report a
+moment after each execution, so a fill is mostly booked before its fee is known:
+about once a minute the order sync reads IBKR's executions for the day's recent
+fills and adds what IBKR has reported since to the fill, the trade's fees and a
+closed trade's P/L and R. Fifteen minutes after its booking a fill's fee is
+settled and no longer looked up. IBKR keeps only the current day's executions, so
+records booked before fees were recorded stay before commissions; the session
+review says so ("Fees not recorded before …") rather than making numbers up.
+
 The reverse case is shown too: **shares without a record** — held at the broker
 beyond what the open-trade records cover, because they were bought or sold
 outside the app or a fill couldn't be booked — are listed under **Open

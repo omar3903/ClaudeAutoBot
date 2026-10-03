@@ -148,6 +148,17 @@ def shares_and_price(fills: List[Any]) -> Tuple[float, float]:
     return (qty, sum(float(f.price) * float(f.quantity) for f in fills) / qty) if qty > 1e-9 else (0.0, 0.0)
 
 
+def fees_of(fills: List[Any]) -> float:
+    """The fees the executions in ``fills`` paid, as far as the broker has reported them (IBKR's commission report
+    comes a moment after the execution)."""
+    return sum(float(getattr(f, "commission", 0.0) or 0.0) for f in fills)
+
+
+def order_fees(res: Any) -> float:
+    """The fees on what an order filled: the broker's figure for the order, else its fills' own."""
+    return float(getattr(res, "commission", 0.0) or 0.0) or fees_of(getattr(res, "fills", None) or [])
+
+
 def stop_exit_reason(initial_stop: Optional[float], trigger: float) -> str:
     """A stop that filled is booked "stop" if it was still where the trade began, "trailing-stop" once
     it had been moved. The order rests at the initial stop rounded to the tick, so the two are compared
@@ -360,9 +371,9 @@ class ProtectiveStops:
             return None
         tag = stop_tag(o.trade_id) if book is self._stops else target_tag(o.trade_id)
         exit_side = Side.SHORT if t["side"] == "LONG" else Side.LONG
-        qty, price = shares_and_price([f for f in executions
-                                       if str(f.order_id) == str(o.order_id) and f.side is exit_side
-                                       and (getattr(f, "tag", "") or tag) == tag])
+        mine = [f for f in executions
+                if str(f.order_id) == str(o.order_id) and f.side is exit_side and (getattr(f, "tag", "") or tag) == tag]
+        qty, price = shares_and_price(mine)
         if qty <= 1e-9:
             return False
         if book.get(o.trade_id) is o and not self._take_resting(book, o):
@@ -371,7 +382,7 @@ class ProtectiveStops:
                     "show %s shares @ %.4f - booked", "STOP" if book is self._stops else "TARGET", o.symbol,
                     o.order_id, qty, price)
         fill(o, OrderResult(order_id=o.order_id, status="FILLED", symbol=o.symbol, submitted_qty=o.qty,
-                            filled_qty=qty, avg_fill_price=price))
+                            filled_qty=qty, avg_fill_price=price, commission=fees_of(mine)))
         return True
 
     def _executions(self, symbol: Optional[str]) -> Optional[List[Any]]:
@@ -1060,12 +1071,13 @@ class ProtectiveStops:
     # ------------------------------------------------------------------ #
     #  Booking what the broker filled                                    #
     # ------------------------------------------------------------------ #
-    def _book_resting(self, book: Dict[str, _Stop], o: _Stop, *booking: Any) -> None:
-        """Book what a resting order that is done filled (_book_exit with ``booking``). A booking the database refuses
-        puts the order back in its book, marked ``unbooked``, before BookingFailed goes on: the next pass reads it again
-        and books its fill then, and until it has, the trade is left as it is (fill_unbooked)."""
+    def _book_resting(self, book: Dict[str, _Stop], o: _Stop, *booking: Any, **paid: Any) -> None:
+        """Book what a resting order that is done filled (_book_exit with ``booking``, and ``paid``: its fees and order
+        id). A booking the database refuses puts the order back in its book, marked ``unbooked``, before BookingFailed
+        goes on: the next pass reads it again and books its fill then, and until it has, the trade is left as it is
+        (fill_unbooked)."""
         try:
-            self._book_exit(*booking)
+            self._book_exit(*booking, **paid)
         except BookingFailed:
             o.unbooked = True
             book.setdefault(o.trade_id, o)
@@ -1093,7 +1105,8 @@ class ProtectiveStops:
         partial = filled < abs(float(t["quantity"])) - 1e-9
         log.warning("STOP AT BROKER FILLED  %s x%s @ %.4f (%s)", st.symbol, filled, price, reason)
         self._book_resting(self._stops, st, st.symbol, st.trade_id, price, filled, reason, partial,
-                           {} if partial else None, st.price)
+                           {} if partial else None, st.price, commission=order_fees(res),
+                           order_id=res.order_id or st.order_id)
         if not partial:
             target = self._targets.pop(st.trade_id, None)       # the broker cancels it with the stop; make sure
             if target is not None:
@@ -1112,10 +1125,11 @@ class ProtectiveStops:
         partial = filled < abs(float(t["quantity"])) - 1e-9
         log.warning("TARGET AT BROKER FILLED  %s x%s @ %.4f (%s)", tg.symbol, filled, price,
                     "part of the position" if partial else "the whole position")
+        paid = {"commission": order_fees(res), "order_id": res.order_id or tg.order_id}
         if partial:
             plan = scale_out_plan(t, getattr(self, "exit_cfg", None))
             self._book_resting(self._targets, tg, tg.symbol, tg.trade_id, price, filled, "target-1", True,
-                               plan[1] if plan else {}, tg.price)
+                               plan[1] if plan else {}, tg.price, **paid)
             st = self._stops.get(tg.trade_id)
             if st is not None:
                 # the broker's group has already shrunk the stop to what the position has left - some of it maybe
@@ -1123,7 +1137,8 @@ class ProtectiveStops:
                 st.qty = min(st.qty, max(0.0, abs(float(t["quantity"])) - filled))
             self._target_retry.pop(tg.trade_id, None)    # the rest gets its own pair on the next pass
             return
-        self._book_resting(self._targets, tg, tg.symbol, tg.trade_id, price, filled, "target", False, None, tg.price)
+        self._book_resting(self._targets, tg, tg.symbol, tg.trade_id, price, filled, "target", False, None, tg.price,
+                           **paid)
         st = self._stops.pop(tg.trade_id, None)          # the broker cancels it with the target; make sure
         if st is not None:
             self._cancel_quietly(st.order_id, "the target filled", st)
@@ -1157,10 +1172,11 @@ class ProtectiveStops:
             if qty <= 1e-9:
                 continue
             if shares >= qty - 1e-9:
-                price = sum(float(f.price) * float(f.quantity) for f in mine) / shares
+                price, fee = sum(float(f.price) * float(f.quantity) for f in mine) / shares, fees_of(mine)
             else:
                 price = float(o.avg_fill_price or 0.0) or float(o.stop_price or o.limit_price or 0.0)
-            found.append((o, tag, qty, price))
+                fee = order_fees(o)
+            found.append((o, tag, qty, price, fee))
         if not found:
             return False
         held = self._held_quantity(symbol)
@@ -1170,7 +1186,7 @@ class ProtectiveStops:
                        if x["symbol"] == symbol and x["side"] == t["side"]
                        and (x.get("broker") or "paper") == self.venue)
         over = recorded - max(0.0, held if long else -held)       # shares on record that the account no longer holds
-        for o, tag, qty, price in found:
+        for o, tag, qty, price, fee in found:
             fresh = self.repo.get_trade(tid)
             if not fresh or fresh.get("status") == "CLOSED":
                 break
@@ -1187,6 +1203,8 @@ class ProtectiveStops:
                 decision, reason, after = o.limit_price, ("target-1" if partial else "target"), (plan[1] if plan else {})
             log.warning("%s AT BROKER FILLED WHILE THE APP WAS OFF  %s x%s @ %.4f (%s)",
                         "STOP" if tag == stop_tag(tid) else "TARGET", symbol, take, price, reason)
-            self._book_exit(symbol, tid, price, take, reason, partial, after if partial else None, decision)
+            # the order's fees on the shares booked from it
+            self._book_exit(symbol, tid, price, take, reason, partial, after if partial else None, decision,
+                            commission=fee * take / qty, order_id=o.order_id)
             over -= take
         return True

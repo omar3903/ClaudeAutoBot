@@ -731,6 +731,10 @@ def test_each_fill_carries_the_tag_of_the_order_it_filled(broker):
     broker._session.ib.reqExecutionsAsync = executions
     [fill] = broker.get_fills("AAPL")
     assert (fill.tag, fill.quantity, fill.price, fill.side) == ("exit:trd_1", 40.0, 12.5, Side.SHORT)
+    assert fill.commission == 1.0
+    for unset in (1.7976931348623157e308, float("nan"), None):                # IBKR's "unset" number, NaN, none
+        item.commissionReport = SimpleNamespace(commission=unset)
+        assert broker.get_fills("AAPL")[0].commission == 0.0
 
 
 def test_executions_that_cant_be_read_raise_when_asked_strictly_rather_than_read_as_none(broker):
@@ -926,6 +930,23 @@ def test_a_stop_ibkr_had_filled_reads_filled_once_its_shares_arrive(broker):
     orders.status(1, "Filled", filled=10.0, avg=98.4)                          # ...then IBKR's own status
     got = broker.get_order(res.order_id)
     assert (got.status, got.filled_qty, got.avg_fill_price) == ("FILLED", 10.0, 98.4)
+
+
+def test_an_orders_fills_carry_the_commission_ibkr_reported_and_the_order_their_sum(broker):
+    orders = IbOrders(broker._session.ib)
+    res = _resting_stop(broker)
+    orders.fill(1, 6.0, 98.4)
+    orders.fill(1, 4.0, 98.4)
+    first, second = orders.book[1].fills
+    first.commissionReport = SimpleNamespace(commission=0.6)
+    second.commissionReport = SimpleNamespace(commission=1.7976931348623157e308)   # IBKR's "unset" number
+    orders.status(1, "Filled", filled=10.0, avg=98.4)
+    got = broker.get_order(res.order_id)
+    assert [f.commission for f in got.fills] == [0.6, 0.0] and got.commission == pytest.approx(0.6)
+    second.commissionReport = SimpleNamespace(commission=0.4)                  # its report has come
+    assert broker.get_order(res.order_id).commission == pytest.approx(1.0)
+    del first.commissionReport, second.commissionReport                        # none yet: no fee, not an error
+    assert broker.get_order(res.order_id).commission == 0.0
 
 
 def test_a_refusal_naming_no_state_is_no_cancel_but_ibkrs_202_is(broker):

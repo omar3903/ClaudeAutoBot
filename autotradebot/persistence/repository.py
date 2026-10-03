@@ -321,13 +321,14 @@ class Repository:
         self, trade_id: str, exit_price: float, exit_reason: str = "manual",
         commission: float = 0.0, exit_qty: Optional[float] = None,
         exit_time: Optional[dt.datetime] = None, decision_price: Optional[float] = None,
-        submitted_at: Optional[dt.datetime] = None,
+        submitted_at: Optional[dt.datetime] = None, broker_order_id: str = "",
     ) -> Optional[Dict[str, Any]]:
         """``exit_time``: when the position actually closed, for a fill learned after the fact
         (default: now); ``decision_price``: the price that triggered the exit, which the fill is
         measured against; ``submitted_at``: when the app's exit order went out, so the seconds it
         took to fill are kept (a stop or target resting at the broker has none - it waits for the
-        price, not for the broker)."""
+        price, not for the broker); ``broker_order_id``: the order that filled, which a fee the broker
+        reports later is put down to (add_fill_fees)."""
         now = (exit_time.astimezone(dt.timezone.utc).replace(tzinfo=None) if exit_time and exit_time.tzinfo
                else exit_time) or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
@@ -340,7 +341,11 @@ class Repository:
             fees = float(t.fees or 0.0) + commission
             # what the part taken off earlier made joins the final P/L; R and % are on the shares entered with
             banked = float(getattr(t, "banked_pl", 0.0) or 0.0)
-            pl = gross - commission + banked
+            # every fee comes off: the entry's, and this exit's - a part taken off earlier banked what it made after
+            # its own already, so the fees on record less those are the ones still to come off
+            parts_paid = float(s.execute(select(func.coalesce(func.sum(Fill.commission), 0.0))
+                                         .where(Fill.trade_id == trade_id, Fill.leg == "EXIT")).scalar() or 0.0)
+            pl = gross - commission - (float(t.fees or 0.0) - parts_paid) + banked
             basis_qty = float(getattr(t, "initial_quantity", None) or qty) if exit_qty is None else qty
             t.exit_price = exit_price
             t.exit_time = now
@@ -363,30 +368,25 @@ class Repository:
                 t.exit_decision_price = float(decision_price)
                 t.exit_slippage_bps = round((float(decision_price) - exit_price) * sign / float(decision_price) * 1e4, 2)
             t.fees = fees
-            t.realized_pl = pl
-            basis = float(t.entry_price) * basis_qty
-            t.realized_pl_pct = (pl / basis * 100.0) if basis else None
-            # R is measured against the ORIGINAL stop, not a trailed one
-            ref_stop = getattr(t, "initial_stop_price", None) or t.stop_price
-            risk_ps = abs(float(t.entry_price) - float(ref_stop)) if ref_stop else 0.0
-            t.r_multiple = (pl / (risk_ps * basis_qty)) if risk_ps and basis_qty else None
+            _score(t, pl, basis_qty)
             # day-trade if entry and exit fall on the same NY session
             if t.entry_time:
                 t.is_day_trade = clock.session_date(_as_utc(t.entry_time)) == clock.session_date(_as_utc(now))
             t.status = "CLOSED"
-            s.add(Fill(trade_id=trade_id, ts=now, side=("SHORT" if t.side == "LONG" else "LONG"),
-                       leg="EXIT", quantity=qty, price=exit_price, commission=commission))
+            s.add(Fill(trade_id=trade_id, broker_order_id=broker_order_id or "", ts=now,
+                       side=("SHORT" if t.side == "LONG" else "LONG"), leg="EXIT", quantity=qty, price=exit_price,
+                       commission=commission))
             out = trade_to_dict(t)
         log.info("trade closed %s: P/L %.2f (%s)", trade_id, out["realized_pl"], exit_reason)
         return out
 
     def reduce_trade(self, trade_id: str, exit_qty: float, exit_price: float, exit_reason: str = "target-1",
                      commission: float = 0.0, stop_price: Optional[float] = None,
-                     target_price: Optional[float] = None) -> Optional[Dict[str, Any]]:
+                     target_price: Optional[float] = None, broker_order_id: str = "") -> Optional[Dict[str, Any]]:
         """Book part of a position taken off - the scale-out at the first target: those shares
-        leave the record, what they made is banked toward the trade's final P/L, and the stop and
-        target move on to what the rest of the position now has to do (the stop only ever in the
-        trade's favour). A part covering the whole position closes the trade instead."""
+        leave the record, what they made after their fee is banked toward the trade's final P/L, and
+        the stop and target move on to what the rest of the position now has to do (the stop only ever
+        in the trade's favour). A part covering the whole position closes the trade instead."""
         with session_scope() as s:
             t = s.get(Trade, trade_id)
             if t is None or t.status == "CLOSED":
@@ -396,7 +396,8 @@ class Repository:
                 return trade_to_dict(t)
             whole = qty >= held - 1e-9
         if whole:
-            return self.close_trade(trade_id, exit_price, exit_reason=exit_reason, commission=commission)
+            return self.close_trade(trade_id, exit_price, exit_reason=exit_reason, commission=commission,
+                                    broker_order_id=broker_order_id)
         now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
             t = s.get(Trade, trade_id)
@@ -416,11 +417,62 @@ class Repository:
                 t.target_price = target_price
             note = f"took {qty:g} off at {exit_price:.2f} ({exit_reason}), {gross:+.2f} banked"
             t.notes = ((t.notes + " | ") if t.notes else "") + note
-            s.add(Fill(trade_id=trade_id, ts=now, side=("SHORT" if t.side == "LONG" else "LONG"),
-                       leg="EXIT", quantity=qty, price=exit_price, commission=commission))
+            s.add(Fill(trade_id=trade_id, broker_order_id=broker_order_id or "", ts=now,
+                       side=("SHORT" if t.side == "LONG" else "LONG"), leg="EXIT", quantity=qty, price=exit_price,
+                       commission=commission))
             out = trade_to_dict(t)
         log.info("trade reduced %s: %s, %s left", trade_id, note, out["quantity"])
         return out
+
+    # -------------------------------------------------------------- #
+    #  Fees the broker reports after the fill                       #
+    # -------------------------------------------------------------- #
+    def fills_on(self, venue: str, day: dt.date) -> List[Dict[str, Any]]:
+        """The fills booked during the New York day ``day`` on trades at ``venue`` that carry the broker's order id,
+        with the fee each was booked with - IBKR's commission report comes a moment after the fill, so a fill is
+        mostly booked before its fee is known, or all of it (Executor._top_up_fees adds the rest). Oldest first."""
+        start, end = _ny_bounds(day)
+        with session_scope() as s:
+            rows = s.execute(select(Fill, Trade.symbol).join(Trade, Fill.trade_id == Trade.id)
+                             .where(Trade.broker == venue, Fill.ts >= start, Fill.ts < end, Fill.broker_order_id != "")
+                             .order_by(Fill.ts, Fill.id)).all()
+            return [{"fill_id": f.id, "trade_id": f.trade_id, "symbol": symbol, "order_id": f.broker_order_id,
+                     "leg": f.leg, "quantity": float(f.quantity), "commission": float(f.commission or 0.0),
+                     "ts": f.ts} for f, symbol in rows]
+
+    def add_fill_fees(self, fees: Dict[int, float]) -> List[str]:
+        """Fees learned after their fills were booked, by fill row id -> what each fill's fee grows by: it goes on the
+        fill and on its trade's fees. A part taken off earlier banked what it made after its fee, so its fee comes off
+        what it banked; a closed trade's P/L loses each one, and its % and R follow. Returns the trades changed."""
+        changed: List[str] = []
+        with session_scope() as s:
+            for fill_id, fee in fees.items():
+                f = s.get(Fill, fill_id)
+                if f is None or not fee:
+                    continue
+                t = s.get(Trade, f.trade_id)
+                if t is None:
+                    continue
+                fee = float(fee)
+                closing = t.status == "CLOSED" and f.id == s.execute(
+                    select(func.max(Fill.id)).where(Fill.trade_id == t.id, Fill.leg == "EXIT")).scalar()
+                f.commission = float(f.commission or 0.0) + fee
+                t.fees = float(t.fees or 0.0) + fee
+                if f.leg == "EXIT" and not closing:
+                    t.banked_pl = float(t.banked_pl or 0.0) - fee
+                if t.status == "CLOSED" and t.realized_pl is not None:
+                    _score(t, float(t.realized_pl) - fee, float(t.initial_quantity or t.quantity))
+                changed.append(t.id)
+        return changed
+
+    def first_fee_day(self) -> Optional[dt.date]:
+        """The New York day of the first fee on record for a trade at a broker (the simulator aside). Records from
+        before it were booked without their commissions - IBKR keeps only the current day's executions, so they
+        can't be had afterwards - and their P/L and R are before fees. None while no fee is on record."""
+        with session_scope() as s:
+            first = s.execute(select(func.min(Fill.ts)).join(Trade, Fill.trade_id == Trade.id)
+                              .where(Fill.commission != 0, Trade.broker != SIMULATOR)).scalar()
+        return _as_utc(first).astimezone(clock.NY).date() if first else None
 
     def open_trades(self) -> List[Dict[str, Any]]:
         with session_scope() as s:
@@ -864,6 +916,17 @@ def _keeping_refusal(row: Optional[PlayLog], new: PlayLog) -> PlayLog:
     if note and REFUSAL not in (new.evidence or {}):
         new.evidence = {**(new.evidence or {}), REFUSAL: note}
     return new
+
+
+def _score(t: Trade, pl: float, basis_qty: float) -> None:
+    """A closed trade's P/L, and the % and R that follow from it, on ``basis_qty`` shares (the ones entered with)."""
+    t.realized_pl = pl
+    basis = float(t.entry_price) * basis_qty
+    t.realized_pl_pct = (pl / basis * 100.0) if basis else None
+    # R is measured against the ORIGINAL stop, not a trailed one
+    ref_stop = getattr(t, "initial_stop_price", None) or t.stop_price
+    risk_ps = abs(float(t.entry_price) - float(ref_stop)) if ref_stop else 0.0
+    t.r_multiple = (pl / (risk_ps * basis_qty)) if risk_ps and basis_qty else None
 
 
 def _shortfall(decision: Optional[Dict[str, Any]], fill_price: float, side: str) -> Dict[str, Any]:

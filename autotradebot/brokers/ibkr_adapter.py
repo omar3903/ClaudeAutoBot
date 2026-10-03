@@ -1186,13 +1186,11 @@ class IbkrBroker(BrokerAdapter):
                 when = dt.datetime.now(dt.timezone.utc)
             elif when.tzinfo is None:
                 when = when.replace(tzinfo=dt.timezone.utc)
-            report = getattr(item, "commissionReport", None)
-            commission = float(getattr(report, "commission", 0.0) or 0.0)
             out.append(Fill(order_id=str(getattr(execution, "orderId", "") or getattr(execution, "execId", "")),
                             symbol=contract.symbol,
                             side=Side.LONG if str(getattr(execution, "side", "")).upper().startswith("B") else Side.SHORT,
                             quantity=shares, price=float(execution.price), ts=when,
-                            commission=commission if commission == commission else 0.0,
+                            commission=_commission(getattr(item, "commissionReport", None)),
                             tag=str(getattr(execution, "orderRef", "") or "")))
         return sorted(out, key=lambda f: f.ts)
 
@@ -1579,7 +1577,8 @@ class IbkrBroker(BrokerAdapter):
         kind = getattr(o, "orderType", "") or ""
         side = Side.LONG if o.action == "BUY" else Side.SHORT
         fills = [Fill(order_id=oid, symbol=t.contract.symbol, side=side,
-                      quantity=float(f.execution.shares), price=float(f.execution.price))
+                      quantity=float(f.execution.shares), price=float(f.execution.price),
+                      commission=_commission(getattr(f, "commissionReport", None)))
                  for f in (t.fills or [])]
         filled, avg = float(os_.filled or 0.0), float(os_.avgFillPrice or 0.0)
         shares = sum(f.quantity for f in fills)
@@ -1591,6 +1590,7 @@ class IbkrBroker(BrokerAdapter):
         return OrderResult(order_id=oid, status=status, symbol=t.contract.symbol,
                            submitted_qty=float(o.totalQuantity or 0.0), filled_qty=filled,
                            avg_fill_price=avg, fills=fills, message=_order_message(t),
+                           commission=sum(f.commission for f in fills),
                            side=side, tag=getattr(o, "orderRef", "") or "",
                            order_type=_ORDER_TYPES.get(kind, kind), limit_price=_price(getattr(o, "lmtPrice", None)),
                            stop_price=_price(getattr(o, "trailStopPrice" if kind == "TRAIL" else "auxPrice", None)),
@@ -1611,6 +1611,13 @@ def _num(v: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return x if math.isfinite(x) else 0.0
+
+
+def _commission(report: Any) -> float:
+    """The fee on an execution's commission report. IBKR sends the report a moment after the execution - until it
+    has, there is none (or ib_async's empty one) - and may put NaN or its huge "unset" number in it: all read 0."""
+    x = _num(getattr(report, "commission", None))
+    return x if abs(x) < 1e300 else 0.0
 
 
 def _price(v: Any) -> float:

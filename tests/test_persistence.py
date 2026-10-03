@@ -124,6 +124,49 @@ def test_the_scale_out_math(repo):
     assert whole["status"] == "CLOSED" and whole["realized_pl"] == 40.0 and whole["r_multiple"] == 2.0
 
 
+def test_every_fee_comes_off_the_pl_the_entrys_too(repo):
+    p = _play(symbol="FEES", entry=100.0, stop=98.0, targets=[104.0, 108.0])
+    repo.record_play(p)
+    tid = repo.open_trade(p, fill_price=100.0, fill_qty=10, broker="ibkr-paper", commission=1.0)
+    part = repo.reduce_trade(tid, 5, 104.0, exit_reason="target-1", commission=0.5)
+    assert part["banked_pl"] == 19.5                                     # 5 x 4, less the part's own fee
+    out = repo.close_trade(tid, exit_price=108.0, exit_reason="target", commission=0.5)
+    assert out["fees"] == 2.0
+    assert out["realized_pl"] == pytest.approx(20.0 + 40.0 - 2.0)       # 5 x 4 and 5 x 8, less every fee once
+    assert out["r_multiple"] == pytest.approx(58.0 / (2.0 * 10))
+
+
+def test_a_fee_the_broker_reports_after_the_fill_was_booked_is_added_to_the_record(repo):
+    from autotradebot.util import clock
+
+    p = _play(symbol="LATE", entry=100.0, stop=98.0, targets=[104.0, 108.0])
+    repo.record_play(p)
+    tid = repo.open_trade(p, 100.0, 10, "ibkr-paper", broker_order_id="901")
+    repo.reduce_trade(tid, 5, 104.0, exit_reason="target-1", broker_order_id="902", commission=0.2)
+    today = clock.now_ny().date()
+
+    def booked():
+        return {r["order_id"]: r for r in repo.fills_on("ibkr-paper", today) if r["trade_id"] == tid}
+
+    first = booked()
+    assert sorted(first) == ["901", "902"] and (first["901"]["leg"], first["902"]["leg"]) == ("ENTRY", "EXIT")
+    assert (first["901"]["commission"], first["902"]["commission"]) == (0.0, pytest.approx(0.2))
+    # the rest of each fee, reported after the booking
+    assert repo.add_fill_fees({first["901"]["fill_id"]: 1.0, first["902"]["fill_id"]: 0.3}) == [tid, tid]
+    t = repo.get_trade(tid)
+    assert (t["fees"], t["banked_pl"]) == (pytest.approx(1.5), pytest.approx(19.5))   # 5 x 4, less the part's fee
+    out = repo.close_trade(tid, 108.0, exit_reason="target", broker_order_id="903")
+    assert out["realized_pl"] == pytest.approx(60.0 - 1.5)
+    assert booked()["903"]["commission"] == 0.0
+    repo.add_fill_fees({booked()["903"]["fill_id"]: 0.5})                    # the closing fill's, later still
+    out = repo.get_trade(tid)
+    assert (out["fees"], out["banked_pl"], out["realized_pl"]) == (pytest.approx(2.0), pytest.approx(19.5),
+                                                                   pytest.approx(58.0))
+    assert out["r_multiple"] == pytest.approx(58.0 / 20.0) and out["realized_pl_pct"] == pytest.approx(5.8)
+    assert [r["commission"] for r in booked().values()] == [1.0, pytest.approx(0.5), 0.5]
+    assert repo.first_fee_day() is not None and repo.first_fee_day() <= today
+
+
 def test_short_trade_pnl(repo):
     p = _play(symbol="SHRT", side=Side.SHORT, entry=50.0, stop=52.0, targets=[46.0])
     repo.record_play(p)

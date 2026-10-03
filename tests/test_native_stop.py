@@ -834,6 +834,26 @@ def test_a_stop_that_filled_in_part_while_the_app_was_off_is_booked_and_the_rest
     assert repo.get_trade("t1")["quantity"] == 40 and [t for t, _ in heard].count("trade.reduced") == 1
 
 
+def test_a_stop_the_broker_filled_is_booked_with_its_fees_and_its_order():
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()
+    broker.live["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                   avg_fill_price=97.9, commission=1.05)
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["status"] == "CLOSED" and repo.paid == [("t1", "EXIT", "1", 1.05)]
+
+
+def test_a_stop_that_filled_while_the_app_was_off_is_booked_with_the_fees_of_the_shares_booked():
+    broker, repo, ex, _ = _setup(_trade(quantity=100), positions={"AAA": 70}, working=[_left_stop()])
+    # its executions show 60 shares sold, but the account is only 30 short of the record: 30 are booked
+    broker.get_fills = lambda symbol=None: [
+        Fill(order_id="77", symbol="AAA", side=Side.SHORT, quantity=30, price=97.9, tag="stop:t1", commission=0.3),
+        Fill(order_id="77", symbol="AAA", side=Side.SHORT, quantity=30, price=97.9, tag="stop:t1", commission=0.3)]
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["quantity"] == 70
+    assert repo.paid == [("t1", "EXIT", "77", pytest.approx(0.3))]
+
+
 def test_a_stop_found_filled_for_the_whole_record_closes_it_once():
     broker, repo, ex, heard = _setup(_trade(quantity=100), positions={}, working=[_left_stop(filled=100, avg=97.8)])
     ex.sync_open_orders()                                                      # no executions here: the order's own count

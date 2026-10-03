@@ -597,18 +597,36 @@ def execution_quality(trades: Sequence[Mapping[str, Any]], assumed_bps: float) -
     return out
 
 
+def fees_note(trades: Sequence[Mapping[str, Any]], fees_since: Optional[dt.date]) -> Optional[str]:
+    """What the records can't say about fees. IBKR keeps only the current day's executions, so the trades at a
+    broker booked before the app recorded commissions can't be given theirs: their P/L and R are before fees, and
+    the review says so rather than making numbers up. ``fees_since``: the first day a broker's fee is on record
+    (Repository.first_fee_day), None while none is. The simulator's trades pay what it charges, and are left out."""
+    before = [t for t in trades if (t.get("broker") or "paper") != "paper"
+              and (fees_since is None or (_ny_day(t.get("entry_time")) or fees_since) < fees_since)]
+    if not before:
+        return None
+    n = f"{len(before)} trade{'s' if len(before) != 1 else ''}"
+    if fees_since is None:
+        return (f"No fees are on record for the {n} at the broker over the last {ROLLING_SESSIONS} sessions: "
+                f"their P/L and R are before any commissions.")
+    return (f"Fees not recorded before {fees_since.isoformat()}: the P/L and R of the {n} entered before then "
+            f"(over the last {ROLLING_SESSIONS} sessions) are before commissions.")
+
+
 def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Sequence[Mapping[str, Any]],
                  rolling: Sequence[Mapping[str, Any]], replay_records: Mapping[str, Mapping[str, Any]],
                  evidence: Mapping[str, Mapping[str, Any]], regime: Optional[Mapping[str, Any]],
                  bars: Optional[Mapping[str, pd.DataFrame]], settings: ReplaySettings, gates: Mapping[str, Any],
                  passes: Callable[[Mapping[str, Any]], bool], styles: Mapping[str, str],
                  titles: Mapping[str, str], breakeven_at_r: float, opened: Sequence[Mapping[str, Any]] = (),
-                 marks: Optional[Mapping[str, float]] = None) -> Dict[str, Any]:
+                 marks: Optional[Mapping[str, float]] = None, fees_since: Optional[dt.date] = None) -> Dict[str, Any]:
     """``bars``: the session's 5-minute candles for the plays not taken - None when they
     couldn't be had, and those plays aren't followed. ``opened``: the trades opened this session,
     closed or not - a session whose entries are all still open is not a session without trades;
     ``marks``: where the open ones' stocks stood at the review. ``gates``: Autopilot's checks in force that
-    session (skip_noise, the floors, min_confirmations) and where they were read (``source``)."""
+    session (skip_noise, the floors, min_confirmations) and where they were read (``source``). ``fees_since``:
+    the first day a broker's fee is on record - the records from before it are before commissions (fees_note)."""
     skip_noise, min_confirmations = list(gates["skip_noise"]), int(gates["min_confirmations"])
     rs = [t.get("r_multiple") for t in trades]
     entered = opened_rows(opened, marks or {})
@@ -646,6 +664,10 @@ def build_review(day: dt.date, *, trades: Sequence[Mapping[str, Any]], plays: Se
         notes.insert(1, f"{n} position{'s' if n != 1 else ''} opened this session{where}.")
     if fills.get("note"):
         notes.append(fills["note"])
+    unpaid = fees_note(rolling, fees_since)
+    if unpaid:
+        notes.append(unpaid)
+    fills["fees_since"] = fees_since.isoformat() if fees_since else None
     if gates.get("source") == "at the rebuild" and plays:
         notes.append("No Autopilot entry recorded the checks in force this session, so its plays were judged "
                      "on the settings at the rebuild.")
