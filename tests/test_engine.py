@@ -50,11 +50,14 @@ def _new_engine(tmp_path, gateway, port) -> TradingEngine:
 
 @pytest.fixture
 def engine(tmp_path, gateway, port):
+    """An engine whose paper orders go to the built-in simulator, with IB Gateway down until a test connects it
+    (_connect: prices only). A test of orders going to the IBKR paper account switches to it (_on_ibkr)."""
     from autotradebot.persistence.db import DB
 
     # a database of its own, so open trades left by other tests can't leak in
     DB.init(url=f"sqlite:///{(tmp_path / 'engine.sqlite').as_posix()}")
     DB.create_all()
+    (tmp_path / "runtime.json").write_text('{"paper_platform": "simulator"}', encoding="utf-8")
     e = _new_engine(tmp_path, gateway, port)
     e._bind()
     yield e
@@ -93,16 +96,78 @@ def _connect(engine, port):
     assert engine._retry_connection(force=True)
 
 
+def _on_ibkr(engine):
+    """Paper orders to the IBKR paper account, as the dashboard's switch sends them."""
+    assert engine.set_paper_platform("ibkr")["ok"]
+
+
 # ---------------------------------------------------------------- where orders go
-def test_orders_go_to_the_simulator_while_the_gateway_is_down(engine):
+def _refused_entry(engine):
+    """An entry sent the way an approval sends it: what came back, and whether anything was booked."""
+    from autotradebot.execution.order_builder import plan_order
+
+    p = _play("AAPL")
+    p.suggested_qty = 5
+    engine.repo.record_play(p)
+    out = engine.executor.execute_play(p, Account(account_id="X", equity=50_000.0, cash=50_000.0),
+                                       plan=plan_order(p, clock.Session.REGULAR, engine.settings.config.execution))
+    return out, engine.repo.open_trades()
+
+
+def test_a_gateway_that_is_down_never_sends_the_orders_to_the_simulator(engine, tmp_path, gateway, port):
+    _on_ibkr(engine)                                                      # IB Gateway is down
     snap = engine.snapshot()
-    assert engine.paper_platform == "ibkr" and snap["venue"]["trading_on"] == "paper"
-    assert engine.broker.name == "paper" and not snap["data"]["connected"]
+    assert engine.paper_platform == "ibkr" and snap["venue"]["trading_on"] == "ibkr-paper"
+    assert engine.broker.name == "ibkr" and not engine.broker.is_connected and not snap["data"]["connected"]
     assert snap["connection"]["cls"] == "bad" and snap["connection"]["action"] == "connections"
+    assert "none go to the simulator" in snap["connection"]["detail"]
     assert any("IB Gateway" in b for b in engine.connections.blockers)
+    out, booked = _refused_entry(engine)
+    assert not out["ok"] and "isn't connected" in out["reason"] and booked == []     # refused, not filled elsewhere
+    assert engine.exit_manager.venue == engine.executor.venue == "ibkr-paper"
+
+    r = engine.reconnect()                                                # still down: the button says so
+    assert not r["ok"] and "no order goes out until it's back" in r["reason"] and engine._venue == "ibkr-paper"
+    refresh = engine.refresh_account_now()
+    assert not refresh["ok"] and "isn't reachable yet" in refresh["reason"]
+
+    engine.stop()                                                         # a start with the Gateway down: the same
+    again = _started_again(tmp_path, gateway, port)
+    try:
+        assert again._venue == "ibkr-paper" and again.broker.name == "ibkr" and not again.broker.is_connected
+    finally:
+        again.stop()
+
+
+def test_orders_held_for_the_gateway_go_to_it_once_it_answers(engine, port, gateway, monkeypatch):
+    _on_ibkr(engine)
+    heard = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **p: heard.append(topic))
+    engine.quit_state = {"mode": "paper"}                                 # even while quitting: nothing moves
+    _connect(engine, port)
+    assert engine._venue == "ibkr-paper" and engine.broker is gateway and engine.executor.broker is gateway
+    assert engine._account is not None and "broker.connected" in heard
+
+
+def test_live_stays_on_the_live_account_while_its_gateway_is_down_and_reconnects_by_itself(
+        engine, tmp_path, gateway, port):
+    import json
+
+    engine.stop()
+    (tmp_path / "runtime.json").write_text(json.dumps({"mode": "live", "paper_platform": "simulator"}))
+    live = _started_again(tmp_path, gateway, port)                        # the app restarts with the Gateway down
+    try:
+        assert live.mode == "live" and live._venue == "ibkr-live" and not live.broker.is_connected
+        assert live._live_blockers and _refused_entry(live)[0]["reason"].startswith("Your IBKR live account")
+        _connect(live, port)
+        assert live.mode == "live" and live._venue == "ibkr-live" and live.broker is gateway
+        assert gateway.kw["mode"] == "live" and gateway.kw["readonly"] is False
+    finally:
+        live.stop()
 
 
 def test_the_chosen_account_connects_once_the_gateway_answers(engine, port, gateway):
+    _on_ibkr(engine)
     assert not engine._retry_connection(force=True)                   # still down
     _connect(engine, port)
     snap = engine.snapshot()
@@ -135,6 +200,7 @@ def test_the_simulator_takes_only_prices_from_the_gateway(engine, port, gateway)
 
 def test_auto_connect_never_moves_orders_away_from_open_positions(engine, port):
     tid = _open(engine, "AAPL")                                          # on the simulator
+    engine.paper_platform = "ibkr"                                       # the switch says IBKR, the orders don't
     port["open"] = True
     assert not engine._retry_connection(force=True)
     assert engine._venue == "paper" and "AAPL" in engine.connections.blockers[0]
@@ -416,6 +482,7 @@ def test_a_replay_a_restart_interrupted_is_resumed_once_and_an_older_one_is_drop
 
 # ---------------------------------------------------------------- the position size factor
 def test_the_size_factor_resizes_the_plays_is_remembered_and_refuses_what_is_out_of_range(engine, port):
+    _on_ibkr(engine)                                                            # sized on the IBKR account
     _connect(engine, port)
     assert engine.size_factor == 1.0 and engine.capital_state()["size_factor"] == 1.0
     p = _play()                                                                 # entry 100, stop 95
@@ -445,6 +512,7 @@ def test_the_most_one_position_may_hold_resizes_the_plays_is_remembered_and_refu
         engine, port, monkeypatch):
     risk = engine.settings.config.risk
     monkeypatch.setattr(risk, "max_position_pct_of_equity", risk.max_position_pct_of_equity)  # put back afterwards
+    _on_ibkr(engine)                                                            # sized on the IBKR account
     _connect(engine, port)
     assert engine.position_pct is None
     assert engine.capital_state()["max_position_pct"] == risk.max_position_pct_of_equity    # config.yaml's, unset
@@ -481,6 +549,7 @@ def test_the_most_one_position_may_hold_on_disk_stands_in_for_the_config_and_abs
 
 # ---------------------------------------------------------------- the split, and changes made while it runs
 def test_entries_still_working_count_in_their_kinds_share_of_the_capital(engine, port):
+    _on_ibkr(engine)                                                            # sized on the IBKR account
     _connect(engine, port)
     engine.set_capital(None, mode="cash")          # the account's own value: the fake's buying power never moves
     engine.set_filters(timeframes=["INTRADAY", "SWING"])
@@ -496,6 +565,7 @@ def test_entries_still_working_count_in_their_kinds_share_of_the_capital(engine,
 
 
 def test_a_kind_over_its_share_says_so_and_takes_nothing_new(engine, port):
+    _on_ibkr(engine)                                                            # sized on the IBKR account
     _connect(engine, port)
     engine.set_filters(timeframes=["INTRADAY", "SWING"])
     engine.set_capital_split(50)
@@ -1006,6 +1076,54 @@ def test_shares_without_a_record_are_listed_and_can_be_exited(engine):
 
     engine._account.positions = [Position(symbol="MSFT", quantity=3, avg_price=100.0)]
     assert engine.untracked_positions() == []                               # fewer than recorded: a mismatch, not untracked
+
+
+def test_shares_no_record_explains_are_said_once_after_two_minutes_of_the_regular_session():
+    check = PositionCheck()
+    trades = [{"symbol": "AAA", "side": "LONG", "quantity": 10}, {"symbol": "BBB", "side": "LONG", "quantity": 5},
+              {"symbol": "FFF", "side": "LONG", "quantity": 8}]
+    held = {"AAA": 10.0, "BBB": -5.0, "CCC": 20.0, "DDD": -3.0, "EEE": 7.0, "FFF": 4.0}
+
+    def check_at(t, regular=True, account_age_s=0.0):
+        return {d["symbol"]: d for d in check.drift("ibkr-paper", "your IBKR paper account", trades, held,
+                                                    in_flight={"EEE"}, regular=regular, account_age_s=account_age_s,
+                                                    connection_age_s=1e9, now=t)}
+
+    assert check_at(0.0) == {} and check_at(119.0) == {}                     # seen, but not two minutes yet
+    said = check_at(120.0)
+    # AAA agrees, EEE has an order working, FFF holds fewer the same way round (the share-count warning's)
+    assert set(said) == {"BBB", "CCC", "DDD"}
+    assert said["BBB"]["urgent"] and "the other way round" in said["BBB"]["note"]       # short where the record is long
+    assert said["DDD"]["urgent"] and said["DDD"]["note"].startswith("URGENT")           # short with no record
+    assert not said["CCC"]["urgent"] and "20 shares long for 2 min with no open record" in said["CCC"]["note"]
+    assert check_at(500.0) == {}                                             # said once
+    held["CCC"] = 25.0                                                       # more of them: timed and said afresh
+    assert check_at(510.0) == {} and set(check_at(630.0)) == {"CCC"}
+    assert check_at(700.0, account_age_s=60.0) == {}                         # a stale account changes nothing
+
+    assert check_at(800.0, regular=False) == {} and check_at(5000.0, regular=False) == {}   # after hours: not timed
+    assert check_at(6000.0) == {} and set(check_at(6120.0)) == {"BBB", "CCC", "DDD"}      # the next session's own
+
+
+def test_shares_the_records_dont_explain_are_logged_and_sent_to_the_dashboard_never_unwound(engine, monkeypatch,
+                                                                                            caplog):
+    import logging
+
+    _open(engine, "MSFT", qty=5)
+    engine.position_check.SETTLE_S = engine.position_check.DRIFT_ALERT_S = 0.0
+    monkeypatch.setattr(clock, "current_session", lambda ts=None: clock.Session.REGULAR)
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="MSFT", quantity=5, avg_price=100.0),
+                                 Position(symbol="AAPL", quantity=-7, avg_price=50.0)]
+    heard, unwound = [], []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **p: heard.append((topic, p)))
+    monkeypatch.setattr(engine.executor, "close_untracked", lambda *a, **k: unwound.append(a))
+    with caplog.at_level(logging.WARNING, logger="autotradebot.engine.engine"):
+        engine._reconcile_open_trades()
+        engine._reconcile_open_trades()
+    [alert] = [p for topic, p in heard if topic == "positions.drift"]        # once
+    assert alert["urgent"] and [a["symbol"] for a in alert["alerts"]] == ["AAPL"]
+    assert "URGENT - AAPL" in caplog.text and unwound == []
 
 
 # ---------------------------------------------------------------- fixing a share count from its warning

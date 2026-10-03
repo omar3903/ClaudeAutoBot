@@ -13,6 +13,7 @@ Everything else imports from here, never from ``os.environ``.
 
 from __future__ import annotations
 
+import datetime as dt
 import functools
 import os
 from pathlib import Path
@@ -146,6 +147,8 @@ class ScannerCfg(_Model):
     gapper_symbols: int = 400             # at most this many hot-list and buffer names get a pre-market request
     gapper_min_gap_pct: float = 2.0       # a pre-market move this big, either way, counts as a gap
     gapper_min_volume: float = 50_000     # ...on at least this many pre-market shares
+    gateway_alert_time: str = "07:45"     # ET - on a trading day, IB Gateway still not connected by then is said once
+                                          # on the dashboard and in the log, before the full scan needs it ("" = off)
     max_universe: int = 0                 # 0 = every listing (smoke tests cap it)
     sectors: list = Field(default_factory=list)
     prefilter: Dict[str, Any] = Field(default_factory=dict)
@@ -161,6 +164,15 @@ class ScannerCfg(_Model):
     def _within_the_live_slots(cls, value: int) -> int:
         """The live-scan names take watch-tier slots, which the hot list and the buffers need too."""
         return max(0, min(20, value))
+
+    @field_validator("gateway_alert_time", mode="after")
+    @classmethod
+    def _a_time_of_day_or_off(cls, value: str) -> str:
+        """A time like 07:45 - one that doesn't read as one is refused, never taken for off - or "" for off."""
+        value = (value or "").strip()
+        if value:
+            dt.time.fromisoformat(value)              # a ValueError here is the config's error, with the field named
+        return value
 
 
 class ValuationCfg(_Model):

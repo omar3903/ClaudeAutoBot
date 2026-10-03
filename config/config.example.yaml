@@ -68,6 +68,8 @@ scanner:
   gapper_symbols: 400                  # at most this many names get a pre-market request
   gapper_min_gap_pct: 2.0              # a pre-market move this big, either way, counts as a gap...
   gapper_min_volume: 50000             # ...on at least this many pre-market shares (Aziz's gappers scan)
+  gateway_alert_time: "07:45"          # ET - on a trading day, IB Gateway still not connected by then is said once
+                                       # on the dashboard and in the log, before the full scan needs it ("" = off)
   max_universe: 0                      # 0 = every listing; a smaller number caps it (for testing)
   sectors: []                          # only scan + trade these, e.g. ["Technology", "Energy"]; [] = all.
                                        # The dashboard's Sectors button overrides this.

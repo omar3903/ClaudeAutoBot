@@ -124,7 +124,8 @@ history** and **P/L summary**. Stop the app with **Quit** or Ctrl+C — see
 [Quitting](#quitting).
 
 Without IB Gateway there are no prices: nothing is scanned, the simulator can't
-fill, and the data pill reads `data: none`. Nothing is ever made up.
+fill, orders meant for an IBKR account are refused until it's back, and the data
+pill reads `data: none`. Nothing is ever made up.
 
 ---
 
@@ -249,10 +250,12 @@ Two switches, both in the dashboard and remembered in `data/runtime.json`
 | Paper | **IBKR paper account** | paper account, trading | your IBKR paper account |
 | Paper | **Built-in simulator** | paper account, read-only (prices only) | the built-in simulator |
 
-- If the Gateway isn't reachable, paper orders fall back to the simulator (which
-  has no prices until the Gateway answers) and the header pill turns red with the
-  fix. **Live** is never faked: if your live account isn't reachable, the switch
-  is refused and tells you why.
+- If the Gateway isn't reachable, orders stay pointed at the IBKR account the
+  switches choose and are refused until it answers — never sent to the simulator
+  in its place — and the header pill turns red with the fix; the app connects by
+  itself once it answers. **Live** is never faked: a switch to Live that can't
+  connect is refused and tells you why, and an app already on Live stays on it,
+  its orders refused, until the live account is back.
 - Every trade is stamped with its venue (`paper`, `ibkr-paper`, `ibkr-live`). The
   exit manager only manages trades on the active venue, a manual **Exit** is
   refused for a position held elsewhere, and a platform or Paper/Live switch is
@@ -301,8 +304,8 @@ re-enters your login automatically, and the app reconnects on its own.
 
 The app keeps checking (every 15 s) and connects as soon as the Gateway answers;
 a successful **Test paper** connects it straight away. It never switches to Live
-on its own, and it won't move paper orders from the simulator to IBKR while
-positions are still open on the simulator — the connection pill says why.
+on its own (a live account it was already on is connected again the same way),
+and it never moves orders away from open positions — the connection pill says why.
 
 **Accounts in another currency.** An IBKR Canada account is kept in CAD. The
 header shows equity, cash and buying power in the account's own currency (hover
@@ -534,7 +537,14 @@ The app is built to be left running:
   IBKR's servers, the app waits on the same connection for IBKR's all-clear; if that hasn't come after
   10 minutes it starts the connection afresh.
 * **The weekly login.** About once a week IBKR wants a full login (with two-factor). If the Gateway
-  has been gone for 10 minutes, the dashboard says so - log in and the app picks up by itself.
+  has been gone for 10 minutes, the dashboard says so - log in and the app picks up by itself. That
+  notice comes at night when the 9 PM restart doesn't come back, so on a trading day a Gateway still
+  gone at 07:45 ET (`scanner.gateway_alert_time`, `""` = off) is said again, once, before the full scan
+  needs it.
+* **A failed connect never moves the orders.** While the IBKR account the switches choose can't be
+  connected - at the start, after **Reconnect**, or on Live - orders stay pointed at it and are refused
+  until it answers; none go to the simulator (or to paper) in its place, so its positions get their
+  exits back the moment it reconnects. The connection pill says so.
 * **A replay running at 9 PM** waits up to 15 minutes for the Gateway instead of failing.
 * **A slow answer never reads as an empty account.** An account or positions read IBKR doesn't
   answer in time (the Gateway busy with a big download, say) keeps the last snapshot, which then
@@ -656,6 +666,12 @@ The reverse case is shown too: **shares without a record** — held at the broke
 beyond what the open-trade records cover, because they were bought or sold
 outside the app or a fill couldn't be booked — are listed under **Open
 positions** with their own **Exit** button. The app doesn't manage their exits.
+A stock held with no open record at all, or held the other way round from its
+record, that stays so for two minutes of the regular session is also logged as
+a warning and said on the dashboard once a session (again if the count changes).
+An account **short** with nothing recorded, or short where the record is long
+(and the reverse), is **urgent** — a position nothing manages — and its notice
+stays up longer. Nothing is traded because of it: the **Exit** above is yours.
 
 ---
 

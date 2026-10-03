@@ -65,5 +65,7 @@ def connection_pill(mode: str, paper_platform: str, conns: Connections) -> Dict[
         return {"label": "Simulator · no prices", "cls": "warn", "action": "connections",
                 "detail": f"The simulator fills on IBKR prices, so nothing trades until IB Gateway connects. {why}"}
     reconnecting = bool(status.get("reconnecting"))
+    # orders stay pointed at the account while it's away (TradingEngine._bind): refused, never sent elsewhere
     return {"label": f"IBKR {role} {'↻' if reconnecting else '✕'}", "cls": "warn" if reconnecting else "bad",
-            "detail": why, "action": "connections"}
+            "detail": f"{why} · No order goes out until it's back - none go to the simulator in its place.",
+            "action": "connections"}

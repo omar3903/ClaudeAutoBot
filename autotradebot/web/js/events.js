@@ -240,6 +240,13 @@ function handle(topic, p) {
       (p.mismatches || []).forEach(m => toast("⚠ " + m.note, "bad"));
       refreshState();
       break;
+    case "positions.drift":
+      // shares no open record explains, minutes into the regular session. An urgent one - short with nothing
+      // recorded, or the other way round from the record - stays up longer. The app never unwinds them: Open
+      // positions lists them with their own Exit
+      (p.alerts || []).forEach(a => a.urgent ? toast("⛔ " + a.note, "bad", 30000) : toast("⚠ " + a.note, "warn"));
+      loadOpen(); refreshState();
+      break;
     case "stop.placed":
       toast(`${p.symbol}: stop order resting at the broker @ ${num(p.stop_price)} for ${num(p.qty, 0)} shares`, "good");
       break;

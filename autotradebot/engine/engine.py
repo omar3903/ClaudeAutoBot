@@ -29,7 +29,8 @@ Whatever the user changes on the dashboard applies straight away, is
 remembered in data/runtime.json (runtime.py) and is broadcast to every tab.
 
 Safety rules: no order without :meth:`approve_play` (or Autopilot, inside its
-caps); no venue change while positions are open on the current one; while
+caps); no venue change while positions are open on the current one, and none
+because a connection failed (its orders are refused until it's back); while
 quitting with positions open, nothing but exits may change; and an OPEN trade
 record is deleted only when a connected broker confirms the position is gone
 (reconcile.py).
@@ -102,7 +103,7 @@ from .journal_ops import JournalOps
 from .pairs_ops import PairsOps
 from .capital_ops import CapitalOps
 from .quit_ops import QuitOps
-from .connections import Connections
+from .connections import Connections, Unreachable
 from .reconcile import PositionCheck
 from .runtime import (RuntimeFile, load_capital, load_capital_mode, load_day_trade_pct, load_filters,
                       load_position_pct, load_size_factor, load_strategy_overrides)
@@ -256,6 +257,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._gateway_seen_up = False
         self._gateway_down_at: Optional[float] = None
         self._gateway_alerted = False
+        #: when (New York time) the Gateway was last seen go down, and the day it was last said to be down still at
+        #: scanner.gateway_alert_time (_say_gateway_late)
+        self._gateway_down_since: Optional[dt.datetime] = None
+        self._gateway_late_on: Optional[dt.date] = None
         self._account: Optional[Account] = None
         self._account_at = 0.0
         self._account_warned_at = float("-inf")     # the last time a failing account read was logged
@@ -389,23 +394,33 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     # ------------------------------------------------------------------ #
     #  Where orders go                                                   #
     # ------------------------------------------------------------------ #
-    def _bind(self) -> None:
-        """Hold the Gateway connection the switches need and point order handling
-        at the right broker. Live falls back to paper when it can't connect."""
+    def _bind(self, fall_back: bool = False) -> None:
+        """Hold the Gateway connection the switches need and point order handling at the right broker. An IBKR
+        account that can't be connected keeps the orders all the same - they are refused until it answers
+        (Connections.unreachable) and the background retry connects it, so a failed connect never sends them to the
+        simulator, or to paper, in its place. Only a switch to Live (``fall_back``) is undone instead: back to paper."""
         plan = plan_venue(self.mode, self.paper_platform)
         ibkr = self.connections.ensure(plan)
         if self.mode == "live" and ibkr is None:
             self._live_blockers = list(self.connections.blockers)
-            log.warning("falling back to paper - your live IBKR account isn't reachable: %s",
-                        "; ".join(self._live_blockers))
-            self.mode = "paper"
-            self._bind()
-            return
-        if self.mode == "live":
+            if fall_back:
+                log.warning("falling back to paper - your live IBKR account isn't reachable: %s",
+                            "; ".join(self._live_blockers))
+                self.mode = "paper"
+                self._bind()
+                return
+        elif self.mode == "live":
             self._live_blockers = []
 
-        if plan.trade and ibkr is not None:
+        if plan.trade:
             broker, venue = ibkr, venue_id(plan)
+            if ibkr is None:
+                again = isinstance(self._broker, Unreachable) and self._venue == venue     # a retry that failed
+                broker = self.connections.unreachable(plan)
+                log.log(logging.DEBUG if again else logging.WARNING,
+                        "%s isn't reachable - orders stay pointed at it and are refused until it's back (none go to "
+                        "the simulator in its place): %s", venue_label(venue),
+                        "; ".join(self.connections.blockers) or "not connected")
         else:
             broker, venue = self.connections.simulator(), "paper"
         if broker is not self._broker:
@@ -431,11 +446,16 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _retry_connection(self, force: bool = False) -> bool:
         """Connect the account the switches want once it's reachable - IB Gateway
-        started after the app, say. Never touches Live (a live switch that couldn't
-        connect already put you back on paper), never acts while quitting, and
-        never moves orders away from open positions."""
+        started after the app, say. Never switches to Live (a live switch that couldn't
+        connect already put you back on paper), never moves orders while quitting, and
+        never moves orders away from open positions. The account orders already go to,
+        refused while it was away (_bind), is connected on Live and while quitting too:
+        that moves nothing."""
         plan = plan_venue(self.mode, self.paper_platform)
-        if self.mode == "live" or self.quit_state or self.connections.holds(plan):
+        if self.connections.holds(plan):
+            return False
+        waiting = plan.trade and self._venue == venue_id(plan)       # its orders are refused until it's back
+        if not waiting and (self.mode == "live" or self.quit_state):
             return False
         now = time.monotonic()
         if not force and now < self._connect_retry_at:
@@ -449,10 +469,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return False                                  # a switch is running; try next time
         try:
             target = venue_id(plan) if plan.trade else self._venue
-            if target == self._venue:
+            if target == self._venue and not waiting:
                 ok = self.connections.ensure(plan) is not None     # prices only - orders stay put
             else:
-                blocked = self._switch_blocked(target)
+                blocked = self._switch_blocked(target)             # (none when waiting: the venue doesn't change)
                 if blocked:
                     self.connections.blockers = [f"{venue_label(target)} is reachable, but orders can't "
                                                  f"move there yet. {blocked}"]
@@ -478,15 +498,18 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     #: after this long without IB Gateway, the dashboard is told what to check
     GATEWAY_DOWN_ALERT_S = 600.0
 
-    def _watch_gateway(self) -> None:
+    def _watch_gateway(self, at: Optional[dt.datetime] = None) -> None:
         """Say when IB Gateway drops and when it's back - its nightly restart, IBKR's maintenance - and,
-        once it has been gone a while, what to check. Positions are only trusted again once the account
-        has settled (see _reconcile_open_trades)."""
+        once it has been gone a while, what to check; and on a trading day, when it's still gone at
+        scanner.gateway_alert_time (_say_gateway_late). Positions are only trusted again once the account
+        has settled (see _reconcile_open_trades). ``at``: the time in New York now (tests)."""
         up, now = self.connections.connected, time.monotonic()
+        wall = (at or clock.now_ny()).astimezone(clock.NY)
         if self._gateway_up is None or up == self._gateway_up:
             if self._gateway_up is None:
                 self._gateway_up, self._gateway_seen_up = up, up
                 self._gateway_down_at = None if up else now
+                self._gateway_down_since = None if up else wall
             elif (not up and self._gateway_down_at is not None and not self._gateway_alerted
                   and now - self._gateway_down_at >= self.GATEWAY_DOWN_ALERT_S):
                 self._gateway_alerted = True
@@ -495,16 +518,17 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                         "by itself. Until then there are no prices, and no automatic exits.")
                 log.warning(note)
                 self._publish("broker.down", note=note)
+            self._say_gateway_late(up, wall)
             return
         self._gateway_up = up
         if not up:
-            self._gateway_down_at, self._gateway_alerted = now, False
+            self._gateway_down_at, self._gateway_alerted, self._gateway_down_since = now, False, wall
             if self._gateway_seen_up:
                 log.warning("IB Gateway disconnected - reconnecting by itself")
                 self._publish("broker.disconnected", note=("IB Gateway disconnected - its nightly restart or IBKR's "
                                                          "maintenance. The app reconnects by itself."))
             return
-        down_for, self._gateway_down_at = now - (self._gateway_down_at or now), None
+        down_for, self._gateway_down_at, self._gateway_down_since = now - (self._gateway_down_at or now), None, None
         if not self._gateway_seen_up:
             self._gateway_seen_up = True                  # the first connection is announced by _retry_connection
             return
@@ -513,6 +537,30 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         log.warning("IB Gateway is back after %s", duration(down_for))
         self._publish("broker.reconnected", state=self.snapshot(),
                     note=f"IB Gateway is back after {duration(down_for)}.")
+
+    def _say_gateway_late(self, up: bool, at: dt.datetime) -> bool:
+        """On a trading day, IB Gateway gone since before scanner.gateway_alert_time (ET) and still gone at it - a
+        nightly restart that never came back, the weekly login IBKR wants - is said once that day, so it can be put
+        right before the full scan needs it. The alert of a drop the night before came while no one was looking;
+        one that starts after that time is GATEWAY_DOWN_ALERT_S's to say. Returns whether it was said."""
+        raw = self.settings.config.scanner.gateway_alert_time
+        day = at.date()
+        if (up or not raw or self._gateway_down_since is None or self._gateway_late_on == day
+                or not clock.is_trading_day(day)):
+            return False
+        due = dt.datetime.combine(day, dt.time.fromisoformat(raw), tzinfo=clock.NY)
+        if at < due or self._gateway_down_since > due:
+            return False
+        self._gateway_late_on = day
+        scan = self.scan_settings.full_scan_time
+        before = f" The full scan is due at {scan:%H:%M}." if at.time() < scan else ""
+        note = (f"IB Gateway still isn't connected at {at:%H:%M} ET, on a trading day - it has been gone since "
+                f"{self._gateway_down_since:%a %H:%M}.{before} If it's asking you to log in - IBKR wants a full login "
+                "about once a week - log in again; the app reconnects by itself. Until then there are no prices, no "
+                "scans and no automatic exits.")
+        log.warning(note)
+        self._publish("broker.down", note=note)
+        return True
 
     def _open_trades(self) -> List[Dict[str, Any]]:
         try:
@@ -661,7 +709,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             if blocked:
                 return {"ok": False, "reason": blocked}
             prev, self.mode = self.mode, mode
-            self._bind()                                   # knocks mode back to paper if live isn't reachable
+            self._bind(fall_back=True)                     # knocks mode back to paper if live isn't reachable
             if mode == "live" and self.mode != "live":
                 return {"ok": False, "reason": "Your live IBKR account isn't reachable.",
                         "blockers": self._live_blockers}
@@ -701,7 +749,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         state = self._venue_state()
         problems = self.connections.blockers or (self._live_blockers if prev != self.mode else [])
         if problems:
-            return {"ok": False, "reason": "; ".join(problems), "venue": state}
+            refused = self._venue != "paper" and not self.connections.connected      # orders wait for it (_bind)
+            return {"ok": False, "venue": state,
+                    "reason": "; ".join(problems) + (" - no order goes out until it's back." if refused else "")}
         return {"ok": True, "venue": state,
                 "note": f"Connected - {'live' if self.mode == 'live' else 'paper'} orders go to "
                         f"{venue_label(self._venue)}."}
@@ -1725,8 +1775,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _reconcile_open_trades(self, force: bool = False) -> List[Dict[str, Any]]:
         """Delete OPEN trade records whose position no longer exists at the broker
-        that holds it, and report positions of a different size than their records
-        add up to (see reconcile.py for when an answer is trusted)."""
+        that holds it, report positions of a different size than their records
+        add up to, and shares no record explains (see reconcile.py for when an
+        answer is trusted)."""
         broker, venue, acc = self._broker, self._venue, self._account
         if broker is None or not broker.is_connected or acc is None or self.executor is None:
             return []
@@ -1759,6 +1810,16 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             log.warning("share counts disagree: %s", m["note"])
         if new:
             self._publish("positions.mismatch", mismatches=new)
+        # shares no record explains - none at all, or the other way round - once they have stayed so a couple of
+        # minutes of the regular session: said, never unwound (the shares' Exit in Open positions is the operator's)
+        drift = self.position_check.drift(
+            venue, venue_label(venue), [t for t in mine if t["id"] not in removed_ids], held=held,
+            in_flight=self.executor.symbols_in_flight(), regular=clock.current_session() is clock.Session.REGULAR,
+            account_age_s=account_age_s, connection_age_s=connection_age_s)
+        for d in drift:
+            log.warning("shares the records don't explain: %s", d["note"])
+        if drift:
+            self._publish("positions.drift", alerts=drift, urgent=any(d["urgent"] for d in drift))
         return closed + removed
 
     def _settle_gone(self, gone: List[Mapping[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
