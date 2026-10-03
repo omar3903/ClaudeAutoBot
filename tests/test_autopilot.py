@@ -316,6 +316,48 @@ def test_cooldown_after_loss_skips_a_stopped_name():
     assert eng.approved_ids() and eng.approved_ids()[0].startswith("play_")
 
 
+def test_the_cooldown_counts_a_position_opened_yesterday_and_stopped_out_today(repo):
+    """The cooldown goes by the session a trade closed in: a position held overnight and stopped out
+    this morning cools the ticker off, one stopped out yesterday doesn't. The repository's own read of
+    the session's trades is used, so the test holds for how it really lists them."""
+    import datetime as dt
+    from autotradebot.persistence.db import session_scope
+    from autotradebot.persistence.models_orm import Trade
+    from autotradebot.util import clock
+
+    today = clock.session_date()
+    yesterday = clock.prev_trading_day(today)
+
+    def ny(day, hour):
+        return dt.datetime.combine(day, dt.time(hour, 0), tzinfo=clock.NY)
+
+    def stopped_out(sym, opened, closed):
+        tid = repo.open_trade(mkplay(sym=sym, tf=Timeframe.SWING), 100.0, 10, "paper")
+        with session_scope() as s:                       # entered on an earlier session
+            t = s.get(Trade, tid)
+            t.entry_time = ny(opened, 15).astimezone(dt.timezone.utc).replace(tzinfo=None)
+            t.session_date = opened
+        repo.close_trade(tid, 98.0, "stop", exit_time=ny(closed, 10))
+        return tid
+
+    tids = [stopped_out("OVA", yesterday, today), stopped_out("OVB", clock.prev_trading_day(yesterday), yesterday)]
+    try:
+        eng = FakeEngine()
+        eng.repo.trades_on = repo.trades_on              # trades opened or closed in a session
+        ap = AutoPilot(eng, _cfg(cooldown_after_loss=True, max_daily_loss_pct=0.0, max_giveback_pct=0.0),
+                       bus=SILENT)
+        held = mkplay(sym="OVA")
+        _run(ap, held)
+        assert eng.approved == []
+        assert "already stopped out today - cooling off" in ap.verdict(held)
+        earlier = mkplay(sym="OVB")
+        _run(ap, earlier)
+        assert eng.approved_ids() == [earlier.id]
+    finally:                                             # the test database is shared by the whole run
+        for tid in tids:
+            repo.delete_trade(tid)
+
+
 def test_live_mode_paper_only_gate():
     eng = FakeEngine(mode="live")
     published = []

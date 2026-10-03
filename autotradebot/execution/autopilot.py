@@ -1020,13 +1020,13 @@ class AutoPilot:
         if pos is not None and abs(pos.quantity) > 1e-9:
             return f"the account already holds {abs(pos.quantity):,.0f} {p.symbol} shares"
         # cooldown: a name that already stopped out today is not a re-entry -
-        # going straight back in turns one loss into long<->short chop.
+        # going straight back in turns one loss into long<->short chop. It goes by the session the trade
+        # closed in (trades_on lists the trades opened or closed today), not the one it opened in: a
+        # position held overnight and stopped out this morning lost today too.
         if self.cooldown_after_loss:
             try:
-                today = clock.session_date().isoformat()
-                for t in self.engine.repo.recent_trades(60):
+                for t in self.engine.repo.trades_on(clock.session_date()):
                     if (t.get("symbol") == p.symbol and t.get("status") == "CLOSED"
-                            and str(t.get("session_date") or "").startswith(today)
                             and float(t.get("realized_pl") or 0.0) < 0):
                         return f"{p.symbol} already stopped out today - cooling off"
             except Exception:  # noqa: BLE001
