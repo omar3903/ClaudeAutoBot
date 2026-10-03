@@ -619,6 +619,18 @@ def _no_quote(symbol):
     raise RuntimeError("no market data")
 
 
+def test_an_exit_decided_on_a_delayed_quote_is_measured_against_no_price():
+    # a delayed quote is minutes old: the fill against it would be how far the price moved since, not its slippage
+    for live, measured in ((True, 97.5), (False, None)):
+        repo = FakeRepo([_trade()])
+        ex = _Sends(repo)
+        em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=97.5, ask=97.5, last=97.5),   # under the stop
+                         cfg=_day_cfg(), bus=SimpleNamespace(publish=lambda *a, **k: None),
+                         quotes_live=lambda live=live: live)
+        em.run_once()
+        assert ex.closed == [("t1", "stop")] and ex.seen == {"t1": measured}, live
+
+
 def test_the_time_exits_go_out_on_a_pass_with_no_price(monkeypatch):
     # a quote that doesn't come - no market data, or only a print from before the entry - mustn't hold a day trade past
     # the flatten or its window, nor a swing trade past its last day: those exits read no price, and none is made up

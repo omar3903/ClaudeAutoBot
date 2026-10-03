@@ -445,7 +445,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         # a later order sync; either way Autopilot hears of the entries it sent (on_entries_adopted)
         self.executor.adopt_working_orders()
         self.exit_manager = ExitManager(self.repo, self.executor, quote_fn=self.md.quote,
-                                        cfg=cfg.exit_manager, bus=BUS, venue=venue)
+                                        cfg=cfg.exit_manager, bus=BUS, venue=venue,
+                                        quotes_live=lambda: not bool(getattr(self.md, "delayed", True)))
         self.position_check.reset()
 
     def _retry_connection(self, force: bool = False) -> bool:
@@ -1829,8 +1830,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             account_age_s=account_age_s, connection_age_s=connection_age_s, force=force)
         closed, removed = self._settle_gone(gone)
         if closed:
-            log.warning("booked %d record(s) closed outside the app from %s's fills: %s", len(closed), venue,
-                        ", ".join(f"{c['symbol']} at {c['exit_price']}" for c in closed))
+            log.warning("booked %d record(s) whose position is gone from %s's fills: %s", len(closed), venue,
+                        ", ".join(f"{c['symbol']} at {c['exit_price']} ({c['reason']})" for c in closed))
         if removed:                                      # each said, with why, as it was deleted (_settle_gone)
             self._publish("trades.removed", trades=removed, venue=venue, venue_label=venue_label(venue))
 
@@ -1862,11 +1863,13 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _settle_gone(self, gone: List[Mapping[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Each record whose position is gone: closed at the price the broker's fills say its remaining
-        shares went for (_exit_fill), so the journal, the strategy records and the sizing learn its outcome.
-        One whose fills couldn't be read is left for a later check - its exit may well be there, and deleted
-        the trade would be lost; only one whose fills, read fine, show no exit since the entry it hasn't
-        booked already (IBKR keeps only the current session's) is deleted, the last resort. Returns (closed,
-        removed)."""
+        shares went for (_exit_fill), so the journal, the strategy records and the sizing learn its outcome -
+        with the reason the orders that sold them give (_gone_reason): "closed-outside" only when an order
+        from outside the app sold some of them; one of its own exits - a quit's - is closed as what it was sent
+        for, its stop as a stop. One whose fills couldn't be read is left for a later check - its exit may well
+        be there, and deleted the trade would be lost; only one whose fills, read fine, show no exit since the
+        entry it hasn't booked already (IBKR keeps only the current session's) is deleted, the last resort.
+        Returns (closed, removed)."""
         closed: List[Dict[str, Any]] = []
         removed: List[Dict[str, Any]] = []
         for t in gone:
@@ -1889,15 +1892,18 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                                 t["symbol"], t["id"], venue_label(self._venue))
                     removed.append(row)
                 continue
-            out = self.repo.close_trade(t["id"], fill["price"], exit_reason="closed-outside",
+            reason = fill["reason"]
+            out = self.repo.close_trade(t["id"], fill["price"], exit_reason=reason,
                                         commission=fill["commission"], exit_time=fill["at"],
                                         broker_order_id=fill["order_id"])
             if out:
                 if self.executor is not None:
                     self.executor.forget_open(t["symbol"])
-                closed.append({**row, "exit_price": fill["price"], "fills": fill["fills"],
+                closed.append({**row, "exit_price": fill["price"], "fills": fill["fills"], "reason": reason,
                                "realized_pl": out.get("realized_pl")})
-                self._publish("trade.closed", trade=out, reason="closed outside the app, booked from the broker's fills")
+                self._publish("trade.closed", trade=out,
+                              reason=("closed outside the app" if reason == "closed-outside" else reason)
+                              + ", booked from the broker's fills")
         return closed, removed
 
     #: what sold the shares _settle_short books, by the kind of the trade's own order, in its log's words
@@ -2002,16 +2008,16 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         symbol since the trade was entered - of its own orders, and of ones from outside the app, never another
         trade's - oldest first, past the shares the record has booked already (_not_booked), averaged by size up
         to the shares it still holds, with only those fills' fees. ``order_id`` is the order they came from when
-        there was one (a fee reported later goes on it), else "". None when the broker reports none the record
-        hasn't booked (IBKR keeps only the current session's); a read that failed raises, as the broker's does -
-        "not known" is no "none"."""
+        there was one (a fee reported later goes on it), else ""; ``reason`` the exit reason those orders give
+        (_gone_reason). None when the broker reports none the record hasn't booked (IBKR keeps only the current
+        session's); a read that failed raises, as the broker's does - "not known" is no "none"."""
         get = getattr(self._broker, "get_fills", None)
         if not callable(get):
             return None
         fills = get(t["symbol"]) or []
         tid, entered = t["id"], _utc(t.get("entry_time"))
         exit_side = Side.SHORT if t["side"] == "LONG" else Side.LONG
-        own = (f"{STOP_TAG}{tid}", f"{TARGET_TAG}{tid}", f"exit:{tid}")
+        own = {f"{STOP_TAG}{tid}": "stop", f"{TARGET_TAG}{tid}": "target", f"exit:{tid}": "exit"}
         picked = [f for f in fills if f.side == exit_side and float(f.quantity) > 0
                   and (entered is None or _utc(f.ts) >= entered - dt.timedelta(minutes=1))
                   and ((getattr(f, "tag", "") or "") in own
@@ -2034,7 +2040,42 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             return None
         orders = {str(f.order_id) for f in used}
         return {"price": round(value / qty, 4), "quantity": qty, "fills": len(used), "commission": round(fees, 2),
-                "at": max(_utc(f.ts) for f in used), "order_id": next(iter(orders)) if len(orders) == 1 else ""}
+                "at": max(_utc(f.ts) for f in used), "order_id": next(iter(orders)) if len(orders) == 1 else "",
+                "reason": self._gone_reason(now, rec, used, own)}
+
+    def _gone_reason(self, t: Mapping[str, Any], rec: Mapping[str, Any], used: Sequence[Any],
+                     own: Mapping[str, str]) -> str:
+        """The exit reason of a record closed from the broker's fills (``used``, oldest first), by the orders that
+        sold its shares - their tags: "closed-outside" when an order from outside the app sold any of them; else the
+        trade's own order that sold the last of them says - its stop the stop's reason (stop, or trailing-stop once
+        it had moved), its target "target", and an exit the app sent the reason it was sent for, as the order audit
+        kept it (a quit's exit is "quit"). An exit sent before the audit kept why is "quit" while a quit that is
+        closing the trade is under way, else "exit" - an exit of the app's own, whatever sent it."""
+        kinds = [own.get(getattr(f, "tag", "") or "", "outside") for f in used]
+        if "outside" in kinds:
+            return "closed-outside"
+        last, kind = used[-1], kinds[-1]
+        if kind == "stop":
+            # the stop order rests at the record's stop: moved from where it began, it was a trailing stop
+            return stop_exit_reason(t.get("initial_stop_price"),
+                                    float(t.get("stop_price") or t.get("initial_stop_price") or 0.0))
+        if kind == "target":
+            return "target"
+        tag, filled_at = f"exit:{t['id']}", _utc(last.ts)
+        sent = [o for o in rec.get("orders") or [] if o.get("action") == "PLACE"
+                and isinstance(o.get("request"), dict) and o["request"].get("tag") == tag]
+        mine = next((o for o in sent if o.get("order_id") and o["order_id"] == str(last.order_id)), None)
+        if mine is None:
+            # its send got no answer in time, so the audit has no order id for it: the last exit sent before it filled
+            before = [o for o in sent if filled_at is None or (_utc(o.get("ts")) or filled_at) <= filled_at]
+            mine = before[-1] if before else None
+        why = str((mine or {}).get("request", {}).get("reason") or "")
+        if why:
+            return why
+        quitting = self.quit_state
+        if quitting and t["id"] not in set(quitting.get("keeping") or ()):
+            return "quit"
+        return "exit"
 
     def untracked_positions(self) -> List[Dict[str, Any]]:
         """Shares the current venue's account holds beyond what its open-trade records cover:

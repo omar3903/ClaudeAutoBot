@@ -236,7 +236,8 @@ class Repository:
     ) -> str:
         """``entry_context``: the play's features at the fill (research/features.py), the row a
         model learns from; ``submitted_at``: when the entry order went out; ``decision``: the quote
-        at the decision (``mid``, ``spread_bps``), which the fill is measured against."""
+        at the decision (``mid``, ``spread_bps``, ``live``), which the fill is measured against when it
+        was live (_shortfall)."""
         tid = f"trd_{play.id.split('_', 1)[-1]}"
         now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
@@ -504,7 +505,10 @@ class Repository:
                           for f in fills],
                 "orders": [{"ts": o.ts.isoformat() if o.ts else None, "action": o.action,
                             "ok": bool(o.ok), "broker": o.broker, "message": o.message,
-                            "request": o.request} for o in orders],
+                            "request": o.request,
+                            # the broker's id for an order placed - the one its fills carry
+                            "order_id": str((o.response if isinstance(o.response, dict) else {}).get("order_id")
+                                            or "")} for o in orders],
             }
 
     # -------------------------------------------------------------- #
@@ -1002,14 +1006,18 @@ def _score(t: Trade, pl: float, basis_qty: float) -> None:
 
 def _shortfall(decision: Optional[Dict[str, Any]], fill_price: float, side: str) -> Dict[str, Any]:
     """Harris's implementation shortfall at the entry: the fill against the mid of the quote the
-    decision was made on, in basis points (+ = paid)."""
+    decision was made on, in basis points (+ = paid) - only when that quote was live (``live``, as the
+    entry check saw the data): a delayed quote is minutes old, and a fill against it measures how far the
+    price moved since, not what the fill cost. The quote's spread is kept either way."""
     mid = float((decision or {}).get("mid") or 0.0)
     if mid <= 0:
         return {}
-    sign = 1.0 if side == "LONG" else -1.0
     spread = (decision or {}).get("spread_bps")
-    return {"decision_price": mid, "spread_bps": float(spread) if spread is not None else None,
-            "entry_slippage_bps": round((float(fill_price) - mid) * sign / mid * 1e4, 2)}
+    out: Dict[str, Any] = {"spread_bps": float(spread) if spread is not None else None}
+    if (decision or {}).get("live"):
+        sign = 1.0 if side == "LONG" else -1.0
+        out.update(decision_price=mid, entry_slippage_bps=round((float(fill_price) - mid) * sign / mid * 1e4, 2))
+    return out
 
 
 def sim_to_dict(t: SimTradeLog) -> Dict[str, Any]:

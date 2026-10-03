@@ -1164,10 +1164,79 @@ def test_a_position_closed_outside_is_booked_at_its_own_fills_past_the_parts_alr
     engine._reconcile_open_trades()
     [settled] = engine._reconcile_open_trades()
     t = engine.repo.get_trade(tid)                                          # the 6 it held, at the stop's own fill
-    assert (t["status"], t["exit_reason"], t["exit_price"], settled["fills"]) == ("CLOSED", "closed-outside", 95.0, 1)
+    assert (t["status"], t["exit_reason"], t["exit_price"], settled["fills"]) == ("CLOSED", "stop", 95.0, 1)
     assert t["realized_pl"] == pytest.approx(4 * 10.0 + 6 * -5.0 - 0.6)
     exits = [f for f in engine.repo.trade_record(tid)["fills"] if f["leg"] == "EXIT"]
     assert [(f["quantity"], f["broker_order_id"], f["commission"]) for f in exits][-1] == (6, "s1", 0.6)
+
+
+def _gone(engine, symbol="AAA", qty=5):
+    """An open record whose position the account no longer holds (the simulator was never given its shares)."""
+    tid = _open(engine, symbol, qty=qty)                                    # entered at 100, stop 95
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    return tid
+
+
+def _exit_sent(engine, tid, at, reason="", order_id="", qty=5):
+    """The order audit's row for an exit the app sent (Executor._send_exit): its tag and why it was sent - before the
+    audit kept why, no reason - and the broker's id for it (none when the send got no answer in time)."""
+    request = {"symbol": "AAA", "side": "SHORT", "qty": qty, "type": "MARKET", "tag": f"exit:{tid}",
+               **({"reason": reason} if reason else {})}
+    answer = {"order_id": order_id, "status": "SUBMITTED"} if order_id else {"error": "no answer", "outcome": "unknown"}
+    engine.repo.record_order_audit("PLACE", request, answer, bool(order_id), "paper", trade_id=tid, ts=at)
+
+
+@pytest.mark.parametrize("reason, quitting, booked", [
+    ("quit", False, "quit"),                # the audit kept why the exit was sent
+    ("", True, "quit"),                     # sent before it kept why, while a quit closing the trade is under way
+    ("", False, "exit"),                    # ...and with none under way: an exit of the app's own, all the same
+])
+def test_a_gone_position_its_own_exit_sold_is_closed_as_what_the_exit_was_sent_for(engine, reason, quitting, booked):
+    tid = _gone(engine)
+    now = dt.datetime.now(dt.timezone.utc)
+    _exit_sent(engine, tid, now, reason="time-stop", order_id="e1")         # an earlier exit, called off unfilled
+    _exit_sent(engine, tid, now + dt.timedelta(minutes=1), reason=reason, order_id="q1")
+    engine.quit_state = {"keeping": []} if quitting else None
+    engine._broker.get_fills = lambda symbol=None: [                        # it filled as the app stopped: unheard
+        Fill(order_id="q1", symbol="AAA", side=Side.SHORT, quantity=5, price=101.0, ts=now + dt.timedelta(minutes=2),
+             tag=f"exit:{tid}")]
+    engine._reconcile_open_trades()
+    [settled] = engine._reconcile_open_trades()
+    engine.quit_state = None
+    t = engine.repo.get_trade(tid)
+    assert (t["status"], t["exit_reason"], t["exit_price"], settled["reason"]) == ("CLOSED", booked, 101.0, booked)
+
+
+def test_an_exit_whose_send_got_no_answer_is_known_by_the_last_exit_sent_before_it_filled(engine):
+    tid = _gone(engine)
+    now = dt.datetime.now(dt.timezone.utc)
+    _exit_sent(engine, tid, now, reason="time-stop", order_id="e1")         # called off unfilled
+    _exit_sent(engine, tid, now + dt.timedelta(minutes=1), reason="quit")   # no answer, so no order id on record
+    _exit_sent(engine, tid, now + dt.timedelta(minutes=5), reason="manual", order_id="m1")   # after it had filled
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="77", symbol="AAA", side=Side.SHORT, quantity=5, price=101.0, ts=now + dt.timedelta(minutes=2),
+             tag=f"exit:{tid}")]
+    engine._reconcile_open_trades()
+    engine._reconcile_open_trades()
+    assert engine.repo.get_trade(tid)["exit_reason"] == "quit"
+
+
+def test_only_a_gone_position_an_order_from_outside_the_app_sold_some_of_is_closed_outside(engine):
+    mixed, whole = _gone(engine, "AAA"), _gone(engine, "BBB")
+    now = dt.datetime.now(dt.timezone.utc)
+    _exit_sent(engine, mixed, now, reason="quit", order_id="q1")
+    _exit_sent(engine, whole, now, reason="quit", order_id="q2")
+    later = now + dt.timedelta(minutes=2)
+    fills = [Fill(order_id="tws", symbol="AAA", side=Side.SHORT, quantity=2, price=99.0, ts=later),     # sold in TWS
+             Fill(order_id="q1", symbol="AAA", side=Side.SHORT, quantity=3, price=101.0, ts=later, tag=f"exit:{mixed}"),
+             Fill(order_id="q2", symbol="BBB", side=Side.SHORT, quantity=5, price=102.0, ts=later, tag=f"exit:{whole}")]
+    engine._broker.get_fills = lambda symbol=None: [f for f in fills if f.symbol == symbol]
+    engine._reconcile_open_trades()
+    engine._reconcile_open_trades()
+    t, w = engine.repo.get_trade(mixed), engine.repo.get_trade(whole)
+    assert (t["exit_reason"], t["exit_price"]) == ("closed-outside", pytest.approx((2 * 99.0 + 3 * 101.0) / 5))
+    assert (w["exit_reason"], w["exit_price"]) == ("quit", 102.0)           # its quit's exit sold every share
 
 
 def test_a_record_over_the_account_books_its_own_stop_that_filled_unseen_never_past_what_it_is_over_by(engine):

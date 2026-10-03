@@ -677,8 +677,14 @@ closed in the broker's own app, or by an exit that filled while the app was down
 the entry (its own orders' and ones placed outside the app, never another
 trade's), oldest first, give the exit price and time of the shares it still
 holds, so the trade's outcome reaches the history, the journal and the strategy
-records (exit reason `closed-outside`). Fills the record has booked already — a
-part taken off earlier, known by its order id — are skipped, and only those
+records. The exit reason comes from the orders that sold them: `closed-outside`
+when an order from outside the app sold any of them; otherwise the trade's own
+order that sold the last of them names it — its stop `stop` (or `trailing-stop`
+once it had moved), its target `target`, and an exit the app sent the reason it
+was sent for, which the order audit keeps with each exit (a quit's exit that
+filled as the app stopped is `quit`, not a close outside the app). Fills the
+record has booked already — a part taken off earlier, known by its order id —
+are skipped, and only those
 fills' fees come off. When the broker reports no such fill (IBKR keeps only the
 current session's) the record is **deleted** instead, as after **Reset paper** —
 but only once the broker has answered: when its fills can't be read (the
@@ -959,10 +965,19 @@ match too, so check the untracked shares first).
 **What fills cost (Harris).** The same last look keeps the quote it saw, and the
 trade record stores the fill against it: `decision_price`, `spread_bps`,
 `entry_slippage_bps`, and for exits `exit_decision_price`, `exit_slippage_bps` -
-the implementation shortfall. On live quotes an entry is refused when the spread
-is more than `execution.max_spread_r` (0.10) of the distance to the stop. The
-daily review averages the measured slippage and says when the account pays more
-than the replay charges.
+the implementation shortfall. The slippage is kept only when the quote the
+decision was made on was live: a delayed quote is minutes old, and a fill against
+it says how far the price moved since, not what the fill cost (a stop or target
+resting at the broker is measured against its own price either way). On live
+quotes an entry is refused when the spread is more than `execution.max_spread_r`
+(0.10) of the distance to the stop. The daily review averages the measured
+slippage, leaving out the fills with none, and says when the account pays more
+than the replay charges. Records from before this change: `python
+scripts/repair_records.py` says which trades it would put right (`--apply` changes
+them) - it clears the slippage measured before the account had real-time prices
+(`--live-since`, default 2026-09-23: the entry's on the trades entered before it,
+the exit's on those that exited before it), and relabels `stop` the closed trades
+booked `trailing-stop` whose stop never moved. It prints trade ids only.
 
 ---
 

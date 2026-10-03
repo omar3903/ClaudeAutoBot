@@ -1189,7 +1189,7 @@ def build() -> str:
          "repo.record_scan / record_play / set_play_status / settle_play / note_refusal"),
         ("trades", "one position from entry to exit, including partial exits (banked_pl), the R multiple, the "
          "play's features at the decision (entry_context) and what the fills cost: decision_price, spread_bps, "
-         "entry_slippage_bps, exit_decision_price, exit_slippage_bps",
+         "entry_slippage_bps, exit_decision_price, exit_slippage_bps (slippage only against a live quote)",
          "repo.open_trade / reduce_trade / close_trade"),
         ("fills", "each broker fill, entry or exit leg, with commission", "executor via the repository"),
         ("account_snapshots", "equity, cash, buying power every snapshot-loop pass", "engine snapshot loop"),

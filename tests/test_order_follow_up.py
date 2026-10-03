@@ -1323,6 +1323,17 @@ def test_the_order_audit_keeps_the_brokers_order_id_status_and_message_for_each_
         == [("1", "SUBMITTED", "held until the open"), ("2", "SUBMITTED", "held until the open")]
 
 
+def test_an_exits_audit_row_keeps_why_it_was_sent_answered_or_not():
+    # what a record whose position is gone is closed as, when its fills show this exit sold the shares (_settle_gone)
+    broker, repo = _Broker({"AAA": 10}), _AuditedRepo([_trade()])
+    assert _executor(broker, repo).close_trade("t1", reason="quit")["ok"]
+    unanswered, unheard = _Unanswered({"AAA": 10}, lands=""), _AuditedRepo([_trade()])
+    assert _executor(unanswered, unheard).close_trade("t1", reason="quit")["sent_unknown"]
+    [sent], [lost] = repo.rows("PLACE"), unheard.rows("PLACE")
+    assert (sent["request"]["tag"], sent["request"]["reason"], sent["response"]["order_id"]) == ("exit:t1", "quit", "1")
+    assert (lost["request"]["tag"], lost["request"]["reason"], lost["ok"]) == ("exit:t1", "quit", False)
+
+
 def test_every_cancel_the_app_asks_for_is_audited_with_why_and_one_the_broker_refused_as_failed():
     import datetime as dt
 

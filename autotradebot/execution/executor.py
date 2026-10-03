@@ -903,6 +903,9 @@ class Executor(ProtectiveStops):
                             t["symbol"], trade_id, f"{qty:,.0f}", f"{wanted:,.0f}", venue_label(held_on))
         req = build_exit_order(t["symbol"], t["side"], qty,
                                limit_price=limit_price, cfg=self.cfg, tag=exit_tag(trade_id))
+        # the audit keeps why it was sent: a record whose position is gone is closed with this reason when the broker's
+        # fills show this order sold the shares (the engine's _settle_gone) - a quit's exit is no close outside the app
+        asked = {**_req_dict(req), "reason": reason}
         sent_at = dt.datetime.now(dt.timezone.utc)
         try:
             res = self.broker.place_order(req)
@@ -911,7 +914,7 @@ class Executor(ProtectiveStops):
             # goes out for the trade until the order syncs have looked for it at the broker by its tag - the exit
             # manager waits meanwhile (a wait, not a failed try)
             why = str(e) or "no answer from the broker in time"
-            self._audit("PLACE", req, {"error": why, "outcome": "unknown"}, ok=False, trade_id=trade_id, msg=why,
+            self._audit("PLACE", asked, {"error": why, "outcome": "unknown"}, ok=False, trade_id=trade_id, msg=why,
                         ts=sent_at)
             self._unknown[req.client_tag or exit_tag(trade_id)] = (
                 _Pending("", Play(**_min_play(t)), "exit", trade_id=trade_id, qty=qty, reason=reason,
@@ -931,9 +934,9 @@ class Executor(ProtectiveStops):
                     "reason": f"{why}. The exit may be working - the app looks for it at the broker before sending "
                               f"another."}
         except BrokerError as e:
-            self._audit("PLACE", req, {"error": str(e)}, ok=False, trade_id=trade_id, msg=str(e), ts=sent_at)
+            self._audit("PLACE", asked, {"error": str(e)}, ok=False, trade_id=trade_id, msg=str(e), ts=sent_at)
             return {"ok": False, "reason": str(e)}
-        self._audit("PLACE", req, res, ok=True, trade_id=trade_id, ts=sent_at)
+        self._audit("PLACE", asked, res, ok=True, trade_id=trade_id, ts=sent_at)
 
         if res.status == "FILLED" or res.filled_qty > 0:
             px = res.avg_fill_price or (res.fills[-1].price if res.fills else limit_price)

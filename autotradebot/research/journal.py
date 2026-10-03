@@ -543,7 +543,9 @@ def _ny_day(stamp: Any) -> Optional[dt.date]:
 def execution_quality(trades: Sequence[Mapping[str, Any]], assumed_bps: float) -> Dict[str, Any]:
     """Harris's implementation shortfall over the rolling sessions: what the fills cost against the
     price at the decision, entries and exits apart, next to what the replay assumes a side costs.
-    A replay that charges less than the account really pays proves setups that lose money."""
+    A replay that charges less than the account really pays proves setups that lose money. Only the
+    fills measured against a live quote count: one decided on delayed data has no slippage on record
+    (Repository._shortfall, ExitManager.quotes_live) and is left out of the averages and the counts."""
     def mean(key: str) -> Optional[float]:
         values = [float(t[key]) for t in trades if t.get(key) is not None]
         return round(sum(values) / len(values), 2) if values else None
