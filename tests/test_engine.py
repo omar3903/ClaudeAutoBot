@@ -1410,7 +1410,7 @@ def test_a_set_amount_and_cash_only_count_shares_the_account_holds_without_a_rec
     assert (state["invested"], state["available"], state["untracked"]) == (10_000, 10_000, 10_000)
 
     _open(engine, "AAA", qty=100)                                          # now it has a record: counted once
-    _open(engine, "MSFT", qty=50)                                          # booked before the next account read
+    _open(engine, "EEE", qty=50)                                           # booked before the next account read
     assert engine.sizing_account().raw["capital_room"] == pytest.approx(5_000)
     assert engine.capital_state()["untracked"] == 0
 
