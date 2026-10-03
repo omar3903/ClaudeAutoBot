@@ -573,9 +573,11 @@ The app is built to be left running:
   on shares the records don't explain counts them. That Exit settles them: the entry is no longer booked,
   so no record, stop or second exit appears later for shares already sold (and if the booking took just
   before the click, the Exit sells only what the records still don't cover) - and while any closing order
-  works for a stock (that one, or one placed by hand), an exit counts it and a stop isn't placed beside it.
-  A quit doesn't cancel such an entry: it waits for its record and closes it like any other before it shuts
-  down.
+  works for a stock (that one, or one placed by hand), an exit counts the shares it still has to sell and a
+  stop isn't placed beside it (an exit that has filled, its booking waiting, counts for nothing: those
+  shares are gone already). A quit doesn't cancel such an entry: it waits for its record and closes it like
+  any other before it shuts down, and a pair leg whose pair is called off meanwhile stays followed too -
+  once booked, the pairs desk closes it.
 * **A restart picks the day up where it left off.** The plays on the board, the setups already traded
   or dismissed this session, the pre-market levels the gap check read and the time of the last wide
   scan are saved as the day goes (`data/day_state.bin`: after a scan at most every two minutes, at once

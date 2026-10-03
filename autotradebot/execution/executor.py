@@ -91,6 +91,8 @@ class _Pending:
     filled_seen: float = 0.0        # an entry: the most the broker has reported filled while it worked...
     avg_seen: float = 0.0           # ...and at what average price
     cancel_at: float = 0.0          # when (monotonic) the app last asked the broker to cancel it
+    left_seen: Optional[float] = None   # an exit: the shares the broker last said it still has to sell (None: not said
+                                        # yet - all of ``qty``); 0 once it is done, its booking waiting or not
 
 
 class Executor(ProtectiveStops):
@@ -300,21 +302,21 @@ class Executor(ProtectiveStops):
 
     def cancel_entries_for(self, play_id: str) -> int:
         """Call off the entry orders still working for one play - a pair leg whose other leg failed. A leg that filled
-        whose booking the database refused so far has nothing to cancel, and is let go all the same: booked after the
-        desk has given up its pair, it would be a pair leg nothing manages - no stop, no exit. Its shares are listed
-        under Shares without a record, with their own Exit, and the check on shares no record explains says them (a leg
-        whose order failed half way the desk closes itself that way: _flatten)."""
+        whose booking the database refused so far has nothing to cancel: it stays followed, its play marked called off
+        all the same, so the next pass books it once the database takes it - a leg whose pair is over, which the desk
+        closes at its next pass (PairDesk.manage, "pair-unwind"). Let go instead, its shares would stay at the broker
+        with no record, no stop and no exit. (A leg whose shares the desk closes as shares without a record - _flatten -
+        is taken off the books by that close: _unwound.)"""
         n = 0
         with self._lock:
             for oid, p in list(self._pending.items()):
                 if p.kind == "entry" and p.play.id == play_id:
                     if self._entry_unbooked(p):
-                        self._let_go_unbooked(p)
-                        log.warning("UNBOOKED ENTRY LET GO  %s (play %s): the pairs desk called its pair off - its "
-                                    "shares are held without a record", p.play.symbol, play_id)
+                        log.warning("UNBOOKED ENTRY KEPT  %s (play %s): the pairs desk called its pair off - the leg "
+                                    "is booked once the database takes it, and closed then", p.play.symbol, play_id)
                     else:
                         self._cancel_quietly(oid, "called off by the pairs desk", p)
-                    self._pending.pop(oid, None)
+                        self._pending.pop(oid, None)
                     p.play.status = PlayStatus.CANCELED
                     n += 1
             n += self._call_off_unknown(lambda p: p.play.id == play_id, "called off by the pairs desk")
@@ -881,10 +883,14 @@ class Executor(ProtectiveStops):
             else:
                 return {"ok": True, "status": "FILLED", "trade": out, "reduced": not closed}
 
-        self._pending[res.order_id] = _Pending(res.order_id, Play(**_min_play(t)), "exit",
-                                               trade_id=trade_id, qty=qty, reason=reason,
-                                               partial=partial, after_fill=after_fill,
-                                               decision_price=decision_price, submitted_at=sent_at)
+        p = self._pending[res.order_id] = _Pending(res.order_id, Play(**_min_play(t)), "exit",
+                                                   trade_id=trade_id, qty=qty, reason=reason,
+                                                   partial=partial, after_fill=after_fill,
+                                                   decision_price=decision_price, submitted_at=sent_at)
+        if res.status in DONE_STATUSES:
+            p.left_seen = 0.0           # filled at once, its booking refused: those shares are out of the account
+        elif res.filled_qty > 0 and float(res.submitted_qty or 0.0) > 0:
+            p.left_seen = min(qty, _remaining(res))
         return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id}
 
     def _book_exit(self, symbol: str, trade_id: str, price: float, qty: float, reason: str,
@@ -970,15 +976,24 @@ class Executor(ProtectiveStops):
         return float(pos.quantity) if pos is not None else 0.0
 
     def _exiting_quantity(self, symbol: str) -> float:
-        """Shares of ``symbol`` that exit orders still working are already selling (or covering)."""
+        """Shares of ``symbol`` the exits followed here were sent to sell (or cover) - all of each: the records they
+        close count them until their fills are booked, so this is what is weighed against the records."""
         return sum(p.qty for p in list(self._pending.values()) if p.kind == "exit" and p.play.symbol == symbol)
 
+    def _exits_left(self, symbol: str) -> float:
+        """Shares of ``symbol`` the exits followed here still have to sell (or cover) - what is weighed against the
+        shares held. What the broker has said they filled is out of the account already: an exit that filled whose
+        booking the database has refused so far sells nothing more, nor does the part filled of one still working.
+        Counted again, those shares would leave another record of the stock with neither a stop nor an exit."""
+        return sum(p.qty if p.left_seen is None else min(p.qty, p.left_seen) for p in list(self._pending.values())
+                   if p.kind == "exit" and p.play.symbol == symbol)
+
     def _closing_quantity(self, symbol: str, side: Side, working: List[OrderResult]) -> float:
-        """Shares of ``symbol`` already being sold (or bought back: ``side``) by closing orders - the exits followed
-        here, and the other orders in ``working`` that may be closing a position: an exit an earlier run left, the close
-        of shares without a record, one sent by hand. An exit is capped at the shares held less these, and a stop (sized
+        """Shares of ``symbol`` still to be sold (or bought back: ``side``) by closing orders - the exits followed here,
+        and the other orders in ``working`` that may be closing a position: an exit an earlier run left, the close of
+        shares without a record, one sent by hand. An exit is capped at the shares held less these, and a stop (sized
         from its record) rests only where they still cover it (_place_stop)."""
-        return self._exiting_quantity(symbol) + _closing_left(working, symbol, side, skip=set(self._pending))
+        return self._exits_left(symbol) + _closing_left(working, symbol, side, skip=set(self._pending))
 
     # ------------------------------------------------------------------ #
     def sync_open_orders(self, wait: bool = True) -> bool:
@@ -1260,9 +1275,13 @@ class Executor(ProtectiveStops):
                 p.filled_seen, p.avg_seen = float(res.filled_qty), float(res.avg_fill_price or p.avg_seen)
                 if p.first_fill_at is None:
                     p.first_fill_at = time.monotonic()  # part of it is bought: expire_entries cuts it short if it stalls
+            elif p.kind == "exit" and float(res.submitted_qty or 0.0) > 0:
+                p.left_seen = min(p.qty, _remaining(res))   # the part it has sold is out of the account (_exits_left)
             return
         if self._pending.pop(res.order_id, None) is None:
             return                                      # another pass (the Refresh button's) has just handled it
+        if p.kind == "exit":
+            p.left_seen = 0.0           # done: it sells nothing more, while its booking waits on the database too
         if res.status == "UNKNOWN" and p.kind == "entry":
             found = self._found_in_executions(p, res)
             if found is None:

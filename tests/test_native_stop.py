@@ -1494,6 +1494,60 @@ def test_a_closing_order_working_at_the_broker_is_no_cover_for_a_stop_nor_room_f
     assert [(s.client_tag, s.quantity) for s in broker.stops()] == [("stop:t1", 10)]
 
 
+def _two_records():
+    """Two records of 10 AAA each (t1, t2), both stops resting on the 20 shares held. Returns what _setup does, and
+    t2's stop's order id."""
+    broker, repo, ex, heard = _setup(positions={"AAA": 20})
+    repo.t["t2"] = _trade(id="t2", entry_time="2026-09-03T09:50:00")
+    ex.STOP_RETRY_S = ex.SHARES_RETRY_S = 0.0
+    ex.sync_open_orders()
+    [stop_t2] = [s.order_id for s in broker.live.values() if s.tag == "stop:t2"]
+    return broker, repo, ex, heard, stop_t2
+
+
+def _resting(broker, tag):
+    return [s for s in broker.live.values() if s.tag == tag and s.status not in ("CANCELED", "FILLED")]
+
+
+def test_an_exit_filled_whose_booking_waits_sells_nothing_more_so_another_record_keeps_a_stop_and_its_exit():
+    broker, repo, ex, heard, stop_t2 = _two_records()
+    real_close = repo.close_trade
+
+    def refuse_t1(tid, *a, **k):                                               # the database won't take t1's close
+        if tid == "t1":
+            raise RuntimeError("database is locked")
+        return real_close(tid, *a, **k)
+
+    repo.close_trade = refuse_t1
+    out = ex.close_trade("t1", reason="stop")
+    broker.reports[out["order_id"]] = OrderResult(order_id=out["order_id"], status="FILLED", symbol="AAA",
+                                                  submitted_qty=10, filled_qty=10, avg_fill_price=97.8)
+    broker.positions["AAA"] = 10                                               # t1's ten are gone: t2's are left
+    ex.sync_open_orders()
+    assert ex.pending_exit_trade_ids() == {"t1"} and repo.get_trade("t1")["status"] == "OPEN"   # booked later
+    broker.live[stop_t2].status = "CANCELED"                                   # t2's stop dropped by the broker...
+    ex.sync_open_orders()
+    assert len(_resting(broker, "stop:t2")) == 1                               # ...is placed again on its 10 shares
+    assert "stop.failed" not in [topic for topic, _ in heard]
+    out = ex.close_trade("t2", reason="eod-flatten")                           # and t2's own exit goes out
+    assert out["ok"] and [(o.client_tag, o.quantity) for o in broker.exits()] == [("exit:t1", 10), ("exit:t2", 10)]
+
+
+def test_the_part_a_working_exit_has_sold_is_not_counted_again_against_the_shares_held():
+    broker, repo, ex, heard, stop_t2 = _two_records()
+    out = ex.close_trade("t1", reason="stop")
+    broker.reports[out["order_id"]] = OrderResult(order_id=out["order_id"], status="SUBMITTED", symbol="AAA",
+                                                  submitted_qty=10, filled_qty=4, avg_fill_price=97.8)
+    broker.positions["AAA"] = 16                                               # 4 sold, 6 still to sell
+    broker.live[stop_t2].status = "CANCELED"
+    ex.sync_open_orders()
+    assert len(_resting(broker, "stop:t2")) == 1 and "stop.failed" not in [topic for topic, _ in heard]
+    broker.positions["AAA"] = 15                                               # one more sold, not reported yet
+    broker.live[_resting(broker, "stop:t2")[0].order_id].status = "CANCELED"
+    ex.sync_open_orders()
+    assert _resting(broker, "stop:t2") == []                                   # 15 held less 6 to sell can't cover it
+
+
 # ---------------------------------------------------------------- one caller at a time: threads side by side
 def test_two_closes_sent_together_send_one_exit_and_the_second_hears_at_once():
     broker, _, ex, _ = _setup()

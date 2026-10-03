@@ -156,6 +156,58 @@ def test_an_error_after_a_leg_filled_leaves_no_shares_behind(setup, repo, monkey
     assert [r["status"] for r in repo.pair_trades(limit=20) if r["pair"] == "PDN/PDO"] == ["FAILED"]
 
 
+def _refuse_bookings(repo, monkeypatch, symbol):
+    """The database refuses to book ``symbol``'s fills (another program holds it, say) while the returned set holds it."""
+    real, refusing = repo.open_trade, {symbol}
+
+    def open_trade(play, *args, **kwargs):
+        if play.symbol in refusing:
+            raise RuntimeError("database is locked")
+        return real(play, *args, **kwargs)
+
+    monkeypatch.setattr(repo, "open_trade", open_trade)
+    return refusing
+
+
+def _held(s, symbol):
+    position = s.broker.get_account().position(symbol)
+    return 0.0 if position is None else position.quantity
+
+
+def test_a_filled_leg_the_database_wont_book_is_closed_once_it_does_when_the_other_leg_cant_be_sent(
+        setup, repo, monkeypatch):
+    s = setup("PDP", "PDQ", no_short=["PDQ"])
+    refusing = _refuse_bookings(repo, monkeypatch, "PDP")
+    out = s.enter()
+    assert not out["ok"] and "PDQ" in out["reason"]
+    assert _held(s, "PDP") > 0 and [w["unbooked"] for w in s.executor.working_entries()] == [True]   # still followed
+    refusing.clear()                                                             # the database takes bookings again
+    s.executor.sync_open_orders()                                                # the leg is booked...
+    s.desk.manage(s.executor, s.prices, s.frames.get, in_window=False)           # ...and closed: its pair is over
+    s.executor.sync_open_orders()
+    assert abs(_held(s, "PDP")) < 1e-9
+    [rec] = [r for r in repo.pair_trades(limit=20) if r["pair"] == "PDP/PDQ"]
+    [leg] = repo.trades_for_pair(rec["id"])
+    assert rec["status"] == "FAILED" and (leg["status"], leg["exit_reason"]) == ("CLOSED", "pair-unwind")
+
+
+def test_legs_that_dont_both_book_in_time_are_closed_one_whose_booking_waited_on_the_database_too(
+        setup, repo, monkeypatch):
+    s = setup("PDR", "PDS")
+    refusing = _refuse_bookings(repo, monkeypatch, "PDR")
+    out = s.enter()
+    assert out["ok"] and out["status"] == "ENTERING" and _held(s, "PDR") > 0 and _held(s, "PDS") < 0
+    monkeypatch.setattr(desk_module, "ENTRY_TIMEOUT_S", -1.0)                    # their time is up
+    s.desk.sync(s.executor)
+    assert _record(repo, out["pair_trade_id"])["status"] == "FAILED" and abs(_held(s, "PDS")) < 1e-9
+    refusing.clear()
+    s.executor.sync_open_orders()
+    s.desk.manage(s.executor, s.prices, s.frames.get, in_window=False)
+    s.executor.sync_open_orders()
+    assert abs(_held(s, "PDR")) < 1e-9
+    assert all(t["status"] == "CLOSED" for t in repo.trades_for_pair(out["pair_trade_id"]))
+
+
 def test_a_leg_closed_outside_the_desk_takes_the_other_with_it(setup, repo):
     s = setup("PDJ", "PDK")
     pid = s.enter()["pair_trade_id"]
