@@ -356,6 +356,13 @@ class ReplayCfg(_Model):
                                           # as the day's watchlist (0 = the watchlist only); costs no requests
     slippage_bps: float = 5.0             # on every market fill, each way
     commission_bps: float = 1.0           # on every fill
+    commission_per_share: float = 0.005   # IBKR's fixed commission on top, on every fill: this much a share...
+    commission_min: float = 1.0           # ...at least this much an order...
+    commission_max_pct: float = 1.0       # ...and at most this % of the order's value (0 = no cap)
+    nominal_risk_usd: float = 1000.0      # the replay counts in R and has no size, so the commission is charged on
+                                          # the shares a trade risking this much would buy (1% of a nominal $100k
+                                          # account). Only the minimum and the cap depend on it: $0.005 a share over
+                                          # the risk a share is the same R at any size
     held_out_fraction: float = 0.3334     # the latest sessions kept out of sample
     workers: int = 0                      # processes replaying stocks side by side; 0 = every core but two
     sessions_per_job: int = 10            # a day-trade job replays this many sessions of one stock, so the work spreads

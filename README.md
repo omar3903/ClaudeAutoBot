@@ -864,9 +864,11 @@ match too, so check the untracked shares first).
 trade record stores the fill against it: `decision_price`, `spread_bps`,
 `entry_slippage_bps`, and for exits `exit_decision_price`, `exit_slippage_bps` -
 the implementation shortfall. On live quotes an entry is refused when the spread
-is more than `execution.max_spread_r` (0.10) of the distance to the stop. The
-daily review averages the measured slippage and says when the account pays more
-than the replay charges.
+is more than `execution.max_spread_r` (0.10) of the distance to the stop. A look
+that refuses an entry keeps its quote with the play (`last_look`, the first
+refusal), and the daily review charges that spread to the play's shadow trade.
+The daily review averages the measured slippage and says when the account pays
+more than the replay charges.
 
 ---
 
@@ -1058,8 +1060,12 @@ taken, averaging at least `min_replay_expectancy_r` (+0.05R) — **and** at leas
 of them in the held-out latest third of the sessions, averaging more than 0R
 there. The statistical noise checks (`not_trending`, `not_mean_reverting`,
 `turbulent_market`) and the two news checks (`news_driven_move`,
-`move_without_news`) are skipped by themselves once the replay shows that the
-trades they remove did worse on every session and on the held-out ones. Each
+`move_without_news`) are skipped by themselves once the replay shows real
+evidence that the trades they remove are worse: over every session they averaged
+at least 0.05R a trade below the ones kept, two standard errors or more apart
+(Welch's t of -2 or lower), and they did worse on the held-out sessions too. A
+gap of a few hundredths of an R, or one inside the noise, would flip the skip on
+and off from one replay to the next. Each
 entry risks no more than `risk.max_risk_per_trade_pct`, lowered to **half-Kelly**
 when the strategy's record calls for less.
 
@@ -1352,11 +1358,13 @@ next replays go on from there until the sixty sessions are covered. A request th
 asked again; a session IBKR really has nothing for is remembered and isn't.
 
 Every day setup is followed twice: **entered on sight** (the record of all trades) and **entered
-after it has shown two bars in a row**, one bar later and once a session per setup - which is how
-Autopilot enters when it asks a day trade to be seen on two candles running. Autopilot's record,
-the one the proof rule reads, is built from the way in it really uses. Before, nearly every
-replayed day trade was entered on sight, so 27 of 1,466 counted and no day setup could ever
-reach the 30 trades proof asks for.
+after it has shown two bars in a row**, one bar later - which is how Autopilot enters when it asks a
+day trade to be seen on two candles running. Either way a setup is entered once a session, the way
+the board settles a setup it has acted on: one that shows again after its trade has closed isn't
+offered again, so it isn't a new trade (before, the entries on sight re-entered it every time it
+fired). Autopilot's record, the one the proof rule reads, is built from the way in it really uses.
+Before, nearly every replayed day trade was entered on sight, so 27 of 1,466 counted and no day
+setup could ever reach the 30 trades proof asks for.
 
 What the day-trade replay still can't know: it reads 5-minute candles, so a stop and a target
 inside one candle count as the stop, fills are the next candle's open with a flat slippage, the
@@ -1373,6 +1381,11 @@ follows every play the way the automatic exits would. Its settings are in
   worker process, and a day-trade replay is cut into jobs of `sessions_per_job` (10) sessions so the
   long ones don't leave workers idle at the end. Series that are the same for every bar of a session
   (the session VWAP, the opening range) are computed once per session.
+* **The candles live sees.** At each 5-minute close a day setup is handed the candle that has just begun
+  as well - priced at its open, no volume yet - the way the candle-close check reads IBKR's bars seconds
+  after a close. So a setup confirms on the bar that has just closed, on the same bar as live, and fills at
+  that new candle's open; before, the replayed candles stopped at the closed bar and every closed-bar
+  confirmation came a bar late.
 * **Only the plays the app would show and take.** A play under the scanner's reward:risk floor
   (`risk.min_reward_risk`) is never on the board, so the replay never trades it; and a strategy's
   Autopilot record counts only the trades Autopilot would take - its skipped flags, its confirmations,
@@ -1393,7 +1406,13 @@ follows every play the way the automatic exits would. Its settings are in
   after that the live store's candles keep it current for nothing. However long the
   history, a replayed setup sees the 300 sessions it would see live. Up to 120
   day-trade sessions can be asked for — 5-minute candles are downloaded once and kept.
-* **Costs**: 5 bps slippage on every market fill and 1 bp commission on every fill.
+* **Costs**: 5 bps slippage on every market fill and 1 bp commission on every fill, and on every
+  order IBKR's fixed commission as well - $0.005 a share, at least $1, at most 1% of the order's value
+  (`commission_per_share`, `commission_min`, `commission_max_pct`) - taken off the trade's R. The
+  replay counts in R and has no size, so the shares are the ones a trade risking
+  `nominal_risk_usd` ($1,000, 1% of a nominal $100k account) would buy. A share's commission over
+  its risk is the same R at any size; only the $1 minimum (a wide stop, or the half taken off at a
+  first target) and the 1% cap (a stock under 50 cents) depend on that assumption.
 * **Held out**: the latest third of the sessions. Every strategy record and every
   noise verdict is also given for those sessions alone, and Autopilot wants a
   strategy to have made money there too.
@@ -1427,7 +1446,7 @@ and they're added once it is. For each mover:
 * **what the bot made of it** — *traded* (with the move or against it, R and P/L),
   *sent, not filled* (an entry went out — Autopilot's or yours — and no trade came of it;
   the row it was sent from is listed beside the setup's first sighting, with what it would
-  have made followed on the candles),
+  have made had it filled, followed on the candles),
   *offered, not taken* (and what the setup would have made, followed on the candles),
   *watched, no setup* (on the hot list, adopted into it, or scanned from a sector buffer),
   or *not watched* — and why: the morning's ranking put it #412 of 2,950, it was too thin
@@ -1459,11 +1478,22 @@ ranking of the previous day's candles can't see them, and the report says so.
   before it was confirmed, going straight back into a stock that had just lost, a
   strategy without a proven record;
 * **the plays not taken**, each followed on the session's 5-minute candles as if
-  it had been, from the next bar after it was on the board with the values it was
-  recorded with (a play's row holds the last scan that wrote it, and a scan's plays
-  reach the board when it finishes); an entry sent that never filled (a sent row
-  no trade was booked from, even one still marked submitted) is followed
-  from the row it was sent from, from the moment it went out, however it scored —
+  it had been, the way Autopilot enters: from the next bar after its confirmations
+  first reached Autopilot's minimum, with the values and readings it had then (the
+  board keeps that moment and those values in the play's evidence, `confirmed_at`
+  and `as_confirmed` - each scan writes the play at its own prices, with readings
+  of the stock's run taken after the entry). A setup that left the board and came
+  back is logged again under a new play; when the comeback is the one that reached
+  the minimum, the comeback is followed from then. A play never
+  confirmed, or logged before that moment was kept, is followed from the next bar
+  after it was on the board with the values it was recorded with (a play's row
+  holds the last scan that wrote it, and a scan's plays reach the board when it
+  finishes). A play the last look refused pays the spread that look read, in R of
+  its risk - the refusal and its quote are kept with the play (`last_look`). An
+  entry sent that never filled (a sent row no trade was booked from, even one
+  still marked submitted) is followed from the row it was sent from, from the
+  moment it went out, however it scored, and counts as no fill: it made nothing,
+  and what it would have made had it filled is kept apart for the Reports page —
   grouped by noise flag and by whether Autopilot's checks passed
   it, so every check is tested on live plays every day. The checks are the ones in
   force that session, as the last Autopilot entry recorded them (a rebuild keeps
@@ -1565,10 +1595,15 @@ scales confidence by Aziz's session clock. **Every play's stop is floored**: a
 stop closer than ~0.6 % of price (or ~0.9 intraday ATRs) is widened, *then*
 reward:risk is re-checked. Indicators the setups share (ATRs, VWAP, relative
 volume, the S/R map, the daily trend) are computed once per stock per scan.
+Relative volume leaves out the 5-minute candle still printing: today's closed
+candles against earlier sessions' up to the same time. The swing setups read
+their signals on **completed daily candles** (during the session today's candle
+is still forming and is left out), the ones the replay signals on at each
+session's close, and enter at the price now.
 
 | key | timeframe | idea |
 |---|---|---|
-| `abcd_pattern` | intraday | hard push A→B, pullback to a **higher low C**; enter near C, target the B retest and measured move |
+| `abcd_pattern` | intraday | hard push A→B, pullback to a **higher low C**, drawn on **closed candles only** (the one still printing can't make the pullback, and a last candle that closed half an ATR through the pullback's low is refused); enter near C, never under it, target the B retest and measured move |
 | `bull_bear_flag` | intraday | near-vertical pole + tight sideways flag; enter on the flag break |
 | `opening_range_breakout` | intraday | break of the first N-min range **only when that range < the daily ATR**, VWAP-side stop |
 | `vwap_reclaim` | intraday | a **5-min close** back across session VWAP after ≥ 3 bars on the other side |
