@@ -429,6 +429,22 @@ def test_two_parts_taken_off_one_record_at_once_never_take_off_more_than_it_hold
     assert results == [t]
 
 
+def test_the_recent_trades_carry_each_trades_exit_average_however_many_are_read(repo, monkeypatch):
+    from autotradebot.persistence import repository
+
+    monkeypatch.setattr(repository, "_IN_CHUNK", 2)                 # the ids are looked up two at a time
+    want = {}
+    for i, price in enumerate((101.0, 102.0, 103.0, 104.0, 105.0)):
+        p = _play(symbol=f"T7{i}")
+        repo.record_play(p)
+        tid = repo.open_trade(p, 100.0, 10, "paper")
+        repo.reduce_trade(tid, 5, price)                            # half off, the other half a dollar higher
+        repo.close_trade(tid, price + 1.0, exit_reason="target")
+        want[tid] = (price + 0.5, 2)
+    rows = {t["id"]: t for t in repo.recent_trades(limit=50)}
+    assert {tid: (rows[tid]["exit_avg_price"], rows[tid]["exit_parts"]) for tid in want} == want
+
+
 def test_the_startup_migration_quotes_names_and_writes_defaults_the_databases_way(tmp_path, monkeypatch):
     """An older database missing a column gets it at start-up with its default in place, even when the
     name is an SQL keyword and the default holds both kinds of quote."""

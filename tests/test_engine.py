@@ -1573,6 +1573,33 @@ def test_a_trade_record_can_be_pulled_up_and_deleted(engine):
     assert engine.trade_record(tid) is None
 
 
+def test_the_history_and_a_record_show_a_position_taken_off_in_parts_whole(engine, monkeypatch):
+    from fastapi.testclient import TestClient
+    from autotradebot.server import security
+    from autotradebot.server.app import create_app
+
+    parted = _open(engine, "T01", qty=10)
+    engine.repo.reduce_trade(parted, 4, 102.0)                              # 4 of the 10 off at the first target
+    engine.repo.close_trade(parted, exit_price=101.0, exit_reason="stop")   # the other 6 at the stop
+    whole = _open(engine, "T02", qty=5)
+    engine.repo.close_trade(whole, exit_price=104.0, exit_reason="target")
+    still = _open(engine, "T03", qty=8)
+
+    monkeypatch.setattr(security, "ALLOWED_CLIENTS", security.ALLOWED_CLIENTS | {"testclient"})
+    monkeypatch.setattr(security, "ALLOWED_HOSTS", security.ALLOWED_HOSTS | {"testserver"})
+    app = create_app(lambda settings: None)
+    app.state.engine = engine
+    client = TestClient(app, headers={"X-ATB-Request": "1"})
+    rows = {t["id"]: t for t in client.get("/api/trades?limit=10").json()["trades"]}
+    shown = lambda t: (t["initial_quantity"], t["exit_avg_price"], t["exit_parts"], t["exit_price"])  # noqa: E731
+    assert shown(rows[parted]) == (10, 101.4, 2, 101.0)          # the shares entered, the average, the last part's price
+    assert shown(rows[whole]) == (5, 104.0, 1, 104.0)
+    assert shown(rows[still]) == (8, None, 0, None)
+    record = client.get(f"/api/trades/{parted}/record").json()["trade"]
+    assert shown(record) == (10, 101.4, 2, 101.0)
+    assert shown(client.get(f"/api/trades/{still}/record").json()["trade"]) == (8, None, 0, None)
+
+
 # ---------------------------------------------------------------- trading capital
 def _tight_play(symbol="NVDA"):
     # 0.50 of risk per share, so the position limits bind rather than the risk budget

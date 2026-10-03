@@ -645,7 +645,10 @@ the market at any time, including while quitting.
 Click an open position or a closed trade for its **record**: status, entry and
 exit, stop moves, what the broker holds right now, why it was taken (the play's
 explanation), every fill and every order sent to the broker — with an **Exit**
-button while it's open. The record opens as a panel across the window, and a
+button while it's open. A closed position taken off in parts shows whole, there
+and in the **Trade history**: the shares it was entered with and the average of
+its exits weighted by their shares, with the last part's price beside it. Times
+are your computer's local time. The record opens as a panel across the window, and a
 chart of the trade fills the rest of it (`GET /api/trades/{id}/chart`): 5-minute
 candles from the session before the entry (daily candles once it has been held
 longer than ten sessions), the entry, stop and target lines with the first stop

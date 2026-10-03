@@ -456,9 +456,12 @@ class Repository:
             return [trade_to_dict(r) for r in rows]
 
     def recent_trades(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """The latest trades, newest first, each with its exit fills averaged (exit_avg_price, exit_parts), so
+        the history can show a position taken off in parts whole, as the journal does."""
         with session_scope() as s:
             rows = s.execute(select(Trade).order_by(Trade.created_at.desc()).limit(limit)).scalars().all()
-            return [trade_to_dict(r) for r in rows]
+            exits = _exit_fills(s, [r.id for r in rows])
+            return [{**trade_to_dict(r), **exits.get(r.id, NO_EXITS)} for r in rows]
 
     def get_trade(self, trade_id: str) -> Optional[Dict[str, Any]]:
         with session_scope() as s:
@@ -483,8 +486,8 @@ class Repository:
         return True
 
     def trade_record(self, trade_id: str) -> Optional[Dict[str, Any]]:
-        """Everything stored about one trade: the trade, the play that led to it,
-        its fills and the broker orders sent for it."""
+        """Everything stored about one trade: the trade (with its exit fills averaged, as recent_trades
+        gives it), the play that led to it, its fills and the broker orders sent for it."""
         with session_scope() as s:
             t = s.get(Trade, trade_id)
             if t is None:
@@ -497,7 +500,7 @@ class Repository:
                 cond = or_(cond, OrderAudit.play_id == t.play_id)
             orders = s.execute(select(OrderAudit).where(cond).order_by(OrderAudit.ts)).scalars().all()
             return {
-                "trade": trade_to_dict(t),
+                "trade": {**trade_to_dict(t), **_exit_fills(s, [trade_id]).get(trade_id, NO_EXITS)},
                 "play": play_to_dict(play) if play else None,
                 "fills": [{"ts": f.ts.isoformat() if f.ts else None, "leg": f.leg, "side": f.side,
                            "quantity": _f(f.quantity), "price": _f(f.price),
@@ -866,18 +869,25 @@ def _ny_bounds(day: dt.date):
 #: a trade with no exit fills on record (a record older than the fills, or one still whole)
 NO_EXITS: Dict[str, Any] = {"exit_avg_price": None, "exit_parts": 0}
 
+#: trade ids per query in _exit_fills - well under SQLite's oldest limit of 999 bound values
+_IN_CHUNK = 500
+
 
 def _exit_fills(s, trade_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Each trade's exit fills, in one grouped query: their size-weighted average price and how many
+    """Each trade's exit fills, in grouped queries: their size-weighted average price and how many
     parts the position left in. A trade's exit_price is only its last part's, so a position taken off
-    in parts needs the average for (exit - entry) x shares to come to what it made."""
-    if not trade_ids:
-        return {}
-    rows = s.execute(select(Fill.trade_id, func.sum(Fill.quantity * Fill.price), func.sum(Fill.quantity), func.count())
-                     .where(Fill.leg == "EXIT", Fill.trade_id.in_(trade_ids))
-                     .group_by(Fill.trade_id)).all()
-    return {tid: {"exit_avg_price": round(float(value) / float(qty), 6), "exit_parts": int(parts)}
-            for tid, value, qty, parts in rows if qty}
+    in parts needs the average for (exit - entry) x shares to come to what it made. A long list (the
+    learning dataset reads every trade) goes _IN_CHUNK ids at a time, under the database's limit on
+    bound values."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for i in range(0, len(trade_ids), _IN_CHUNK):
+        rows = s.execute(select(Fill.trade_id, func.sum(Fill.quantity * Fill.price), func.sum(Fill.quantity),
+                                func.count())
+                         .where(Fill.leg == "EXIT", Fill.trade_id.in_(trade_ids[i:i + _IN_CHUNK]))
+                         .group_by(Fill.trade_id)).all()
+        out.update({tid: {"exit_avg_price": round(float(value) / float(qty), 6), "exit_parts": int(parts)}
+                    for tid, value, qty, parts in rows if qty})
+    return out
 
 
 # --------------------------------------------------------------------------- #
