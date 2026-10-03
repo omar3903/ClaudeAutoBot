@@ -488,7 +488,9 @@ async function approve(id) {
   pending.delete(id);
   if (r.ok) {
     const where = r.order_session === "EXTENDED" ? " (extended-hours limit)" : "";
-    toast(`Order sent for ${symbol}: ${r.order_type || ""} ${r.status || "ok"}${where}`, "good");
+    // the shares sent: the last look re-sizes an entry it re-prices off the quote, so they can differ from the preview
+    const shares = r.qty ? `${num(r.qty, 0)} shares, ` : "";
+    toast(`Order sent for ${symbol}: ${shares}${r.order_type || ""} ${r.status || "ok"}${where}`, "good");
     mergePlay({ id, status: r.status === "FILLED" ? "FILLED" : "SUBMITTED", trade_id: r.trade_id || null });
     if (S.selected === id) selectPlay(id);            // another play picked meanwhile stays shown
     loadOpen();

@@ -56,11 +56,19 @@ def in_account_currency(acc: Account) -> Dict[str, Any]:
             "buying_power": round(amount("buying_power", acc.buying_power), 2)}
 
 
+def invested_by_symbol(acc: Optional[Account], trades: Iterable[Mapping[str, Any]]) -> Dict[str, float]:
+    """What the bot has in these positions per stock, at the broker's marks."""
+    marks = {p.symbol: p.market_price for p in (acc.positions if acc else [])}
+    out: Dict[str, float] = {}
+    for t in trades:
+        value = abs(float(t.get("quantity") or 0.0)) * float(marks.get(t["symbol"]) or t.get("entry_price") or 0.0)
+        out[t["symbol"]] = out.get(t["symbol"], 0.0) + value
+    return out
+
+
 def invested_usd(acc: Optional[Account], trades: Iterable[Mapping[str, Any]]) -> float:
     """What the bot has in these positions, at the broker's marks."""
-    marks = {p.symbol: p.market_price for p in (acc.positions if acc else [])}
-    return sum(abs(float(t.get("quantity") or 0.0)) * float(marks.get(t["symbol"]) or t.get("entry_price") or 0.0)
-               for t in trades)
+    return sum(invested_by_symbol(acc, trades).values())
 
 
 def kind_of(timeframe: Any) -> str:
@@ -117,6 +125,9 @@ def state(acc: Account, venue: str, label: str, limit: Optional[float], invested
     else:                                   # with margin: what the positions hold plus the buying power left
         effective = capacity_usd(acc, None, invested, mode) / rate
     held = invested / rate if rate else 0.0
+    # cash only or a set amount, ``invested`` counts what the broker holds beyond the trade records too
+    # (CapitalOps._invested_usd); the kinds count only the bot's own trades
+    beyond = max(0.0, invested - sum(by_kind.values())) if by_kind else 0.0
 
     def part(kind: str) -> Dict[str, float]:
         size = effective * share_of(kind, day_pct)
@@ -130,6 +141,7 @@ def state(acc: Account, venue: str, label: str, limit: Optional[float], invested
             "limit": limit, "mode": "amount" if limit else mode, "buying_power": worth["buying_power"],
             "account_value": value, "effective": round(effective, 2),
             "invested": round(held, 2), "available": round(max(0.0, effective - held), 2),
+            "untracked": round(beyond / rate, 2) if rate else 0.0,
             "clipped": bool(limit and limit > value), "fx_missing": not rate,
             "split": {"day_pct": day_pct, "day": part(DAY), "swing": part(SWING)}}
 

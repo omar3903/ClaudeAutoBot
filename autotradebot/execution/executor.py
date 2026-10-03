@@ -33,9 +33,12 @@ A fill whose booking the database refuses (busy with another writer, say) is nev
 BookingFailed once it has been logged and the dashboard told (order.unbooked, again every few minutes while it keeps
 failing), and the order stays followed - in ``_pending``, ``_unknown`` or its stop's book - so the next order sync
 books it. Meanwhile it counts as working: an entry keeps Autopilot's slot, and no second exit goes out for the
-position. An entry's shares are no longer in flight though (``symbols_in_flight(unbooked=False)``): its order is done,
-and the checks on shares no record explains see them. Closing them as shares without a record (close_untracked) takes
-the entry off the books, so no record appears later for shares already sold; a quit's cancels leave it followed.
+position. An entry stays listed among the working entries while its fill is being booked, too (``_booking``), until
+its record is saved: the open risk sizing counts, and Autopilot's caps, are read on other threads, with no lock, and
+would otherwise find it neither working nor recorded for as long as the database takes. An entry's shares are no
+longer in flight though (``symbols_in_flight(unbooked=False)``): its order is done, and the checks on shares no record
+explains see them. Closing them as shares without a record (close_untracked) takes the entry off the books, so no
+record appears later for shares already sold; a quit's cancels leave it followed.
 
 The order audit (``order_audit``, :meth:`Executor._audit`) records what happened to each order: every order placed,
 with the broker's order id, status and message (PLACE); every cancel the app asks for, and why (CANCEL); every move of
@@ -93,6 +96,8 @@ class _Pending:
     cancel_at: float = 0.0          # when (monotonic) the app last asked the broker to cancel it
     left_seen: Optional[float] = None   # an exit: the shares the broker last said it still has to sell (None: not said
                                         # yet - all of ``qty``); 0 once it is done, its booking waiting or not
+    sized_at: Optional[Tuple[float, float]] = None  # an entry: the price it was sized at and its risk per share there,
+                                                    # as it was sent (_sized_at) - its play may be sized again since
 
 
 class Executor(ProtectiveStops):
@@ -140,6 +145,9 @@ class Executor(ProtectiveStops):
         self._unknown: Dict[str, Tuple[_Pending, float]] = {}
         #: ...and, of those still not found a while on, when (monotonic) each was last said (_warn_unknown)
         self._unknown_said: Dict[str, Tuple[_Pending, float]] = {}
+        #: entries whose fill is being booked this moment, taken out of ``_pending`` or ``_unknown`` for it (by id):
+        #: listed with the working entries (_sent) until their record is saved, or they go back on a refusal
+        self._booking: Dict[int, _Pending] = {}
         #: fills the database refused to book, by what they were for ("entry:<play id>", "exit:<trade id>") -> the
         #: tries that failed so far: the dashboard hears of the first, and again every few minutes while they keep
         #: failing (when, monotonic: ``_unbooked_said``), the log of each, till one takes (_booking_failed)
@@ -323,9 +331,19 @@ class Executor(ProtectiveStops):
         return n
 
     def _sent(self) -> List[_Pending]:
-        """Every order sent and not finished: the ones followed, and the ones whose send got no answer in time, which
-        may be working too (_unknown)."""
-        return list(self._pending.values()) + [p for p, _ in list(self._unknown.values())]
+        """Every order sent and not finished: the ones followed, the ones whose send got no answer in time, which
+        may be working too (_unknown), and the entries whose fill is being booked this moment (_booking). Read with no
+        lock - sizing on the scan thread, say, while an order sync books a fill - so ``_booking`` is read before and
+        after the other two, and an entry moving into it or back out (put in its new place before it leaves the old)
+        is always found in one of them."""
+        booking = list(self._booking.values())
+        sent = list(self._pending.values()) + [p for p, _ in list(self._unknown.values())]
+        seen = {id(p) for p in sent}
+        for p in booking + list(self._booking.values()):
+            if id(p) not in seen:
+                seen.add(id(p))
+                sent.append(p)
+        return sent
 
     def pending_exit_trade_ids(self) -> set:
         """Trades whose close order is still working at the broker - or may be: one whose send got no answer in time
@@ -335,12 +353,20 @@ class Executor(ProtectiveStops):
     def working_entries(self) -> List[Dict[str, Any]]:
         """Entry orders sent but not filled yet - one whose send got no answer in time too (no order id yet), and one
         that filled whose booking the database refused so far (``unbooked``: its shares are at the broker, with no
-        record yet). Anything that limits positions has to count these too, or a slow fill gets doubled up."""
-        return [{"order_id": p.order_id, "play_id": p.play.id, "symbol": p.play.symbol,
-                 "strategy": p.play.strategy, "timeframe": p.play.timeframe.value,
-                 "qty": p.qty, "notional": p.play.entry * p.qty,
-                 "risk": abs(p.play.entry - p.play.stop) * p.qty, "unbooked": self._entry_unbooked(p)}
-                for p in self._sent() if p.kind == "entry"]
+        record yet). Anything that limits positions has to count these too, or a slow fill gets doubled up.
+        ``notional`` and ``risk`` are at the price the entry was sized at (_sized_at): the limit the last look
+        re-priced it to, if it did - as it was sent, whatever its play is sized at since. ``pair_leg``: one leg of a
+        pair trade, whose stop - and so its ``risk`` - is a placeholder."""
+        out = []
+        for p in self._sent():
+            if p.kind != "entry":
+                continue
+            price, per_share = p.sized_at or _sized_at(p.play)
+            out.append({"order_id": p.order_id, "play_id": p.play.id, "symbol": p.play.symbol,
+                        "strategy": p.play.strategy, "timeframe": p.play.timeframe.value,
+                        "qty": p.qty, "notional": price * p.qty, "risk": per_share * p.qty,
+                        "unbooked": self._entry_unbooked(p), "pair_leg": _pair_leg(p.play)})
+        return out
 
     def symbols_in_flight(self, unbooked: bool = True) -> set:
         """Symbols with an order still working - their share counts are about to change. With ``unbooked`` False, an
@@ -659,6 +685,7 @@ class Executor(ProtectiveStops):
             p = _Pending(res.order_id, play, "entry", qty=qty)
             p.order_type, p.order_session = ot, osess
             p.context, p.submitted_at, p.decision = context, submitted_at, decision
+            p.sized_at = _sized_at(play)
             self._note(play, PlayStatus.SUBMITTED)
             self._pending[res.order_id] = p
             return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id,
@@ -675,7 +702,7 @@ class Executor(ProtectiveStops):
         self._audit("PLACE", entry, {"error": why, "outcome": "unknown"}, ok=False, play_id=play.id, msg=why,
                     ts=submitted_at)
         p = _Pending("", play, "entry", qty=qty, order_type=ot, order_session=osess, context=context,
-                     submitted_at=submitted_at, decision=decision)
+                     submitted_at=submitted_at, decision=decision, sized_at=_sized_at(play))
         self._note(play, PlayStatus.SUBMITTED)
         self._unknown[entry.client_tag or play.id] = (p, time.monotonic())
         log.warning("ENTRY NOT CONFIRMED  %s %s x%s (play %s): %s - looked for at %s by its tag before anything else "
@@ -1118,9 +1145,9 @@ class Executor(ProtectiveStops):
             got, price = shares_and_price(mine)
             if got <= 1e-9 and time.monotonic() - at < self.UNKNOWN_GIVE_UP_S:
                 continue                                        # not seen yet: looked for again next pass
-            del self._unknown[ref]
-            settled.append(ref)
             if got <= 1e-9:
+                del self._unknown[ref]
+                settled.append(ref)
                 self._unknown_not_sent(p)
                 continue
             p.order_id = str(mine[-1].order_id)
@@ -1128,6 +1155,10 @@ class Executor(ProtectiveStops):
             res = OrderResult(order_id=p.order_id, status="FILLED" if done else "CANCELED", symbol=p.play.symbol,
                               submitted_qty=p.qty, filled_qty=got, avg_fill_price=price,
                               message="" if done else "it ended with only part of it filled")
+            if p.kind == "entry":
+                self._booking[id(p)] = p        # listed while it is booked, like a fill heard live (_on_order_update)
+            del self._unknown[ref]
+            settled.append(ref)
             try:
                 if done:
                     self._on_filled(p, res)
@@ -1139,6 +1170,8 @@ class Executor(ProtectiveStops):
                 self._unknown[ref] = (p, at)
                 settled.remove(ref)
                 continue
+            finally:
+                self._booking.pop(id(p), None)
             self._found_unknown(p, f"filled at {venue_label(self.venue)} after all (order {p.order_id}): {got:,.0f} "
                                    f"of {p.qty:,.0f} shares @ {price:.4f} - booked")
         return settled
@@ -1278,26 +1311,33 @@ class Executor(ProtectiveStops):
             elif p.kind == "exit" and float(res.submitted_qty or 0.0) > 0:
                 p.left_seen = min(p.qty, _remaining(res))   # the part it has sold is out of the account (_exits_left)
             return
-        if self._pending.pop(res.order_id, None) is None:
-            return                                      # another pass (the Refresh button's) has just handled it
-        if p.kind == "exit":
-            p.left_seen = 0.0           # done: it sells nothing more, while its booking waits on the database too
-        if res.status == "UNKNOWN" and p.kind == "entry":
-            found = self._found_in_executions(p, res)
-            if found is None:
-                # the executions couldn't be read: not known is no "none bought" - followed on, and looked for again
-                # once the broker has gone another few polls without knowing it
-                p.unseen = 0
-                self._pending.setdefault(res.order_id, p)
-                return
-            res = found
+        if p.kind == "entry":
+            # an entry is listed with the working entries until its record is saved (_sent) - put there before it
+            # leaves _pending, so the open risk and the caps, read on other threads, always find it in one or the other
+            self._booking[id(p)] = p
         try:
-            if res.status == "FILLED":
-                self._on_filled(p, res)
-            else:
-                self._on_unfilled(p, res)
-        except BookingFailed:
-            self._pending.setdefault(res.order_id, p)  # still followed: booked on the next pass, never lost
+            if self._pending.pop(res.order_id, None) is None:
+                return                                  # another pass (the Refresh button's) has just handled it
+            if p.kind == "exit":
+                p.left_seen = 0.0       # done: it sells nothing more, while its booking waits on the database too
+            if res.status == "UNKNOWN" and p.kind == "entry":
+                found = self._found_in_executions(p, res)
+                if found is None:
+                    # the executions couldn't be read: not known is no "none bought" - followed on, and looked for
+                    # again once the broker has gone another few polls without knowing it
+                    p.unseen = 0
+                    self._pending.setdefault(res.order_id, p)
+                    return
+                res = found
+            try:
+                if res.status == "FILLED":
+                    self._on_filled(p, res)
+                else:
+                    self._on_unfilled(p, res)
+            except BookingFailed:
+                self._pending.setdefault(res.order_id, p)  # still followed: booked on the next pass, never lost
+        finally:
+            self._booking.pop(id(p), None)
 
     def _found_in_executions(self, p: _Pending, res: OrderResult) -> Optional[OrderResult]:
         """An entry the broker no longer knows, before it is given up: what the broker's executions show it bought
@@ -1605,6 +1645,17 @@ def _play_from_row(row: dict) -> Play:
                 targets=[float(x) for x in (row.get("targets") or [])],
                 confidence=float(row.get("confidence") or 0.5), sector=row.get("sector") or "",
                 tags=list(row.get("tags") or []), id=row["id"], status=PlayStatus.SUBMITTED)
+
+
+def _sized_at(play: Play) -> Tuple[float, float]:
+    """The price an entry was sized at, and its risk per share there: the play's entry - or, for an entry the last
+    look re-priced, its limit, where engine._repriced_check sized it again, leaving the play's entry as it was and
+    its risk per share from that limit to the stop. A play never sized (a pair leg, one taken back after a restart)
+    is at its entry."""
+    base = abs(play.entry - play.stop)
+    per_share = float(play.risk_per_share or 0.0) or base
+    sign = 1.0 if play.side is Side.LONG else -1.0
+    return round(play.entry + sign * (per_share - base), 4), per_share
 
 
 def _pair_leg(play: Play) -> bool:

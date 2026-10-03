@@ -813,13 +813,30 @@ Either way:
 - Risk per trade, the open-risk ceiling and the per-position size limit are
   measured against the **account's value** (or the set amount), never against
   margin: margin only lets more positions be open at once. New positions only use
-  what's left of the trading capital after the bot's open positions.
+  what's left of the trading capital after the bot's open positions. Cash only or
+  with a set amount, that counts everything the broker holds on the account, entries
+  still working included - shares with no trade record (bought by hand, or left
+  untracked) use the same money. The day / swing split counts the bot's own trades.
+- The open-risk ceiling (`risk.max_open_risk_pct`, 4%) counts the risk already at
+  work on the account: each open trade from its entry to the stop it opened with,
+  times its shares, plus the entries still working (pair legs aside) at the price
+  each was sized at when it was sent - one whose fill is being saved counts as
+  working until its record is there. A new position is sized with only what's
+  left under it - and is refused when that isn't enough for one share (Autopilot
+  asks again on its next pass: room frees as trades close). While the open trades
+  can't be read, nothing is sized.
 - Two sliders over the plays tune position size for you and Autopilot alike:
   the **Position Size factor** (0-5, every new position's risk times this) and
   **Max % per position** (1-100, the most one position may hold, as a share of
   the account's value - `risk.max_position_pct_of_equity`). A day trade's stop
   is usually tight, so its risk budget would buy far more than this cap allows:
   for most day trades the cap, not the factor, decides the size.
+- Every entry's record says how it was sized (`sizing` in the play's
+  `evidence.at_entry` and in `trades.entry_context`): its risk, the size factor,
+  which limit decided the share count - the risk budget, the open-risk ceiling,
+  the per-position %, the per-stock cap, the volume cap, buying power or the
+  trading capital's room (or `preview`: an entry re-sized at the last look held
+  to the order card's count) - and what each limit allowed, in dollars and shares.
 - Autopilot and the pair desk fill up to **Max % of trading capital in positions**
   (`autopilot.max_gross_exposure_pct`, 10-100) of it. With margin, IBKR closes
   positions itself if the account's excess liquidity runs out, so a maximum under
@@ -891,7 +908,15 @@ checked against the play: once the price has run past the entry by more than
 `execution.max_chase_r` (0.25) of the distance to the stop, the reward:risk the
 play was judged on is gone and the entry is refused. Within that, a limit entry
 is priced off the quote so it fills now instead of waiting for the price to come
-back through the entry — which is the move failing. A day-trade entry still
+back through the entry — which is the move failing — and is judged again at that
+price: it is re-sized there (the risk budget over the wider distance to the stop,
+the per-position cap at the price paid), so the shares that go out can be fewer
+than the order card's - never more - and it is refused when that comes to nothing
+or when its reward:risk to the first target falls under the floor —
+`risk.min_reward_risk` for a click, the higher of that and Autopilot's
+`min_reward_risk` for its entries. A price
+already at or through the play's stop refuses the entry outright: the setup is
+void. A day-trade entry still
 working after `execution.entry_timeout_min` (10) minutes is cancelled for the
 same reason; swing entries keep their DAY life. The log says which quote each
 check read (a stream's, a snapshot or a candle) and how old it was.
@@ -1120,11 +1145,12 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | concurrent auto trades from **one** strategy | 2 | `max_per_strategy` |
 | new auto entries **per scan cycle** | 1 | `max_new_per_cycle` - a cycle is a scan of the market (5 minutes for swing trades, the 60-second fast cycle for day trades), not the 15-second re-check of the board |
 | **no entries while prices can't be read** | always | IBKR refusing candles (the login active somewhere else) stops every entry, and an order whose last-look quote fails is refused - never sent blind |
-| **cool off** a ticker after it stops out today | on | `cooldown_after_loss` |
+| **no entries while its own records can't be read** | always | a database read that fails refuses rather than guesses: a pass that can't read Autopilot's open trades takes nothing and the log warns (once, until they read again); a play whose already-held or cool-off check can't be read is refused; today's realized P/L keeps the last figure read, so a stop for the day holds |
+| **cool off** a ticker after it stops out today | on | `cooldown_after_loss` (goes by the day the trade closed, so a position held overnight and stopped out today counts) |
 | **proof is not luck**: the replayed edge, net of the stocks' own drift, survives a reality check across every setup tried, and costs take no more than a third of it | p ≤ 0.10 | `proof_p_value` (Aronson; Carver's speed limit; 0 = the luck test off) |
 | **the learned model** | shadow | `model_mode`: `shadow` logs its odds, `gate` refuses plays under `model_min_p`, `size` also scales the risk - only while the model is usable |
-| **stop for the day** once today's closed trades have lost this % of equity | 2 % | `max_daily_loss_pct` (Aziz's daily maximum loss; 0 = off) |
-| **stop for the day** once the day's realized gain has given back this % of its best | 30 % | `max_giveback_pct` (Aziz: never lose more than 30 % of what the morning made; `giveback_floor_pct` 0.25 % of equity is the smallest gain that counts; 0 = off) |
+| **stop for the day** once today's closed trades have lost this % of equity | 2 % | `max_daily_loss_pct` (Aziz's daily maximum loss; every trade closed today counts, swing trades too; 0 = off) |
+| **stop for the day** once the day trades' realized gain has given back this % of its best | 30 % | `max_giveback_pct` (Aziz: never lose more than 30 % of what the morning made; only day trades count, so a swing closed at a profit doesn't make a peak one day-trade loss gives back; `giveback_floor_pct` 0.25 % of equity is the smallest gain that counts; 0 = off). Either stop holds for the rest of the session, even if a later trade brings the P/L back, and through a restart; only changing one of the two limits lifts it |
 | **no new day trades** in the last minutes of the session | 30 | `min_minutes_to_close` (Aziz keeps the last half hour for closing; the exit manager flattens day trades 10 minutes before the bell; 0 = off) |
 | require a catalyst / dry-run | off | `require_catalyst`, `dry_run` |
 
@@ -1141,9 +1167,13 @@ Autopilot is on, a play it won't take gets a faded grey robot: hovering it gives
 the first check the play fails, in the words the entry gate itself uses (the
 badge and the gate share one set of checks). The play's detail panel says the
 same in one line. A play Autopilot tried and was refused - by the engine's
-assessment (say as too thin to trade) or the broker - gets the faded robot with
-the refusal, and a note in **Autopilot notes**; it isn't tried again that day
-unless a setting changes.
+assessment (say as too thin to trade), the last look at the quote (the spread, a
+chase) or the broker - gets the faded robot with the refusal, and a note in
+**Autopilot notes**; it isn't tried again that day unless a setting changes (one
+refused only for want of room under the open-risk ceiling is tried on each pass
+until room frees). The
+refusal is logged too, and kept on the play's row (`evidence.autopilot_refused`)
+with the play's confidence, reward:risk, confirmations and noise flags then.
 
 **The strip under the header** says what Autopilot is doing now and why, in one
 line: off, paper-only, no prices, stopped for the day, done (the day's entries

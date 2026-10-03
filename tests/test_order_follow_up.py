@@ -547,6 +547,8 @@ def test_a_part_filled_entry_that_stalls_has_the_rest_cancelled_so_its_shares_ar
     ex = _executor(broker, repo)
     swing = _entry(ex, timeframe=Timeframe.SWING)                           # a swing entry too: no time-out of its own
     leg = _entry(ex, "BBB", tags=["pair-leg"])                             # the pairs desk works its own legs
+    # a leg's stop is a placeholder, so its risk is left out of the open risk (TradingEngine.open_risk_usd)
+    assert [(w["symbol"], w["pair_leg"]) for w in ex.working_entries()] == [("AAA", False), ("BBB", True)]
     for oid, sym in (("1", "AAA"), ("2", "BBB")):
         broker.reports[oid] = OrderResult(order_id=oid, status="WORKING", symbol=sym, submitted_qty=10,
                                           filled_qty=4, avg_fill_price=100.01)
@@ -970,6 +972,58 @@ def test_an_entry_fill_whose_booking_fails_keeps_counting_as_working_and_is_book
     [t] = repo.open_trades()
     assert (t["quantity"], t["entry_price"], t["entry_context"]) == (10, 100.02, {"schema": 1})
     assert ex.working_entries() == [] and len(calls) == 2 and play.status is PlayStatus.FILLED
+
+
+def _watch_booking(ex, repo, refuse=0):
+    """``repo``'s open_trade notes the working entries ``ex`` lists while each booking is under way - the database
+    writing, or waiting on another writer - and raises the first ``refuse`` times. Returns what each try saw."""
+    real, seen = repo.open_trade, []
+
+    def booking(*a, **k):
+        seen.append([(w["play_id"], w["risk"]) for w in ex.working_entries()])
+        if len(seen) <= refuse:
+            raise RuntimeError("database is locked")
+        return real(*a, **k)
+
+    repo.open_trade = booking
+    return seen
+
+
+def test_an_entry_whose_fill_is_being_booked_counts_as_working_until_its_record_is_saved():
+    broker, repo = _Broker(), _Repo([])
+    ex = _executor(broker, repo)
+    play = _day_play()                                                     # 10 shares, entry 100, stop 98
+    assert ex.execute_play(play, Account(account_id="DU"), plan=PLAN)["ok"]
+    seen = _watch_booking(ex, repo, refuse=1)
+    broker.reports["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                      avg_fill_price=100.0)
+    ex.sync_open_orders()                                                  # refused: followed on
+    ex.sync_open_orders()                                                  # saved
+    assert seen == [[(play.id, 20.0)], [(play.id, 20.0)]]                  # its $20 counted while each try ran
+    assert ex.working_entries() == [] and ex._booking == {} and len(repo.open_trades()) == 1
+
+
+def test_an_unanswered_entry_found_filled_counts_as_working_until_its_record_is_saved():
+    broker, repo = _Unanswered(lands="filled"), _Repo([])
+    ex = _executor(broker, repo)
+    play = _day_play()
+    assert ex.execute_play(play, Account(account_id="DU"), plan=PLAN)["sent_unknown"]
+    seen = _watch_booking(ex, repo, refuse=1)
+    ex.sync_open_orders()                                                  # found filled, refused: looked for again
+    ex.sync_open_orders()                                                  # saved
+    assert seen == [[(play.id, 20.0)], [(play.id, 20.0)]]
+    assert ex.working_entries() == [] and ex._booking == {} and len(repo.open_trades()) == 1
+
+
+def test_a_working_entry_keeps_the_risk_and_cost_it_was_sent_with_whatever_its_play_is_sized_at_since():
+    broker, repo = _Broker(), _Repo([])
+    ex = _executor(broker, repo)
+    play = _day_play()                                                     # entry 100, stop 98
+    play.risk_per_share = 2.5                                              # re-priced by the last look to 100.50
+    assert ex.execute_play(play, Account(account_id="DU"), plan=PLAN)["ok"]
+    play.risk_per_share = 2.0                                              # sized again at its own entry since
+    [w] = ex.working_entries()
+    assert (w["risk"], w["notional"]) == (25.0, 1005.0)
 
 
 def test_an_entry_fill_whose_booking_keeps_failing_is_said_again_and_its_shares_are_no_order_in_flight(monkeypatch):

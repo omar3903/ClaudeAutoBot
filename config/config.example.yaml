@@ -22,7 +22,8 @@ account:
 
 risk:
   max_risk_per_trade_pct: 1.0          # % of equity risked between entry and stop
-  max_open_risk_pct: 4.0               # sum of open-trade risk not allowed to exceed this
+  max_open_risk_pct: 4.0               # all the risk at work: each open trade from its entry to the stop it
+                                       # opened with, plus entries working; a new trade gets what's left
   max_position_pct_of_equity: 12.0     # notional cap per trade (the dashboard's "Max % per position" replaces it once moved)
   max_symbol_pct_of_equity: 15.0       # cap per stock: shares already held + entries working + the new trade
   max_adv_pct: 1.0                     # one order's shares, as % of the stock's median daily volume over its
@@ -194,8 +195,9 @@ autopilot:
   cooldown_after_loss: true          # skip a ticker for the rest of the session after it stops out
   max_daily_loss_pct: 2.0            # Aziz's daily maximum loss: once today's closed trades have lost this
                                      # % of equity, no more entries until the next session (0 = off)
-  max_giveback_pct: 30.0             # ...or once the day's realized gain has given back this % of its best
-                                     # (Aziz: never lose more than 30% of what the morning made; 0 = off)
+  max_giveback_pct: 30.0             # ...or once the day trades' realized gain has given back this % of its best
+                                     # (Aziz: never lose more than 30% of what the morning made; swing trades
+                                     # don't count; 0 = off). Either stop holds for the rest of the session
   giveback_floor_pct: 0.25           # the give-back rule only counts a peak gain of at least this % of equity
   require_catalyst: false            # true = only auto-take plays tagged gap / catalyst
   dry_run: false                     # true = log every entry it WOULD take but place nothing

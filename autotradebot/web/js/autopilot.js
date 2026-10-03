@@ -38,9 +38,9 @@ export function renderAutopilot() {
   const split = splitSlots();
   const caps = `${ap.open_auto_positions ?? 0}/${ap.max_auto_positions ?? 0} open${split.text ? ` (${split.text})` : ""} · ${ap.auto_trades_today ?? 0}/${ap.max_auto_trades_per_day ?? 0} today`
     + ((ap.sent_today ?? 0) > (ap.auto_trades_today ?? 0) ? ` (${ap.sent_today}/${ap.sent_ceiling} orders sent)` : "");
+  // the reason the stop was made with: it holds for the rest of the day, whatever today's P/L does after
   const stopped = !ap.daily_loss_stop ? ""
-    : (ap.realized_today || 0) < 0 ? ` Stopped for the day: today's closed trades have lost ${Math.abs(ap.realized_today || 0).toFixed(0)}, past the ${ap.max_daily_loss_pct}% daily limit.`
-    : ` Stopped for the day: today's realized gain fell from ${(ap.peak_realized || 0).toFixed(0)} to ${(ap.realized_today || 0).toFixed(0)}, giving back more than ${ap.max_giveback_pct}% of it.`;
+    : ` Stopped for the day: ${ap.daily_loss_reason || "the daily loss limit or the give-back rule was reached"}.`;
   const cadence = fast ? ` The hot list is rescanned every ~${secs}s while the session is open.`
     : enabled && eff ? ` The hot list and buffers are rescanned every ${mins} min, and the hot list every ~${secs}s once the session opens.` : "";
   btn.title = enabled
@@ -60,7 +60,7 @@ let lossWhy = "", lossDismissed = false;
 export function onDailyLoss(p) {
   lossWhy = p.reason || "";
   lossDismissed = false;
-  S.state.autopilot = { ...(S.state.autopilot || {}), daily_loss_stop: true };   // until the next snapshot says so
+  S.state.autopilot = { ...(S.state.autopilot || {}), daily_loss_stop: true, daily_loss_reason: lossWhy };   // until the next snapshot says so
   toast(`🤖 Autopilot stopped for the day: ${lossWhy || "the daily loss limit was reached"}`, "bad");
   renderAutopilot();
 }
@@ -180,7 +180,7 @@ function configure() {
       </div>
       <div class="ap-row">
         <span><label title="Aziz's daily maximum loss: once today's closed trades have lost this share of equity, no more entries until tomorrow. 0 = off">Stop for the day after losing % of equity</label><input type="number" id="ap-dayloss" min="0" max="50" step="0.5" value="${ap.max_daily_loss_pct ?? 2}"></span>
-        <span><label title="Aziz's give-back rule: once the day's realized gain has fallen this far from its best, stop for the day and keep what's left. 0 = off">...or after giving back % of the day's gain</label><input type="number" id="ap-giveback" min="0" max="100" step="5" value="${ap.max_giveback_pct ?? 30}"></span>
+        <span><label title="Aziz's give-back rule: once the day trades' realized gain has fallen this far from its best, stop for the day and keep what's left. Swing trades don't count. Either stop holds for the rest of the day; changing either limit lifts it. 0 = off">...or after giving back % of the day trades' gain</label><input type="number" id="ap-giveback" min="0" max="100" step="5" value="${ap.max_giveback_pct ?? 30}"></span>
       </div>
       <div class="ap-row">
         <span><label title="How many times in a row a day setup must show before Autopilot takes it - on new 5-minute candles while the box below is ticked, otherwise in scans">Day trades: seen in a row</label><input type="number" id="ap-confirm" min="1" max="10" step="1" value="${ap.min_confirmations ?? 2}"></span>

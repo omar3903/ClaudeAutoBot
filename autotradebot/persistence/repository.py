@@ -16,6 +16,9 @@ from .models_orm import (AccountSnapshot, DailyReviewLog, Fill, OrderAudit, Pair
 
 log = logging.getLogger(__name__)
 
+#: where a play row's evidence keeps why Autopilot refused it and how the play stood then (note_refusal)
+REFUSAL = "autopilot_refused"
+
 
 def _expected_exit_times(entry: dt.datetime, timeframe: str, typ: float, mx: float):
     """(expected_exit_at, overwatch_at) as naive-UTC datetimes."""
@@ -169,11 +172,20 @@ class Repository:
                 row = s.get(PlayLog, p.id)
                 if row is not None and row.status != "PROPOSED":
                     continue
-                s.merge(_play_row(p))
+                s.merge(_keeping_refusal(row, _play_row(p)))
 
     def record_play(self, play: Play) -> None:
         with session_scope() as s:
-            s.merge(_play_row(play))
+            s.merge(_keeping_refusal(s.get(PlayLog, play.id), _play_row(play)))
+
+    def note_refusal(self, play: Play, refusal: Dict[str, Any]) -> None:
+        """Why Autopilot refused a play at the engine's assessment or at the last look before the order, and how the
+        play stood then, kept in its row's evidence (REFUSAL) - written first when no scan logged the play. Its status
+        stays: the play is still offered (a click can take it, a change of settings hands it back to Autopilot), and
+        the row written again by a later scan, or by an approval, keeps the note (_keeping_refusal)."""
+        with session_scope() as s:
+            row = s.get(PlayLog, play.id) or s.merge(_play_row(play))
+            row.evidence = {**(row.evidence or {}), REFUSAL: dict(refusal)}
 
     def get_play(self, play_id: str) -> Optional[Dict[str, Any]]:
         with session_scope() as s:
@@ -843,6 +855,15 @@ def _play_row(p: Play) -> PlayLog:
         probability=float(getattr(p, "probability", 0.5) or 0.0),
         status=p.status.value if hasattr(p.status, "value") else str(p.status),
     )
+
+
+def _keeping_refusal(row: Optional[PlayLog], new: PlayLog) -> PlayLog:
+    """``new``, the row a play is written again as, with the refusal Autopilot noted on the row it replaces
+    (note_refusal): a scan that finds the setup again writes it from the board's play, which doesn't carry it."""
+    note = (row.evidence or {}).get(REFUSAL) if row is not None else None
+    if note and REFUSAL not in (new.evidence or {}):
+        new.evidence = {**(new.evidence or {}), REFUSAL: note}
+    return new
 
 
 def _shortfall(decision: Optional[Dict[str, Any]], fill_price: float, side: str) -> Dict[str, Any]:

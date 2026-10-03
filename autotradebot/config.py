@@ -101,7 +101,8 @@ class AccountCfg(_Model):
 
 class RiskCfg(_Model):
     max_risk_per_trade_pct: float = 1.0
-    max_open_risk_pct: float = 4.0
+    max_open_risk_pct: float = 4.0             # all the risk at work: each open trade from its entry to the stop it
+                                               # opened with, plus entries working; a new trade gets what's left
     max_position_pct_of_equity: float = 12.0   # one trade's notional (or the dashboard's "Max % per position")
     max_symbol_pct_of_equity: float = 15.0     # everything in one stock: shares held + entries working + this trade
     max_adv_pct: float = 1.0                   # one order's shares, as % of the stock's median daily volume over its
@@ -219,7 +220,8 @@ class ExecutionCfg(_Model):
     max_chase_r: float = 0.25             # an entry is refused once the price has run past the play's entry by more
                                           # than this share of the distance to the stop - the reward:risk the play was
                                           # judged on is gone; within it a limit entry is priced off the live quote so
-                                          # it fills now (0 = off)
+                                          # it fills now, re-sized at that price and refused when its reward:risk to
+                                          # the first target falls under the floor (0 = off)
     stream_lines: int = 80                # on proven real-time data, hold IBKR streams for this many stocks - the
                                           # positions and working entries first, then the best plays, then the watch
                                           # tier - and price them off a stream that ticked in the last 2 s instead of
@@ -320,7 +322,8 @@ class AutopilotCfg(_Model):
                                           # (Aronson's reality check on the replayed trades), is this or less; 0 = off
     cooldown_after_loss: bool = True
     max_daily_loss_pct: float = 2.0       # no new entries once today's closed trades have lost this % of equity (0 = off)
-    max_giveback_pct: float = 30.0        # ...or once the day's realized gain has given back this % of its peak (0 = off)
+    max_giveback_pct: float = 30.0        # ...or once the day trades' realized gain has given back this % of its peak
+                                          # (swing and pair trades don't count; 0 = off). Either stop holds all session
     giveback_floor_pct: float = 0.25      # the give-back rule only counts a peak gain of at least this % of equity
     require_catalyst: bool = False
     dry_run: bool = False

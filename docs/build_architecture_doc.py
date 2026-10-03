@@ -1030,11 +1030,14 @@ def build() -> str:
       '<li><b>Assessment and sizing.</b> <code>engine.assess_play()</code> checks the session, the pattern-day-'
       'trader rule (live only), and calls <code>risk/position_sizing.py size_play()</code>: risk 1% of equity per '
       'trade, lowered by the strategy\'s half-Kelly (a quarter of the risk until the replay has proven the '
-      'strategy), the mid-day factor, the open-risk ceiling (4%), the per-'
+      'strategy), the mid-day factor, the open-risk ceiling (4%, less the risk the open trades and working '
+      'entries already carry - <code>open_risk_usd()</code>; none at all while the open trades can\'t be read), '
+      'the per-'
       'position cap (12% of equity), the per-symbol cap (15%) and the liquidity cap: one order takes at most 1% of '
       'the stock\'s median daily volume over its last 20 completed sessions (<code>evidence.adv_shares</code>), and '
       'a stock too thin for one share is refused with that reason. The order card lists the caps that bound under '
-      '"Size limited by".</li>'
+      '"Size limited by"; each entry keeps which limit decided its share count and what every limit allowed '
+      '(<code>sizing</code> in its entry context).</li>'
       '<li><b>Order.</b> <code>Executor.execute_play()</code> builds a limit order (5 bps through the price) and, '
       'where the broker supports it, a native bracket with the stop and target attached. An immediate fill opens '
       'the trade; otherwise the order is tracked and <code>sync_open_orders()</code> books the fill later.</li>'
@@ -1052,9 +1055,10 @@ def build() -> str:
     A('<h3>The Autopilot gates, in order (execution/autopilot.py)</h3>')
     A(table(["Gate", "Rule", "Setting"], [
         ("switched on, venue ok", "Autopilot on; live trading only when the live checks pass", "enabled"),
-        ("daily stop", "no entries once today's closed trades lost 2% of equity, or gave back 30% of the day's "
-         "peak gain (after +0.25%)", "max_daily_loss_pct, max_giveback_pct"),
-        ("per-cycle / per-day / concurrent caps", "1 new entry per pass, 5 per day, 10 open, 2 per strategy",
+        ("daily stop", "no entries for the rest of the day once today's closed trades lost 2% of equity, or the "
+         "day trades gave back 30% of their peak gain (after +0.25%)", "max_daily_loss_pct, max_giveback_pct"),
+        ("per-cycle / per-day / concurrent caps", "1 new entry per pass, 5 per day, 10 open, 2 per strategy; a "
+         "pass that can't read Autopilot's open trades takes nothing",
          "max_new_per_cycle, max_auto_trades_per_day, max_auto_positions, max_per_strategy"),
         ("trade type", "day and swing follow the filter bar; pairs separately", "trade_types"),
         ("confidence", "the setup's own conviction >= the floor (0.62 default; PR #22 adds a swing floor of 0.5)",
@@ -1067,7 +1071,8 @@ def build() -> str:
          "between sightings starts again (setting off: 2 scans in a row, as before)",
          "min_confirmations, confirm_on_new_candle"),
         ("catalyst", "optional: a news or earnings tag", "require_catalyst"),
-        ("already in it", "not holding the symbol, no entry working, not stopped out today (cooldown)", "-"),
+        ("already in it", "not holding the symbol, no entry working, not stopped out today (cooldown); a check whose "
+         "read fails refuses the play", "-"),
         ("late in the day", "no new day trade with fewer than 30 minutes to the close", "min_minutes_to_close"),
         ("<b>proof</b>", "the strategy's replay record: >= 30 trades at >= +0.05R (also net of the stocks' own "
          "drift), a positive held-out sample of >= 10 trades, a reality-check p-value <= 0.10 across every setup "
@@ -1079,11 +1084,16 @@ def build() -> str:
         ("the learned model", "in gate or size mode, and only while its own walk-forward verdict calls it usable: "
          "plays it gives under 55% are refused; shadow (the default) only logs its odds",
          "model_mode, model_min_p"),
-        ("engine assessment", "session valid, PDT ok, size > 0, R:R ok, open-risk and gross-exposure ceilings",
+        ("engine assessment", "session valid, PDT ok, size > 0, R:R ok, open-risk and gross-exposure ceilings; a "
+         "play refused for want of room under the open-risk ceiling alone is asked again on the next pass",
          "risk.*, max_gross_exposure_pct"),
         ("the last look", "at the live quote (a stream's when it ticked in the last 2 s, else a snapshot - the log "
-         "says which, and how old): refused when the spread is over 0.10R of the risk or the price has "
-         "run 0.25R past the entry; within that the limit is priced off the quote; a day-trade entry unfilled "
+         "says which, and how old): refused when the price is already at or through the stop, the spread is "
+         "over 0.10R of the risk or the price has run 0.25R past the entry; within that the limit is priced off "
+         "the quote and judged again there - re-sized at that price (never above the order preview's shares), "
+         "and refused when it sizes to nothing or its reward:risk to the first target falls under the floor (the "
+         "higher of Autopilot's and risk.min_reward_risk for its entries, risk.min_reward_risk for a click); a "
+         "day-trade entry unfilled "
          "after 10 minutes is cancelled; any entry filled in part 30 seconds ago and still working has the rest "
          "cancelled, so the shares bought get their record and stop; the first refusal and its quote are kept "
          "with the play (evidence.last_look)", "execution.max_spread_r, max_chase_r, "
@@ -1178,9 +1188,10 @@ def build() -> str:
     A(table(["Table", "One row is", "Written by"], [
         ("scan_runs", "one scan (full, gappers, cycle, fast, plays) with its timings and counts",
          "engine._run_scan -> repo.record_scan"),
-        ("play_logs", "one play shown on the board, with its decision (approved, rejected, auto) and what became "
-         "of it once sent (SUBMITTED, FILLED, CANCELED/ERROR with evidence.entry_outcome)",
-         "repo.record_scan / record_play / set_play_status / settle_play"),
+        ("play_logs", "one play shown on the board, with its decision (approved, rejected, auto), what became "
+         "of it once sent (SUBMITTED, FILLED, CANCELED/ERROR with evidence.entry_outcome) and why Autopilot refused "
+         "it at the assessment or the last look (evidence.autopilot_refused)",
+         "repo.record_scan / record_play / set_play_status / settle_play / note_refusal"),
         ("trades", "one position from entry to exit, including partial exits (banked_pl), the R multiple, the "
          "play's features at the decision (entry_context) and what the fills cost: decision_price, spread_bps, "
          "entry_slippage_bps, exit_decision_price, exit_slippage_bps",
