@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import and_, delete, func, insert, or_, select, update
+from sqlalchemy.exc import OperationalError
 
 from ..core.models import Account, Play
 from ..util import clock
@@ -18,6 +21,28 @@ log = logging.getLogger(__name__)
 
 #: where a play row's evidence keeps why Autopilot refused it and how the play stood then (note_refusal)
 REFUSAL = "autopilot_refused"
+
+# the pauses before a trade write SQLite turned away as "database is locked" is tried again: once its busy wait ran out
+# (persistence/db.py), or at once where waiting could deadlock two writers. The transaction was rolled back whole, so
+# trying it again can't book anything twice; one still refused after these goes back to the caller (the executor
+# keeps the fill followed and books it on a later pass)
+_LOCKED_RETRY_S = (0.2, 0.5)
+
+
+def _retry_locked(write):
+    """``write`` (a Repository method that opens its own transaction) tried again after each of _LOCKED_RETRY_S when
+    the database is locked. Any other error goes straight back."""
+    @functools.wraps(write)
+    def tried(*args, **kwargs):
+        for pause in (*_LOCKED_RETRY_S, None):
+            try:
+                return write(*args, **kwargs)
+            except OperationalError as e:
+                if pause is None or "database is locked" not in str(e):
+                    raise
+                log.warning("%s: the database is locked, trying again in %.1f s", write.__name__, pause)
+                time.sleep(pause)
+    return tried
 
 
 def _expected_exit_times(entry: dt.datetime, timeframe: str, typ: float, mx: float):
@@ -227,6 +252,7 @@ class Repository:
     # -------------------------------------------------------------- #
     #  Trades                                                       #
     # -------------------------------------------------------------- #
+    @_retry_locked
     def open_trade(
         self, play: Play, fill_price: float, fill_qty: float, broker: str,
         broker_order_id: str = "", commission: float = 0.0,
@@ -285,6 +311,7 @@ class Repository:
                  fill_price, order_type, order_session)
         return tid
 
+    @_retry_locked
     def update_trade_risk(
         self, trade_id: str, *, stop_price: Optional[float] = None,
         target_price: Optional[float] = None, hwm_price: Optional[float] = None,
@@ -318,6 +345,7 @@ class Repository:
             if t and not t.overdue_notified:
                 t.overdue_notified = True
 
+    @_retry_locked
     def close_trade(
         self, trade_id: str, exit_price: float, exit_reason: str = "manual",
         commission: float = 0.0, exit_qty: Optional[float] = None,
@@ -342,6 +370,7 @@ class Repository:
             log.info("trade closed %s: P/L %.2f (%s)", trade_id, out["realized_pl"], exit_reason)
         return out
 
+    @_retry_locked
     def reduce_trade(self, trade_id: str, exit_qty: float, exit_price: float, exit_reason: str = "target-1",
                      commission: float = 0.0, stop_price: Optional[float] = None,
                      target_price: Optional[float] = None, broker_order_id: str = "") -> Optional[Dict[str, Any]]:

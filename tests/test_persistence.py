@@ -475,3 +475,117 @@ def test_the_startup_migration_quotes_names_and_writes_defaults_the_databases_wa
         row = conn.execute(sa.select(live)).one()
     assert row._asdict() == {"id": 1, "order": 'it\'s "ok"', "done": True}
     eng.dispose()
+
+
+def test_a_sqlite_database_waits_half_a_minute_for_another_writer_and_keeps_its_journal(tmp_path, monkeypatch):
+    """Every connection - the one that checks the database is there, later ones, and the fallback's - waits 30 s for
+    another connection's write before giving up, where sqlite3 alone waits 5 s. The journal mode isn't changed."""
+    import types
+
+    from autotradebot.persistence import db as dbmod
+
+    def waits(db):
+        with db.engine.connect() as first, db.engine.connect() as fresh:      # the pooled check's and a new one
+            got = [c.exec_driver_sql("PRAGMA busy_timeout").scalar() for c in (first, fresh)]
+            journal = fresh.exec_driver_sql("PRAGMA journal_mode").scalar()
+        db.engine.dispose()
+        return got, journal
+
+    named = dbmod._DB()
+    named.init(url=f"sqlite:///{(tmp_path / 'named.sqlite').as_posix()}")
+    assert waits(named) == ([30000, 30000], "delete")
+
+    fallback = f"sqlite:///{(tmp_path / 'fallback.sqlite').as_posix()}"
+    settings = types.SimpleNamespace(
+        secrets=types.SimpleNamespace(resolved_database_url=lambda: "nosuchdb://nowhere", db_allow_sqlite_fallback=True,
+                                      sqlite_fallback_url=lambda: fallback),
+        config=types.SimpleNamespace(database=types.SimpleNamespace(echo_sql=False, pool_size=5)))
+    monkeypatch.setattr(dbmod, "get_settings", lambda: settings)
+    fell = dbmod._DB()
+    fell.init()                                      # the database asked for can't be opened: SQLite in its place
+    assert fell.url == fallback
+    assert waits(fell) == ([30000, 30000], "delete")
+
+
+def _locked(monkeypatch, times):
+    """The first ``times`` commits are refused the way SQLite refuses one while another connection holds the write
+    lock past the busy wait. Returns the list of refusals so far."""
+    import sqlite3
+
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.orm import Session
+
+    from autotradebot.persistence import repository
+
+    real, refused = Session.commit, []
+
+    def commit(self):
+        if len(refused) < times:
+            refused.append("COMMIT")
+            raise OperationalError("COMMIT", {}, sqlite3.OperationalError("database is locked"))
+        return real(self)
+
+    monkeypatch.setattr(Session, "commit", commit)
+    monkeypatch.setattr(repository, "_LOCKED_RETRY_S", (0.01, 0.02))      # the pauses, short for the test
+    return refused
+
+
+@pytest.mark.parametrize("write,symbol", [("open_trade", "T81"), ("update_trade_risk", "T82"), ("close_trade", "T83"),
+                                          ("reduce_trade", "T84")])
+def test_a_trade_write_the_database_turned_away_as_locked_is_tried_again_and_lands_once(repo, monkeypatch, caplog,
+                                                                                         write, symbol):
+    p = _play(symbol=symbol)
+    repo.record_play(p)
+    tid = None if write == "open_trade" else repo.open_trade(p, 100.0, 10, "paper")
+    refused = _locked(monkeypatch, times=1)
+    if write == "open_trade":
+        tid = repo.open_trade(p, 100.0, 10, "paper")
+    elif write == "update_trade_risk":
+        repo.update_trade_risk(tid, stop_price=99.0, note_append="stop->99.00")
+    elif write == "close_trade":
+        repo.close_trade(tid, 103.0, exit_reason="target")
+    else:
+        repo.reduce_trade(tid, 4, 103.0, exit_reason="exit")
+    assert refused == ["COMMIT"] and f"{write}: the database is locked, trying again" in caplog.text
+
+    rec = repo.trade_record(tid)
+    t, legs = rec["trade"], [(f["leg"], f["quantity"], f["price"]) for f in rec["fills"]]
+    assert legs[0] == ("ENTRY", 10.0, 100.0)
+    if write == "update_trade_risk":
+        assert (t["stop_price"], t["notes"], legs) == (99.0, "stop->99.00", legs[:1])
+    elif write == "close_trade":
+        assert (t["status"], t["realized_pl"], legs[1:]) == ("CLOSED", 30.0, [("EXIT", 10.0, 103.0)])
+    elif write == "reduce_trade":
+        assert (t["status"], t["quantity"], t["banked_pl"], legs[1:]) == ("OPEN", 6.0, 12.0, [("EXIT", 4.0, 103.0)])
+    else:
+        assert (t["status"], len(legs)) == ("OPEN", 1)
+
+
+def test_a_write_still_locked_after_the_retries_or_refused_for_another_reason_is_raised(repo, monkeypatch):
+    """Three tries, then the refusal goes back - the executor keeps the fill followed and books it on a later pass -
+    with nothing booked. An error that isn't a lock isn't tried again."""
+    import sqlite3
+
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.orm import Session
+
+    p = _play(symbol="T89")
+    repo.record_play(p)
+    tid = repo.open_trade(p, 100.0, 10, "paper")
+    refused = _locked(monkeypatch, times=3)
+    with pytest.raises(OperationalError, match="database is locked"):
+        repo.close_trade(tid, 103.0, exit_reason="target")
+    assert len(refused) == 3
+    t = repo.trade_record(tid)
+    assert (t["trade"]["status"], [f["leg"] for f in t["fills"]]) == ("OPEN", ["ENTRY"])
+
+    tries = []
+
+    def broken(self):
+        tries.append("COMMIT")
+        raise OperationalError("COMMIT", {}, sqlite3.OperationalError("disk I/O error"))
+
+    monkeypatch.setattr(Session, "commit", broken)
+    with pytest.raises(OperationalError, match="disk I/O error"):
+        repo.close_trade(tid, 103.0, exit_reason="target")
+    assert tries == ["COMMIT"]
