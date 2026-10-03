@@ -23,7 +23,9 @@ For each OPEN trade it:
         - to break-even (+ a small buffer) once the trade is +``breakeven_at_r`` R
         - then trails so the stop keeps ``trail_lock_ratio`` of the open R once
           the trade is past ``trail_start_r`` R
-     The stop only ever moves in your favour and never past the last price.
+     The stop only ever moves in your favour and never past the last price, and only in the
+     regular session: a pre-market or after-hours print still marks the excursions and trips
+     the stop and target, but doesn't move the stop.
 
 The time exits (3, 4) read no price, so a full pass with no quote for the stock - or only
 one from before the entry - still runs them; it only skips the rest.
@@ -33,7 +35,10 @@ be sent, or that the broker rejects or cancels, is sent again - waiting a
 little longer after each try (``RETRY_DELAYS_S``). One that only had to wait on
 the broker (a stop's cancel to confirm, its orders reloading after a connect) is
 no failed try: it goes again in ``WAIT_RETRY_S`` - and a wait that goes on past
-``WAIT_WARN_S`` is reported like a failed exit.
+``WAIT_WARN_S`` is reported like a failed exit. Nor is one turned away because the
+market is closed (IBKR can't fill it then): it's asked again every ``CLOSED_RETRY_S``,
+and the regular session's first pass starts every exit's tries afresh, so each goes
+out at the open rather than minutes into the session.
 
 Between full passes, a streamed tick on a stock held runs a tick pass on just that
 stock (``run_once(only=...)``, engine._sync_loop): steps 1, 2 and 5 on the fresh
@@ -118,6 +123,9 @@ class ExitManager:
     RETRY_DELAYS_S = (5.0, 15.0, 30.0, 60.0, 120.0, 300.0)
     #: seconds before an exit that waited on the broker is tried again - no longer after each wait
     WAIT_RETRY_S = 5.0
+    #: seconds before an exit turned away because the market is closed is asked again - no failed try either; the
+    #: regular session's first pass lets every exit go at once (_tries_afresh_at_the_open)
+    CLOSED_RETRY_S = 60.0
     #: an exit still waiting on the broker after this long - past the minute its orders take to reload after a
     #: connect - is reported, and again every WAIT_REPEAT_S while it waits
     WAIT_WARN_S, WAIT_REPEAT_S = 90.0, 300.0
@@ -131,6 +139,7 @@ class ExitManager:
         self.cfg = cfg
         self.bus = bus
         self._tries: Dict[str, Tuple[int, float]] = {}  # trade id -> (exits sent, monotonic time the next may go)
+        self._open_day: Optional[dt.date] = None        # the session whose regular hours last started the tries afresh
         self._last_failure: Dict[str, str] = {}         # trade id -> the failure last published
         self._waiting: Dict[str, float] = {}                 # trade id -> when its exit began waiting on the broker
         self._wait_warned: Dict[str, float] = {}             # trade id -> when that wait was last reported
@@ -157,6 +166,7 @@ class ExitManager:
             return []
         if not full and not only:
             return []
+        self._tries_afresh_at_the_open()
         try:
             open_trades = self.repo.open_trades()
         except Exception:  # noqa: BLE001
@@ -187,6 +197,23 @@ class ExitManager:
         finally:
             self._prices = {}
         return acted
+
+    @staticmethod
+    def _session_now() -> "clock.Session":
+        """The market's session now (the tests set it, as they do the executor's)."""
+        return clock.current_session()
+
+    def _tries_afresh_at_the_open(self) -> None:
+        """At the first pass of each day's regular session every exit's tries start afresh: an exit turned away since
+        the last one - the market closed, or a refusal whose back-off had stretched to minutes - goes out at the open,
+        not minutes into it. What was last reported about them goes too, so a refusal that comes back is told again."""
+        if self._session_now() is not clock.Session.REGULAR:
+            return
+        today = clock.session_date(clock.now_ny())
+        if self._open_day != today:
+            self._open_day = today
+            self._tries.clear()
+            self._last_failure.clear()
 
     def _fetch_prices(self, symbols) -> Dict[str, Tuple[Optional[float], Optional[dt.datetime]]]:
         """One quote per symbol, fetched concurrently - with several positions a
@@ -242,6 +269,17 @@ class ExitManager:
             return None
         self._waiting.pop(tid, None)
         self._wait_warned.pop(tid, None)
+        if out.get("market_closed"):
+            # the exchange is closed and the exit can't fill (Executor._exchange_closed): no failed try, so no
+            # back-off - asked again now and then, and the open lets it go at once (_tries_afresh_at_the_open)
+            self._tries[tid] = (tries, now + self.CLOSED_RETRY_S)
+            why = out.get("reason") or "the market is closed"
+            if self._last_failure.get(tid) != why:
+                self._last_failure[tid] = why
+                log.info("AUTO-EXIT %s (%s) waits for the regular session: %s", tid, reason, why)
+                self.bus.publish("exit.failed", trade_id=tid, reason=why, attempt=tries + 1,
+                                 retry_in_s=round(self.CLOSED_RETRY_S), market_closed=True)
+            return None
         tries += 1
         wait = self.RETRY_DELAYS_S[min(tries, len(self.RETRY_DELAYS_S)) - 1]
         self._tries[tid] = (tries, now + wait)
@@ -500,9 +538,13 @@ class ExitManager:
         if not managed or risk_ps <= 0:
             return None
         new_stop = float(work_stop) if work_stop else float(init_stop)
+        # on regular-session prices only: a pre-market or after-hours print is thin - a few hundred shares can print far
+        # from where the stock trades at the open - and a stop ratcheted off one never comes back down. Those prints
+        # still mark the excursions and trip the stop and target (1.); a move a tick pass made is still told below
+        ratchet = self._session_now() is clock.Session.REGULAR
 
         be_r = float(getattr(self.cfg, "breakeven_at_r", 1.3) or 0.0)
-        if be_r > 0 and r_now >= be_r:
+        if ratchet and be_r > 0 and r_now >= be_r:
             # lock a small profit rather than a pure scratch - a +1.3R trade
             # that pulls back should still book something, not go to zero.
             lock_r = float(getattr(self.cfg, "breakeven_lock_r", 0.3) or 0.0)
@@ -512,7 +554,7 @@ class ExitManager:
 
         trail_start = float(getattr(self.cfg, "trail_start_r", 1.5) or 0.0)
         lock = float(getattr(self.cfg, "trail_lock_ratio", 0.5) or 0.0)
-        if trail_start > 0 and lock > 0 and r_now >= trail_start:
+        if ratchet and trail_start > 0 and lock > 0 and r_now >= trail_start:
             locked_r = (r_now * lock)
             trail = entry + sign * locked_r * risk_ps
             new_stop = max(new_stop, trail) if side == "LONG" else min(new_stop, trail)

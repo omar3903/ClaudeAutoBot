@@ -597,9 +597,12 @@ positions:
 | **IBKR (paper or live), swing positions with a stop at the broker** | the dialog also offers **Keep them open & quit**: those positions stay open, protected by their stop orders resting at IBKR, and the app picks them up again when it starts; day trades, pair legs and any position without a resting stop are closed first. Targets and trailing are not worked while the app is off |
 
 **After hours** an exit can't fill, so the app never sends one into a closed exchange - and never takes a
-position's stop off the broker for an exit that can't go out. **Close all & quit** is refused while the market is
-closed; **Keep them open & quit** then keeps every position. A quit that can't finish can be stopped from the
-banner (**Stop quitting**): the positions still open stay open and managed, and the app unlocks.
+position's stop off the broker for an exit that can't go out. An automatic exit turned away for that waits for
+the open (the dashboard says so once) without counting as a failed try, and the first pass of the regular session
+starts every exit's retries afresh, so each goes at the open rather than minutes into it. **Close all & quit**
+is refused while the market is closed; **Keep them open & quit** then keeps every position. A quit that can't
+finish can be stopped from the banner (**Stop quitting**): the positions still open stay open and managed, and
+the app unlocks.
 
 The Active orders tab has **Cancel working orders**: every working entry, exit and stray order is cancelled;
 the stops protecting open positions stay (close the position and its stop goes with it).
@@ -993,7 +996,9 @@ held on the active platform — **entries need your click, exits never do**:
 | **flatten day trades** before the (holiday-aware) close - one still open from an earlier session at the next regular-session pass | 10 min before | `flatten_intraday_before_close_min` |
 | force-close **stale swings** at the flatten on their last day | 10 trading days, the entry's counted | `max_swing_hold_days` |
 
-The stop only ever ratchets in your favour and never through the last price. R
+The stop only ever ratchets in your favour and never through the last price, and
+only in the regular session: a pre-market or after-hours print is thin, so it still
+counts in the trade's excursions and trips its stop or target, but moves no stop. R
 is measured against the **original** stop. Each open position has an **Auto
 exit** toggle in the blotter if you want to hand-manage it.
 

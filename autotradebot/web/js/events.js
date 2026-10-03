@@ -213,6 +213,11 @@ function handle(topic, p) {
       toast("Auto-exit skipped: " + (p.reason || "the broker doesn't show that position"), "warn");
       break;
     case "exit.failed":
+      if (p.market_closed) {
+        // no failed try: the exit waits for the regular session and goes out at its first pass
+        toast("Auto-exit waits for the open: " + p.reason, "warn");
+        break;
+      }
       toast(`⚠ Auto-exit not sent (try ${p.attempt}, again in ${p.retry_in_s}s): ${p.reason}`, "bad");
       break;
     case "orders.updated":
