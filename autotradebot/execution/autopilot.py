@@ -672,6 +672,21 @@ class AutoPilot:
             if p.id not in self._acted:
                 self._last_reason[p.id] = why
 
+    def _note_refusal(self, p: Any, stage: str, reason: str) -> None:
+        """A play that passed Autopilot's own checks and was refused at the engine's assessment or at the last look
+        (approve_play: the check at the live quote, or an order that didn't go out). Logged, and kept on its play
+        row with how it stood then - its confidence, reward:risk, confirmations and noise flags - since the play is
+        not looked at again until a setting changes: the row is how a review finds out why a setup that passed
+        every check never became a trade."""
+        log.info("autopilot refused %s %s (%s) at the %s: %s", p.side.value, p.symbol, p.strategy, stage, reason)
+        note = {"at": clock.now_ny().isoformat(timespec="seconds"), "stage": stage, "reason": reason,
+                "confidence": round(float(p.confidence), 3), "reward_risk": round(float(p.reward_risk), 2),
+                "confirmations": int(p.confirmations), "noise": list(p.noise or [])}
+        try:
+            self.engine.repo.note_refusal(p, note)
+        except Exception:  # noqa: BLE001
+            log.debug("could not save why %s was refused", p.id, exc_info=True)
+
     # ------------------------------------------------------------------ #
     def consider(self, plays: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Called by the engine right after a scan publishes fresh plays.
@@ -777,8 +792,9 @@ class AutoPilot:
                 self._last_reason[p.id] = f"assess failed: {e}"
                 continue
             if not pre.get("ok") or not pre.get("can_execute"):
-                reason = "; ".join(pre.get("reasons", [])) or "not executable"
+                reason = "; ".join(pre.get("reasons", [])) or pre.get("reason") or "not executable"
                 self._last_reason[p.id] = reason
+                self._note_refusal(p, "assessment", reason)
                 self.bus.publish("autopilot.skipped", play_id=p.id, symbol=p.symbol,
                                  strategy=p.strategy, reason=reason)
                 self._acted.add(p.id)
@@ -852,6 +868,7 @@ class AutoPilot:
                 self._persist()
                 self._refused.add(p.id)
                 self._last_reason[p.id] = out.get("reason", "execution failed")
+                self._note_refusal(p, "last look", self._last_reason[p.id])
                 self.bus.publish("autopilot.skipped", play_id=p.id, symbol=p.symbol,
                                  strategy=p.strategy, reason=self._last_reason[p.id])
 

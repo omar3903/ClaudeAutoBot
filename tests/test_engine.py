@@ -1805,6 +1805,42 @@ def test_an_approval_sends_the_size_re_priced_at_the_last_look_and_says_so(engin
     assert not refused["ok"] and "Autopilot's minimum of 2" in refused["reason"] and len(sent) == 1
 
 
+def test_an_entry_keeps_how_it_was_sized_and_which_limit_decided_it(engine, monkeypatch):
+    _plain_sizing(engine, monkeypatch)
+    assert engine.set_size_factor(1.5)["ok"]
+    p, repriced = _play("T07"), _play("T08")
+    p.targets = repriced.targets = [112.0]                                  # entry 100, stop 95, target 112
+    engine.board.replace([p, repriced])
+    plan = {"executable": True, "order_type": "LIMIT", "limit_price": 100.05, "order_session": "REGULAR"}
+    assess = engine.assess_play                                             # its real sizing, whatever the clock says
+    monkeypatch.setattr(engine, "assess_play", lambda pid: {**assess(pid), "can_execute": True, "reasons": [],
+                                                            "order_plan": dict(plan)})
+    sent = {}
+
+    def execute(play, account, **kw):
+        sent[play.symbol] = kw["context"]
+        return {"ok": True, "status": "SUBMITTED"}
+
+    monkeypatch.setattr(engine.executor, "execute_play", execute)
+    assert engine.approve_play(p.id)["ok"]                                  # no price source: sent as previewed
+    sizing = p.evidence["at_entry"]["sizing"]
+    # 1.5% of $100,000 is $1,500 of risk, 300 shares at $5 a share; the 12% per-position cap allows 120 at 100
+    assert (sizing["qty"], sizing["est_risk"], sizing["size_factor"], sizing["decided_by"]) == (120, 600.0, 1.5,
+                                                                                               "per_position")
+    assert sizing["limits"]["risk_budget"] == {"pct": 1.5, "size_factor": 1.5, "usd": 1500.0, "shares": 300}
+    assert sizing["limits"]["per_position"] == {"pct": 12.0, "usd": 12000.0, "shares": 120}
+    assert "max position % of equity" in sizing["caps"] and "repriced_to" not in sizing
+    assert sent["T07"]["sizing"] == sizing                                  # the trade's own record
+    assert engine.repo.get_play(p.id)["evidence"]["at_entry"]["sizing"] == sizing
+
+    _live_tape(engine, monkeypatch, 101.0)                                  # re-priced to 101.05 and sized again there
+    assert engine.approve_play(repriced.id)["ok"]
+    again = repriced.evidence["at_entry"]["sizing"]
+    assert (again["qty"], again["est_risk"], again["repriced_to"], again["decided_by"]) == (118, 713.9, 101.05,
+                                                                                          "per_position")
+    assert again["limits"]["per_position"]["shares"] == 118 and sent["T08"]["sizing"] == again
+
+
 def test_autopilot_takes_only_what_the_filters_and_its_own_boxes_both_allow(engine):
     ap = engine.autopilot
     ap.enabled, ap.trade_types = True, ["INTRADAY", "SWING"]              # its own boxes: day and swing

@@ -2332,7 +2332,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                 "expected_hold": (f"~{p.expected_hold_typical:.0f} {hold_unit} "
                                   f"(review after {p.expected_hold_max:.0f})"),
                 "est_cost": round(p.notional, 2), "est_risk": round(p.dollar_risk, 2),
-                "caps": list(sizing.caps_hit),
+                "caps": list(sizing.caps_hit), "sizing": self._sizing_record(sizing),
                 "note": plan.get("note", ""), "routes_to": ROUTE_LABELS.get(self._venue, self._venue.upper()),
             },
         }
@@ -2346,6 +2346,16 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                          symbol_notional=self.exposure_by_symbol().get(p.symbol, 0.0),
                          risk_pct=self._play_risk_pct(p), risk_why=self.strategy_risk_why(p.strategy),
                          size_factor=self.size_factor)
+
+    def _sizing_record(self, sizing: SizingResult) -> Dict[str, Any]:
+        """How an entry was sized, for the entry context its trade keeps (_entry_context): the shares, their risk
+        and cost, the position size factor, the limit the share count stopped at (``decided_by``: the risk budget,
+        the open-risk ceiling, the per-position %, the cap on one stock, the slice of its daily volume, buying power
+        or the trading capital's room) and every limit's value - so a review can tell a trade the risk budget sized
+        from one a cap cut down, and by how much."""
+        return {"qty": sizing.qty, "est_risk": sizing.dollar_risk, "est_cost": sizing.notional,
+                "size_factor": float(self.size_factor), "decided_by": sizing.decided_by,
+                "caps": list(sizing.caps_hit), "limits": dict(sizing.limits)}
 
     def approve_play(self, play_id: str, operator: str = "operator") -> Dict[str, Any]:
         with self._switch_lock:
@@ -2364,14 +2374,17 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             if not pre["can_execute"]:
                 return {"ok": False, "reason": "; ".join(pre["reasons"]) or "not executable"}
             seen: Dict[str, Any] = {}
-            chased = self._chase_check(p, pre["order_plan"], seen, operator=operator)
+            # how the entry is sized: the order preview's, unless the last look re-sizes it at a re-priced limit
+            sized = dict((pre.get("order_preview") or {}).get("sizing") or {})
+            chased = self._chase_check(p, pre["order_plan"], seen, operator=operator, sized=sized)
             if chased:
                 return {"ok": False, "reason": chased}
 
             p.status = PlayStatus.ACCEPTED
-            p.evidence["at_entry"] = at_entry = self._entry_context(p, operator)
+            p.evidence["at_entry"] = at_entry = self._entry_context(p, operator, sizing=sized or None)
             context = play_features(p, now=clock.now_ny(), market=self.regime.context(), at_entry=at_entry,
                                     by=operator)
+            context["sizing"] = at_entry.get("sizing")    # the trade's own record says how it was sized, too
             self.repo.record_play(p)
             self.repo.set_play_status(p.id, p.status.value, operator)
             try:
@@ -2468,7 +2481,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         return pct
 
     def _chase_check(self, p: Play, plan: Dict[str, Any], seen: Optional[Dict[str, Any]] = None, *,
-                     operator: str = "operator") -> Optional[str]:
+                     operator: str = "operator", sized: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """The last look before an order goes out, at the live quote. Returns why the entry is
         refused, if it is; ``seen`` is filled with the quote (mid, bid, ask, spread_bps, live), which
         the fill is later measured against - Harris's implementation shortfall.
@@ -2490,7 +2503,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
         The quote is quote()'s: a stream's latest when it ticked in the last 2 s, else a snapshot - an
         entry never waits for a stream. Where it came from and how old it was are logged, and kept in
-        ``seen`` as quote_source / quote_age_ms (the trade record keeps only the mid and the spread)."""
+        ``seen`` as quote_source / quote_age_ms (the trade record keeps only the mid and the spread).
+        ``sized``: the entry's sizing record (_sizing_record), replaced by the re-sized one when a re-priced
+        entry passes."""
         cfg = self.settings.config.execution
         risk = abs(float(p.entry) - float(p.stop))
         if risk <= 0 or not self.md.attached:
@@ -2534,20 +2549,21 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if run > 0 and plan.get("order_type") == "LIMIT" and plan.get("limit_price"):
             offset = float(getattr(cfg, "limit_offset_bps", 5.0)) / 1e4
             limit = round(px * (1 + sign * offset), 2)
-            refused = self._repriced_check(p, limit, operator)
+            refused = self._repriced_check(p, limit, operator, sized)
             if refused:
                 return refused
             plan["limit_price"] = limit
         return None
 
-    def _repriced_check(self, p: Play, limit: float, operator: str) -> Optional[str]:
+    def _repriced_check(self, p: Play, limit: float, operator: str,
+                        sized: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """A limit entry the last look re-priced off the quote, judged again at that price - where the order
         fills, not the play's entry: the further it runs, the more the risk to the stop and the less the reward to
         the target. Refused when the reward:risk to the first target falls below the floor the entry was judged by
         (Autopilot's own for its entries, risk.min_reward_risk for a click), or when the size at that price - the
         risk budget over the wider stop distance, the per-position cap at the dearer price - comes to nothing.
         Otherwise the play takes that size, so the shares sent, and the risk and cost the trade records, are the
-        re-priced entry's. None when it passes."""
+        re-priced entry's - and so is ``sized``, the sizing record its entry context keeps. None when it passes."""
         sign = 1.0 if p.side is Side.LONG else -1.0
         risk = (limit - float(p.stop)) * sign
         target = p.primary_target
@@ -2570,6 +2586,9 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                     f"{', '.join(sizing.caps_hit) or 'risk budget too small for one share'}) - not entering")
         p.suggested_qty, p.risk_per_share = at_limit.suggested_qty, at_limit.risk_per_share
         p.dollar_risk, p.notional = at_limit.dollar_risk, at_limit.notional
+        if sized is not None:
+            sized.clear()
+            sized.update(self._sizing_record(sizing), repriced_to=limit)
         return None
 
     def reject_play(self, play_id: str, operator: str = "operator") -> Dict[str, Any]:

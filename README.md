@@ -803,6 +803,11 @@ Either way:
   the account's value - `risk.max_position_pct_of_equity`). A day trade's stop
   is usually tight, so its risk budget would buy far more than this cap allows:
   for most day trades the cap, not the factor, decides the size.
+- Every entry's record says how it was sized (`sizing` in the play's
+  `evidence.at_entry` and in `trades.entry_context`): its risk, the size factor,
+  which limit decided the share count - the risk budget, the open-risk ceiling,
+  the per-position %, the per-stock cap, the volume cap, buying power or the
+  trading capital's room - and what each limit allowed, in dollars and shares.
 - Autopilot and the pair desk fill up to **Max % of trading capital in positions**
   (`autopilot.max_gross_exposure_pct`, 10-100) of it. With margin, IBKR closes
   positions itself if the account's excess liquidity runs out, so a maximum under
@@ -1130,9 +1135,11 @@ Autopilot is on, a play it won't take gets a faded grey robot: hovering it gives
 the first check the play fails, in the words the entry gate itself uses (the
 badge and the gate share one set of checks). The play's detail panel says the
 same in one line. A play Autopilot tried and was refused - by the engine's
-assessment (say as too thin to trade) or the broker - gets the faded robot with
-the refusal, and a note in **Autopilot notes**; it isn't tried again that day
-unless a setting changes.
+assessment (say as too thin to trade), the last look at the quote (the spread, a
+chase) or the broker - gets the faded robot with the refusal, and a note in
+**Autopilot notes**; it isn't tried again that day unless a setting changes. The
+refusal is logged too, and kept on the play's row (`evidence.autopilot_refused`)
+with the play's confidence, reward:risk, confirmations and noise flags then.
 
 **The strip under the header** says what Autopilot is doing now and why, in one
 line: off, paper-only, no prices, stopped for the day, done (the day's entries

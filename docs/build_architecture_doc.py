@@ -1031,7 +1031,8 @@ def build() -> str:
       'position cap (12% of equity), the per-symbol cap (15%) and the liquidity cap: one order takes at most 1% of '
       'the stock\'s median daily volume over its last 20 completed sessions (<code>evidence.adv_shares</code>), and '
       'a stock too thin for one share is refused with that reason. The order card lists the caps that bound under '
-      '"Size limited by".</li>'
+      '"Size limited by"; each entry keeps which limit decided its share count and what every limit allowed '
+      '(<code>sizing</code> in its entry context).</li>'
       '<li><b>Order.</b> <code>Executor.execute_play()</code> builds a limit order (5 bps through the price) and, '
       'where the broker supports it, a native bracket with the stop and target attached. An immediate fill opens '
       'the trade; otherwise the order is tracked and <code>sync_open_orders()</code> books the fill later.</li>'
@@ -1179,9 +1180,10 @@ def build() -> str:
     A(table(["Table", "One row is", "Written by"], [
         ("scan_runs", "one scan (full, gappers, cycle, fast, plays) with its timings and counts",
          "engine._run_scan -> repo.record_scan"),
-        ("play_logs", "one play shown on the board, with its decision (approved, rejected, auto) and what became "
-         "of it once sent (SUBMITTED, FILLED, CANCELED/ERROR with evidence.entry_outcome)",
-         "repo.record_scan / record_play / set_play_status / settle_play"),
+        ("play_logs", "one play shown on the board, with its decision (approved, rejected, auto), what became "
+         "of it once sent (SUBMITTED, FILLED, CANCELED/ERROR with evidence.entry_outcome) and why Autopilot refused "
+         "it at the assessment or the last look (evidence.autopilot_refused)",
+         "repo.record_scan / record_play / set_play_status / settle_play / note_refusal"),
         ("trades", "one position from entry to exit, including partial exits (banked_pl), the R multiple, the "
          "play's features at the decision (entry_context) and what the fills cost: decision_price, spread_bps, "
          "entry_slippage_bps, exit_decision_price, exit_slippage_bps",

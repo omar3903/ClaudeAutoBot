@@ -44,6 +44,31 @@ def test_trade_lifecycle_and_pnl(repo):
     assert abs(s["realized_total"] - before["realized_total"] - 40.0) < 1e-6
 
 
+def test_a_refusal_noted_on_a_play_row_outlasts_the_scans_and_the_approval_that_write_the_row_again(repo):
+    import dataclasses
+
+    from autotradebot.scanner.scanner import ScanResult
+
+    p = _play(symbol="RFA")
+    repo.record_play(p)
+    note = {"stage": "last look", "reason": "the spread is too dear to cross", "confidence": 0.7,
+            "reward_risk": 2.0, "confirmations": 2, "noise": []}
+    repo.note_refusal(p, note)
+    row = repo.get_play(p.id)
+    assert row["evidence"]["autopilot_refused"] == note and row["status"] == "PROPOSED"   # still offered
+
+    again = dataclasses.replace(p, confirmations=3, evidence={})            # the next scan's play for the same setup
+    repo.record_scan(ScanResult(kind="cycle", plays=[again]), plays=[again])
+    row = repo.get_play(p.id)
+    assert row["evidence"]["autopilot_refused"] == note and row["confirmations"] == 3
+    repo.record_play(again)                                                 # taken by a click later
+    assert repo.get_play(p.id)["evidence"]["autopilot_refused"] == note
+
+    unlogged = _play(symbol="RFB")                                          # no scan logged it: the row is written
+    repo.note_refusal(unlogged, note)
+    assert repo.get_play(unlogged.id)["evidence"]["autopilot_refused"] == note
+
+
 def test_closed_trades_are_counted_by_type_as_a_profit_a_loss_or_even(repo):
     before = repo.pnl_summary()["by_type"]          # other tests share this database: count what this one adds
 

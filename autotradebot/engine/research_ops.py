@@ -279,15 +279,16 @@ class ResearchOps:
         self.strategy_risk_pct(key)                            # sized now, or already
         return PRACTICE_LABEL if key in self._practice else None
 
-    def _entry_context(self, p: Play, operator: str) -> Dict[str, Any]:
-        """What a play was taken on, kept in its evidence for the journal."""
+    def _entry_context(self, p: Play, operator: str, sizing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """What a play was taken on, kept in its evidence for the journal. ``sizing``: how the entry was sized
+        (TradingEngine._sizing_record) - the risk, the size factor and which limit decided the share count."""
         return {"at": clock.now_ny().isoformat(), "by": operator, "noise": list(p.noise),
                 "confirmations": p.confirmations, "score": round(p.score, 4), "confidence": round(p.confidence, 3),
                 "probability": round(p.probability, 3), "reward_risk": round(p.reward_risk, 2),
                 "market_regime": self.regime.context(), "skipped_noise": self.autopilot.skipped_noise(),
                 "unproven": self.autopilot.proof_missing(p.strategy), "replay_record": self.strategy_record(p.strategy),
                 "evidence_weight": self.evidence_weights().get(p.strategy, 1.0),
-                "risk_pct": self.strategy_risk_pct(p.strategy),
+                "risk_pct": self.strategy_risk_pct(p.strategy), "sizing": sizing,
                 # the gates in force when it was taken, so a trade taken on looser rules is never mistaken for
                 # one the strict rules would have taken
                 "settings": {"proof_required": self.autopilot.proof_required,

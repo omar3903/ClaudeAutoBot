@@ -458,6 +458,37 @@ def test_a_play_it_tried_and_was_refused_says_so_on_its_row():
     assert not ap.decorate_play(unassessed.to_row())["autopilot"]["skipped"]
 
 
+def test_a_refusal_at_the_assessment_or_the_last_look_is_logged_and_kept_with_how_the_play_stood(caplog):
+    """A play the engine's assessment refuses, or the last look before the order, isn't looked at again until a
+    setting changes: the reason goes in the log, and on the play's row with the play as it was then."""
+    import logging
+
+    eng = FakeEngine()
+    noted = []
+    eng.repo.note_refusal = lambda play, note: noted.append((play.id, note))
+    ap = AutoPilot(eng, _cfg(), bus=SILENT)
+    unassessed, unsent = mkplay(sym="AAA", conf=0.81), mkplay(sym="BBB", target=105.0)
+    unassessed.confirmations, unsent.confirmations, unsent.noise = 3, 2, ["conflict"]
+    eng.can_execute = False
+    with caplog.at_level(logging.INFO, logger="autotradebot.execution.autopilot"):
+        _run(ap, unassessed)
+        eng.can_execute = True
+        eng.approve_play = lambda pid, operator="operator": {"ok": False, "reason": "the spread is too dear to cross"}
+        _run(ap, unsent)
+    said = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert ("autopilot refused LONG AAA (opening_range_breakout) at the assessment: not executable in this session"
+            in said)
+    assert ("autopilot refused LONG BBB (opening_range_breakout) at the last look: the spread is too dear to cross"
+            in said)
+    assert [pid for pid, _ in noted] == [unassessed.id, unsent.id]
+    (_, first), (_, second) = noted
+    assert first.pop("at") and second.pop("at")
+    assert first == {"stage": "assessment", "reason": "not executable in this session", "confidence": 0.81,
+                     "reward_risk": 3.0, "confirmations": 3, "noise": []}
+    assert second == {"stage": "last look", "reason": "the spread is too dear to cross", "confidence": 0.75,
+                      "reward_risk": 2.5, "confirmations": 2, "noise": ["conflict"]}
+
+
 def test_configure_updates_and_persists():
     calls = []
     ap = AutoPilot(FakeEngine(), _cfg(), bus=SILENT, persist=lambda: calls.append(1))
