@@ -1831,9 +1831,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if closed:
             log.warning("booked %d record(s) closed outside the app from %s's fills: %s", len(closed), venue,
                         ", ".join(f"{c['symbol']} at {c['exit_price']}" for c in closed))
-        if removed:
-            log.warning("removed %d trade record(s) no longer held at %s: %s", len(removed), venue,
-                        ", ".join(r["symbol"] for r in removed))
+        if removed:                                      # each said, with why, as it was deleted (_settle_gone)
             self._publish("trades.removed", trades=removed, venue=venue, venue_label=venue_label(venue))
 
         removed_ids = {r["id"] for r in removed} | {c["id"] for c in closed}
@@ -1864,25 +1862,36 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
 
     def _settle_gone(self, gone: List[Mapping[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Each record whose position is gone: closed at the price the broker's fills say it went
-        for, so the journal, the strategy records and the sizing learn its outcome - or, when the
-        broker reports no such fill, deleted as before. Returns (closed, removed)."""
+        for, so the journal, the strategy records and the sizing learn its outcome. One whose fills
+        couldn't be read is left for a later check - its exit may well be there, and deleted the trade
+        would be lost; only one whose fills, read fine, show no exit since the entry (IBKR keeps only
+        the current session's) is deleted, the last resort. Returns (closed, removed)."""
         closed: List[Dict[str, Any]] = []
         removed: List[Dict[str, Any]] = []
         for t in gone:
             row = {"id": t["id"], "symbol": t["symbol"], "side": t["side"], "quantity": t["quantity"]}
-            fill = self._exit_fill(t)
-            out = None
-            if fill is not None:
-                out = self.repo.close_trade(t["id"], fill["price"], exit_reason="closed-outside",
-                                            commission=fill["commission"], exit_time=fill["at"])
+            try:
+                fill = self._exit_fill(t)
+            except Exception as e:  # noqa: BLE001 - the broker couldn't say what closed it: nothing is changed
+                # the position check hands it back after its next misses, and the fills are read again then
+                log.info("%s's position is gone from %s, but its fills couldn't be read (%s) - the record %s is "
+                         "kept and looked at again on a later check", t["symbol"], venue_label(self._venue), e, t["id"])
+                continue
+            if fill is None:
+                if self.repo.delete_trade(t["id"]):
+                    log.warning("TRADE RECORD DELETED  %s (%s): its position is gone from %s and the broker's fills, "
+                                "read fine, show no exit since the entry (IBKR keeps only the current session's)",
+                                t["symbol"], t["id"], venue_label(self._venue))
+                    removed.append(row)
+                continue
+            out = self.repo.close_trade(t["id"], fill["price"], exit_reason="closed-outside",
+                                        commission=fill["commission"], exit_time=fill["at"])
             if out:
                 if self.executor is not None:
                     self.executor.forget_open(t["symbol"])
                 closed.append({**row, "exit_price": fill["price"], "fills": fill["fills"],
                                "realized_pl": out.get("realized_pl")})
                 self._publish("trade.closed", trade=out, reason="closed outside the app, booked from the broker's fills")
-            elif self.repo.delete_trade(t["id"]):
-                removed.append(row)
         return closed, removed
 
     def _settle_short(self, trades: List[Mapping[str, Any]], held: Mapping[str, float]) -> List[Dict[str, Any]]:
@@ -1912,12 +1921,12 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             seen = self.__dict__.setdefault("_short_checked", {})
             if seen.get(tid) == (record, now_held):
                 continue                                 # looked already: the fills don't explain it (sold in TWS, say)
-            seen[tid] = (record, now_held)
             try:
                 fills = [f for f in get(sym) if getattr(f, "tag", "") == f"exit:{tid}"
                          and (f.side is Side.SHORT) == (t["side"] == "LONG")]
-            except Exception:  # noqa: BLE001 - the broker couldn't say: nothing is booked
+            except Exception:  # noqa: BLE001 - the broker couldn't say: nothing is booked, and it's looked at again
                 continue
+            seen[tid] = (record, now_held)
             # the shares its record already took off were booked when they filled: the rest of the fills weren't
             done = max(0.0, abs(float(t.get("initial_quantity") or record)) - record)
             left, qty, value = done, 0.0, 0.0
@@ -1945,15 +1954,12 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def _exit_fill(self, t: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         """What closed a position outside the app, from the broker's executions: the exit-side fills
         of the symbol since the trade was entered, averaged by size. None when the broker reports
-        none (IBKR keeps only the current session's)."""
+        none (IBKR keeps only the current session's); a read that failed raises, as the broker's does -
+        "not known" is no "none"."""
         get = getattr(self._broker, "get_fills", None)
         if not callable(get):
             return None
-        try:
-            fills = get(t["symbol"]) or []
-        except Exception:  # noqa: BLE001
-            log.debug("fills for %s unavailable", t["symbol"], exc_info=True)
-            return None
+        fills = get(t["symbol"]) or []
         entered = _utc(t.get("entry_time"))
         exit_side = Side.SHORT if t["side"] == "LONG" else Side.LONG
         picked = [f for f in fills if f.side == exit_side and float(f.quantity) > 0

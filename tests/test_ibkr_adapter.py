@@ -737,18 +737,21 @@ def test_each_fill_carries_the_tag_of_the_order_it_filled(broker):
         assert broker.get_fills("AAPL")[0].commission == 0.0
 
 
-def test_executions_that_cant_be_read_raise_when_asked_strictly_rather_than_read_as_none(broker):
+def test_executions_that_cant_be_read_raise_rather_than_read_as_none(broker):
     async def timed_out(wanted):
         raise asyncio.TimeoutError("no answer from IB Gateway")
 
+    async def none_today(wanted):
+        return []
+
+    broker._session.ib.reqExecutionsAsync = none_today
+    assert broker.get_fills("AAA") == []                                       # IBKR answered: there are none
     broker._session.ib.reqExecutionsAsync = timed_out
-    assert broker.get_fills("AAA") == []                                       # the old answer, for the old callers
-    with pytest.raises(BrokerError, match="couldn't be read"):
-        broker.get_fills("AAA", strict=True)
+    with pytest.raises(BrokerError, match="couldn't be read"):                 # no answer is no "none"
+        broker.get_fills("AAA")
     broker._connected = False
-    assert broker.get_fills() == []
     with pytest.raises(BrokerError, match="not connected"):
-        broker.get_fills(strict=True)
+        broker.get_fills()
 
 
 # --------------------------------------------------------------------------- #

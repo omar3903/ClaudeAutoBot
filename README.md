@@ -677,8 +677,11 @@ closed in the broker's own app, or by an exit that filled while the app was down
 the entry give the exit price and time, so the trade's outcome reaches the
 history, the journal and the strategy records (exit reason `closed-outside`).
 When the broker reports no such fill (IBKR keeps only the current session's) the
-record is **deleted** instead, as after **Reset paper**. A wrong deletion would
-orphan a real position, so the check is strict: it only acts on a connected
+record is **deleted** instead, as after **Reset paper** — but only once the broker
+has answered: when its fills can't be read (the connection dropped, no answer in
+time) the record is kept and looked at again on a later check, never deleted for
+a fill the app couldn't see. A wrong deletion would orphan a real position, so
+the check is strict: it only acts on a connected
 broker's fresh account snapshot, after the connection has been up a minute, for
 trades older than 90 s whose close isn't in flight, and after two misses in a
 row. Closed trades are never deleted, and the broker order audit log is always

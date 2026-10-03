@@ -1051,6 +1051,57 @@ def test_a_position_closed_outside_the_app_is_booked_from_the_brokers_fills(engi
     assert engine.snapshot()["mismatches"] == []
 
 
+def test_a_gone_position_whose_fills_cant_be_read_keeps_its_record_until_a_read_finds_no_exit(engine, caplog):
+    import logging
+
+    from autotradebot.brokers.base import BrokerError
+
+    tid = _open(engine, "AAA", qty=5)
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    readable = []
+
+    def fills(symbol=None):
+        if not readable:
+            raise BrokerError("IBKR's executions for AAA couldn't be read: no answer in time")
+        return []                                                           # read fine: nothing since the entry
+
+    engine._broker.get_fills = fills
+    with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
+        assert all(engine._reconcile_open_trades() == [] for _ in range(4))     # gone, check after check
+    assert engine.repo.get_trade(tid)["status"] == "OPEN"                   # "not known" is no "none": kept
+    assert "its fills couldn't be read" in caplog.text and "TRADE RECORD DELETED" not in caplog.text
+    readable.append(True)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="autotradebot.engine.engine"):
+        removed = [r for _ in range(2) for r in engine._reconcile_open_trades()]
+    assert [r["id"] for r in removed] == [tid] and engine.repo.get_trade(tid) is None   # the last resort, said
+    assert f"TRADE RECORD DELETED  AAA ({tid})" in caplog.text
+
+
+def test_an_exit_called_off_part_filled_is_booked_once_its_fills_can_be_read(engine):
+    from autotradebot.brokers.base import BrokerError
+
+    tid = _open(engine, "AAA", qty=10)                                      # entered at 100
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAA", quantity=6, avg_price=100.0, market_price=101.0)]
+    now, readable = dt.datetime.now(dt.timezone.utc), []
+
+    def fills(symbol=None):
+        if not readable:
+            raise BrokerError("IBKR's executions for AAA couldn't be read: no answer in time")
+        return [Fill(order_id="e1", symbol="AAA", side=Side.SHORT, quantity=4, price=104.0, ts=now, tag=f"exit:{tid}")]
+
+    engine._broker.get_fills = fills
+    engine._reconcile_open_trades()
+    assert engine.repo.get_trade(tid)["quantity"] == 10                     # not known: nothing booked...
+    readable.append(True)
+    engine._reconcile_open_trades()
+    t = engine.repo.get_trade(tid)                                          # ...and not taken as looked at already
+    assert (t["quantity"], t["banked_pl"]) == (6, pytest.approx(4 * 4.0))
+
+
 def test_an_exit_called_off_after_filling_in_part_is_booked_from_its_tagged_fills(engine):
     import datetime as dt
 

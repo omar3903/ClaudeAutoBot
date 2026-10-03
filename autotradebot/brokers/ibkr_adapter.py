@@ -1150,15 +1150,14 @@ class IbkrBroker(BrokerAdapter):
         got = self._session.run_coro(run, timeout=budget)
         return Candles({s: f for s, f in got if f is not None and len(f)}, failed=failed)
 
-    def get_fills(self, symbol: Optional[str] = None, timeout: float = 15.0, strict: bool = False) -> List[Fill]:
+    def get_fills(self, symbol: Optional[str] = None, timeout: float = 15.0) -> List[Fill]:
         """This session's executions on the account (IBKR keeps the current day's), oldest first.
         They book a record whose position was closed in TWS, or by an exit that filled while the
-        app was down. A read that fails (not connected, an error, no answer in time) answers [] -
-        or, with ``strict``, raises BrokerError, for a caller that must tell "none" from "not known"."""
+        app was down. [] only when IBKR answered with none: a read that fails (not connected, an
+        error, no answer in time) raises BrokerError - "not known" is never "none", which would
+        let a record whose position is gone be deleted rather than booked."""
         if not self.is_connected:
-            if strict:
-                raise BrokerError("IBKR is not connected - its executions can't be read")
-            return []
+            raise BrokerError("IBKR is not connected - its executions can't be read")
         from ib_async import ExecutionFilter
 
         wanted = ExecutionFilter(symbol=symbol or "", acctCode=self.account_id or "")
@@ -1170,9 +1169,7 @@ class IbkrBroker(BrokerAdapter):
             reported = self._session.run_coro(run, timeout=timeout) or []
         except Exception as e:  # noqa: BLE001
             log.debug("executions for %s unavailable: %s", symbol or "the account", e)
-            if strict:
-                raise BrokerError(f"IBKR's executions for {symbol or 'the account'} couldn't be read: {e}") from e
-            return []
+            raise BrokerError(f"IBKR's executions for {symbol or 'the account'} couldn't be read: {e}") from e
         out: List[Fill] = []
         for item in reported:
             execution, contract = getattr(item, "execution", None), getattr(item, "contract", None)

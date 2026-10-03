@@ -120,7 +120,8 @@ class BrokerAdapter(abc.ABC):
 
     def get_fills(self, symbol: Optional[str] = None) -> List[Fill]:
         """The fills the venue reports for the current session, oldest first - what books a
-        position that was closed outside the app. Venues that can't say return []."""
+        position that was closed outside the app. Venues that keep none return []; a read that
+        failed raises BrokerError instead - "none" lets a record whose position is gone be deleted."""
         return []
 
     def order_errors(self) -> List[Dict[str, Any]]:

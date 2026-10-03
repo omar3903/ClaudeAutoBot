@@ -71,7 +71,6 @@ Every stop and target placed, every cancel and every move asked of the broker he
 from __future__ import annotations
 
 import datetime as dt
-import inspect
 import logging
 import threading
 import time
@@ -132,14 +131,6 @@ def _unconfirmed_cancel(res: OrderResult) -> bool:
     """The order reads cancelled, but the broker never said it cancelled it (IBKR's 202, or its own order
     status) - an error read as the order's end. Brokers that don't say count as having confirmed."""
     return res.status == "CANCELED" and (res.raw or {}).get("cancel_confirmed") is False
-
-
-def _takes_strict(get_fills) -> bool:
-    """Whether a broker's ``get_fills`` takes ``strict`` - raise on a read that failed, rather than answer []."""
-    try:
-        return "strict" in inspect.signature(get_fills).parameters
-    except (TypeError, ValueError):
-        return False
 
 
 def shares_and_price(fills: List[Any]) -> Tuple[float, float]:
@@ -387,14 +378,13 @@ class ProtectiveStops:
 
     def _executions(self, symbol: Optional[str]) -> Optional[List[Any]]:
         """The broker's executions this session - of ``symbol``, or the whole account's - oldest first; None when
-        the read failed. A broker that can tell a read that failed from one that found nothing (IBKR answers [] for
-        both unless asked ``strict``) is asked to: here "none" must mean none. One that keeps no executions at all
+        the read failed (IBKR's raises then: here "none" must mean none). One that keeps no executions at all
         answers [], as the base adapter's does - it will never say more."""
         get = getattr(self.broker, "get_fills", None)
         if not callable(get):
             return []
         try:
-            return list((get(symbol, strict=True) if _takes_strict(get) else get(symbol)) or [])
+            return list(get(symbol) or [])
         except Exception:  # noqa: BLE001
             log.debug("executions for %s unavailable", symbol or "the account", exc_info=True)
             return None

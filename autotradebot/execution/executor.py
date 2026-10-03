@@ -566,8 +566,8 @@ class Executor(ProtectiveStops):
         working = self._working_or_none() if rows else []
         fills = self._executions(None) if rows else []
         if working is None or fills is None:
-            # not known: looked for again shortly (IBKR's executions are read strictly - a request that failed or
-            # timed out is no "none", or the entry would never be looked for again)
+            # not known: looked for again shortly (a request for IBKR's executions that failed or timed out raises -
+            # it is no "none", or the entry would never be looked for again)
             self._entries_retry_at = time.monotonic() + self.ENTRY_LOOK_RETRY_S
             return []
         working_for, found = {o.tag for o in working}, []

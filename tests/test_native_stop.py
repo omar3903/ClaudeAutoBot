@@ -1325,8 +1325,8 @@ def test_an_executions_read_that_fails_at_the_start_is_tried_again_and_the_entry
     repo, asked = _Repo([]), []
     repo.submitted_plays = lambda since, until: [_sent("play_off", "AAA")]
 
-    def get_fills(symbol=None, strict=False):                                  # IBKR's, asked strictly
-        asked.append(strict)
+    def get_fills(symbol=None):                                                # IBKR's: raises when it can't say
+        asked.append(symbol)
         if len(asked) == 1:
             raise BrokerError("IBKR's executions for the account couldn't be read: no answer in time")
         return [Fill(order_id="11", symbol="AAA", side=Side.LONG, quantity=10, price=100.0, tag="play_off")]
@@ -1339,11 +1339,11 @@ def test_an_executions_read_that_fails_at_the_start_is_tried_again_and_the_entry
     broker.connected_since -= ex.RESYNC_GRACE_S + 1
     ex.sync_open_orders()
     ex.sync_open_orders()
-    assert repo.open_trades() == [] and asked == [True]                        # failed - tried again in a while
+    assert repo.open_trades() == [] and asked == [None]                        # failed - tried again in a while
     ex._entries_retry_at -= ex.ENTRY_LOOK_RETRY_S
     ex.sync_open_orders()
     [t] = repo.open_trades()
-    assert (t["symbol"], t["quantity"], asked) == ("AAA", 10, [True, True])
+    assert (t["symbol"], t["quantity"], asked) == ("AAA", 10, [None, None])
     assert [(s.symbol, s.quantity) for s in broker.stops()] == [("AAA", 10)]
 
 

@@ -621,7 +621,7 @@ def test_an_entry_the_broker_loses_track_of_is_not_given_up_while_its_executions
     broker.reports["1"] = OrderResult(order_id="1", status="UNKNOWN", symbol="?", submitted_qty=0)
     readable = []
 
-    def get_fills(symbol=None, strict=False):                          # IBKR's, asked strictly
+    def get_fills(symbol=None):                                        # IBKR's: raises when it can't say
         if not readable:
             raise BrokerError("IBKR's executions for AAA couldn't be read: no answer in time")
         return [Fill(order_id="1", symbol="AAA", side=Side.LONG, quantity=10, price=100.01, tag=play.id)]
@@ -744,7 +744,7 @@ class _Unanswered(_Broker):
             raise TimeoutError()
         raise OrderOutcomeUnknown("IBKR didn't answer the order within 10 s", order_ref=req.client_tag)
 
-    def get_fills(self, symbol=None, strict=False):
+    def get_fills(self, symbol=None):
         return [f for f in self.fills if symbol is None or f.symbol == symbol]
 
 
@@ -1299,7 +1299,7 @@ class _Reporting(_Broker):
         super().__init__(*a, **kw)
         self.reported, self.asked = [], 0
 
-    def get_fills(self, symbol=None, strict=False):
+    def get_fills(self, symbol=None):
         self.asked += 1
         return list(self.reported)
 
