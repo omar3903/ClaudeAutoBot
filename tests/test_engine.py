@@ -1109,11 +1109,11 @@ def test_shares_the_records_dont_explain_are_logged_and_sent_to_the_dashboard_ne
                                                                                             caplog):
     import logging
 
-    _open(engine, "MSFT", qty=5)
+    _open(engine, "BBB", qty=5)
     engine.position_check.SETTLE_S = engine.position_check.DRIFT_ALERT_S = 0.0
     monkeypatch.setattr(clock, "current_session", lambda ts=None: clock.Session.REGULAR)
     engine._refresh_account()
-    engine._account.positions = [Position(symbol="MSFT", quantity=5, avg_price=100.0),
+    engine._account.positions = [Position(symbol="BBB", quantity=5, avg_price=100.0),
                                  Position(symbol="AAPL", quantity=-7, avg_price=50.0)]
     heard, unwound = [], []
     monkeypatch.setattr(engine, "_publish", lambda topic, **p: heard.append((topic, p)))
