@@ -588,8 +588,12 @@ The app is built to be left running:
   is taken over rather than placed twice. The dashboard hears of an unanswered exit at once - its stop at
   the broker may already be cancelled for it - and of any order still not found a minute and a half on,
   again every five minutes, even while IBKR's orders can't be read or the Gateway is down.
-* **A fill the trade log can't save is saved on the next pass, never lost.** When the database refuses
-  to book a fill (busy with another writer, say) - an entry, an exit, or a stop or target IBKR filled - the
+* **A fill the trade log can't save is saved on the next pass, never lost.** A busy database is waited
+  on first: SQLite waits up to 30 s for another writer to finish (sqlite3 alone waits 5), and a trade's
+  opening, close, part taken off or stop move it still turns away as locked is tried twice more, a moment
+  apart - the refused try was undone whole, so nothing is booked twice. (Its journal mode is left as it is:
+  the database can sit in a synced folder, where WAL isn't safe.) When the database still refuses
+  to book a fill - an entry, an exit, or a stop or target IBKR filled - the
   app logs it, the dashboard says so (again every five minutes while it keeps failing), and the order stays
   followed until the next order sync books it. Meanwhile it still counts as working: an entry keeps
   Autopilot's slot, and nothing else is done for the position - no second exit, and its stop is neither
@@ -670,7 +674,10 @@ the market at any time, including while quitting.
 Click an open position or a closed trade for its **record**: status, entry and
 exit, stop moves, what the broker holds right now, why it was taken (the play's
 explanation), every fill and every order sent to the broker — with an **Exit**
-button while it's open. The record opens as a panel across the window, and a
+button while it's open. A closed position taken off in parts shows whole, there
+and in the **Trade history**: the shares it was entered with and the average of
+its exits weighted by their shares, with the last part's price beside it. Times
+are your computer's local time. The record opens as a panel across the window, and a
 chart of the trade fills the rest of it (`GET /api/trades/{id}/chart`): 5-minute
 candles from the session before the entry (daily candles once it has been held
 longer than ten sessions), the entry, stop and target lines with the first stop
@@ -699,15 +706,61 @@ never written into it.
 An open-trade record whose position no longer exists where it was opened —
 closed in the broker's own app, or by an exit that filled while the app was down
 — is **closed from the broker's fills**: the exit-side fills of the stock since
-the entry give the exit price and time, so the trade's outcome reaches the
-history, the journal and the strategy records (exit reason `closed-outside`).
-When the broker reports no such fill (IBKR keeps only the current session's) the
-record is **deleted** instead, as after **Reset paper**. A wrong deletion would
-orphan a real position, so the check is strict: it only acts on a connected
+the entry (its own orders' and ones placed outside the app, never another
+trade's), oldest first, give the exit price and time of the shares it still
+holds, so the trade's outcome reaches the history, the journal and the strategy
+records. The exit reason comes from the orders that sold them: `closed-outside`
+when an order from outside the app sold any of them; otherwise the trade's own
+order that sold the last of them names it — its stop `stop` (or `trailing-stop`
+once it had moved), its target `target`, and an exit the app sent the reason it
+was sent for, which the order audit keeps with each exit (a quit's exit that
+filled as the app stopped is `quit`, not a close outside the app). Fills the
+record has booked already — a part taken off earlier, known by its order id —
+are skipped, and only those
+fills' fees come off. Shares no fill accounts for are priced as the fills found
+were, and the record's notes say they are an estimate. When the broker reports no
+such fill (IBKR keeps only the current session's) the record is **deleted**
+instead, as after **Reset paper** — but only once the broker has answered: when
+its fills can't be read (the connection dropped, no answer in time) the record is
+kept and looked at again on a later check, never deleted for a fill the app
+couldn't see. A record with a part already booked off (an exit capped at the
+shares held, a target's part) is never deleted: it keeps that part, and the rest
+is closed at the price of its last exit booked, noted as an estimate. The check
+decides and books under the order sync's lock, and leaves to the sync a trade
+whose exit is still working or whose stop or target fill it is about to book; a
+booking the database refuses is said on the dashboard and tried again on the next
+check. An exit IBKR reports filled with no price is never booked at zero: it stays
+followed until its executions can be read, and is left to this check when they
+show none. A wrong deletion
+would orphan a real position, so the check is strict: it only acts on a connected
 broker's fresh account snapshot, after the connection has been up a minute, for
 trades older than 90 s whose close isn't in flight, and after two misses in a
 row. Closed trades are never deleted, and the broker order audit log is always
 kept.
+
+**Fees** are booked with each fill — the entry's, every part taken off and the
+exit's — and a trade's realised P/L, % and R are after all of them (a part taken
+off banks what it made after its own fee). IBKR sends its commission report a
+moment after each execution, so a fill is mostly booked before its fee is known:
+about once a minute the order sync reads IBKR's executions for the day's recent
+fills (waiting three seconds at most, so a slow Gateway never holds the exits up)
+and adds what IBKR has reported since to the fill, the trade's fees and a
+closed trade's P/L and R. Fifteen minutes after its booking a fill's fee is
+settled and no longer looked up. IBKR keeps only the current day's executions, so
+records booked before fees were recorded stay before commissions; the session
+review says so ("Fees not recorded before …") rather than making numbers up.
+
+Each booking checks and writes the record in one transaction: a close takes it
+from open in one conditional write, and a part comes off only a record still
+holding more shares than it, so two bookings of one record at once — the order
+sync's and the position check's, say — can't both land. A part's fill counts in
+the trade's best and worst prices (MFE, MAE, high-water mark) as the exit's does.
+
+The header's **P/L today** and the **P/L summary**'s *Realized today* and
+*Realized week* add up the trades closed this session and in the last five, by
+when they closed — a swing trade entered last week and closed today is today's —
+on the account orders go to now (the simulator, the IBKR paper account or the
+live one). The summary's other figures cover every closed trade.
 
 The reverse case is shown too: **shares without a record** — held at the broker
 beyond what the open-trade records cover, because they were bought or sold
@@ -877,8 +930,13 @@ shown so you can see where live would stop you.
 - **PDT** — FINRA flags a *pattern day trader* at **4 day trades in 5 business
   days** on a **margin** account; flagged accounts must hold **$25,000**. Below
   that line you get **3 day trades per rolling 5 sessions**. The guard counts
-  closed same-session round-trips (plus still-open intraday trades opened today)
-  and **blocks the 4th**, warning from the 2nd–3rd.
+  closed same-session round-trips, trades with a part sold on the session they
+  were entered (a day trade then, even while the rest is held or goes later;
+  one per trade, however many parts) and still-open intraday trades opened
+  today, and **blocks the 4th**, warning from the 2nd–3rd. It counts the trades
+  of the account orders go to now — the rule is per account, so the paper
+  account's or the simulator's day trades don't use up the live account's — and
+  the header's day-trade tally is the same count.
 - Every **intraday** play is treated as a *potential* day trade.
 - **Cash account** (`account.cash_account: true`) — PDT does not apply, but the
   guard warns about T+1 settlement / good-faith violations.
@@ -950,12 +1008,21 @@ match too, so check the untracked shares first).
 **What fills cost (Harris).** The same last look keeps the quote it saw, and the
 trade record stores the fill against it: `decision_price`, `spread_bps`,
 `entry_slippage_bps`, and for exits `exit_decision_price`, `exit_slippage_bps` -
-the implementation shortfall. On live quotes an entry is refused when the spread
-is more than `execution.max_spread_r` (0.10) of the distance to the stop. A look
-that refuses an entry keeps its quote with the play (`last_look`, the first
-refusal), and the daily review charges that spread to the play's shadow trade.
-The daily review averages the measured slippage and says when the account pays
-more than the replay charges.
+the implementation shortfall. The slippage is kept only when the quote the
+decision was made on was live: a delayed quote is minutes old, and a fill against
+it says how far the price moved since, not what the fill cost (a stop or target
+resting at the broker is measured against its own price either way). On live
+quotes an entry is refused when the spread is more than `execution.max_spread_r`
+(0.10) of the distance to the stop. A look that refuses an entry keeps its quote
+with the play (`last_look`, the first refusal), and the daily review charges that
+spread to the play's shadow trade. The daily review averages the measured
+slippage, leaving out the fills with none, and says when the account pays more
+than the replay charges. Records from before this change: `python
+scripts/repair_records.py` says which trades it would put right (`--apply` changes
+them) - it clears the slippage measured before the account had real-time prices
+(`--live-since`, default 2026-09-23: the entry's on the trades entered before it,
+the exit's on those that exited before it), and relabels `stop` the closed trades
+booked `trailing-stop` whose stop never moved. It prints trade ids only.
 
 ---
 
@@ -1048,12 +1115,19 @@ so, with the reason, and again every five minutes until it's fixed.
 
 **An exit called off after filling in part is booked.** Quitting and then pressing *Stop quitting*, or
 cancelling an exit, can call off an exit order that has already sold part of the position. The app books
-that part when the broker reports the cancelled order - unless it stops first. So the position check also
-books it from the broker's executions: when a record holds more shares than the broker, the same way round,
-the fills tagged with that trade's own exit orders (`exit:<trade>`) are booked at their prices - never more
-than the record is over by, never while an exit for it is still working, only for a symbol with one record.
-The counts then agree, and the stop and target go back at the broker for what's left. A difference its own
-fills don't explain (shares sold by hand in TWS) is left alone and reported, as before.
+that part off the record at its own price when the broker reports the order ended (rejected, cancelled,
+expired, or found in the executions after an order the broker didn't answer in time), and the next exit
+sells what the record then holds - unless it stops first. An exit capped by the shares the account holds
+(fewer than the record: some went without the record hearing) books only what it sells, never the whole
+record at its price. So the position check also books from the broker's executions: when a record holds
+more shares than the broker, the same way round, the fills of that trade's own orders - its exits
+(`exit:<trade>`), and its stop (`stop:<trade>`) or target (`tgt:<trade>`) that filled while the app wasn't
+following them (a restart) - are booked oldest first, each order at its own price and with its own reason
+(`exit`, `stop` / `trailing-stop`, `target-1`), past the shares the record has booked already and never
+more than it is over by. Never while an exit for it is still working, never from a stop or target the app
+follows (it books those when they finish), only for a symbol with one record. The counts then agree, and
+the stop and target go back at the broker for what's left. A difference its own fills don't explain
+(shares sold by hand in TWS) is left alone and reported, as before.
 
 **A share count that disagrees can be fixed from its warning.** Each yellow share-count warning has a
 **Fix…** button. It reads the account again and shows what the record and the account hold, the broker's
@@ -1072,7 +1146,11 @@ record or a pair leg, and - the exit only - while the market is closed. More sha
 exited from **Shares without a record**, as before.
 
 The Open orders panel lists them as **stop** and **target** with their trade. The
-simulator keeps its own bracket and gets no such orders.
+simulator keeps its own bracket and gets no such orders. A fill of the bracket's stop or
+target closes the trade whose entry it was attached to, once, and never another trade of the
+stock. An exit the app sends for the whole position cancels what is left of the bracket
+first, and so does a record closed because its position is gone, so the bracket can't fill
+later and open the other side.
 
 `autotradebot/execution/exit_manager.py` runs every few seconds on every open trade
 held on the active platform — **entries need your click, exits never do**:

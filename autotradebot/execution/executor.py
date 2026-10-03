@@ -40,6 +40,11 @@ longer in flight though (``symbols_in_flight(unbooked=False)``): its order is do
 explains see them. Closing them as shares without a record (close_untracked) takes the entry off the books, so no
 record appears later for shares already sold; a quit's cancels leave it followed.
 
+Each fill is booked with the fees the broker has reported for it (OrderResult.commission, or its fills') and the id of
+the order that filled. IBKR's commission report comes a moment after each execution, so the order sync adds what it
+reports later to the day's fills booked before it had all come in (:meth:`Executor._top_up_fees`): a closed trade's
+P/L and R are after every fee.
+
 The order audit (``order_audit``, :meth:`Executor._audit`) records what happened to each order: every order placed,
 with the broker's order id, status and message (PLACE); every cancel the app asks for, and why (CANCEL); every move of
 a stop resting at the broker (MODIFY, protective_stops.py); and every error the broker sends about one of the app's
@@ -56,7 +61,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..brokers.base import OUTCOME_UNKNOWN, DONE_STATUSES, BrokerAdapter, BrokerError, OrderNotSent
@@ -66,7 +71,8 @@ from ..core.eventbus import BUS
 from ..core.models import Account, OrderRequest, OrderResult, Play
 from ..util import clock
 from .order_builder import build_entry_order, build_exit_order, plan_order
-from .protective_stops import TAG as STOP_TAG, TARGET_TAG, BookingFailed, ProtectiveStops, shares_and_price
+from .protective_stops import (TAG as STOP_TAG, TARGET_TAG, BookingFailed, ProtectiveStops, fees_of, order_fees,
+                               shares_and_price)
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +106,19 @@ class _Pending:
                                                     # as it was sent (_sized_at) - its play may be sized again since
 
 
+@dataclass
+class _Bracket:
+    """The stop and target a venue holding native brackets (the simulator) attached to the entry that opened a trade."""
+    symbol: str
+    entry_id: str                   # the entry's order id - the children's parent
+    play_id: str                    # ...and its play's id, which the children's tags start with
+    children: List[str] = field(default_factory=list)   # their order ids, as listed when the entry was booked
+
+    def holds(self, o: OrderResult) -> bool:
+        """Whether ``o`` is one of them: noted at the entry's booking, or a child of that entry by its parent or tag."""
+        return o.order_id in self.children or _bracket_of(o, self.entry_id, self.play_id)
+
+
 class Executor(ProtectiveStops):
     #: polls in a row (the sync loop runs every 4 s) a connected broker may not know an order before it's given up
     LOST_AFTER_POLLS = 5
@@ -119,6 +138,15 @@ class Executor(ProtectiveStops):
     #: computer's differ a little. (An exit's tag is shared by every exit its trade has had: the earlier ones' fills,
     #: booked before this one went out, are left out by their time)
     CLOCK_SLACK_S = 2.0
+    #: seconds between looks in IBKR's executions for the fees of the day's fills booked before all of them were
+    #: reported (its commission report comes a moment after each execution)
+    FEES_CHECK_S = 60.0
+    #: seconds after its booking that a fill's fee is settled: every report is in by then, and the fill is looked up
+    #: no more (an account charged nothing has none to send)
+    FEES_WAIT_S = 900.0
+    #: seconds that look may wait for IBKR's executions: it runs in the order sync, under the executor's lock, and a
+    #: Gateway slow to answer must not hold the exits up for long - a look that runs out is tried again a minute on
+    FEES_READ_TIMEOUT_S = 3.0
 
     def __init__(self, broker: BrokerAdapter, repo, cfg, bus=BUS,
                  venue: Optional[str] = None) -> None:
@@ -153,7 +181,13 @@ class Executor(ProtectiveStops):
         #: failing (when, monotonic: ``_unbooked_said``), the log of each, till one takes (_booking_failed)
         self._unbooked: Dict[str, int] = {}
         self._unbooked_said: Dict[str, float] = {}
-        self._open_by_symbol: Dict[str, str] = {}   # symbol -> trade_id
+        #: the stop and target the simulator holds for each trade's entry (its native bracket), by trade id: a fill of one
+        #: closes that trade and no other (_maybe_close_from_bracket), and the app's own close of the trade cancels them
+        #: (_cancel_brackets). Kept across a rebind: the simulator is the same one when the app comes back to it, and
+        #: they are still working there. Let go once the trade is closed
+        self._brackets: Dict[str, _Bracket] = {}
+        #: the bracket orders whose fill has been booked - each closes its trade once
+        self._bracket_fills: set = set()
         #: the exit manager takes part of a position off at the first target, so a native bracket
         #: (the simulator's) carries the stop only - a take-profit child would close all of it there
         self.scale_out: bool = False
@@ -171,12 +205,16 @@ class Executor(ProtectiveStops):
         #: looked for in the broker's executions (_book_entries_filled_while_off)
         self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
         self._entries_retry_at = 0.0
+        #: when (monotonic) the day's fills are next looked up in the broker's executions for fees reported after their
+        #: booking, and the fills (row ids) whose fees are settled - looked up FEES_WAIT_S after it (_top_up_fees)
+        self._fees_due_at, self._fees_settled = 0.0, set()
         self._init_stops()
 
     def rebind(self, broker: BrokerAdapter, venue: Optional[str] = None) -> None:
         """Point at a different broker (paper <-> live / platform switch).
         In-flight order tracking is broker-specific, so it is dropped; open
-        trades in the database are untouched."""
+        trades in the database are untouched, and so are the simulator's brackets
+        (``_brackets``) - it is the same simulator when the app comes back to it."""
         with self._lock:                # never under an order sync's feet, nor an exit's
             self._audit_order_errors()  # what the broker left behind said, written before it is let go
             self.broker = broker
@@ -186,9 +224,9 @@ class Executor(ProtectiveStops):
             self._unknown_said.clear()
             self._unbooked.clear()
             self._unbooked_said.clear()
-            self._open_by_symbol.clear()
             self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
             self._entries_retry_at = 0.0
+            self._fees_due_at = 0.0     # the new venue's fills are looked up on the next pass
             self._init_stops()          # the other venue's stops stay where they are; found again by their tags
 
     def cancel_pending_entries(self) -> int:
@@ -303,9 +341,14 @@ class Executor(ProtectiveStops):
         self._unbooked.pop(f"entry:{p.play.id}", None)
         self._unbooked_said.pop(f"entry:{p.play.id}", None)
 
-    def forget_open(self, symbol: str) -> None:
-        """Drop the note that ``symbol`` is held - its record was closed without an exit going through here."""
-        self._open_by_symbol.pop(symbol, None)
+    def forget_open(self, symbol: str, trade_id: str = "") -> None:
+        """A record of ``symbol`` (``trade_id``) was closed without an exit going through here - its position is gone
+        from the broker. The stop and target the simulator still holds for its entry are cancelled: with no shares
+        left, one that filled would open the other side."""
+        if trade_id in self._brackets and self._holds_brackets():
+            with self._lock:
+                self._cancel_brackets(trade_id, "its position is gone")
+                self._brackets.pop(trade_id, None)
         self._swept_at = 0.0            # ...so its stop at the broker goes on the very next pass
 
     def cancel_entries_for(self, play_id: str) -> int:
@@ -344,6 +387,13 @@ class Executor(ProtectiveStops):
                 seen.add(id(p))
                 sent.append(p)
         return sent
+
+    @property
+    def lock(self) -> "threading.RLock":
+        """The executor's lock, for a caller elsewhere that books a fill the order sync may be booking this moment (the
+        engine's position check, from the broker's executions): while it holds it, no order is followed or booked here,
+        so what it reads of the records and the orders followed stays true until its booking is done."""
+        return self._lock
 
     def pending_exit_trade_ids(self) -> set:
         """Trades whose close order is still working at the broker - or may be: one whose send got no answer in time
@@ -550,8 +600,8 @@ class Executor(ProtectiveStops):
         working = self._working_or_none() if rows else []
         fills = self._executions(None) if rows else []
         if working is None or fills is None:
-            # not known: looked for again shortly (IBKR's executions are read strictly - a request that failed or
-            # timed out is no "none", or the entry would never be looked for again)
+            # not known: looked for again shortly (a request for IBKR's executions that failed or timed out raises -
+            # it is no "none", or the entry would never be looked for again)
             self._entries_retry_at = time.monotonic() + self.ENTRY_LOOK_RETRY_S
             return []
         working_for, found = {o.tag for o in working}, []
@@ -563,12 +613,12 @@ class Executor(ProtectiveStops):
                     and f.symbol == row["symbol"]]
             qty, price = shares_and_price(mine)
             if qty > 1e-9:
-                found.append((row, side, qty, price, str(mine[-1].order_id)))
+                found.append((row, side, qty, price, str(mine[-1].order_id), fees_of(mine)))
         self._entries_due = False
         booked: List[str] = []
-        for row, side, qty, price, order_id in found:
+        for row, side, qty, price, order_id, fee in found:
             try:
-                tid = self._book_entry_filled_while_off(row, side, qty, price, order_id)
+                tid = self._book_entry_filled_while_off(row, side, qty, price, order_id, fee)
             except BookingFailed:
                 tid = None                              # (said as it failed) looked for again shortly
             except Exception:  # noqa: BLE001 - the database busy, say: this one is looked for again, the rest go on
@@ -585,9 +635,10 @@ class Executor(ProtectiveStops):
         return booked
 
     def _book_entry_filled_while_off(self, row: Dict[str, Any], side: Side, qty: float, price: float,
-                                     order_id: str) -> Optional[str]:
-        """Book one entry found filled while the app was off. Returns its trade id, "" when the account holds none
-        of its shares beyond the records (nothing booked), None when the account couldn't be read."""
+                                     order_id: str, commission: float = 0.0) -> Optional[str]:
+        """Book one entry found filled while the app was off (``commission``: what its executions paid). Returns its
+        trade id, "" when the account holds none of its shares beyond the records (nothing booked), None when the
+        account couldn't be read."""
         # never more than the account holds beyond the records: shares sold by hand meanwhile get no record,
         # and the record that is booked matches the account, so its stop can go on
         held = self._held_quantity(row["symbol"])
@@ -601,7 +652,7 @@ class Executor(ProtectiveStops):
             log.warning("an entry for %s (play %s) filled while the app was off, but the account holds none of "
                         "its shares beyond the records - not booked", row["symbol"], row["id"])
             return ""
-        tid = self._open_trade(_play_from_row(row), price, take, order_id)
+        tid = self._open_trade(_play_from_row(row), price, take, order_id, commission=commission * take / qty)
         log.warning("ENTRY FILLED WHILE THE APP WAS OFF  %s %s x%s @ %.4f (play %s) - booked from the broker's "
                     "executions", row["symbol"], side.value, take, price, row["id"])
         return tid
@@ -671,7 +722,8 @@ class Executor(ProtectiveStops):
                 fill_price = res.avg_fill_price or (res.fills[-1].price if res.fills else play.entry)
                 try:
                     tid = self._open_trade(play, fill_price, res.filled_qty or qty, res.order_id, ot, osess,
-                                           context=context, submitted_at=submitted_at, decision=decision)
+                                           context=context, submitted_at=submitted_at, decision=decision,
+                                           commission=order_fees(res))
                 except BookingFailed:
                     pass        # followed below instead: the next order sync reads the fill and books it then
                 else:
@@ -723,7 +775,9 @@ class Executor(ProtectiveStops):
         to confirm, its orders reloading after a connect) comes back ``wait``: not a failed exit, one to try
         again in seconds. So does one the broker didn't answer in time (``sent_unknown`` too): it may be working,
         or have filled, and no other exit goes out for the trade until the order syncs have looked for it at the
-        broker by its tag (_look_for_unknown).
+        broker by its tag (_look_for_unknown). An exit never sells more than the account holds, less what other exits
+        are selling: capped below the record that way, it books only what it sells, and the shares the record holds
+        beyond the account are left to the position check (the engine's _settle_short / _settle_gone).
 
         One exit per trade at a time: a close for a trade whose exit another thread is sending this moment comes
         back at once, ``wait`` too - that one's outcome settles it, and one queued behind it would only find its exit
@@ -852,6 +906,9 @@ class Executor(ProtectiveStops):
                 if stood == "filled" or t["status"] == "CLOSED":
                     return {"ok": True, "status": "FILLED", "trade": t, "by": "broker-stop"}
                 wanted = abs(float(t["quantity"]))
+            # ...and the stop and target the simulator holds for the entry (its native bracket): left working, one
+            # would fill after this exit and open the other side of the position
+            self._cancel_brackets(trade_id, "stood down for the app's own exit")
         qty = min(float(qty), wanted) if partial else wanted
         held = self._held_quantity(t["symbol"])
         if held is not None:
@@ -866,8 +923,19 @@ class Executor(ProtectiveStops):
             if qty <= 0:
                 return {"ok": False, "reason": f"Exit orders already working cover all {abs(held):,.0f} "
                                                f"{t['symbol']} shares held - no exit sent."}
+            if not partial and qty < wanted - 1e-9:
+                # fewer shares to sell than the record holds - some went without the record hearing (a stop that filled
+                # while the app was off, say), or another exit is selling them: the exit books what it sells, never the
+                # whole record at its price, and the rest is the position check's to book from the broker's fills
+                partial = True
+                log.warning("EXIT SHORT OF THE RECORD  %s %s: only %s of the %s shares on record can be sold at %s - "
+                            "those are booked off it when they fill, and the position check books the rest",
+                            t["symbol"], trade_id, f"{qty:,.0f}", f"{wanted:,.0f}", venue_label(held_on))
         req = build_exit_order(t["symbol"], t["side"], qty,
                                limit_price=limit_price, cfg=self.cfg, tag=exit_tag(trade_id))
+        # the audit keeps why it was sent: a record whose position is gone is closed with this reason when the broker's
+        # fills show this order sold the shares (the engine's _settle_gone) - a quit's exit is no close outside the app
+        asked = {**_req_dict(req), "reason": reason}
         sent_at = dt.datetime.now(dt.timezone.utc)
         try:
             res = self.broker.place_order(req)
@@ -876,7 +944,7 @@ class Executor(ProtectiveStops):
             # goes out for the trade until the order syncs have looked for it at the broker by its tag - the exit
             # manager waits meanwhile (a wait, not a failed try)
             why = str(e) or "no answer from the broker in time"
-            self._audit("PLACE", req, {"error": why, "outcome": "unknown"}, ok=False, trade_id=trade_id, msg=why,
+            self._audit("PLACE", asked, {"error": why, "outcome": "unknown"}, ok=False, trade_id=trade_id, msg=why,
                         ts=sent_at)
             self._unknown[req.client_tag or exit_tag(trade_id)] = (
                 _Pending("", Play(**_min_play(t)), "exit", trade_id=trade_id, qty=qty, reason=reason,
@@ -896,15 +964,16 @@ class Executor(ProtectiveStops):
                     "reason": f"{why}. The exit may be working - the app looks for it at the broker before sending "
                               f"another."}
         except BrokerError as e:
-            self._audit("PLACE", req, {"error": str(e)}, ok=False, trade_id=trade_id, msg=str(e), ts=sent_at)
+            self._audit("PLACE", asked, {"error": str(e)}, ok=False, trade_id=trade_id, msg=str(e), ts=sent_at)
             return {"ok": False, "reason": str(e)}
-        self._audit("PLACE", req, res, ok=True, trade_id=trade_id, ts=sent_at)
+        self._audit("PLACE", asked, res, ok=True, trade_id=trade_id, ts=sent_at)
 
         if res.status == "FILLED" or res.filled_qty > 0:
             px = res.avg_fill_price or (res.fills[-1].price if res.fills else limit_price)
             try:
                 out, closed = self._book_exit(t["symbol"], trade_id, float(px), res.filled_qty or qty, reason,
-                                              partial, after_fill, decision_price, submitted_at=sent_at)
+                                              partial, after_fill, decision_price, submitted_at=sent_at,
+                                              commission=order_fees(res), order_id=res.order_id)
             except BookingFailed:
                 pass            # followed below instead: the next order sync reads the fill and books it then
             else:
@@ -922,27 +991,34 @@ class Executor(ProtectiveStops):
 
     def _book_exit(self, symbol: str, trade_id: str, price: float, qty: float, reason: str,
                    partial: bool = False, after_fill: Optional[Dict[str, float]] = None,
-                   decision_price: Optional[float] = None, submitted_at: Optional[dt.datetime] = None):
+                   decision_price: Optional[float] = None, submitted_at: Optional[dt.datetime] = None,
+                   commission: float = 0.0, order_id: str = ""):
         """Book an exit fill: the whole position closes the record, part of it (the scale-out)
-        reduces it. Returns (the record, whether it is now closed). Raises BookingFailed when the
-        database refuses it - the caller keeps the order followed, and books it again on the next pass."""
+        reduces it. ``commission``: the fees the broker has reported for it so far; ``order_id``: the order
+        that filled, which a fee reported later is put down to (_top_up_fees). Returns (the record, whether
+        it is now closed). Raises BookingFailed when the database refuses it - the caller keeps the order
+        followed, and books it again on the next pass."""
         key = f"exit:{trade_id}"
+        paid = {"commission": float(commission or 0.0), "broker_order_id": str(order_id or "")}
         try:
             if partial:
                 out = self.repo.reduce_trade(trade_id, float(qty), float(price), exit_reason=reason,
-                                             **(after_fill or {}))
+                                             **(after_fill or {}), **paid)
             else:
                 seen = {"decision_price": float(decision_price)} if decision_price else {}
                 if submitted_at is not None:
                     seen["submitted_at"] = submitted_at          # an exit the app sent: how long it took to fill
-                out = self.repo.close_trade(trade_id, float(price), exit_reason=reason, **seen)
+                out = self.repo.close_trade(trade_id, float(price), exit_reason=reason, **seen, **paid)
         except Exception as e:  # noqa: BLE001 - the database busy, say
             raise self._booking_failed(key, symbol, "exit", e) from e
         self._booked(key, symbol, "exit")
         if partial and out and out.get("status") == "OPEN":
             self.bus.publish("trade.reduced", trade=out, reason=reason, qty=qty, price=round(price, 4))
             return out, False
-        self._open_by_symbol.pop(symbol, None)
+        if trade_id in self._brackets:
+            # the simulator's bracket for the entry: what is left of it goes with the trade
+            self._cancel_brackets(trade_id, "its trade is closed")
+            self._brackets.pop(trade_id, None)
         self.bus.publish("trade.closed", trade=out, reason=reason)
         return out, True
 
@@ -1097,7 +1173,7 @@ class Executor(ProtectiveStops):
         except Exception:  # noqa: BLE001
             log.exception("protective stops check failed")
 
-        # 5) detect broker-side bracket exits (child order filled against an open trade)
+        # 5) the simulator's bracket stops and targets that filled: each closes the trade whose entry it was attached to
         try:
             for o in self.broker.list_orders(status="FILLED"):
                 self._maybe_close_from_bracket(o)
@@ -1106,6 +1182,12 @@ class Executor(ProtectiveStops):
 
         # 6) what the broker has said went wrong with the app's orders since the last pass, into the order audit
         self._audit_order_errors()
+
+        # 7) the fees IBKR reported after the fills were booked, onto their records
+        try:
+            self._top_up_fees()
+        except Exception:  # noqa: BLE001
+            log.exception("adding the fees the broker reported to the day's fills failed")
 
     def _look_for_unknown(self) -> List[str]:
         """Look for the orders whose send got no answer in time (OrderOutcomeUnknown) at the broker, by their tag. One
@@ -1153,7 +1235,7 @@ class Executor(ProtectiveStops):
             p.order_id = str(mine[-1].order_id)
             done = got >= p.qty - 1e-9
             res = OrderResult(order_id=p.order_id, status="FILLED" if done else "CANCELED", symbol=p.play.symbol,
-                              submitted_qty=p.qty, filled_qty=got, avg_fill_price=price,
+                              submitted_qty=p.qty, filled_qty=got, avg_fill_price=price, commission=fees_of(mine),
                               message="" if done else "it ended with only part of it filled")
             if p.kind == "entry":
                 self._booking[id(p)] = p        # listed while it is booked, like a fill heard live (_on_order_update)
@@ -1344,48 +1426,73 @@ class Executor(ProtectiveStops):
         - it may have filled while the app wasn't following it (the connection was down when it finished, say).
         All of it reads as filled, part of it as the order ended with that part filled. None when the executions
         couldn't be read: the entry isn't given up on that."""
-        executed = self._executed(p, res.order_id)
-        if executed is None:
+        mine = self._executions_of(p, res.order_id)
+        if mine is None:
             return None
-        got, price = executed
+        got, price = shares_and_price(mine)
         if got <= float(res.filled_qty or 0.0) + 1e-9:
             return res
         log.warning("ENTRY FOUND IN THE EXECUTIONS  %s order %s is no longer known to the broker, but its executions "
                     "show %s of %s shares bought @ %.4f - booked", p.play.symbol, res.order_id, got, p.qty, price)
-        return replace(res, symbol=p.play.symbol, filled_qty=got, avg_fill_price=price,
+        return replace(res, symbol=p.play.symbol, filled_qty=got, avg_fill_price=price, commission=fees_of(mine),
                        status="FILLED" if got >= p.qty - 1e-9 else res.status)
 
     def _executed(self, p: _Pending, order_id: str) -> Optional[Tuple[float, float]]:
         """The shares, and their average price, the broker's executions show for order ``order_id`` - and, for an
         entry, for any order tagged with its play's id (an entry's tag; an exit's is shared by every exit its trade
         has had). (0, 0) when they show none; None when they can't be read."""
+        mine = self._executions_of(p, order_id)
+        return None if mine is None else shares_and_price(mine)
+
+    def _executions_of(self, p: _Pending, order_id: str) -> Optional[List[Any]]:
+        """The broker's executions _executed adds up; None when they can't be read."""
         fills = self._executions(p.play.symbol)
         if fills is None:
             return None
         side = p.play.side if p.kind == "entry" else _exit_side(p.play.side.value)
         tag = p.play.id if p.kind == "entry" else ""
-        return shares_and_price([f for f in fills if f.side is side
-                                 and (str(f.order_id) == str(order_id) or (tag and getattr(f, "tag", "") == tag))])
+        return [f for f in fills if f.side is side
+                and (str(f.order_id) == str(order_id) or (tag and getattr(f, "tag", "") == tag))]
 
     def _on_filled(self, p: _Pending, res) -> None:
+        """Book an order the broker reports filled. An exit is never booked at no price: one with none on the report,
+        in the broker's executions or as the quote it was decided on (an exit decided on delayed quotes keeps none, nor
+        does one sent by hand) stays followed while the executions can't be read - BookingFailed, as for a booking the
+        database refuses, so the next pass reads them again - and is left to the position check when they show none."""
         px = res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0)
         if not px:
             # finished with no price on the report - an order rebuilt after a reconnect with no executions on it
-            px = (self._executed(p, res.order_id) or (0.0, 0.0))[1] or (
+            executed = self._executed(p, res.order_id)
+            px = (executed or (0.0, 0.0))[1] or (
                 (p.avg_seen or p.play.entry) if p.kind == "entry" else (p.decision_price or 0.0))
+            if not px and p.kind == "exit" and executed is None:
+                log.debug("the %s exit order %s filled with no price on its report, and the broker's executions "
+                          "couldn't be read - followed on, and read again next pass", p.play.symbol, res.order_id)
+                raise BookingFailed(f"the {p.play.symbol} exit's price isn't known yet")
+            if not px and p.kind == "exit":
+                # booked at 0 it would look like the whole position lost: the record keeps its shares, and the position
+                # check books them from the broker's fills, or says what it can't
+                log.warning("the %s exit order %s filled with no price on its report or in the broker's executions - "
+                            "its record is left to the position check", p.play.symbol, res.order_id)
+                return
         if p.kind == "entry":
             # an adopted entry's clock restarted at the restart (for its time-out) - it isn't when it went out
             self._open_trade(p.play, px, res.filled_qty or p.qty, res.order_id,
                              p.order_type, p.order_session, context=p.context,
-                             submitted_at=None if p.adopted else p.submitted_at, decision=p.decision)
+                             submitted_at=None if p.adopted else p.submitted_at, decision=p.decision,
+                             commission=order_fees(res))
         else:
             self._book_exit(res.symbol, p.trade_id, float(px), res.filled_qty or p.qty, p.reason or "order",
-                            p.partial, p.after_fill, p.decision_price, submitted_at=p.submitted_at)
+                            p.partial, p.after_fill, p.decision_price, submitted_at=p.submitted_at,
+                            commission=order_fees(res), order_id=res.order_id)
 
     def _on_unfilled(self, p: _Pending, res) -> None:
         """The broker finished an order without filling all of it - rejected,
-        cancelled, expired - or no longer knows it. What did fill is booked and the
-        reason is published; the exit manager sends an exit again."""
+        cancelled, expired - or no longer knows it. What did fill is booked - an entry's
+        shares get their record, an exit's part comes off its record at its own price -
+        and the reason is published; the exit manager sends an exit again, for what the
+        record then holds. A booking the database refuses raises BookingFailed before
+        anything is published: the order stays followed, and all of it happens on the next pass."""
         filled = float(res.filled_qty or 0.0)
         reason = p.expired or res.message or "no reason given"
         if p.kind == "entry" and res.status == "UNKNOWN" and p.filled_seen > filled and not _pair_leg(p.play):
@@ -1394,7 +1501,8 @@ class Executor(ProtectiveStops):
             if filled > 0:
                 px = res.avg_fill_price or (res.fills[-1].price if res.fills else (p.avg_seen or p.play.entry))
                 self._open_trade(p.play, px, filled, res.order_id, p.order_type, p.order_session,
-                                 context=p.context, submitted_at=p.submitted_at, decision=p.decision)
+                                 context=p.context, submitted_at=p.submitted_at, decision=p.decision,
+                                 commission=order_fees(res))
             else:
                 self._note(p.play, PlayStatus.CANCELED if res.status in ("CANCELED", "EXPIRED") else PlayStatus.ERROR,
                            {"status": res.status, "reason": reason,
@@ -1403,6 +1511,20 @@ class Executor(ProtectiveStops):
                 # (UNKNOWN) may have filled while the app wasn't looking, so it keeps its slot
                 if res.status in ("CANCELED", "EXPIRED", "REJECTED") and not res.fills:
                     self._entry_unfilled(p.play.id)
+        elif filled > 0:
+            # an exit that sold part of what it was sent for before it died: that part is out of the account, and
+            # comes off the record now - left on it, the next exit would close the whole record at its own price.
+            # (A scale-out's part gets the stop and target the rest was to have, as a resting target's part does)
+            px = (res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0)
+                  or (self._executed(p, res.order_id) or (0.0, 0.0))[1])
+            if px:
+                self._book_exit(res.symbol or p.play.symbol, p.trade_id, float(px), filled, p.reason or "order", True,
+                                p.after_fill if p.partial else None, p.decision_price, submitted_at=p.submitted_at,
+                                commission=order_fees(res), order_id=res.order_id)
+            else:
+                log.warning("the %s shares the %s exit order %s sold before it ended have no price on the broker's "
+                            "report or in its executions - they are left to the position check",
+                            f"{filled:,.0f}", p.play.symbol, res.order_id)
         if res.status == "REJECTED":
             self._cancel_quietly(res.order_id, "rejected - an inactive order must stay dead", p)
         what = "is no longer known to the broker" if res.status == "UNKNOWN" else f"was {res.status.lower()}"
@@ -1501,38 +1623,135 @@ class Executor(ProtectiveStops):
                         ts=at if isinstance(at, dt.datetime) else None)
         return len(errors)
 
-    def _maybe_close_from_bracket(self, o) -> None:
-        sym = o.symbol
-        tid = self._open_by_symbol.get(sym)
-        if not tid:
+    def _top_up_fees(self, now: Optional[float] = None) -> List[str]:
+        """Put the fees IBKR reports on the day's fills booked before it had reported all of them: its commission
+        report for each execution comes a moment after it, so a fill is mostly booked with no fee, or part of it. What
+        each fill's order has paid by now, by the broker's executions - shared by shares among the fills booked from
+        that order - beyond what the fill was booked with goes on the record (add_fill_fees: the fill, the trade's
+        fees, and a closed trade's P/L, % and R). Every FEES_CHECK_S on an IBKR venue, while the day has fills not yet
+        settled: a fill is settled at the first look FEES_WAIT_S or more after its booking (every report is in by then;
+        an account charged nothing has none to send). A read that failed - or took more than FEES_READ_TIMEOUT_S - is
+        tried again on the next look, and none is made while the broker is still reloading after a connect. Under the
+        executor's lock (the order sync), so nothing is booked meanwhile. Returns the trades whose fees changed."""
+        now = time.monotonic() if now is None else now
+        if (not str(self.venue).startswith("ibkr") or getattr(self.broker, "is_connected", True) is False
+                or now < self._fees_due_at or self._broker_resyncing()):
+            return []
+        find, add = getattr(self.repo, "fills_on", None), getattr(self.repo, "add_fill_fees", None)
+        if not (callable(find) and callable(add)):
+            return []
+        self._fees_due_at = now + self.FEES_CHECK_S
+        rows = [r for r in find(self.venue, clock.now_ny().date()) if r["fill_id"] not in self._fees_settled]
+        if not rows:
+            return []
+        executions = self._executions(None, timeout=self.FEES_READ_TIMEOUT_S)
+        if executions is None:
+            return []
+        reported: Dict[Tuple[str, str], List[Any]] = {}
+        for f in executions:
+            reported.setdefault((str(f.order_id), f.symbol), []).append(f)
+        booked: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for r in rows:
+            booked.setdefault((str(r["order_id"]), r["symbol"]), []).append(r)
+        settled = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - dt.timedelta(seconds=self.FEES_WAIT_S)
+        fees: Dict[int, float] = {}
+        for key, fills in booked.items():
+            mine = reported.get(key, [])
+            if mine:
+                # what the order has paid, by the shares each fill booked from it holds - never more than all of it.
+                # A fee only grows: an order the executions show in part never takes back what was booked
+                total = fees_of(mine)
+                shares = max(sum(float(f.quantity) for f in mine), sum(r["quantity"] for r in fills))
+                for r in fills:
+                    more = round(total * r["quantity"] / shares - r["commission"], 6)
+                    if more > 1e-6:
+                        fees[r["fill_id"]] = more
+            self._fees_settled.update(r["fill_id"] for r in fills if r["ts"] is not None and r["ts"] < settled)
+        changed = add(fees) if fees else []
+        if changed:
+            log.info("the fees %s reported added to %d fill(s) of %s", venue_label(self.venue), len(fees),
+                     ", ".join(sorted(set(changed))))
+        return changed
+
+    def _maybe_close_from_bracket(self, o: OrderResult) -> None:
+        """A stop or target the simulator held for an entry (its native bracket) that filled: the trade that entry
+        opened is closed at its price - that trade only, never another of the stock (a filled order stays in the
+        simulator's list, so the stock's next trade would be closed by it too), and each fill once. One the database
+        refuses to book is booked on the next pass. Under the executor's lock (the order sync)."""
+        tag = str((o.raw or {}).get("client_tag") or o.tag or "")
+        if not self._brackets or o.order_id in self._bracket_fills or not tag.endswith((":TP", ":SL")):
             return
-        tag = (o.raw or {}).get("client_tag", "")
-        if ":TP" in tag or ":SL" in tag:
-            reason = "target" if ":TP" in tag else "stop"
-            px = o.avg_fill_price or (o.fills[-1].price if o.fills else 0.0)
-            if px:
-                out = self.repo.close_trade(tid, float(px), exit_reason=reason)
-                self._open_by_symbol.pop(sym, None)
-                self.bus.publish("trade.closed", trade=out, reason=reason)
+        tid = next((tid for tid, b in list(self._brackets.items()) if b.holds(o)), None)
+        if tid is None:
+            return                  # not noted: its trade is closed and its bracket let go, or its entry not booked yet
+        t = self.repo.get_trade(tid)
+        if not t or t["status"] != "OPEN":
+            self._brackets.pop(tid, None)           # closed meanwhile - by the position check, say
+            self._bracket_fills.add(o.order_id)
+            return
+        px = o.avg_fill_price or (o.fills[-1].price if o.fills else 0.0)
+        if not px:
+            return
+        reason = "target" if tag.endswith(":TP") else "stop"
+        try:
+            self._book_exit(t["symbol"], tid, float(px), abs(float(t["quantity"])), reason,
+                            commission=order_fees(o), order_id=str(o.order_id or ""))
+        except BookingFailed:
+            return                  # said as it failed: the order stays in the simulator's list for the next pass
+        self._bracket_fills.add(o.order_id)
+
+    def _holds_brackets(self) -> bool:
+        """Whether the venue holds native brackets - the stop and target attached to an entry (the simulator)."""
+        return bool(getattr(self.broker, "supports_bracket_native", False))
+
+    def _note_brackets(self, trade_id: str, play: Play, order_id: str) -> None:
+        """Note the stop and target the simulator attached to the entry ``order_id`` that opened ``trade_id``: a fill
+        of one closes this trade and no other (_maybe_close_from_bracket), and the app's own close of it cancels them
+        (_cancel_brackets)."""
+        if not self._holds_brackets():
+            return
+        b = self._brackets[trade_id] = _Bracket(play.symbol, str(order_id or ""), play.id)
+        try:
+            b.children = [o.order_id for o in self.broker.list_orders(status="WORKING") if b.holds(o)]
+        except Exception:  # noqa: BLE001 - known by their parent and tag all the same
+            log.debug("could not list the orders attached to the entry of %s", trade_id, exc_info=True)
+
+    def _cancel_brackets(self, trade_id: str, why: str) -> int:
+        """Cancel the stop and target the simulator still holds for a trade's entry (its native bracket): the app is
+        closing the trade itself, or it is closed - left working, one would fill and open the other side. The trade
+        stays noted (a fill of one already, whose booking waits on the database, is still booked to it). Under the
+        executor's lock. Returns how many were asked to cancel."""
+        b = self._brackets.get(trade_id)
+        if b is None or not self._holds_brackets():
+            return 0
+        try:
+            working = [(o.order_id, o) for o in self.broker.list_orders(status="WORKING") if b.holds(o)]
+        except Exception:  # noqa: BLE001 - which still work isn't known: each one noted is asked
+            working = [(oid, None) for oid in b.children]
+        for oid, o in working:
+            self._cancel_quietly(oid, why, o)
+        return len(working)
 
     # ------------------------------------------------------------------ #
     def _open_trade(self, play: Play, price: float, qty: float, order_id: str,
                     order_type: str = "LIMIT", order_session: str = "REGULAR",
                     context: Optional[Dict[str, Any]] = None,
                     submitted_at: Optional[dt.datetime] = None,
-                    decision: Optional[Dict[str, Any]] = None) -> str:
-        """Book an entry fill as an open trade. Raises BookingFailed when the database refuses it - the caller
+                    decision: Optional[Dict[str, Any]] = None, commission: float = 0.0) -> str:
+        """Book an entry fill as an open trade (``commission``: the fees the broker has reported for it so far - one
+        reported later is added by _top_up_fees). Raises BookingFailed when the database refuses it - the caller
         keeps the order followed, and books it again on the next pass."""
         seen = {"decision": decision} if decision else {}
         key = f"entry:{play.id}"
         try:
             tid = self.repo.open_trade(play, float(price), float(qty), self.venue, order_id,
+                                       commission=float(commission or 0.0),
                                        order_type=order_type, order_session=order_session,
                                        entry_context=context, submitted_at=submitted_at, **seen)
         except Exception as e:  # noqa: BLE001 - the database busy, say
             raise self._booking_failed(key, play.symbol, "entry", e) from e
         self._booked(key, play.symbol, "entry")
-        self._open_by_symbol[play.symbol] = tid
+        self._note_brackets(tid, play, order_id)
         self._left_looked.add(tid)                      # a record this run made: no earlier run left orders for it
         play.status = PlayStatus.FILLED
         play.trade_id = tid
@@ -1682,6 +1901,17 @@ def _may_close(o: OrderResult) -> bool:
     untagged one (sent by hand, or before orders were tagged). Never a bracket's target or stop
     child - that belongs to its entry."""
     return o.tag.startswith(("exit:", "unwind:")) or (not o.tag and not (o.raw or {}).get("parent_id"))
+
+
+def _bracket_of(o: OrderResult, entry_id: str, play_id: str) -> bool:
+    """Whether ``o`` is the stop or target (``<play id>:SL`` / ``:TP``) the simulator attached to the entry ``entry_id``
+    of the play ``play_id``: that entry is its parent, or its tag starts with that play's id."""
+    raw = o.raw or {}
+    tag = str(raw.get("client_tag") or o.tag or "")
+    if not tag.endswith((":TP", ":SL")):
+        return False
+    return bool(entry_id and str(raw.get("parent_id") or "") == entry_id) or bool(
+        play_id and tag.startswith(f"{play_id}:"))
 
 
 def _closing_left(working: List[OrderResult], symbol: str, side: Side, skip: Optional[set] = None) -> float:

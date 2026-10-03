@@ -339,6 +339,21 @@ def test_fill_times_are_a_true_median_over_the_fills_they_say_and_a_slow_market_
     assert "orders typically filled in 9,000.0s coming out (1 exit, slowest 2.5 h (9,000s))" in only["latency_note"]
 
 
+def test_the_review_says_the_records_from_before_fees_were_recorded_are_before_commissions():
+    def fee_notes(review):
+        return [n for n in review["lessons"] if "before commissions" in n or "before any commissions" in n]
+
+    at_broker = [{**t, "broker": "ibkr-paper"} for t in TRADES]                # all entered on DAY
+    review = _review(rolling=at_broker, fees_since=DAY + dt.timedelta(days=1))
+    [note] = fee_notes(review)
+    assert note.startswith("Fees not recorded before 2026-09-11: the P/L and R of the 4 trades entered before then")
+    assert review["execution"]["fees_since"] == "2026-09-11"
+    assert fee_notes(_review(rolling=at_broker, fees_since=DAY)) == []         # theirs are on record
+    [none] = fee_notes(_review(rolling=at_broker))                             # no fee on record at all
+    assert none.startswith("No fees are on record for the 4 trades at the broker")
+    assert fee_notes(_review()) == []                                          # the simulator's: what it charges
+
+
 def _plays_at(avg, n, spread=1.0):
     """n plays averaging ``avg``R, spread ``spread``R either side of it."""
     rs = [avg + (spread if i % 2 else -spread) for i in range(n - n % 2)] + [avg] * (n % 2)

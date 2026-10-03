@@ -834,6 +834,26 @@ def test_a_stop_that_filled_in_part_while_the_app_was_off_is_booked_and_the_rest
     assert repo.get_trade("t1")["quantity"] == 40 and [t for t, _ in heard].count("trade.reduced") == 1
 
 
+def test_a_stop_the_broker_filled_is_booked_with_its_fees_and_its_order():
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()
+    broker.live["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                   avg_fill_price=97.9, commission=1.05)
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["status"] == "CLOSED" and repo.paid == [("t1", "EXIT", "1", 1.05)]
+
+
+def test_a_stop_that_filled_while_the_app_was_off_is_booked_with_the_fees_of_the_shares_booked():
+    broker, repo, ex, _ = _setup(_trade(quantity=100), positions={"AAA": 70}, working=[_left_stop()])
+    # its executions show 60 shares sold, but the account is only 30 short of the record: 30 are booked
+    broker.get_fills = lambda symbol=None: [
+        Fill(order_id="77", symbol="AAA", side=Side.SHORT, quantity=30, price=97.9, tag="stop:t1", commission=0.3),
+        Fill(order_id="77", symbol="AAA", side=Side.SHORT, quantity=30, price=97.9, tag="stop:t1", commission=0.3)]
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["quantity"] == 70
+    assert repo.paid == [("t1", "EXIT", "77", pytest.approx(0.3))]
+
+
 def test_a_stop_found_filled_for_the_whole_record_closes_it_once():
     broker, repo, ex, heard = _setup(_trade(quantity=100), positions={}, working=[_left_stop(filled=100, avg=97.8)])
     ex.sync_open_orders()                                                      # no executions here: the order's own count
@@ -1305,8 +1325,8 @@ def test_an_executions_read_that_fails_at_the_start_is_tried_again_and_the_entry
     repo, asked = _Repo([]), []
     repo.submitted_plays = lambda since, until: [_sent("play_off", "AAA")]
 
-    def get_fills(symbol=None, strict=False):                                  # IBKR's, asked strictly
-        asked.append(strict)
+    def get_fills(symbol=None):                                                # IBKR's: raises when it can't say
+        asked.append(symbol)
         if len(asked) == 1:
             raise BrokerError("IBKR's executions for the account couldn't be read: no answer in time")
         return [Fill(order_id="11", symbol="AAA", side=Side.LONG, quantity=10, price=100.0, tag="play_off")]
@@ -1319,11 +1339,11 @@ def test_an_executions_read_that_fails_at_the_start_is_tried_again_and_the_entry
     broker.connected_since -= ex.RESYNC_GRACE_S + 1
     ex.sync_open_orders()
     ex.sync_open_orders()
-    assert repo.open_trades() == [] and asked == [True]                        # failed - tried again in a while
+    assert repo.open_trades() == [] and asked == [None]                        # failed - tried again in a while
     ex._entries_retry_at -= ex.ENTRY_LOOK_RETRY_S
     ex.sync_open_orders()
     [t] = repo.open_trades()
-    assert (t["symbol"], t["quantity"], asked) == ("AAA", 10, [True, True])
+    assert (t["symbol"], t["quantity"], asked) == ("AAA", 10, [None, None])
     assert [(s.symbol, s.quantity) for s in broker.stops()] == [("AAA", 10)]
 
 

@@ -198,6 +198,23 @@ def test_the_simulator_takes_only_prices_from_the_gateway(engine, port, gateway)
     assert engine.snapshot()["connection"]["label"] == "Simulator"
 
 
+def test_the_day_trades_and_todays_pl_shown_are_the_account_orders_go_to(engine):
+    for symbol, venue, exit_price in (("T01", "ibkr-paper", 104.0), ("T02", "ibkr-paper", 101.0),
+                                      ("T03", "paper", 98.0)):
+        engine.repo.close_trade(_open(engine, symbol, venue), exit_price=exit_price, exit_reason="target")
+    held = SimpleNamespace(round_trips=0)
+
+    def shown():
+        snap = engine.snapshot()
+        return (snap["day_trades_5d"], snap["pnl"]["realized_today"], engine.pnl_summary()["realized_today"],
+                engine.pdt.day_trades_last_5_sessions(held))
+
+    assert shown() == (1, -10.0, -10.0, 1)                               # on the simulator: its trade only
+    _on_ibkr(engine)
+    assert shown() == (2, 25.0, 25.0, 2)                                 # the IBKR paper account's two
+    assert engine.pnl_summary()["realized_total"] == 15.0                # the history keeps every venue's
+
+
 def test_auto_connect_never_moves_orders_away_from_open_positions(engine, port):
     tid = _open(engine, "AAPL")                                          # on the simulator
     engine.paper_platform = "ibkr"                                       # the switch says IBKR, the orders don't
@@ -1051,6 +1068,57 @@ def test_a_position_closed_outside_the_app_is_booked_from_the_brokers_fills(engi
     assert engine.snapshot()["mismatches"] == []
 
 
+def test_a_gone_position_whose_fills_cant_be_read_keeps_its_record_until_a_read_finds_no_exit(engine, caplog):
+    import logging
+
+    from autotradebot.brokers.base import BrokerError
+
+    tid = _open(engine, "AAA", qty=5)
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    readable = []
+
+    def fills(symbol=None):
+        if not readable:
+            raise BrokerError("IBKR's executions for AAA couldn't be read: no answer in time")
+        return []                                                           # read fine: nothing since the entry
+
+    engine._broker.get_fills = fills
+    with caplog.at_level(logging.INFO, logger="autotradebot.engine.engine"):
+        assert all(engine._reconcile_open_trades() == [] for _ in range(4))     # gone, check after check
+    assert engine.repo.get_trade(tid)["status"] == "OPEN"                   # "not known" is no "none": kept
+    assert "its fills couldn't be read" in caplog.text and "TRADE RECORD DELETED" not in caplog.text
+    readable.append(True)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="autotradebot.engine.engine"):
+        removed = [r for _ in range(2) for r in engine._reconcile_open_trades()]
+    assert [r["id"] for r in removed] == [tid] and engine.repo.get_trade(tid) is None   # the last resort, said
+    assert f"TRADE RECORD DELETED  AAA ({tid})" in caplog.text
+
+
+def test_an_exit_called_off_part_filled_is_booked_once_its_fills_can_be_read(engine):
+    from autotradebot.brokers.base import BrokerError
+
+    tid = _open(engine, "AAA", qty=10)                                      # entered at 100
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAA", quantity=6, avg_price=100.0, market_price=101.0)]
+    now, readable = dt.datetime.now(dt.timezone.utc), []
+
+    def fills(symbol=None):
+        if not readable:
+            raise BrokerError("IBKR's executions for AAA couldn't be read: no answer in time")
+        return [Fill(order_id="e1", symbol="AAA", side=Side.SHORT, quantity=4, price=104.0, ts=now, tag=f"exit:{tid}")]
+
+    engine._broker.get_fills = fills
+    engine._reconcile_open_trades()
+    assert engine.repo.get_trade(tid)["quantity"] == 10                     # not known: nothing booked...
+    readable.append(True)
+    engine._reconcile_open_trades()
+    t = engine.repo.get_trade(tid)                                          # ...and not taken as looked at already
+    assert (t["quantity"], t["banked_pl"]) == (6, pytest.approx(4 * 4.0))
+
+
 def test_an_exit_called_off_after_filling_in_part_is_booked_from_its_tagged_fills(engine):
     import datetime as dt
 
@@ -1077,6 +1145,241 @@ def test_an_exit_called_off_after_filling_in_part_is_booked_from_its_tagged_fill
     assert t["banked_pl"] == pytest.approx(3 * 4.0 + 1 * 6.0)                # its own exit's four shares, at their prices
     engine._reconcile_open_trades()
     assert engine.repo.get_trade(tid)["quantity"] == 6                      # booked once: the counts agree now
+
+
+@pytest.mark.parametrize("order_id", ["g1", ""])                            # the part booked with its order's id, or not
+def test_a_position_closed_outside_is_booked_at_its_own_fills_past_the_parts_already_booked(engine, order_id):
+    tid = _open(engine, "AAA", qty=10)                                      # entered at 100
+    engine.repo.reduce_trade(tid, 4, 110.0, exit_reason="target-1", broker_order_id=order_id)   # its target part
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="g1", symbol="AAA", side=Side.SHORT, quantity=4, price=110.0, ts=now, tag=f"tgt:{tid}"),
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=6, price=95.0, ts=now + dt.timedelta(seconds=1),
+             commission=0.6, tag=f"stop:{tid}"),
+        Fill(order_id="x9", symbol="AAA", side=Side.SHORT, quantity=3, price=80.0, ts=now + dt.timedelta(seconds=2),
+             tag="exit:trd_other"),                                         # another trade's exit
+        Fill(order_id="tws", symbol="AAA", side=Side.SHORT, quantity=5, price=90.0, ts=now + dt.timedelta(seconds=3))]
+    engine._reconcile_open_trades()
+    [settled] = engine._reconcile_open_trades()
+    t = engine.repo.get_trade(tid)                                          # the 6 it held, at the stop's own fill
+    assert (t["status"], t["exit_reason"], t["exit_price"], settled["fills"]) == ("CLOSED", "stop", 95.0, 1)
+    assert t["realized_pl"] == pytest.approx(4 * 10.0 + 6 * -5.0 - 0.6)
+    exits = [f for f in engine.repo.trade_record(tid)["fills"] if f["leg"] == "EXIT"]
+    assert [(f["quantity"], f["broker_order_id"], f["commission"]) for f in exits][-1] == (6, "s1", 0.6)
+
+
+def _gone(engine, symbol="AAA", qty=5):
+    """An open record whose position the account no longer holds (the simulator was never given its shares)."""
+    tid = _open(engine, symbol, qty=qty)                                    # entered at 100, stop 95
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    return tid
+
+
+def _exit_sent(engine, tid, at, reason="", order_id="", qty=5):
+    """The order audit's row for an exit the app sent (Executor._send_exit): its tag and why it was sent - before the
+    audit kept why, no reason - and the broker's id for it (none when the send got no answer in time)."""
+    request = {"symbol": "AAA", "side": "SHORT", "qty": qty, "type": "MARKET", "tag": f"exit:{tid}",
+               **({"reason": reason} if reason else {})}
+    answer = {"order_id": order_id, "status": "SUBMITTED"} if order_id else {"error": "no answer", "outcome": "unknown"}
+    engine.repo.record_order_audit("PLACE", request, answer, bool(order_id), "paper", trade_id=tid, ts=at)
+
+
+@pytest.mark.parametrize("reason, quitting, booked", [
+    ("quit", False, "quit"),                # the audit kept why the exit was sent
+    ("", True, "quit"),                     # sent before it kept why, while a quit closing the trade is under way
+    ("", False, "exit"),                    # ...and with none under way: an exit of the app's own, all the same
+])
+def test_a_gone_position_its_own_exit_sold_is_closed_as_what_the_exit_was_sent_for(engine, reason, quitting, booked):
+    tid = _gone(engine)
+    now = dt.datetime.now(dt.timezone.utc)
+    _exit_sent(engine, tid, now, reason="time-stop", order_id="e1")         # an earlier exit, called off unfilled
+    _exit_sent(engine, tid, now + dt.timedelta(minutes=1), reason=reason, order_id="q1")
+    engine.quit_state = {"keeping": []} if quitting else None
+    engine._broker.get_fills = lambda symbol=None: [                        # it filled as the app stopped: unheard
+        Fill(order_id="q1", symbol="AAA", side=Side.SHORT, quantity=5, price=101.0, ts=now + dt.timedelta(minutes=2),
+             tag=f"exit:{tid}")]
+    engine._reconcile_open_trades()
+    [settled] = engine._reconcile_open_trades()
+    engine.quit_state = None
+    t = engine.repo.get_trade(tid)
+    assert (t["status"], t["exit_reason"], t["exit_price"], settled["reason"]) == ("CLOSED", booked, 101.0, booked)
+
+
+def test_an_exit_whose_send_got_no_answer_is_known_by_the_last_exit_sent_before_it_filled(engine):
+    tid = _gone(engine)
+    now = dt.datetime.now(dt.timezone.utc)
+    _exit_sent(engine, tid, now, reason="time-stop", order_id="e1")         # called off unfilled
+    _exit_sent(engine, tid, now + dt.timedelta(minutes=1), reason="quit")   # no answer, so no order id on record
+    _exit_sent(engine, tid, now + dt.timedelta(minutes=5), reason="manual", order_id="m1")   # after it had filled
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="77", symbol="AAA", side=Side.SHORT, quantity=5, price=101.0, ts=now + dt.timedelta(minutes=2),
+             tag=f"exit:{tid}")]
+    engine._reconcile_open_trades()
+    engine._reconcile_open_trades()
+    assert engine.repo.get_trade(tid)["exit_reason"] == "quit"
+
+
+def test_only_a_gone_position_an_order_from_outside_the_app_sold_some_of_is_closed_outside(engine):
+    mixed, whole = _gone(engine, "AAA"), _gone(engine, "BBB")
+    now = dt.datetime.now(dt.timezone.utc)
+    _exit_sent(engine, mixed, now, reason="quit", order_id="q1")
+    _exit_sent(engine, whole, now, reason="quit", order_id="q2")
+    later = now + dt.timedelta(minutes=2)
+    fills = [Fill(order_id="tws", symbol="AAA", side=Side.SHORT, quantity=2, price=99.0, ts=later),     # sold in TWS
+             Fill(order_id="q1", symbol="AAA", side=Side.SHORT, quantity=3, price=101.0, ts=later, tag=f"exit:{mixed}"),
+             Fill(order_id="q2", symbol="BBB", side=Side.SHORT, quantity=5, price=102.0, ts=later, tag=f"exit:{whole}")]
+    engine._broker.get_fills = lambda symbol=None: [f for f in fills if f.symbol == symbol]
+    engine._reconcile_open_trades()
+    engine._reconcile_open_trades()
+    t, w = engine.repo.get_trade(mixed), engine.repo.get_trade(whole)
+    assert (t["exit_reason"], t["exit_price"]) == ("closed-outside", pytest.approx((2 * 99.0 + 3 * 101.0) / 5))
+    assert (w["exit_reason"], w["exit_price"]) == ("quit", 102.0)           # its quit's exit sold every share
+
+
+def test_a_record_over_the_account_books_its_own_stop_that_filled_unseen_never_past_what_it_is_over_by(engine):
+    tid = _open(engine, "AAA", qty=10)                                      # entered at 100, stop 95
+    engine.repo.reduce_trade(tid, 2, 110.0, exit_reason="target-1", broker_order_id="g1")   # booked when it filled
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAA", quantity=3, avg_price=100.0, market_price=96.0)]
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="g1", symbol="AAA", side=Side.SHORT, quantity=2, price=110.0, ts=now, tag=f"tgt:{tid}"),
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=6, price=95.0, ts=now + dt.timedelta(seconds=1),
+             commission=0.6, tag=f"stop:{tid}"),
+        Fill(order_id="e1", symbol="AAA", side=Side.SHORT, quantity=4, price=90.0, ts=now + dt.timedelta(seconds=2),
+             tag=f"exit:{tid}")]
+    booked = engine._settle_short(engine.repo.open_trades(), {"AAA": 3.0})
+    assert [(b["qty"], b["price"], b["reason"]) for b in booked] == [(5, 95.0, "stop")]   # over by 5, oldest first
+    t = engine.repo.get_trade(tid)
+    assert (t["status"], t["quantity"]) == ("OPEN", 3) and "took 5 off at 95.00 (stop)" in t["notes"]
+    assert t["banked_pl"] == pytest.approx(2 * 10.0 + 5 * -5.0 - 0.5)       # its own share of the stop's fee
+    engine._short_checked.clear()
+    assert engine._settle_short(engine.repo.open_trades(), {"AAA": 3.0}) == []   # booked once: the counts agree
+
+
+def test_a_record_over_the_account_books_its_target_that_filled_unseen_as_the_first_target(engine):
+    tid = _open(engine, "AAA", qty=10)
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="g1", symbol="AAA", side=Side.SHORT, quantity=4, price=110.0, ts=now, tag=f"tgt:{tid}")]
+    [b] = engine._settle_short(engine.repo.open_trades(), {"AAA": 6.0})
+    t = engine.repo.get_trade(tid)
+    assert (b["reason"], t["quantity"], t["banked_pl"]) == ("target-1", 6, pytest.approx(40.0))
+
+
+def test_a_stop_or_target_the_order_sync_follows_is_left_to_it_and_its_fills_are_no_room_for_others(engine):
+    from autotradebot.execution.protective_stops import _Stop
+
+    tid = _open(engine, "AAA", qty=10)
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=6, price=95.0, ts=now, tag=f"stop:{tid}"),
+        Fill(order_id="e1", symbol="AAA", side=Side.SHORT, quantity=4, price=90.0, ts=now + dt.timedelta(seconds=1),
+             tag=f"exit:{tid}")]
+    engine.executor._stops[tid] = _Stop("s1", tid, "AAA", 10, 95.0)         # still working: it books its fills itself
+    assert engine._settle_short(engine.repo.open_trades(), {"AAA": 4.0}) == []
+    assert engine.repo.get_trade(tid)["quantity"] == 10
+
+
+def test_a_part_the_database_refuses_to_book_off_a_record_over_the_account_is_booked_on_the_next_check(engine,
+                                                                                                         monkeypatch):
+    import sqlite3
+
+    from sqlalchemy.exc import OperationalError
+
+    tid = _open(engine, "AAA", qty=10)                                      # entered at 100
+    engine.position_check.GRACE_S = engine.position_check.SETTLE_S = 0.0
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAA", quantity=6, avg_price=100.0, market_price=96.0)]
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [                        # its stop filled while the app restarted
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=4, price=95.0, ts=now, tag=f"stop:{tid}")]
+    real, refused, heard = engine.repo.reduce_trade, [], []
+
+    def reduce_trade(*a, **kw):
+        if not refused:                                                     # busy past its wait and its retries
+            refused.append(True)
+            raise OperationalError("UPDATE", {}, sqlite3.OperationalError("database is locked"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(engine.repo, "reduce_trade", reduce_trade)
+    monkeypatch.setattr(engine, "_publish", lambda topic, **p: heard.append((topic, p)))
+    engine._reconcile_open_trades()                                         # the rest of the check still runs...
+    assert engine.repo.get_trade(tid)["quantity"] == 10
+    [said] = [p for topic, p in heard if topic == "order.unbooked"]
+    assert "database is locked" in said["msg"]
+    engine._reconcile_open_trades()                                         # ...and it isn't taken as looked at
+    t = engine.repo.get_trade(tid)
+    assert (t["quantity"], t["banked_pl"]) == (6, pytest.approx(4 * -5.0))
+
+
+def test_a_gone_position_with_a_part_booked_off_already_is_closed_on_an_estimate_never_deleted(engine):
+    tid = _gone(engine, qty=10)                                             # entered at 100
+    # an exit capped at the 6 shares the account held sold them, and was booked; the other 4 left on an earlier
+    # session, which the broker's executions no longer cover
+    engine.repo.reduce_trade(tid, 6, 104.0, exit_reason="exit", broker_order_id="q1")
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="q1", symbol="AAA", side=Side.SHORT, quantity=6, price=104.0, ts=now, tag=f"exit:{tid}")]
+    engine._reconcile_open_trades()
+    [settled] = engine._reconcile_open_trades()
+    t = engine.repo.get_trade(tid)
+    assert t is not None and (t["status"], t["exit_reason"], t["exit_price"]) == ("CLOSED", "closed-outside", 104.0)
+    assert settled["estimated"] and "4 of the shares closed have no execution at the broker" in t["notes"]
+    assert t["realized_pl"] == pytest.approx(6 * 4.0 + 4 * 4.0) and t["is_day_trade"]   # the part's outcome kept
+
+
+def test_a_fill_the_order_sync_books_while_a_gone_position_is_settled_waits_for_it_and_counts_once(engine,
+                                                                                                    monkeypatch):
+    tid = _gone(engine, qty=10)                                             # entered at 100
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="g1", symbol="AAA", side=Side.SHORT, quantity=4, price=110.0, ts=now, tag=f"tgt:{tid}"),
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=6, price=95.0, ts=now + dt.timedelta(seconds=1),
+             tag=f"stop:{tid}")]
+
+    def sync_books_the_target():                                            # the order sync, under the executor's lock
+        with engine.executor.lock:
+            engine.repo.reduce_trade(tid, 4, 110.0, exit_reason="target-1", broker_order_id="g1")
+
+    real, runs = engine.repo.trade_record, []
+
+    def trade_record(trade_id):                     # the sync's booking comes just after the position check's read
+        found = real(trade_id)
+        if not runs:
+            runs.append(threading.Thread(target=sync_books_the_target, daemon=True))
+            runs[0].start()
+            runs[0].join(timeout=1.0)
+        return found
+
+    engine._reconcile_open_trades()
+    monkeypatch.setattr(engine.repo, "trade_record", trade_record)
+    engine._reconcile_open_trades()
+    runs[0].join(timeout=30)
+    t = engine.repo.get_trade(tid)
+    assert (t["status"], t["realized_pl"]) == ("CLOSED", pytest.approx(4 * 10.0 + 6 * -5.0))   # each share once
+
+
+def test_a_gone_position_whose_stop_the_order_sync_books_is_left_to_it(engine):
+    from autotradebot.execution.protective_stops import _Stop
+
+    tid = _gone(engine, qty=10)
+    now = dt.datetime.now(dt.timezone.utc)
+    engine._broker.get_fills = lambda symbol=None: [
+        Fill(order_id="s1", symbol="AAA", side=Side.SHORT, quantity=10, price=95.0, ts=now, tag=f"stop:{tid}")]
+    stop = engine.executor._stops[tid] = _Stop("s1", tid, "AAA", 10, 95.0, unbooked=True)
+    for why in ("its fill waits to be saved", "followed: booked when the sync sees it done"):
+        engine._reconcile_open_trades()
+        assert engine._reconcile_open_trades() == [] and engine.repo.get_trade(tid)["status"] == "OPEN", why
+        stop.unbooked = False
+    del engine.executor._stops[tid]                                         # not followed: the position check books it
+    engine._reconcile_open_trades()
+    [settled] = engine._reconcile_open_trades()
+    assert (settled["reason"], engine.repo.get_trade(tid)["status"]) == ("stop", "CLOSED")
 
 
 def test_a_record_over_the_broker_for_a_reason_its_own_fills_dont_explain_is_left_alone(engine):
@@ -1365,6 +1668,33 @@ def test_a_trade_record_can_be_pulled_up_and_deleted(engine):
     assert isinstance(rec["fills"], list) and isinstance(rec["orders"], list)
     assert engine.repo.delete_trade(tid) and not engine.repo.delete_trade(tid)
     assert engine.trade_record(tid) is None
+
+
+def test_the_history_and_a_record_show_a_position_taken_off_in_parts_whole(engine, monkeypatch):
+    from fastapi.testclient import TestClient
+    from autotradebot.server import security
+    from autotradebot.server.app import create_app
+
+    parted = _open(engine, "T01", qty=10)
+    engine.repo.reduce_trade(parted, 4, 102.0)                              # 4 of the 10 off at the first target
+    engine.repo.close_trade(parted, exit_price=101.0, exit_reason="stop")   # the other 6 at the stop
+    whole = _open(engine, "T02", qty=5)
+    engine.repo.close_trade(whole, exit_price=104.0, exit_reason="target")
+    still = _open(engine, "T03", qty=8)
+
+    monkeypatch.setattr(security, "ALLOWED_CLIENTS", security.ALLOWED_CLIENTS | {"testclient"})
+    monkeypatch.setattr(security, "ALLOWED_HOSTS", security.ALLOWED_HOSTS | {"testserver"})
+    app = create_app(lambda settings: None)
+    app.state.engine = engine
+    client = TestClient(app, headers={"X-ATB-Request": "1"})
+    rows = {t["id"]: t for t in client.get("/api/trades?limit=10").json()["trades"]}
+    shown = lambda t: (t["initial_quantity"], t["exit_avg_price"], t["exit_parts"], t["exit_price"])  # noqa: E731
+    assert shown(rows[parted]) == (10, 101.4, 2, 101.0)          # the shares entered, the average, the last part's price
+    assert shown(rows[whole]) == (5, 104.0, 1, 104.0)
+    assert shown(rows[still]) == (8, None, 0, None)
+    record = client.get(f"/api/trades/{parted}/record").json()["trade"]
+    assert shown(record) == (10, 101.4, 2, 101.0)
+    assert shown(client.get(f"/api/trades/{still}/record").json()["trade"]) == (8, None, 0, None)
 
 
 # ---------------------------------------------------------------- trading capital

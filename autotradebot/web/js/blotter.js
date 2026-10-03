@@ -327,6 +327,19 @@ async function exitAll() {
 }
 
 /* ---------- history and P/L ---------- */
+/* A closed position taken off in parts shows whole, as the journal shows it: the shares it was entered with and
+   the average of its exits weighted by their shares (exit_avg_price, from its exit fills - its exit_price is only
+   the last part's), so (exit − entry) × shares comes to what it made before fees. The last part's price stands
+   beside the average. A record with no exit fills on file keeps its own price. */
+const wholeShares = t => t.initial_quantity || t.quantity;
+
+function wholeExit(t) {
+  const avg = t.exit_avg_price ?? t.exit_price;
+  return t.exit_parts > 1
+    ? `${num(avg)} <span class="muted" title="${escapeHtml(`The average of its ${t.exit_parts} exits, weighted by their shares; the last part went at ${num(t.exit_price)}`)}">last ${num(t.exit_price)}</span>`
+    : num(avg);
+}
+
 export async function loadHistory() {
   if (S.stopped) return;
   let trades;
@@ -336,13 +349,15 @@ export async function loadHistory() {
   const el = $("#tab-history");
   if (!closed.length) { el.innerHTML = `<p class="muted pad">No closed trades yet.</p>`; return; }
   el.innerHTML = `<table><thead><tr><th>Closed</th><th>Symbol</th><th>Side</th><th>Strategy</th>
-    <th class="num">Entry</th><th class="num">Exit</th><th class="num">P/L</th><th class="num">P/L %</th>
+    <th class="num" title="The shares the position was entered with">Qty</th>
+    <th class="num">Entry</th><th class="num" title="The average of every exit when it came off in parts">Exit</th><th class="num">P/L</th><th class="num">P/L %</th>
     <th class="num">R</th><th>DT</th><th>Reason</th></tr></thead><tbody>${
     closed.map(t => `<tr class="clickable-row" data-record="${escapeHtml(t.id)}">
-      <td>${(t.exit_time || "").slice(5, 16).replace("T", " ")}</td>
+      <td>${fmtTime(t.exit_time)}</td>
       <td class="sym">${escapeHtml(t.symbol)}</td><td>${sideBadge(t.side)}</td>
       <td>${stratLabel(t.strategy)}</td>
-      <td class="num">${num(t.entry_price)}</td><td class="num">${num(t.exit_price)}</td>
+      <td class="num">${num(wholeShares(t), 0)}</td>
+      <td class="num">${num(t.entry_price)}</td><td class="num">${wholeExit(t)}</td>
       <td class="num ${t.realized_pl >= 0 ? "pl-pos" : "pl-neg"}">${usd(t.realized_pl)}</td>
       <td class="num ${t.realized_pl >= 0 ? "pl-pos" : "pl-neg"}">${pct(t.realized_pl_pct)}</td>
       <td class="num">${num(t.r_multiple, 2)}</td>
@@ -493,6 +508,7 @@ function orderSummary(req) {
 function renderRecord(rec) {
   const t = rec.trade, p = rec.play || {}, bp = rec.broker_position, open = t.status === "OPEN";
   const moved = t.initial_stop_price != null && Math.abs((t.stop_price ?? 0) - t.initial_stop_price) > 0.01;
+  const partOff = t.initial_quantity && Math.abs(t.initial_quantity - t.quantity) > 1e-9;   // as the open row says it
   const fills = rec.fills || [], orders = rec.orders || [];
   const atBroker = bp ? `${num(bp.quantity, 0)} @ ${num(bp.market_price)} · <span class="${bp.unrealized_pl >= 0 ? "pl-pos" : "pl-neg"}">${usd(bp.unrealized_pl)}</span>`
     : rec.on_current_venue ? "not reported yet" : `held on ${escapeHtml(rec.venue_label)} — switch to it to manage`;
@@ -503,9 +519,10 @@ function renderRecord(rec) {
       <span>Status</span><span>${open ? "OPEN" : `CLOSED${t.exit_reason ? ` (${escapeHtml(t.exit_reason)})` : ""}`}</span>
       <span>Opened</span><span>${fmtTime(t.entry_time)}</span>
       ${open ? "" : `<span>Closed</span><span>${fmtTime(t.exit_time)}</span>`}
-      <span>Quantity</span><span>${num(t.quantity, 0)}</span>
+      <span>Quantity</span><span>${open ? num(t.quantity, 0) + (partOff ? ` <span class="muted">of ${num(t.initial_quantity, 0)} (part taken off)</span>` : "")
+        : num(wholeShares(t), 0)}</span>
       <span>Entry</span><span>${num(t.entry_price)}</span>
-      ${open ? "" : `<span>Exit</span><span>${num(t.exit_price)}</span>`}
+      ${open ? "" : `<span>Exit</span><span>${wholeExit(t)}</span>`}
       <span>Stop</span><span>${num(t.stop_price)}${moved ? ` (moved from ${num(t.initial_stop_price)})` : ""}</span>
       <span>Target</span><span>${num(t.target_price)}</span>
       ${open ? `<span>At the broker</span><span>${atBroker}</span><span>Market price</span><span data-price></span>`

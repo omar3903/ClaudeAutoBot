@@ -132,11 +132,15 @@ class ExitManager:
     WAIT_WARN_S, WAIT_REPEAT_S = 90.0, 300.0
 
     def __init__(self, repo, executor, quote_fn: Callable[[str], Any], cfg, bus=BUS,
-                 venue: Optional[str] = None) -> None:
+                 venue: Optional[str] = None, quotes_live: Optional[Callable[[], bool]] = None) -> None:
         self.repo = repo
         self.venue = venue                  # only manage trades held on this venue
         self.executor = executor
         self.quote_fn = quote_fn
+        # whether quote_fn's prices are real-time right now (the engine: the price source isn't on delayed data). An
+        # exit decided on a delayed quote keeps no decision price: its fill measured against a price minutes old would
+        # be the move since, not the slippage
+        self.quotes_live = quotes_live or (lambda: True)
         self.cfg = cfg
         self.bus = bus
         self._tries: Dict[str, Tuple[int, float]] = {}  # trade id -> (exits sent, monotonic time the next may go)
@@ -247,13 +251,13 @@ class ExitManager:
     def _close(self, tid: str, reason: str, qty: Optional[float] = None,
                after_fill: Optional[Dict[str, float]] = None, seen: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """Send the exit - the whole position, or with ``qty`` the part taken off at the first target.
-        ``seen``: the price that triggered it, which the fill is measured against."""
+        ``seen``: the price that triggered it, which the fill is measured against - when it was a live quote."""
         tries, next_at = self._tries.get(tid, (0, 0.0))
         now = time.monotonic()
         if now < next_at:
             return None                     # the last exit didn't take - wait before sending another
         extra = {"qty": qty, "after_fill": after_fill} if qty is not None else {}
-        if seen:
+        if seen and self.quotes_live():
             extra["decision_price"] = float(seen)
         out = self.executor.close_trade(tid, reason=reason, **extra) or {}
         if out.get("not_held"):

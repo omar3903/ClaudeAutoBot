@@ -154,6 +154,9 @@ class OrderResult:
     limit_price: Optional[float] = None
     stop_price: Optional[float] = None       # a stop order's trigger
     tif: str = ""                            # time in force: DAY | GTC ...
+    #: the fees on what it filled, when the broker says - IBKR's commission reports, which come a moment after the
+    #: fill (0 till then: the order sync adds them to the record later, Executor._top_up_fees)
+    commission: float = 0.0
 
 
 # --------------------------------------------------------------------------- #

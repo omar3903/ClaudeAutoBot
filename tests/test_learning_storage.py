@@ -253,3 +253,16 @@ def test_a_trade_keeps_what_its_fills_cost_against_the_price_at_the_decision(rep
     assert "more than the replay charges" in told["note"] and told["exit_slippage_bps"] == 12.0
     fine = execution_quality([{**row, "entry_slippage_bps": 3.0, "exit_slippage_bps": 5.0}] * 6, assumed_bps=6.0)
     assert "within what the replay charges" in fine["note"]
+
+
+def test_an_entry_decided_on_a_delayed_quote_keeps_no_slippage_and_the_review_leaves_it_out(repo):
+    from autotradebot.research.journal import execution_quality
+
+    # the quote is minutes old: the fill against it is how far the price moved since, not what the fill cost
+    tid = repo.open_trade(_play(), 100.5, 10, "paper", decision={"mid": 100.0, "spread_bps": 4.0, "live": False})
+    t = repo.get_trade(tid)
+    assert (t["decision_price"], t["entry_slippage_bps"], t["spread_bps"]) == (None, None, 4.0)
+
+    measured = {"entry_slippage_bps": 3.0, "exit_slippage_bps": 5.0, "spread_bps": 4.0}
+    out = execution_quality([measured] * 6 + [t] * 6, assumed_bps=6.0)
+    assert (out["entries"], out["entry_slippage_bps"]) == (6, 3.0) and "6 and 6 measured" in out["note"]

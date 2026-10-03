@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import and_, delete, func, insert, or_, select
+from sqlalchemy import and_, delete, func, insert, or_, select, update
+from sqlalchemy.exc import OperationalError
 
 from ..core.models import Account, Play
 from ..util import clock
@@ -18,6 +21,28 @@ log = logging.getLogger(__name__)
 
 #: where a play row's evidence keeps why Autopilot refused it and how the play stood then (note_refusal)
 REFUSAL = "autopilot_refused"
+
+# the pauses before a trade write SQLite turned away as "database is locked" is tried again: once its busy wait ran out
+# (persistence/db.py), or at once where waiting could deadlock two writers. The transaction was rolled back whole, so
+# trying it again can't book anything twice; one still refused after these goes back to the caller (the executor
+# keeps the fill followed and books it on a later pass)
+_LOCKED_RETRY_S = (0.2, 0.5)
+
+
+def _retry_locked(write):
+    """``write`` (a Repository method that opens its own transaction) tried again after each of _LOCKED_RETRY_S when
+    the database is locked. Any other error goes straight back."""
+    @functools.wraps(write)
+    def tried(*args, **kwargs):
+        for pause in (*_LOCKED_RETRY_S, None):
+            try:
+                return write(*args, **kwargs)
+            except OperationalError as e:
+                if pause is None or "database is locked" not in str(e):
+                    raise
+                log.warning("%s: the database is locked, trying again in %.1f s", write.__name__, pause)
+                time.sleep(pause)
+    return tried
 
 
 def _expected_exit_times(entry: dt.datetime, timeframe: str, typ: float, mx: float):
@@ -227,6 +252,7 @@ class Repository:
     # -------------------------------------------------------------- #
     #  Trades                                                       #
     # -------------------------------------------------------------- #
+    @_retry_locked
     def open_trade(
         self, play: Play, fill_price: float, fill_qty: float, broker: str,
         broker_order_id: str = "", commission: float = 0.0,
@@ -236,7 +262,8 @@ class Repository:
     ) -> str:
         """``entry_context``: the play's features at the fill (research/features.py), the row a
         model learns from; ``submitted_at``: when the entry order went out; ``decision``: the quote
-        at the decision (``mid``, ``spread_bps``), which the fill is measured against."""
+        at the decision (``mid``, ``spread_bps``, ``live``), which the fill is measured against when it
+        was live (_shortfall)."""
         tid = f"trd_{play.id.split('_', 1)[-1]}"
         now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
@@ -284,6 +311,7 @@ class Repository:
                  fill_price, order_type, order_session)
         return tid
 
+    @_retry_locked
     def update_trade_risk(
         self, trade_id: str, *, stop_price: Optional[float] = None,
         target_price: Optional[float] = None, hwm_price: Optional[float] = None,
@@ -317,110 +345,149 @@ class Repository:
             if t and not t.overdue_notified:
                 t.overdue_notified = True
 
+    @_retry_locked
     def close_trade(
         self, trade_id: str, exit_price: float, exit_reason: str = "manual",
         commission: float = 0.0, exit_qty: Optional[float] = None,
         exit_time: Optional[dt.datetime] = None, decision_price: Optional[float] = None,
-        submitted_at: Optional[dt.datetime] = None,
+        submitted_at: Optional[dt.datetime] = None, broker_order_id: str = "", note: str = "",
     ) -> Optional[Dict[str, Any]]:
         """``exit_time``: when the position actually closed, for a fill learned after the fact
         (default: now); ``decision_price``: the price that triggered the exit, which the fill is
         measured against; ``submitted_at``: when the app's exit order went out, so the seconds it
         took to fill are kept (a stop or target resting at the broker has none - it waits for the
-        price, not for the broker)."""
+        price, not for the broker); ``broker_order_id``: the order that filled, which a fee the broker
+        reports later is put down to (add_fill_fees); ``note``: added to the record's notes (an exit
+        price that is an estimate says so). A record closed already is returned as it stands
+        and nothing more is booked: the close takes it from OPEN in one conditional write, so two closes
+        of the same record at once - the order sync's and the position check's, say - can't both book."""
         now = (exit_time.astimezone(dt.timezone.utc).replace(tzinfo=None) if exit_time and exit_time.tzinfo
                else exit_time) or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
-            t = s.get(Trade, trade_id)
-            if t is None or t.status == "CLOSED":
-                return trade_to_dict(t) if t else None
-            qty = float(exit_qty if exit_qty is not None else t.quantity)
-            sign = 1.0 if t.side == "LONG" else -1.0
-            gross = (exit_price - float(t.entry_price)) * qty * sign
-            fees = float(t.fees or 0.0) + commission
-            # what the part taken off earlier made joins the final P/L; R and % are on the shares entered with
-            banked = float(getattr(t, "banked_pl", 0.0) or 0.0)
-            pl = gross - commission + banked
-            basis_qty = float(getattr(t, "initial_quantity", None) or qty) if exit_qty is None else qty
-            t.exit_price = exit_price
-            t.exit_time = now
-            t.exit_reason = exit_reason
-            # the fill is the last price the trade saw, and the passes that mark the excursions (the exit manager)
-            # never see it: a stop that fills through the worst point marked so far would leave the MAE short of the
-            # trade's own loss, a target that fills past the best point its MFE and high-water mark short
-            entry = float(t.entry_price)
-            gain, loss = (exit_price - entry) * sign, (entry - exit_price) * sign
-            if gain > float(t.mfe or 0.0) + 1e-6:
-                t.mfe, t.mfe_at = gain, now
-            if loss > float(t.mae or 0.0) + 1e-6:
-                t.mae = loss
-            if t.hwm_price is None or (exit_price - float(t.hwm_price)) * sign > 1e-6:
-                t.hwm_price = exit_price
-            if submitted_at is not None and (t.broker or SIMULATOR) != SIMULATOR:
-                t.exit_submitted_at = _naive(submitted_at)
-                t.exit_latency_s = _took(submitted_at, now)
-            if decision_price and float(decision_price) > 0:
-                t.exit_decision_price = float(decision_price)
-                t.exit_slippage_bps = round((float(decision_price) - exit_price) * sign / float(decision_price) * 1e4, 2)
-            t.fees = fees
-            t.realized_pl = pl
-            basis = float(t.entry_price) * basis_qty
-            t.realized_pl_pct = (pl / basis * 100.0) if basis else None
-            # R is measured against the ORIGINAL stop, not a trailed one
-            ref_stop = getattr(t, "initial_stop_price", None) or t.stop_price
-            risk_ps = abs(float(t.entry_price) - float(ref_stop)) if ref_stop else 0.0
-            t.r_multiple = (pl / (risk_ps * basis_qty)) if risk_ps and basis_qty else None
-            # day-trade if entry and exit fall on the same NY session
-            if t.entry_time:
-                t.is_day_trade = clock.session_date(_as_utc(t.entry_time)) == clock.session_date(_as_utc(now))
-            t.status = "CLOSED"
-            s.add(Fill(trade_id=trade_id, ts=now, side=("SHORT" if t.side == "LONG" else "LONG"),
-                       leg="EXIT", quantity=qty, price=exit_price, commission=commission))
-            out = trade_to_dict(t)
-        log.info("trade closed %s: P/L %.2f (%s)", trade_id, out["realized_pl"], exit_reason)
+            out, closed = _close(s, trade_id, exit_price, exit_reason, now, commission=commission, exit_qty=exit_qty,
+                                 decision_price=decision_price, submitted_at=submitted_at,
+                                 broker_order_id=broker_order_id, note=note)
+        if closed:
+            log.info("trade closed %s: P/L %.2f (%s)", trade_id, out["realized_pl"], exit_reason)
         return out
 
+    @_retry_locked
     def reduce_trade(self, trade_id: str, exit_qty: float, exit_price: float, exit_reason: str = "target-1",
                      commission: float = 0.0, stop_price: Optional[float] = None,
-                     target_price: Optional[float] = None) -> Optional[Dict[str, Any]]:
+                     target_price: Optional[float] = None, broker_order_id: str = "") -> Optional[Dict[str, Any]]:
         """Book part of a position taken off - the scale-out at the first target: those shares
-        leave the record, what they made is banked toward the trade's final P/L, and the stop and
-        target move on to what the rest of the position now has to do (the stop only ever in the
-        trade's favour). A part covering the whole position closes the trade instead."""
-        with session_scope() as s:
-            t = s.get(Trade, trade_id)
-            if t is None or t.status == "CLOSED":
-                return trade_to_dict(t) if t else None
-            qty, held = float(exit_qty), float(t.quantity)
-            if qty <= 0:
-                return trade_to_dict(t)
-            whole = qty >= held - 1e-9
-        if whole:
-            return self.close_trade(trade_id, exit_price, exit_reason=exit_reason, commission=commission)
+        leave the record, what they made after their fee is banked toward the trade's final P/L, and
+        the stop and target move on to what the rest of the position now has to do (the stop only ever
+        in the trade's favour). A part covering the whole position closes the trade instead. The check
+        and the booking are one transaction, so two bookings at once can't both take the same shares off,
+        nor one take a part off a record another has just closed. A part sold on the session the trade
+        was entered makes it a day trade - one buy and a sale the same day - whatever becomes of the rest."""
+        qty = float(exit_qty)
         now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
+            # the shares come off first, in one conditional write: only from an OPEN record holding more than them.
+            # The write also locks the record (SQLite: the database) until this commits, so what is read below stays
+            # as read
+            cut = qty > 0 and s.execute(
+                update(Trade).where(Trade.id == trade_id, Trade.status == "OPEN", Trade.quantity > qty + 1e-9)
+                .values(quantity=Trade.quantity - qty,
+                        initial_quantity=func.coalesce(Trade.initial_quantity, Trade.quantity))
+                .execution_options(synchronize_session=False)).rowcount == 1
             t = s.get(Trade, trade_id)
-            sign = 1.0 if t.side == "LONG" else -1.0
-            gross = (exit_price - float(t.entry_price)) * qty * sign - commission
-            if t.initial_quantity is None:
-                t.initial_quantity = t.quantity
-            t.banked_pl = float(t.banked_pl or 0.0) + gross
-            t.fees = float(t.fees or 0.0) + commission
-            t.quantity = float(t.quantity) - qty
-            if stop_price is not None:
-                current = t.stop_price
-                better = current is None or (stop_price > float(current) if sign > 0 else stop_price < float(current))
-                if better:
-                    t.stop_price = stop_price
-            if target_price is not None:
-                t.target_price = target_price
-            note = f"took {qty:g} off at {exit_price:.2f} ({exit_reason}), {gross:+.2f} banked"
-            t.notes = ((t.notes + " | ") if t.notes else "") + note
-            s.add(Fill(trade_id=trade_id, ts=now, side=("SHORT" if t.side == "LONG" else "LONG"),
-                       leg="EXIT", quantity=qty, price=exit_price, commission=commission))
-            out = trade_to_dict(t)
-        log.info("trade reduced %s: %s, %s left", trade_id, note, out["quantity"])
+            if not cut:
+                if t is None or t.status != "OPEN" or qty <= 0:
+                    return trade_to_dict(t) if t else None
+                # the part is the whole position: it closes the trade, in this same transaction
+                out, closed = _close(s, trade_id, exit_price, exit_reason, now, commission=commission,
+                                     broker_order_id=broker_order_id)
+            else:
+                closed = False
+                sign = 1.0 if t.side == "LONG" else -1.0
+                gross = (exit_price - float(t.entry_price)) * qty * sign - commission
+                t.banked_pl = float(t.banked_pl or 0.0) + gross
+                t.fees = float(t.fees or 0.0) + commission
+                if stop_price is not None:
+                    current = t.stop_price
+                    better = current is None or (stop_price > float(current) if sign > 0
+                                                 else stop_price < float(current))
+                    if better:
+                        t.stop_price = stop_price
+                if target_price is not None:
+                    t.target_price = target_price
+                _fold_fill(t, exit_price, now)
+                if t.entry_time and clock.session_date(_as_utc(t.entry_time)) == clock.session_date(_as_utc(now)):
+                    t.is_day_trade = True
+                note = f"took {qty:g} off at {exit_price:.2f} ({exit_reason}), {gross:+.2f} banked"
+                t.notes = ((t.notes + " | ") if t.notes else "") + note
+                s.add(Fill(trade_id=trade_id, broker_order_id=broker_order_id or "", ts=now,
+                           side=("SHORT" if t.side == "LONG" else "LONG"), leg="EXIT", quantity=qty, price=exit_price,
+                           commission=commission))
+                out = trade_to_dict(t)
+        if closed:
+            log.info("trade closed %s: P/L %.2f (%s)", trade_id, out["realized_pl"], exit_reason)
+        elif cut:
+            log.info("trade reduced %s: %s, %s left", trade_id, note, out["quantity"])
         return out
+
+    # -------------------------------------------------------------- #
+    #  Fees the broker reports after the fill                       #
+    # -------------------------------------------------------------- #
+    def fills_on(self, venue: str, day: dt.date) -> List[Dict[str, Any]]:
+        """The fills booked during the New York day ``day`` on trades at ``venue`` that carry the broker's order id,
+        with the fee each was booked with - IBKR's commission report comes a moment after the fill, so a fill is
+        mostly booked before its fee is known, or all of it (Executor._top_up_fees adds the rest). Oldest first."""
+        start, end = _ny_bounds(day)
+        with session_scope() as s:
+            rows = s.execute(select(Fill, Trade.symbol).join(Trade, Fill.trade_id == Trade.id)
+                             .where(Trade.broker == venue, Fill.ts >= start, Fill.ts < end, Fill.broker_order_id != "")
+                             .order_by(Fill.ts, Fill.id)).all()
+            return [{"fill_id": f.id, "trade_id": f.trade_id, "symbol": symbol, "order_id": f.broker_order_id,
+                     "leg": f.leg, "quantity": float(f.quantity), "commission": float(f.commission or 0.0),
+                     "ts": f.ts} for f, symbol in rows]
+
+    def add_fill_fees(self, fees: Dict[int, float]) -> List[str]:
+        """Fees learned after their fills were booked, by fill row id -> what each fill's fee grows by: it goes on the
+        fill and on its trade's fees. A part taken off earlier banked what it made after its fee, so its fee comes off
+        what it banked; a closed trade's P/L loses each one, and its % and R follow. Returns the trades changed."""
+        changed: List[str] = []
+        with session_scope() as s:
+            for fill_id, fee in fees.items():
+                if not fee:
+                    continue
+                fee = float(fee)
+                # the fee is added where it is stored, written before anything of the trade is read: values worked out
+                # from a read would write over a close or a part taken off of the same trade that committed meanwhile
+                # (the position check's, a share-count fix), and lose this fee or that booking's. The first write also
+                # locks the database (SQLite) until this commits, so what is read below stays as read
+                if s.execute(update(Fill).where(Fill.id == fill_id)
+                             .values(commission=func.coalesce(Fill.commission, 0.0) + fee)
+                             .execution_options(synchronize_session=False)).rowcount != 1:
+                    continue
+                tid, leg = s.execute(select(Fill.trade_id, Fill.leg).where(Fill.id == fill_id)).one()
+                s.execute(update(Trade).where(Trade.id == tid).values(fees=func.coalesce(Trade.fees, 0.0) + fee)
+                          .execution_options(synchronize_session=False))
+                t = s.get(Trade, tid)
+                if t is None:
+                    continue
+                closing = t.status == "CLOSED" and fill_id == s.execute(
+                    select(func.max(Fill.id)).where(Fill.trade_id == tid, Fill.leg == "EXIT")).scalar()
+                if leg == "EXIT" and not closing:
+                    s.execute(update(Trade).where(Trade.id == tid)
+                              .values(banked_pl=func.coalesce(Trade.banked_pl, 0.0) - fee)
+                              .execution_options(synchronize_session=False))
+                if t.status == "CLOSED" and t.realized_pl is not None:
+                    _score(t, float(t.realized_pl) - fee, float(t.initial_quantity or t.quantity))
+                changed.append(tid)
+        return changed
+
+    def first_fee_day(self) -> Optional[dt.date]:
+        """The New York day of the first fee on record for a trade at a broker (the simulator aside). Records from
+        before it were booked without their commissions - IBKR keeps only the current day's executions, so they
+        can't be had afterwards - and their P/L and R are before fees. None while no fee is on record."""
+        with session_scope() as s:
+            first = s.execute(select(func.min(Fill.ts)).join(Trade, Fill.trade_id == Trade.id)
+                              .where(Fill.commission != 0, Trade.broker != SIMULATOR)).scalar()
+        return _as_utc(first).astimezone(clock.NY).date() if first else None
 
     def open_trades(self) -> List[Dict[str, Any]]:
         with session_scope() as s:
@@ -429,9 +496,12 @@ class Repository:
             return [trade_to_dict(r) for r in rows]
 
     def recent_trades(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """The latest trades, newest first, each with its exit fills averaged (exit_avg_price, exit_parts), so
+        the history can show a position taken off in parts whole, as the journal does."""
         with session_scope() as s:
             rows = s.execute(select(Trade).order_by(Trade.created_at.desc()).limit(limit)).scalars().all()
-            return [trade_to_dict(r) for r in rows]
+            exits = _exit_fills(s, [r.id for r in rows])
+            return [{**trade_to_dict(r), **exits.get(r.id, NO_EXITS)} for r in rows]
 
     def get_trade(self, trade_id: str) -> Optional[Dict[str, Any]]:
         with session_scope() as s:
@@ -444,10 +514,17 @@ class Repository:
                           .order_by(Trade.entry_time.desc())).scalars().first()
             return trade_to_dict(t) if t else None
 
-    def delete_trade(self, trade_id: str) -> bool:
+    def delete_trade(self, trade_id: str, open_only: bool = False) -> bool:
         """Remove a trade and its fills. The order audit log is kept - it's the
-        record of what was actually sent to a broker."""
+        record of what was actually sent to a broker. ``open_only``: only while the record is still OPEN - one closed
+        meanwhile (its exit booked on another thread) keeps its outcome, and False is returned."""
         with session_scope() as s:
+            # the check is a conditional write that changes nothing: it locks the record (SQLite: the database) until
+            # this commits, so no close can land between it and the delete
+            if open_only and s.execute(update(Trade).where(Trade.id == trade_id, Trade.status == "OPEN")
+                                       .values(status="OPEN")
+                                       .execution_options(synchronize_session=False)).rowcount != 1:
+                return False
             t = s.get(Trade, trade_id)
             if t is None:
                 return False
@@ -456,8 +533,8 @@ class Repository:
         return True
 
     def trade_record(self, trade_id: str) -> Optional[Dict[str, Any]]:
-        """Everything stored about one trade: the trade, the play that led to it,
-        its fills and the broker orders sent for it."""
+        """Everything stored about one trade: the trade (with its exit fills averaged, as recent_trades
+        gives it), the play that led to it, its fills and the broker orders sent for it."""
         with session_scope() as s:
             t = s.get(Trade, trade_id)
             if t is None:
@@ -470,7 +547,7 @@ class Repository:
                 cond = or_(cond, OrderAudit.play_id == t.play_id)
             orders = s.execute(select(OrderAudit).where(cond).order_by(OrderAudit.ts)).scalars().all()
             return {
-                "trade": trade_to_dict(t),
+                "trade": {**trade_to_dict(t), **_exit_fills(s, [trade_id]).get(trade_id, NO_EXITS)},
                 "play": play_to_dict(play) if play else None,
                 "fills": [{"ts": f.ts.isoformat() if f.ts else None, "leg": f.leg, "side": f.side,
                            "quantity": _f(f.quantity), "price": _f(f.price),
@@ -478,27 +555,36 @@ class Repository:
                           for f in fills],
                 "orders": [{"ts": o.ts.isoformat() if o.ts else None, "action": o.action,
                             "ok": bool(o.ok), "broker": o.broker, "message": o.message,
-                            "request": o.request} for o in orders],
+                            "request": o.request,
+                            # the broker's id for an order placed - the one its fills carry
+                            "order_id": str((o.response if isinstance(o.response, dict) else {}).get("order_id")
+                                            or "")} for o in orders],
             }
 
     # -------------------------------------------------------------- #
     #  PDT counter                                                  #
     # -------------------------------------------------------------- #
-    def count_day_trades(self, lookback_sessions: int = 5) -> int:
-        window = list(clock.last_n_sessions(clock.session_date(), lookback_sessions))
-        lo = window[0]
+    def count_day_trades(self, lookback_sessions: int = 5, venue: Optional[str] = None) -> int:
+        """The day trades of the last ``lookback_sessions`` sessions: the closed trades that were one (closed on
+        the session they were entered, or a part sold then), the open ones with a part sold on the session they were
+        entered - a day trade already, whatever becomes of the rest - and the open day trades entered today, which
+        the session's end will make one. A trade counts once, however many parts it left in. ``venue``: only the
+        trades booked there - the rule is counted per account, and the simulator's or the paper account's trades
+        say nothing about the live one's."""
+        today = clock.session_date()
+        lo = clock.last_n_sessions(today, lookback_sessions)[0]
+        here = _at_venue(venue)
         with session_scope() as s:
             closed = s.execute(
                 select(func.count()).select_from(Trade)
                 .where(Trade.is_day_trade.is_(True), Trade.status == "CLOSED",
-                       Trade.session_date >= lo)
+                       Trade.session_date >= lo, *here)
             ).scalar_one()
-            open_today = s.execute(
-                select(func.count()).select_from(Trade)
-                .where(Trade.status == "OPEN", Trade.timeframe == "INTRADAY",
-                       Trade.session_date == clock.session_date())
-            ).scalar_one()
-        return int(closed) + int(open_today)
+            still_open = s.execute(select(Trade.id, Trade.timeframe, Trade.session_date)
+                                   .where(Trade.status == "OPEN", Trade.session_date >= lo, *here)).all()
+            parted = _sold_on_entry_session(s, {r.id: r.session_date for r in still_open})
+        return int(closed) + sum(1 for r in still_open
+                                 if r.id in parted or (r.timeframe == "INTRADAY" and r.session_date == today))
 
     # -------------------------------------------------------------- #
     #  Pair trades (pairs/desk.py)                                   #
@@ -705,9 +791,16 @@ class Repository:
     # -------------------------------------------------------------- #
     #  P/L analytics                                                #
     # -------------------------------------------------------------- #
-    def pnl_summary(self) -> Dict[str, Any]:
+    def pnl_summary(self, venue: Optional[str] = None) -> Dict[str, Any]:
+        """The closed trades' P/L figures. realized_today / realized_week are the trades closed this session and in
+        the last five, by when they closed - a swing trade entered last week and closed today is today's - and with
+        ``venue`` only those booked there, the account orders go to now. The rest covers every closed trade."""
         today = clock.session_date()
         wk = clock.last_n_sessions(today, 5)[0]
+        # a session runs to the next one's day: a close booked on a weekend or a holiday belongs to the session
+        # before it, as clock.session_date has it
+        day_from, week_from = _ny_bounds(today)[0], _ny_bounds(wk)[0]
+        until = _ny_bounds(clock.next_trading_day(today))[0]
         with session_scope() as s:
             closed = s.execute(select(Trade).where(Trade.status == "CLOSED")).scalars().all()
             pairs_open = set(s.execute(select(Trade.pair_id).where(Trade.status != "CLOSED",
@@ -729,10 +822,9 @@ class Repository:
             _count_outcome(by_type["PAIRS"], pl)
         wins = [x for x in pls if x > 0]
         losses = [x for x in pls if x < 0]
-        day = sum(float(t.realized_pl or 0) for t in closed
-                  if t.session_date and t.session_date >= today)
-        week = sum(float(t.realized_pl or 0) for t in closed
-                   if t.session_date and t.session_date >= wk)
+        here = [t for t in closed if t.exit_time and (not venue or (t.broker or SIMULATOR) == venue)]
+        day = sum(float(t.realized_pl or 0) for t in here if day_from <= t.exit_time < until)
+        week = sum(float(t.realized_pl or 0) for t in here if week_from <= t.exit_time < until)
         gross_win = sum(wins)
         gross_loss = abs(sum(losses))
         n = len(pls)
@@ -759,7 +851,7 @@ class Repository:
             s.add(AccountSnapshot(
                 broker=broker, equity=account.equity, cash=account.cash,
                 buying_power=account.buying_power,
-                day_trades_5d=self.count_day_trades(5),
+                day_trades_5d=self.count_day_trades(5, venue=broker),
                 open_positions=len([p for p in account.positions if abs(p.quantity) > 1e-9]),
                 unrealized_pl=sum(p.unrealized_pl for p in account.positions),
                 realized_pl_day=realized_day,
@@ -824,18 +916,25 @@ def _ny_bounds(day: dt.date):
 #: a trade with no exit fills on record (a record older than the fills, or one still whole)
 NO_EXITS: Dict[str, Any] = {"exit_avg_price": None, "exit_parts": 0}
 
+#: trade ids per query in _exit_fills - well under SQLite's oldest limit of 999 bound values
+_IN_CHUNK = 500
+
 
 def _exit_fills(s, trade_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Each trade's exit fills, in one grouped query: their size-weighted average price and how many
+    """Each trade's exit fills, in grouped queries: their size-weighted average price and how many
     parts the position left in. A trade's exit_price is only its last part's, so a position taken off
-    in parts needs the average for (exit - entry) x shares to come to what it made."""
-    if not trade_ids:
-        return {}
-    rows = s.execute(select(Fill.trade_id, func.sum(Fill.quantity * Fill.price), func.sum(Fill.quantity), func.count())
-                     .where(Fill.leg == "EXIT", Fill.trade_id.in_(trade_ids))
-                     .group_by(Fill.trade_id)).all()
-    return {tid: {"exit_avg_price": round(float(value) / float(qty), 6), "exit_parts": int(parts)}
-            for tid, value, qty, parts in rows if qty}
+    in parts needs the average for (exit - entry) x shares to come to what it made. A long list (the
+    learning dataset reads every trade) goes _IN_CHUNK ids at a time, under the database's limit on
+    bound values."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for i in range(0, len(trade_ids), _IN_CHUNK):
+        rows = s.execute(select(Fill.trade_id, func.sum(Fill.quantity * Fill.price), func.sum(Fill.quantity),
+                                func.count())
+                         .where(Fill.leg == "EXIT", Fill.trade_id.in_(trade_ids[i:i + _IN_CHUNK]))
+                         .group_by(Fill.trade_id)).all()
+        out.update({tid: {"exit_avg_price": round(float(value) / float(qty), 6), "exit_parts": int(parts)}
+                    for tid, value, qty, parts in rows if qty})
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -866,16 +965,118 @@ def _keeping_refusal(row: Optional[PlayLog], new: PlayLog) -> PlayLog:
     return new
 
 
+def _close(s, trade_id: str, exit_price: float, exit_reason: str, now: dt.datetime, commission: float = 0.0,
+           exit_qty: Optional[float] = None, decision_price: Optional[float] = None,
+           submitted_at: Optional[dt.datetime] = None, broker_order_id: str = "", note: str = ""):
+    """Repository.close_trade's booking, in the session ``s`` - reduce_trade's too, when the part it was given is the
+    whole position. Returns (the record, whether this call closed it)."""
+    # the record is taken from OPEN first, in one conditional write: a second close of it - one running at the same
+    # time, or one retried after the first went through - changes no row and books nothing. The write also locks the
+    # record (SQLite: the database) until this commits, so nothing read below can change meanwhile
+    claimed = s.execute(update(Trade).where(Trade.id == trade_id, Trade.status == "OPEN").values(status="CLOSED")
+                        .execution_options(synchronize_session=False)).rowcount == 1
+    t = s.get(Trade, trade_id)
+    if not claimed:
+        return (trade_to_dict(t) if t else None), False
+    qty = float(exit_qty if exit_qty is not None else t.quantity)
+    sign = 1.0 if t.side == "LONG" else -1.0
+    gross = (exit_price - float(t.entry_price)) * qty * sign
+    fees = float(t.fees or 0.0) + commission
+    # what the part taken off earlier made joins the final P/L; R and % are on the shares entered with
+    banked = float(getattr(t, "banked_pl", 0.0) or 0.0)
+    # every fee comes off: the entry's, and this exit's - a part taken off earlier banked what it made after
+    # its own already, so the fees on record less those are the ones still to come off
+    parts_paid = float(s.execute(select(func.coalesce(func.sum(Fill.commission), 0.0))
+                                 .where(Fill.trade_id == trade_id, Fill.leg == "EXIT")).scalar() or 0.0)
+    pl = gross - commission - (float(t.fees or 0.0) - parts_paid) + banked
+    basis_qty = float(getattr(t, "initial_quantity", None) or qty) if exit_qty is None else qty
+    t.exit_price = exit_price
+    t.exit_time = now
+    t.exit_reason = exit_reason
+    _fold_fill(t, exit_price, now)
+    if submitted_at is not None and (t.broker or SIMULATOR) != SIMULATOR:
+        t.exit_submitted_at = _naive(submitted_at)
+        t.exit_latency_s = _took(submitted_at, now)
+    if decision_price and float(decision_price) > 0:
+        t.exit_decision_price = float(decision_price)
+        t.exit_slippage_bps = round((float(decision_price) - exit_price) * sign / float(decision_price) * 1e4, 2)
+    t.fees = fees
+    if note:
+        t.notes = ((t.notes + " | ") if t.notes else "") + note
+    _score(t, pl, basis_qty)
+    # day-trade if entry and exit fall on the same NY session - or a part was sold on the session it was entered,
+    # which made it one then, whenever the rest went
+    if t.entry_time:
+        entered = clock.session_date(_as_utc(t.entry_time))
+        t.is_day_trade = (entered == clock.session_date(_as_utc(now))
+                          or trade_id in _sold_on_entry_session(s, {trade_id: entered}))
+    t.status = "CLOSED"             # written above already; this keeps the object (and what is returned) in step
+    s.add(Fill(trade_id=trade_id, broker_order_id=broker_order_id or "", ts=now,
+               side=("SHORT" if t.side == "LONG" else "LONG"), leg="EXIT", quantity=qty, price=exit_price,
+               commission=commission))
+    return trade_to_dict(t), True
+
+
+def _fold_fill(t: Trade, price: float, at: dt.datetime) -> None:
+    """An exit fill into the record's excursions - the whole position's or a part's. The fill is a price the trade
+    saw, and the passes that mark the excursions (the exit manager) never see it: a stop that fills through the worst
+    point marked so far would leave the MAE short of the trade's own loss, a target that fills past the best point its
+    MFE and high-water mark short."""
+    sign = 1.0 if t.side == "LONG" else -1.0
+    entry = float(t.entry_price)
+    gain, loss = (price - entry) * sign, (entry - price) * sign
+    if gain > float(t.mfe or 0.0) + 1e-6:
+        t.mfe, t.mfe_at = gain, at
+    if loss > float(t.mae or 0.0) + 1e-6:
+        t.mae = loss
+    if t.hwm_price is None or (price - float(t.hwm_price)) * sign > 1e-6:
+        t.hwm_price = price
+
+
+def _at_venue(venue: Optional[str]) -> tuple:
+    """The where-clause for the trades booked at ``venue`` - none, for every venue, when it isn't given. A record
+    with no broker on it (null or empty) is the simulator's, the column's default, as the engine reads it."""
+    if not venue:
+        return ()
+    if venue == SIMULATOR:
+        return (or_(Trade.broker == venue, Trade.broker.is_(None), Trade.broker == ""),)
+    return (Trade.broker == venue,)
+
+
+def _sold_on_entry_session(s, entered: Dict[str, dt.date]) -> set:
+    """Of the trades in ``entered`` (id -> the New York session it was entered on), the ones with a part sold on
+    that session - an exit fill on record then: a buy and a sale the same day, which makes a day trade."""
+    if not entered:
+        return set()
+    rows = s.execute(select(Fill.trade_id, Fill.ts).where(Fill.leg == "EXIT", Fill.trade_id.in_(list(entered)))).all()
+    return {tid for tid, ts in rows if ts and clock.session_date(_as_utc(ts)) == entered[tid]}
+
+
+def _score(t: Trade, pl: float, basis_qty: float) -> None:
+    """A closed trade's P/L, and the % and R that follow from it, on ``basis_qty`` shares (the ones entered with)."""
+    t.realized_pl = pl
+    basis = float(t.entry_price) * basis_qty
+    t.realized_pl_pct = (pl / basis * 100.0) if basis else None
+    # R is measured against the ORIGINAL stop, not a trailed one
+    ref_stop = getattr(t, "initial_stop_price", None) or t.stop_price
+    risk_ps = abs(float(t.entry_price) - float(ref_stop)) if ref_stop else 0.0
+    t.r_multiple = (pl / (risk_ps * basis_qty)) if risk_ps and basis_qty else None
+
+
 def _shortfall(decision: Optional[Dict[str, Any]], fill_price: float, side: str) -> Dict[str, Any]:
     """Harris's implementation shortfall at the entry: the fill against the mid of the quote the
-    decision was made on, in basis points (+ = paid)."""
+    decision was made on, in basis points (+ = paid) - only when that quote was live (``live``, as the
+    entry check saw the data): a delayed quote is minutes old, and a fill against it measures how far the
+    price moved since, not what the fill cost. The quote's spread is kept either way."""
     mid = float((decision or {}).get("mid") or 0.0)
     if mid <= 0:
         return {}
-    sign = 1.0 if side == "LONG" else -1.0
     spread = (decision or {}).get("spread_bps")
-    return {"decision_price": mid, "spread_bps": float(spread) if spread is not None else None,
-            "entry_slippage_bps": round((float(fill_price) - mid) * sign / mid * 1e4, 2)}
+    out: Dict[str, Any] = {"spread_bps": float(spread) if spread is not None else None}
+    if (decision or {}).get("live"):
+        sign = 1.0 if side == "LONG" else -1.0
+        out.update(decision_price=mid, entry_slippage_bps=round((float(fill_price) - mid) * sign / mid * 1e4, 2))
+    return out
 
 
 def sim_to_dict(t: SimTradeLog) -> Dict[str, Any]:

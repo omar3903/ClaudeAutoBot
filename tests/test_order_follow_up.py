@@ -35,6 +35,7 @@ class _Repo:
     def __init__(self, trades):
         self.t = {x["id"]: dict(x) for x in trades}
         self.settled = []                        # (play id, status, outcome) - what became of each sent play
+        self.paid = []                           # (trade id, ENTRY | EXIT, broker order id, commission) per booking
 
     def settle_play(self, play_id, status, outcome=None):
         self.settled.append((play_id, status, outcome))
@@ -49,21 +50,25 @@ class _Repo:
     def update_trade_risk(self, tid, **kw):
         self.t[tid].update({k: v for k, v in kw.items() if v is not None})
 
-    def open_trade(self, play, price, qty, venue, order_id, order_type="LIMIT", order_session="REGULAR",
-                   entry_context=None, submitted_at=None, decision=None):
+    def open_trade(self, play, price, qty, venue, order_id, commission=0.0, order_type="LIMIT",
+                   order_session="REGULAR", entry_context=None, submitted_at=None, decision=None):
         tid = f"t{len(self.t) + 1}"
         self.t[tid] = _trade(id=tid, symbol=play.symbol, entry_price=price, quantity=qty, broker=venue)
         self.t[tid]["entry_context"], self.t[tid]["submitted_at"] = entry_context, submitted_at
         self.t[tid]["decision"] = decision
+        self.paid.append((tid, "ENTRY", order_id, commission))
         return tid
 
-    def close_trade(self, tid, exit_price, exit_reason="", decision_price=None, submitted_at=None):
+    def close_trade(self, tid, exit_price, exit_reason="", decision_price=None, submitted_at=None, commission=0.0,
+                    broker_order_id=""):
         self.t[tid].update(status="CLOSED", exit_price=exit_price, exit_reason=exit_reason,
                            exit_decision_price=decision_price, exit_submitted_at=submitted_at)
+        self.paid.append((tid, "EXIT", broker_order_id, commission))
         return dict(self.t[tid])
 
     def reduce_trade(self, tid, exit_qty, exit_price, exit_reason="", commission=0.0, stop_price=None,
-                     target_price=None):
+                     target_price=None, broker_order_id=""):
+        self.paid.append((tid, "EXIT", broker_order_id, commission))
         t = self.t[tid]
         t["quantity"] -= exit_qty
         t["banked_pl"] = t.get("banked_pl", 0.0) + (exit_price - t["entry_price"]) * exit_qty
@@ -393,6 +398,53 @@ def test_a_partial_exit_reduces_the_record_when_it_fills():
     assert (t["stop_price"], t["target_price"]) == (100.05, 120.0) and not ex.pending_exit_trade_ids()
 
 
+def test_an_exit_that_filled_in_part_and_died_books_that_part_and_the_next_exit_sells_the_rest():
+    heard = []
+    broker, repo = _Broker({"AAA": 10}), _Repo([_trade()])                 # 10 shares entered at 100
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    assert ex.close_trade("t1", reason="stop", decision_price=97.9)["ok"]
+    broker.reports["1"] = OrderResult(order_id="1", status="CANCELED", symbol="AAA", submitted_qty=10, filled_qty=4,
+                                      avg_fill_price=97.5, commission=0.4, message="cancelled by the exchange")
+    ex.sync_open_orders()
+    t = repo.get_trade("t1")                                               # the part it sold, at its own price
+    assert (t["status"], t["quantity"], t["banked_pl"]) == ("OPEN", 6, pytest.approx(4 * -2.5))
+    assert ("t1", "EXIT", "1", 0.4) in repo.paid and not ex.pending_exit_trade_ids()
+    [failed] = [p for topic, p in heard if topic == "order.failed"]
+    assert failed["filled_qty"] == 4 and "after 4 of 10 shares filled" in failed["msg"]
+
+    broker.positions["AAA"] = 6
+    assert ex.close_trade("t1", reason="stop")["ok"] and broker.orders[-1].quantity == 6   # the try again: the rest
+    broker.reports["2"] = OrderResult(order_id="2", status="FILLED", symbol="AAA", submitted_qty=6, filled_qty=6,
+                                      avg_fill_price=97.0)
+    ex.sync_open_orders()
+    assert (repo.get_trade("t1")["status"], repo.get_trade("t1")["exit_price"]) == ("CLOSED", 97.0)
+
+
+def test_a_scale_out_that_filled_in_part_and_died_gives_the_rest_its_new_stop_and_target():
+    repo = _Repo([_trade(quantity=10, initial_quantity=10, target2_price=120.0)])
+    broker = _Broker(positions={"AAA": 10})
+    ex = _executor(broker, repo)
+    ex.close_trade("t1", reason="target-1", qty=4, after_fill={"stop_price": 100.05, "target_price": 120.0})
+    broker.reports["1"] = OrderResult(order_id="1", status="EXPIRED", symbol="AAA", submitted_qty=4, filled_qty=1,
+                                      avg_fill_price=110.0)
+    ex.sync_open_orders()
+    t = repo.get_trade("t1")
+    assert (t["quantity"], t["banked_pl"], t["stop_price"], t["target_price"]) == (9, 10.0, 100.05, 120.0)
+
+
+def test_an_exit_capped_by_the_shares_held_books_only_what_it_sells_and_leaves_the_rest_on_the_record(caplog):
+    broker, repo = _Broker({"AAA": 4}), _Repo([_trade()])                 # the record says 10: 6 went unbooked
+    ex = _executor(broker, repo)
+    with caplog.at_level(logging.WARNING, logger="autotradebot.execution.executor"):
+        assert ex.close_trade("t1", reason="stop")["ok"]
+    assert broker.orders[-1].quantity == 4 and "only 4 of the 10 shares on record" in caplog.text
+    broker.reports["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=4, filled_qty=4,
+                                      avg_fill_price=97.0)
+    ex.sync_open_orders()
+    t = repo.get_trade("t1")                                               # never the whole record at that price
+    assert (t["status"], t["quantity"], t["banked_pl"]) == ("OPEN", 6, pytest.approx(4 * -3.0))
+
+
 def test_how_long_each_order_took_to_fill_is_kept(repo):
     """Entry and exit both: from the order going out to the fill coming back. A stop or target
     resting at the broker has none - it waits for the price, not for the broker."""
@@ -616,7 +668,7 @@ def test_an_entry_the_broker_loses_track_of_is_not_given_up_while_its_executions
     broker.reports["1"] = OrderResult(order_id="1", status="UNKNOWN", symbol="?", submitted_qty=0)
     readable = []
 
-    def get_fills(symbol=None, strict=False):                          # IBKR's, asked strictly
+    def get_fills(symbol=None):                                        # IBKR's: raises when it can't say
         if not readable:
             raise BrokerError("IBKR's executions for AAA couldn't be read: no answer in time")
         return [Fill(order_id="1", symbol="AAA", side=Side.LONG, quantity=10, price=100.01, tag=play.id)]
@@ -645,6 +697,34 @@ def test_an_entry_reported_filled_without_a_price_is_booked_at_its_executions_pr
     broker.get_fills = lambda symbol=None: [f for f in executions if symbol in (None, f.symbol)]
     ex.sync_open_orders()
     assert sorted((t["symbol"], t["entry_price"]) for t in repo.open_trades()) == [("AAA", 99.98), ("BBB", 100.0)]
+
+
+def test_an_exit_reported_filled_without_a_price_is_booked_at_its_executions_price_never_at_zero():
+    from autotradebot.core.models import Fill
+
+    broker, repo = _Broker({"AAA": 10, "BBB": 10}), _Repo([_trade(), _trade(id="t2", symbol="BBB")])
+    ex = _executor(broker, repo)
+    for tid in ("t1", "t2"):                            # sent by hand - or decided on delayed quotes: no deciding price
+        assert ex.close_trade(tid, reason="manual")["ok"]
+    for oid, symbol in (("1", "AAA"), ("2", "BBB")):   # rebuilt after a reconnect, no price on it
+        broker.reports[oid] = OrderResult(order_id=oid, status="FILLED", symbol=symbol, submitted_qty=10, filled_qty=10)
+    readable = []
+
+    def get_fills(symbol=None):                                        # IBKR's: raises when it can't say
+        if not readable:
+            raise BrokerError("IBKR's executions couldn't be read: no answer in time")
+        return [f for f in [Fill(order_id="1", symbol="AAA", side=Side.SHORT, quantity=10, price=97.5, tag="exit:t1")]
+                if symbol in (None, f.symbol)]
+
+    broker.get_fills = get_fills
+    ex.sync_open_orders()
+    assert [t["status"] for t in repo.t.values()] == ["OPEN", "OPEN"]      # not known: neither booked...
+    assert ex.pending_exit_trade_ids() == {"t1", "t2"}                     # ...and both followed on
+    readable.append(True)
+    ex.sync_open_orders()
+    assert (repo.t["t1"]["status"], repo.t["t1"]["exit_price"]) == ("CLOSED", 97.5)
+    # none in its executions: its record keeps its shares for the position check to book
+    assert repo.t["t2"]["status"] == "OPEN" and ex.pending_exit_trade_ids() == set()
 
 
 # ---------------------------------------------------------------- the dashboard's countdowns on a working entry
@@ -739,7 +819,7 @@ class _Unanswered(_Broker):
             raise TimeoutError()
         raise OrderOutcomeUnknown("IBKR didn't answer the order within 10 s", order_ref=req.client_tag)
 
-    def get_fills(self, symbol=None, strict=False):
+    def get_fills(self, symbol=None):
         return [f for f in self.fills if symbol is None or f.symbol == symbol]
 
 
@@ -902,6 +982,20 @@ def test_an_exit_the_broker_didnt_answer_that_filled_is_booked_from_its_own_exec
     assert ex.pending_exit_trade_ids() == set() and len(broker.orders) == 1
 
 
+def test_an_exit_the_broker_didnt_answer_that_filled_in_part_is_booked_for_that_part():
+    import datetime as dt
+
+    broker, repo = _Unanswered({"AAA": 10}, lands=""), _Repo([_trade()])
+    ex = _executor(broker, repo)
+    assert ex.close_trade("t1", reason="stop")["sent_unknown"]
+    broker.fills.append(Fill(order_id="1", symbol="AAA", side=Side.SHORT, quantity=3, price=97.0,
+                             ts=dt.datetime.now(dt.timezone.utc), commission=0.3, tag="exit:t1"))
+    ex.sync_open_orders()
+    t = repo.get_trade("t1")                                               # 3 of the 10 sold, then it ended
+    assert (t["status"], t["quantity"], t["banked_pl"]) == ("OPEN", 7, pytest.approx(3 * -3.0))
+    assert ("t1", "EXIT", "1", 0.3) in repo.paid and ex.pending_exit_trade_ids() == set()
+
+
 def test_an_exit_the_broker_shows_neither_working_nor_filled_goes_out_again_once_looked_for(monkeypatch):
     from autotradebot.execution import executor as executor_module
 
@@ -956,6 +1050,22 @@ def test_an_exit_fill_whose_booking_fails_is_booked_on_the_next_sync_and_no_seco
     assert ex.pending_exit_trade_ids() == set() and len(calls) == 2 and len(broker.orders) == 1
     topics = [topic for topic, _ in heard]
     assert topics.count("order.unbooked") == 1 and topics.count("trade.closed") == 1
+
+
+def test_the_part_of_a_dead_exit_whose_booking_fails_is_booked_once_on_the_next_sync():
+    heard = []
+    broker, repo = _Broker({"AAA": 10}), _Repo([_trade()])
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    calls = _refuses_once(repo, "reduce_trade")
+    assert ex.close_trade("t1", reason="stop")["ok"]
+    broker.reports["1"] = OrderResult(order_id="1", status="CANCELED", symbol="AAA", submitted_qty=10, filled_qty=4,
+                                      avg_fill_price=97.5)
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["quantity"] == 10 and ex.pending_exit_trade_ids() == {"t1"}   # still followed
+    assert not ex.close_trade("t1", reason="stop")["ok"] and len(broker.orders) == 1        # no second exit meanwhile
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["quantity"] == 6 and len(calls) == 2 and ex.pending_exit_trade_ids() == set()
+    assert [topic for topic, _ in heard].count("order.failed") == 1                       # said once, once booked
 
 
 def test_an_entry_fill_whose_booking_fails_keeps_counting_as_working_and_is_booked_once_on_the_next_sync():
@@ -1241,6 +1351,17 @@ def test_the_order_audit_keeps_the_brokers_order_id_status_and_message_for_each_
         == [("1", "SUBMITTED", "held until the open"), ("2", "SUBMITTED", "held until the open")]
 
 
+def test_an_exits_audit_row_keeps_why_it_was_sent_answered_or_not():
+    # what a record whose position is gone is closed as, when its fills show this exit sold the shares (_settle_gone)
+    broker, repo = _Broker({"AAA": 10}), _AuditedRepo([_trade()])
+    assert _executor(broker, repo).close_trade("t1", reason="quit")["ok"]
+    unanswered, unheard = _Unanswered({"AAA": 10}, lands=""), _AuditedRepo([_trade()])
+    assert _executor(unanswered, unheard).close_trade("t1", reason="quit")["sent_unknown"]
+    [sent], [lost] = repo.rows("PLACE"), unheard.rows("PLACE")
+    assert (sent["request"]["tag"], sent["request"]["reason"], sent["response"]["order_id"]) == ("exit:t1", "quit", "1")
+    assert (lost["request"]["tag"], lost["request"]["reason"], lost["ok"]) == ("exit:t1", "quit", False)
+
+
 def test_every_cancel_the_app_asks_for_is_audited_with_why_and_one_the_broker_refused_as_failed():
     import datetime as dt
 
@@ -1264,3 +1385,101 @@ def test_every_cancel_the_app_asks_for_is_audited_with_why_and_one_the_broker_re
     # the broker's words are kept, the account number isn't
     assert called_off["message"] == "called off by the pairs desk: account <account>: order 2 can't be cancelled now"
     assert "DU1234567" not in str(repo.audit)
+
+
+# ---------------------------------------------------------------- fees
+def test_an_orders_fees_are_booked_with_its_fill_and_the_order_that_paid_them():
+    broker, repo = _Broker({"AAA": 10}), _Repo([])
+    ex = _executor(broker, repo)
+    _entry(ex)
+    # the entry's fees are on its fills only; the exit's the broker gives for the whole order
+    broker.reports["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                      avg_fill_price=100.0,
+                                      fills=[Fill(order_id="1", symbol="AAA", side=Side.LONG, quantity=6, price=100.0,
+                                                  commission=0.6),
+                                             Fill(order_id="1", symbol="AAA", side=Side.LONG, quantity=4, price=100.0,
+                                                  commission=0.4)])
+    ex.sync_open_orders()
+    [tid] = [t["id"] for t in repo.open_trades()]
+    assert ex.close_trade(tid)["ok"]
+    broker.reports["2"] = OrderResult(order_id="2", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                      avg_fill_price=101.0, commission=1.25)
+    ex.sync_open_orders()
+    assert repo.paid == [(tid, "ENTRY", "1", pytest.approx(1.0)), (tid, "EXIT", "2", 1.25)]
+
+
+class _Reporting(_Broker):
+    """An IBKR account whose executions carry the commission reports in ``reported`` - none yet, to begin with."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.reported, self.asked, self.waits = [], 0, []
+
+    def get_fills(self, symbol=None, timeout=15.0):                         # IbkrBroker's, with its wait
+        self.asked += 1
+        self.waits.append(timeout)
+        return list(self.reported)
+
+
+def _booked_round_trip(repo, symbol, entry_id, exit_id, entry_fee=0.0):
+    play = Play(symbol=symbol, side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                timeframe=Timeframe.INTRADAY, entry=100.0, stop=98.0, targets=[104.0])
+    repo.record_play(play)
+    tid = repo.open_trade(play, 100.0, 10, VENUE, entry_id, commission=entry_fee)
+    repo.close_trade(tid, 104.0, exit_reason="target", broker_order_id=exit_id)
+    return tid
+
+
+def test_the_fees_ibkr_reports_after_the_fills_were_booked_are_added_to_the_days_records(repo):
+    tid = _booked_round_trip(repo, "FEE1", "501", "502", entry_fee=0.6)      # the entry's first report only
+    assert repo.get_trade(tid)["realized_pl"] == pytest.approx(39.4)
+    broker = _Reporting()
+    ex = _executor(broker, repo)
+
+    def entry(qty, fee):
+        return Fill(order_id="501", symbol="FEE1", side=Side.LONG, quantity=qty, price=100.0, commission=fee)
+
+    broker.reported = [entry(6, 0.6), entry(4, 0.0),
+                       Fill(order_id="502", symbol="FEE1", side=Side.SHORT, quantity=10, price=104.0)]
+    assert ex._top_up_fees(now=1000.0) == [] and broker.asked == 1           # nothing more reported yet
+    broker.reported = [entry(6, 0.6), entry(4, 0.4),
+                       Fill(order_id="502", symbol="FEE1", side=Side.SHORT, quantity=10, price=104.0, commission=1.0)]
+    assert ex._top_up_fees(now=1030.0) == [] and broker.asked == 1           # looked at again only a minute on
+    assert set(ex._top_up_fees(now=1060.0)) == {tid}
+    t = repo.get_trade(tid)
+    assert (t["fees"], t["realized_pl"], t["r_multiple"]) == (pytest.approx(2.0), pytest.approx(38.0),
+                                                              pytest.approx(1.9))
+    ex._top_up_fees(now=1120.0)
+    assert repo.get_trade(tid)["realized_pl"] == pytest.approx(38.0)        # once
+
+
+def test_a_fills_fee_is_settled_a_while_after_its_booking_and_the_simulator_is_never_asked(repo):
+    from autotradebot.util import clock
+
+    tid = _booked_round_trip(repo, "FEE2", "601", "602")
+    broker = _Reporting()
+    broker.reported = [Fill(order_id="601", symbol="FEE2", side=Side.LONG, quantity=10, price=100.0)]
+    ex = _executor(broker, repo)
+    ex.FEES_WAIT_S = 0.0                                                       # (fifteen minutes on, in the app)
+    assert ex._top_up_fees(now=1000.0) == [] and broker.asked == 1           # an account charged nothing
+    mine = {r["fill_id"] for r in repo.fills_on(VENUE, clock.now_ny().date()) if r["trade_id"] == tid}
+    assert len(mine) == 2 and mine <= ex._fees_settled
+    ex._top_up_fees(now=1060.0)
+    assert broker.asked == 1                                                   # every fill of the day settled
+    simulator = _Reporting()
+    Executor(simulator, repo, cfg=get_settings().config.execution, bus=SILENT, venue="paper")._top_up_fees(now=1000.0)
+    assert simulator.asked == 0
+
+
+def test_the_fee_look_waits_moments_for_ibkr_and_none_is_made_while_it_reloads_after_a_connect(repo):
+    import time
+
+    _booked_round_trip(repo, "FEE3", "701", "702")
+    broker = _Reporting()
+    ex = _executor(broker, repo)
+    broker.connected_since = time.monotonic()                                  # it has only just (re)connected
+    assert ex._top_up_fees(now=1000.0) == [] and broker.asked == 0
+    broker.connected_since = time.monotonic() - ex.RESYNC_GRACE_S - 1.0
+    ex._top_up_fees(now=1000.0)
+    # the look runs in the order sync, under the executor's lock: a Gateway slow to answer holds the exits up moments
+    assert broker.waits == [ex.FEES_READ_TIMEOUT_S] and ex.FEES_READ_TIMEOUT_S <= 5.0

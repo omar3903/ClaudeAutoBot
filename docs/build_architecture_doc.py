@@ -1180,6 +1180,9 @@ def build() -> str:
     A('<p><code>persistence/db.py</code> builds one SQLAlchemy engine. With no <code>DATABASE_URL</code> in '
       '<code>.env</code> it tries the MySQL URL built from the <code>DB_*</code> settings and, when that is not '
       'reachable, falls back to <b>SQLite at <code>data/autotradebot.sqlite</code></b> - which is what runs today. '
+      'On SQLite every connection waits up to 30 s for another writer (<code>PRAGMA busy_timeout</code>; the '
+      'journal mode is left as it is), and the trade writes - <code>open_trade</code>, <code>close_trade</code>, '
+      '<code>reduce_trade</code>, <code>update_trade_risk</code> - are tried twice more when it is still locked. '
       '<code>create_all()</code> creates the tables and <code>_add_missing_columns()</code> adds any column the '
       'ORM has and the table lacks, so a new field never needs a manual migration. Every '
       '<code>Repository</code> method opens its own short session (<code>session_scope()</code>) and returns '
@@ -1194,7 +1197,7 @@ def build() -> str:
          "repo.record_scan / record_play / set_play_status / settle_play / note_refusal"),
         ("trades", "one position from entry to exit, including partial exits (banked_pl), the R multiple, the "
          "play's features at the decision (entry_context) and what the fills cost: decision_price, spread_bps, "
-         "entry_slippage_bps, exit_decision_price, exit_slippage_bps",
+         "entry_slippage_bps, exit_decision_price, exit_slippage_bps (slippage only against a live quote)",
          "repo.open_trade / reduce_trade / close_trade"),
         ("fills", "each broker fill, entry or exit leg, with commission", "executor via the repository"),
         ("account_snapshots", "equity, cash, buying power every snapshot-loop pass", "engine snapshot loop"),
@@ -1483,8 +1486,10 @@ def build() -> str:
          "it); the ids that can come back persist as counted_today; at most twice the cap in orders a day"),
         ("execution/exit_manager.py", "stop_locked(), intraday_time_stop", "a day trade past its setup's window whose "
          "stop isn't at break-even is closed (time-stop); the replay's _step does the same"),
-        ("engine/engine.py", "_settle_short()", "a record over the broker's count because an app exit filled in part "
-         "before it was called off: booked from the fills tagged exit:<trade>, capped at the difference"),
+        ("engine/engine.py", "_settle_short()", "a record over the broker's count because one of its own orders sold "
+         "shares it never booked (an exit called off part-filled; its stop or target filling while the app wasn't "
+         "following it): booked from the fills tagged exit:/stop:/tgt:<trade>, each order at its own price and "
+         "reason, past what the record booked, capped at the difference"),
         ("execution/protective_stops.py", "_watch_unprotected(), unprotected()", "a position with no stop at the broker "
          "for 90 s is reported with the reason, and again every 5 minutes; it places nothing"),
         ("engine/engine.py", "_replay_after_full_scan()", "the morning full scan finishing starts the day's replay "

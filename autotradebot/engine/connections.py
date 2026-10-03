@@ -84,10 +84,8 @@ class Unreachable(BrokerAdapter):
     def list_orders(self, status: Optional[str] = None) -> List[OrderResult]:
         raise AuthError(self.refusal)
 
-    def get_fills(self, symbol: Optional[str] = None, strict: bool = False) -> List[Fill]:
-        if strict:
-            raise AuthError(self.refusal)
-        return []
+    def get_fills(self, symbol: Optional[str] = None) -> List[Fill]:
+        raise AuthError(self.refusal)
 
 
 class Connections:

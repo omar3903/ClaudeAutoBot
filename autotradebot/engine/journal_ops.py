@@ -120,7 +120,8 @@ class JournalOps:
             settings=ReplaySettings.from_exit_rules(cfg.exit_manager, cfg.replay, cfg.risk.min_reward_risk),
             gates=gates, passes=lambda row: self._passes_checks(row, gates),
             styles={k: c.style for k, c in REGISTRY.items()}, titles={k: c.title for k, c in REGISTRY.items()},
-            breakeven_at_r=float(cfg.exit_manager.breakeven_at_r), opened=opened, marks=self._review_marks(day, opened))
+            breakeven_at_r=float(cfg.exit_manager.breakeven_at_r), opened=opened, marks=self._review_marks(day, opened),
+            fees_since=self.repo.first_fee_day())
         if pair_trades:
             review["pairs"] = [{k: r.get(k) for k in ("id", "pair", "side", "opened_at", "closed_at", "entry_z",
                                                    "exit_z_at", "exit_reason", "realized_pl", "r_multiple", "by")}
