@@ -144,7 +144,17 @@ Settings so it's done before the bell):
    stock type (common stock, ADR, REIT…) and IBKR's industry, which maps onto the
    11 sectors. Kept in `data/symbols.json`, so only new listings cost a request.
 3. **Daily candles.** Each stock's daily candles live on disk (`data/bars/`); a
-   stock is downloaded in full once, then only the sessions it's missing.
+   stock is downloaded in full once, then only the sessions it's missing. The
+   ranking lets a stock miss one session, and a download can fail: during the
+   session such a stock's candle for yesterday is built from its 5-minute bars,
+   so its gap, its prior close and its intraday heat start from yesterday's
+   close and never an older one. When the 5-minute bars don't hold yesterday
+   either, its day-trade setups are skipped; the swing setups still run (the
+   first such stock each session is logged at INFO). Yesterday is the last
+   session the stock's 5-minute bars or the S&P 500 ETF's candles hold, so a
+   weekday the market was shut that the holiday calendar doesn't list isn't
+   taken for a missed session; the calendar decides only when no candles reach
+   today.
 4. **Daily heat** — no requests: relative volume in the last session, the size of
    its move against its ATR, a close near a 20-day high or low, volatility and
    dollar volume, each turned into a percentile across every **liquid** stock
@@ -177,6 +187,9 @@ buffer name looked at is:
 - **kept** — among the two best seen so far in its sector, waiting for a slot;
 - **dropped** — of less use than what's already hot or kept.
 
+A hot-list stock whose candles didn't come this cycle keeps the heat it had, so
+a missed request doesn't make it the coolest and cost it its slot.
+
 So each sector's buffer is worked through over the day for a handful of requests
 per cycle — about 60 every 15 minutes. While **Autopilot** is day-trading an
 open session, the hot list alone is also rescanned every minute.
@@ -191,7 +204,11 @@ the board within the half hour. Its intraday heat refreshes the hot list: a
 stock hotter than the coolest hot-list name by 10 % takes its slot (within the
 cap of a third per sector), and the best of the rest per sector are kept
 waiting. It takes two to three minutes of Gateway time and the 5-minute cycle
-waits for it. (The Gateway takes about half a second over a candle request
+waits for it. Between its chunks it steps aside for a candle-close check that
+has come due and for the 15-second re-check of the plays, each followed by
+Autopilot's pass, so neither waits out the sweep; a stock such a check read
+after the sweep did keeps the check's plays, which are on the newer candle.
+(The Gateway takes about half a second over a candle request
 whether it asks for an hour or a week, so the rate is set by how many are in
 flight: twelve at once read about 17 stocks a second, none refused in a test of
 700; thirty-two timed out.) The plays it finds stay on the board and are
@@ -225,8 +242,8 @@ next buffer names.
 
 Also in `config.yaml`: `gapper_symbols` (400), `gapper_min_gap_pct` (2), `gapper_min_volume`
 (50,000), `buffer_picks_per_sector` (2), `kept_per_sector` (2),
-`fast_cycle_seconds` (60), `close_check` (true) and `mover_atr` (1.0) (see
-**Candle-close check**), `live_scan` (10; see **Live scans**),
+`fast_cycle_seconds` (60), `close_check` (true), `close_grace_s` (8) and
+`mover_atr` (1.0) (see **Candle-close check**), `live_scan` (10; see **Live scans**),
 `fundamentals_leaders` (8), the liquidity `prefilter`,
 and `max_universe` (0 = every listing; `SCANNER_MAX_UNIVERSE` caps it without
 editing the file).
@@ -334,19 +351,26 @@ speed and show only: the setups, confirmations and the replay still run on
 IBKR's own 5-minute candles.
 
 **Candle-close check.** At every 5-minute close in regular hours (09:35 to
-15:55) the watch tier's setups are checked on IBKR's just-closed bars about 2
-seconds after the close - one request per stock for the last hour of bars - so
-a setup is typically published 5-8 seconds after its candle closes instead of
-up to a couple of minutes later. The check stands in for the fast cycle due
-then. Between closes, a watch stock whose streamed 1-minute candle spans at
-least `scanner.mover_atr` (1.0; 0 = off) of its 5-minute ATRs, or makes a new
+15:55) the watch tier's setups are checked on IBKR's just-closed bars
+`scanner.close_grace_s` (8; 0-30) seconds after the close - one request per
+stock for the last hour of bars - so a setup is typically published within a
+few seconds of that instead of up to a couple of minutes later. IBKR prints a
+stock's new bar a few seconds after the close, and a check much sooner finds
+few of them; the stocks whose new bar isn't in yet are asked once more about
+15 seconds after the check read (IBKR refuses the same request within 15 s),
+and any still missing then wait for the fast cycle or the next close. A check
+that read at least half its stocks stands in for the fast cycle due then; one
+that read fewer leaves the fast cycle to its second ask. Between closes, a
+watch stock whose streamed 1-minute candle spans at least
+`scanner.mover_atr` (1.0; 0 = off) of its 5-minute ATRs, or makes a new
 high or low of the day on 3x its average minute volume, gets an early-mover
 check at once (at most once per 5 minutes). An early-mover check can't add a
 candle confirmation - its 5-minute candle hasn't closed - so it catches
 price-level setups and refreshes the stock's plays. `scanner.close_check:
 false` turns both off (the fast cycle as before). The log says `close check
-10:05 ET: ... published 5.4 s after the candle closed` or `early-mover check
-10:07 ET (...)` for each one, and once a session `live candles vs IBKR
+10:05 ET: ... published 9.4 s after the candle closed` (`close check 10:05 ET
+(second ask): ...` for the second ask) or `early-mover check 10:07 ET (...)`
+for each one, and once a session `live candles vs IBKR
 5-minute bars` with the volume ratio that tells whether the stream counts
 shares or lots of 100.
 
@@ -355,7 +379,8 @@ live market scans - the biggest % gainers, the biggest % losers and the
 stocks hottest by volume (US stocks and ADRs at $3-600), one open at a time
 and each cancelled once it answers. The first `scanner.live_scan` (10; 0 =
 off) of their names that are ordinary shares in the sectors the filters
-allow, with daily candles and not on the hot list already, take watch-tier
+allow, with daily candles through yesterday (or 5-minute candles in hand that
+hold yesterday's session) and not on the hot list already, take watch-tier
 slots right after the hot list - so a stock that was quiet until today is
 streamed and checked at each close like the rest. Liquidity is judged on
 today's volume: after a candle-close check, a live name whose dollar volume
@@ -1063,7 +1088,8 @@ lists what is skipped now, and each trade keeps that list.
 the regular session is open, the hot list is rescanned every
 `scanner.fast_cycle_seconds` (60) between the regular cycles. The header button
 shows it (`Autopilot: day ⚡60s`). At each 5-minute close the candle-close check
-(see **Candle-close check**) takes the place of the fast cycle due then.
+(see **Candle-close check**) takes the place of the fast cycle due then, once it
+has read at least half the watch stocks.
 
 ---
 
@@ -1157,13 +1183,17 @@ A background service (`autotradebot/signals/`) watches what happens off the pric
 * **Connections** — paper platform, IB Gateway settings, **Test paper / Test
   live**, **Reconnect**.
 * **Settings** — the scan schedule and list sizes, the scan status, **Run full
-  scan now** and **Rescan hot list now**.
+  scan now** and **Rescan hot list now**. A setup that raised an error in a scan is
+  named in its status line with how many stocks it failed on (it found nothing on
+  them); its first failure each day is logged as a warning with the traceback, the
+  rest at DEBUG.
 * **Signals** — insider trades and company news, their sources and what they do to plays (see [Signals](#signals--insider-trades-and-company-news)).
 * **Reports** — each session's report (see [Reports](#reports--every-session-the-market-and-the-bot));
   a dot marks one you haven't opened.
 * **Scan now** — rescan the hot list and the next buffer names. The plays header
-  shows the last scan, a progress bar while one runs, when the next full
-  scan is due, and "replay running" while a replay runs in the background.
+  shows the last scan (and any setup that failed in it), a progress bar while one
+  runs, when the next full scan is due, and "replay running" while a replay runs in
+  the background.
 * **Long / Short / Intraday / Swing** and **Sectors** — what the bot scans for
   and may trade.
 * **Strategies** — switch setups on or off and weight them.
