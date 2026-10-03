@@ -13,6 +13,7 @@ Everything else imports from here, never from ``os.environ``.
 
 from __future__ import annotations
 
+import datetime as dt
 import functools
 import os
 from pathlib import Path
@@ -149,6 +150,8 @@ class ScannerCfg(_Model):
     gapper_symbols: int = 400             # at most this many hot-list and buffer names get a pre-market request
     gapper_min_gap_pct: float = 2.0       # a pre-market move this big, either way, counts as a gap
     gapper_min_volume: float = 50_000     # ...on at least this many pre-market shares
+    gateway_alert_time: str = "07:45"     # ET - on a trading day, IB Gateway still not connected by then is said once
+                                          # on the dashboard and in the log, before the full scan needs it ("" = off)
     max_universe: int = 0                 # 0 = every listing (smoke tests cap it)
     sectors: list = Field(default_factory=list)
     prefilter: Dict[str, Any] = Field(default_factory=dict)
@@ -170,6 +173,15 @@ class ScannerCfg(_Model):
     def _within_the_live_slots(cls, value: int) -> int:
         """The live-scan names take watch-tier slots, which the hot list and the buffers need too."""
         return max(0, min(20, value))
+
+    @field_validator("gateway_alert_time", mode="after")
+    @classmethod
+    def _a_time_of_day_or_off(cls, value: str) -> str:
+        """A time like 07:45 - one that doesn't read as one is refused, never taken for off - or "" for off."""
+        value = (value or "").strip()
+        if value:
+            dt.time.fromisoformat(value)              # a ValueError here is the config's error, with the field named
+        return value
 
 
 class ValuationCfg(_Model):
@@ -232,18 +244,25 @@ class ExecutionCfg(_Model):
 
 class ExitManagerCfg(_Model):
     enabled: bool = True
+    broker_stop_grace_s: float = 10.0     # a stop cross while the trade's stop rests at the broker: that stop gets this
+                                          # many seconds to fill before the app stands it down and sends its own exit
+                                          # - the broker fills it on real prices, a cancel and a market order cost a
+                                          # round trip and a worse fill (0 = the app's exit at once)
     breakeven_at_r: float = 1.3           # tighten the stop once the trade is +this R  (0 = off)
     breakeven_lock_r: float = 0.3         # ...to lock +this R of profit, not a pure scratch
     breakeven_buffer_bps: float = 5.0
     trail_start_r: float = 2.0            # begin trailing past this R  (0 = off)
     trail_lock_ratio: float = 0.5
-    flatten_intraday_before_close_min: int = 10
+    flatten_intraday_before_close_min: int = 10   # day trades go this many min before the close - and one left
+                                          # open from an earlier session at the next regular-session pass
     intraday_time_stop: bool = True       # a day trade past its setup's own window (the play's longest expected
                                           # hold) that isn't working - its stop not yet at break-even - is closed
                                           # then, not left to the close: its reason to be held has run out, and it
                                           # holds a slot and capital a fresh setup could use. One that is working
                                           # keeps its trailing stop until the flatten. The replay does the same
-    max_swing_hold_days: int = 10
+    max_swing_hold_days: int = 10         # a swing trade is closed once held this many trading days, its entry's
+                                          # counted: at the day trades' flatten on the last one, where the replay
+                                          # closes it at that day's close (0 = off)
     scale_out_pct: float = 50.0           # at the first target of a play with two, take this % off (0 = exit all there)
     scale_out_lock_r: float = 0.0         # ...and move the stop to the entry plus this R (Aziz: break-even)
 

@@ -231,14 +231,15 @@ function openRow(t, here) {
   const status = t.time_status || "on_track";
   const barCls = status === "overdue" ? "bad" : status === "aging" ? "warn" : "ok";
   // when the setup usually exits, when it is due a look, and - for a swing trade - the day the time stop closes it
+  // (time_stop_at, Engine.open_positions: counted in trading days on the server, which knows the holidays)
   const swing = t.timeframe === "SWING", when = swing ? fmtDay : fmtClock;
   const maxDays = (S.state.exit_manager || {}).max_swing_hold_days;
-  const last = swing && maxDays && t.entry_time ? new Date(new Date(/[zZ]|[+-]\d\d:\d\d$/.test(t.entry_time) ? t.entry_time : t.entry_time + "Z").getTime() + maxDays * 864e5) : null;
-  const usual = t.expected_exit_at ? new Date(/[zZ]|[+-]\d\d:\d\d$/.test(t.expected_exit_at) ? t.expected_exit_at : t.expected_exit_at + "Z") : null;
+  const last = swing && t.time_stop_at ? parseDate(t.time_stop_at) : null;
+  const usual = t.expected_exit_at ? parseDate(t.expected_exit_at) : null;
   const byTimeStop = !!(last && usual && last < usual);           // the time stop comes before the setup's usual exit
   const expectTitle = [t.expected_exit_at ? `This setup usually exits by ${when(t.expected_exit_at)}` : "",
     t.overwatch_at ? `it is flagged for a look after ${when(t.overwatch_at)}` : "",
-    last ? `the time stop closes it on ${fmtDay(last.toISOString())} at the latest (${maxDays} days)` : (swing ? "" : "day trades are flat before the close")]
+    last ? `the time stop closes it on ${fmtDay(last.toISOString())} (its ${maxDays}-session limit, the entry's day counted)` : (swing ? "" : "day trades are flat before the close")]
     .filter(Boolean).join("; ");
   const timeCell = `<div class="timecell" title="${escapeHtml(expectTitle)}">
     <span>${t.held_label || "–"}</span>
@@ -485,6 +486,7 @@ function orderSummary(req) {
   const parts = [req.side, req.qty, req.symbol, req.type].filter(v => v != null && v !== "");
   if (req.limit != null) parts.push(`@ ${num(req.limit)}`);
   if (req.stop != null) parts.push(`stop ${num(req.stop)}`);
+  if (req.order_id) parts.push(`order ${req.order_id}`);   // a cancel, a stop move or a broker's error names its order
   return parts.join(" ");
 }
 

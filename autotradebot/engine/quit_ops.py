@@ -75,6 +75,10 @@ class QuitOps:
                 kept, held = {t["id"] for t in self._positions_here()}, []
             if self.mode == "live" and held and not close_all:
                 return {"ok": False, "reason": "Quit cancelled - your live positions stay open and managed."}
+            # the sync loop checks the quit's progress as soon as it is set: with no retry time set yet it would send a
+            # second round of closes beside this one - while the working entries are cancelled, too. (Set again once
+            # the closes are out: the wait counts from then)
+            self._quit_retry_at = time.monotonic() + self.QUIT_RETRY_S
             self.quit_state = {"started_at": dt.datetime.now(dt.timezone.utc).isoformat(), "mode": self.mode,
                                "venue": self._venue, "by": operator, "reset_sim": self._venue == "paper",
                                "keeping": sorted(kept)}
@@ -88,7 +92,10 @@ class QuitOps:
             self._quit_retry_at = time.monotonic() + self.QUIT_RETRY_S
         self._check_quit_progress()
         failed = [r for r in results if not r["ok"]]
-        if not held:
+        unbooked = self._unbooked_left()
+        if not held and unbooked:
+            note = self._unbooked_note(unbooked) + " The app shuts down once it's out."
+        elif not held:
             note = (f"Keeping {len(kept)} swing position(s) open with their stops at the broker - shutting down."
                     if kept else "No open positions - shutting down.")
         elif failed:
@@ -123,14 +130,33 @@ class QuitOps:
     def _quit_status(self) -> Optional[Dict[str, Any]]:
         if not self.quit_state:
             return None
-        left = self._to_close()
-        return {**self.quit_state, "left": len(left), "symbols": sorted({t["symbol"] for t in left}),
-                "waiting": self._exits_cant_fill() if left else None}
+        left, unbooked = self._to_close(), self._unbooked_left()
+        waiting = self._exits_cant_fill() if left else None
+        if unbooked:
+            said = self._unbooked_note(unbooked)
+            waiting = f"{waiting} {said}" if waiting else said
+        return {**self.quit_state, "left": len(left) + len(unbooked),
+                "symbols": sorted({t["symbol"] for t in left} | {w["symbol"] for w in unbooked}), "waiting": waiting}
 
     def _to_close(self) -> List[Dict[str, Any]]:
         """The positions a quit in progress still has to get out of - not the ones it keeps."""
         keeping = set((self.quit_state or {}).get("keeping") or ())
         return [t for t in self._positions_here() if t["id"] not in keeping]
+
+    def _unbooked_left(self) -> List[Dict[str, Any]]:
+        """The entries that filled whose booking the database has refused so far (the executor keeps them followed
+        through the quit's cancels): their shares are held, with no record and no stop yet, so the quit waits for the
+        record and closes it like any other - shut down first, the app would leave those shares behind with nothing
+        to protect them. Not on the simulator, whose reset at the end wipes them."""
+        if not self.quit_state or self.quit_state.get("reset_sim"):
+            return []
+        return [w for w in self.working_entries() if w.get("unbooked")]
+
+    @staticmethod
+    def _unbooked_note(unbooked: List[Dict[str, Any]]) -> str:
+        names = ", ".join(sorted({w["symbol"] for w in unbooked}))
+        return (f"The {names} entry fill couldn't be saved yet - its position is closed once it is (or exit it under "
+                f"Shares without a record).")
 
     def _check_quit_progress(self) -> None:
         if not self.quit_state:
@@ -152,7 +178,7 @@ class QuitOps:
                         self._quit_rounds += 1
                     self._quit_retry_at = time.monotonic() + self.QUIT_RETRY_S
                     left = self._to_close()
-            if left:
+            if left or self._unbooked_left():
                 self._publish("quit.progress", quit=self._quit_status())
                 return
 

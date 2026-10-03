@@ -126,6 +126,31 @@ def test_the_plays_sent_whose_ending_was_never_heard_are_listed_for_the_start(re
     assert sent.id not in {r["id"] for r in repo.submitted_plays(start - dt.timedelta(days=1), start)}
 
 
+def test_a_brokers_error_written_after_the_rows_around_it_keeps_its_place_in_the_trade_record(repo):
+    import datetime as dt
+
+    p = _play(symbol="T93")
+    repo.record_play(p)
+    tid = repo.open_trade(p, 100.0, 10, "ibkr-paper")
+    t0 = dt.datetime.now(dt.timezone.utc)
+    at = {"PLACE": t0, "CANCEL": t0 + dt.timedelta(seconds=1), "MODIFY": t0 + dt.timedelta(seconds=3)}
+    stop = {"symbol": "T93", "side": "SHORT", "qty": 10, "type": "STOP", "stop": 98.0, "tag": f"stop:{tid}"}
+    repo.record_order_audit("PLACE", stop, {"order_id": "7", "status": "SUBMITTED", "message": ""}, True, "ibkr",
+                            trade_id=tid, message="protective stop", ts=at["PLACE"])
+    repo.record_order_audit("CANCEL", {"order_id": "7", "symbol": "T93", "why": "stood down"}, {"status": "sent"},
+                            True, "ibkr", trade_id=tid, message="stood down", ts=at["CANCEL"])
+    repo.record_order_audit("MODIFY", {"order_id": "7", "symbol": "T93", "stop": 99.0}, {"error": "refused"}, False,
+                            "ibkr", trade_id=tid, message="refused", ts=at["MODIFY"])
+    # the broker's refusal of the cancel, heard between the two and written last, on the next order sync
+    repo.record_order_audit("ERROR", {"order_id": "7", "symbol": "T93", "tag": f"stop:{tid}"},
+                            {"code": 10148, "state": "Filled"}, False, "ibkr", trade_id=tid,
+                            message="cancel refused (10148)", ts=t0 + dt.timedelta(seconds=2))
+    orders = repo.trade_record(tid)["orders"]
+    assert [(o["action"], o["ok"]) for o in orders] == [("PLACE", True), ("CANCEL", True), ("ERROR", False),
+                                                        ("MODIFY", False)]
+    assert orders[2]["message"] == "cancel refused (10148)"
+
+
 def test_day_trade_counter(repo):
     for i in range(2):
         p = _play(symbol=f"DT{i}")

@@ -305,7 +305,7 @@ class FakeSession:
             raise TypeError("A coroutine object is required")
         return asyncio.new_event_loop().run_until_complete(coro)
 
-    def call(self, fn, timeout=15.0):
+    def call(self, fn, timeout=15.0, order_ref=None):
         return fn(self.ib)
 
     def stop(self):
@@ -954,6 +954,41 @@ def test_a_cancel_reads_confirmed_only_on_ibkrs_word(broker):
     assert confirmed == [True, True, False]
 
 
+def test_ibkrs_errors_on_the_apps_orders_are_told_once_for_the_audit_but_its_warnings_and_confirmations_are_not(
+        broker):
+    orders = IbOrders(broker._session.ib)
+    first, second, third, fourth = (_resting_stop(broker) for _ in range(4))
+    orders.answer_cancel = (10148, "OrderId 1 that needs to be cancelled cannot be cancelled, state: Filled.")
+    broker.cancel_order(first.order_id)                                        # refused: the stop is filling
+    orders.answer_cancel = (202, "Order Canceled - reason:")
+    broker.cancel_order(second.order_id)                                       # the app's own cancel, confirmed
+    orders.error(3, 399, "Order Message: the order is held until the open")    # a warning: it works on
+    orders.error(3, 202, "Order Canceled - reason:")                           # IBKR cancelled it, unasked
+    orders.error(4, 201, "Order rejected - reason:<br>not allowed for this account")
+    broker._on_error(77, 162, "Historical Market Data Service error message:no data", None)   # a request's error
+    broker._on_error(-1, 2104, "Market data farm connection is OK", None)
+    errors = broker.order_errors()
+    assert [(e["order_id"], e["code"], e["what"]) for e in errors] == [
+        ("1", 10148, "cancel refused"), ("3", 202, "cancelled by the broker, not by the app"), ("4", 201, "error")]
+    assert (errors[0]["state"], errors[0]["tag"], errors[0]["symbol"]) == ("Filled", "stop:trd_1", "AAA")
+    assert "state" not in errors[1] and errors[2]["message"] == "Order rejected - reason: not allowed for this account"
+    assert all(isinstance(e["at"], dt.datetime) for e in errors)
+    assert broker.order_errors() == []                                         # each told once
+
+
+def test_a_change_ibkr_refuses_is_told_for_the_audit_only_while_it_answers_the_change(broker):
+    orders = IbOrders(broker._session.ib)
+    res = _resting_stop(broker, price=98.5)
+    orders.answer_modify = (110, "The price does not conform to the minimum price variation for this contract.")
+    with pytest.raises(OrderRejected):
+        broker.modify_stop(res.order_id, stop_price=99.004, quantity=10)
+    [refused] = broker.order_errors()
+    assert (refused["order_id"], refused["code"], refused["what"]) == ("1", 110, "change refused")
+    _a_minute_on(broker, res.order_id)                     # long after the change, a warning is the order's own
+    orders.error(1, 110, "The price does not conform to the minimum price variation for this contract.")
+    assert broker.order_errors() == []
+
+
 @pytest.mark.parametrize("code,text", [
     (201, "Order rejected - reason:The order would exceed a limit"),            # an error: ib_async says Cancelled
     (321, "Error validating request.-'bN' : cause - The order can't be changed"),   # a warning
@@ -1273,6 +1308,94 @@ def test_a_request_that_outlasts_its_wait_is_cancelled_on_the_loop():
         assert cancelled.wait(timeout=5)
     finally:
         session.stop()
+
+
+def _hold_the_loop(session, seconds):
+    """Keep the session's loop busy for a while (the Gateway's connection swamped, say) - set once it has begun."""
+    busy = threading.Event()
+
+    def hold():
+        busy.set()
+        time.sleep(seconds)
+
+    session._loop.call_soon_threadsafe(hold)
+    assert busy.wait(timeout=5)
+
+
+def test_a_call_the_loop_never_got_to_is_called_off_and_an_order_call_says_it_was_not_sent():
+    session = ThreadedSession()
+    session.start()
+    ran = []
+    try:
+        _hold_the_loop(session, 0.4)
+        with pytest.raises(FutureTimeout):                       # any other call: the timeout, as before
+            session.call(lambda ib: ran.append("read"), timeout=0.05)
+        with pytest.raises(mod.OrderNotSent, match="not sent"):
+            session.call(lambda ib: ran.append("order"), timeout=0.05, order_ref="play_1")
+        assert session.call(lambda ib: "free again", timeout=5) == "free again"
+        assert ran == []                                          # neither ran once the loop got to them
+    finally:
+        session.stop()
+
+
+def test_an_order_call_that_started_but_got_no_answer_in_time_is_outcome_unknown_with_its_tag():
+    from autotradebot.brokers.base import OUTCOME_UNKNOWN, OrderOutcomeUnknown
+
+    session = ThreadedSession()
+    session.start()
+    try:
+        with pytest.raises(OrderOutcomeUnknown) as caught:
+            session.call(lambda ib: time.sleep(0.3), timeout=0.05, order_ref="exit:t1")
+        assert caught.value.order_ref == "exit:t1" and isinstance(caught.value, BrokerError)
+        assert isinstance(caught.value, OUTCOME_UNKNOWN)
+        with pytest.raises(FutureTimeout):                       # a read that started: still the plain timeout
+            session.call(lambda ib: time.sleep(0.3), timeout=0.05)
+    finally:
+        session.stop()
+
+
+def test_an_order_ibkr_doesnt_answer_in_time_is_never_reported_as_not_sent(threaded):
+    from autotradebot.brokers.base import OrderOutcomeUnknown
+
+    session, real = threaded._session, threaded._session.call
+    session.call = lambda fn, timeout=15.0, order_ref=None: real(fn, timeout=min(timeout, 0.05), order_ref=order_ref)
+    ib, place = session.ib, session.ib.placeOrder
+    ib.placeOrder = lambda contract, order: (time.sleep(0.3), place(contract, order))[1]
+    req = OrderRequest(symbol="AAA", side=Side.LONG, quantity=5, order_type=OrderType.LIMIT, limit_price=10.0,
+                       client_tag="play_1")
+    with pytest.raises(OrderOutcomeUnknown) as caught:            # it started: it may well be at IBKR
+        threaded.place_order(req)
+    assert caught.value.order_ref == "play_1"
+    _wait_for(lambda: len(ib.placed) == 3)                        # (it reached IBKR, as it happens)
+
+    ib.placeOrder = place
+    _hold_the_loop(session, 0.4)
+    with pytest.raises(mod.OrderNotSent):                         # never started: certainly not sent...
+        threaded.place_order(OrderRequest(symbol="BBB", side=Side.LONG, quantity=5, order_type=OrderType.LIMIT,
+                                          limit_price=10.0, client_tag="play_2"))
+    session.call = real
+    assert real(lambda ib: len(ib.placed), timeout=5) == 3        # ...and never sent late
+
+
+def test_a_stop_move_the_loop_never_got_to_leaves_the_stop_reading_what_ibkr_still_holds(threaded):
+    session, real = threaded._session, threaded._session.call
+    stop = threaded.place_order(OrderRequest(symbol="AAA", side=Side.SHORT, quantity=10, order_type=OrderType.STOP,
+                                             stop_price=98.0, tif=TimeInForce.GTC, client_tag="stop:t1"))
+    placed = real(lambda ib: len(ib.placed), timeout=5)
+
+    def swamped(fn, timeout=15.0, order_ref=None):                # the loop swamped just as the move goes out
+        if order_ref is None:
+            return real(fn, timeout=timeout)
+        _hold_the_loop(session, 0.4)
+        return real(fn, timeout=0.05, order_ref=order_ref)
+
+    session.call = swamped
+    with pytest.raises(mod.OrderNotSent):
+        threaded.modify_stop(stop.order_id, stop_price=99.5, quantity=5)
+    session.call = real
+    assert real(lambda ib: len(ib.placed), timeout=5) == placed   # never sent, nor late
+    after = threaded.get_order(stop.order_id)
+    assert (after.stop_price, after.submitted_qty) == (98.0, 10)  # what IBKR holds - never read as moved
 
 
 # --------------------------------------------------------------------------- #

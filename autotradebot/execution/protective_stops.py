@@ -24,14 +24,18 @@ Resting orders bring two dangers, and the rules here exist for them:
   asked to cancel that reads cancelled without the broker's word on it (waited for, pass after pass,
   for ``CANCEL_UNCONFIRMED_S``). While an exit stands a trade's orders down - and while a cancel it
   asked for awaits the broker's word - the order sync leaves them alone; and the sync holds a trade's
-  orders itself while it places, moves or books one. An exit in the minute after a start, before the first
+  orders itself while it places, moves or books one. (Both take their turn under the executor's
+  lock, and a resting order that is done is taken out of its book before its fill is booked, so it
+  is booked once.) An exit in the minute after a start, before the first
   pass has taken over what an earlier run left, takes that run's orders for the trade over and stands
   them down the same way; while the broker's orders can't be read (the connection down too), or are
   still reloading after a connect with none found, the exit waits - until a full list has shown
   nothing of an earlier run's for the trade (or this run opened it). A close that waited for a trade's
   orders while another caller had them reads the record and the exits working again first. While a
   target rests at the broker the exit manager leaves the target to it, and a part it would take off
-  beside one is never sent.
+  beside one is never sent; a stop crossed while it rests (``stop_resting``: the price reaching it
+  where it rests at the broker, in the regular session) gets ``broker_stop_grace_s`` to fill before
+  the exit manager sends an exit of its own.
 * **An order that outlives its position** would open a position the other way when it triggers.
   Orders are only placed while the broker shows the shares and its order list could be read for
   certain; every pass cancels a tracked order whose trade record is no longer open; and a sweep
@@ -41,7 +45,9 @@ Resting orders bring two dangers, and the rules here exist for them:
   what it filled booked first, and is replaced by a fresh pair for what the record then holds. One
   the broker no longer knows at all is looked for in its executions before it is given up, or stood
   down for an exit: what it filled (the connection down as it finished, say) is booked like a fill
-  heard live.
+  heard live. A fill the database refuses to save (BookingFailed: busy, say) puts the order back in
+  its book: the next pass books it, and until then nothing else is done for the trade - no exit of
+  the app's own, no move, no fresh pair.
 
 The trade record is the single source of truth: each pass compares the record's shares, stop and
 target with the orders at the broker. The stop's price is moved in place (the break-even and
@@ -53,11 +59,18 @@ where one belongs, a target for the wrong shares or price, the scale-out just ta
 stood down and placed afresh in a new group, because an order can't change its group (only once the
 broker's orders have been read: never a stop cancelled that can't be replaced). A broker that refuses
 the pair gets a plain stop, and the app works the target itself as before. A move the broker can't
-make until it says what became of the stop (OrderInDoubt) leaves the stop resting where it is.
+make until it says what became of the stop (OrderInDoubt) leaves the stop resting where it is. A stop,
+target or move the broker doesn't answer in time is no refusal either: the order may rest all the same,
+so it is looked for among the broker's orders by its tag before another is placed, and taken over if
+it is there.
+
+Every stop and target placed, every cancel and every move asked of the broker here is a row of the order audit
+(PLACE, CANCEL, MODIFY - see executor.py), failed with why when the broker refused it or didn't answer in time.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import inspect
 import logging
 import threading
@@ -65,7 +78,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..brokers.base import DONE_STATUSES, BrokerError, OrderInDoubt
+from ..brokers.base import OUTCOME_UNKNOWN, DONE_STATUSES, BrokerError, OrderInDoubt, OrderNotSent
 from ..core.enums import OrderType, Side, TimeInForce
 from ..core.models import OrderRequest, OrderResult
 from .exit_manager import scale_out_plan
@@ -75,6 +88,13 @@ log = logging.getLogger(__name__)
 TAG = "stop:"
 TARGET_TAG = "tgt:"
 OCA_REDUCE = 3                     # IBKR: the others are reduced by what fills, no routing block
+
+
+class BookingFailed(Exception):
+    """The database refused to save a fill the broker reported (busy with another writer, say). Raised by the
+    executor's bookings (_open_trade, _book_exit) once they have logged it and told the dashboard: whoever followed
+    the order keeps following it - or puts it back where it was followed - so the next pass books the fill again,
+    and it is never lost."""
 
 
 @dataclass
@@ -88,6 +108,7 @@ class _Stop:
     moved_at: float = 0.0
     unseen: int = 0
     group: str = ""                # the one-cancels-all group it was placed in; "" = on its own
+    unbooked: bool = False         # done, and its fill couldn't be saved: back in its book until it is (_book_resting)
 
 
 def stop_tag(trade_id: str) -> str:
@@ -170,6 +191,9 @@ class ProtectiveStops:
         self._bare_since: Dict[str, float] = {}      # when each position was first seen with no stop at the broker
         self._bare_warned: Dict[str, float] = {}
         self._plain: set = set()          # trades whose one-cancels-all pair the broker refused: a stop alone
+        #: trades whose target got no answer in time (OrderOutcomeUnknown) -> the group it was sent in: looked for at
+        #: the broker before the pair is placed afresh (_adopt_unknown_target)
+        self._targets_unknown: Dict[str, str] = {}
         self._group_seq = getattr(self, "_group_seq", 0)
         self._swept_at = 0.0
         self._cancels_sent: Dict[str, float] = {}   # order id -> when a stand-down first asked the broker to cancel it
@@ -225,6 +249,28 @@ class ProtectiveStops:
         """Whether the broker is working this trade's target - the exit manager then leaves it to it."""
         return trade_id in self._targets
 
+    def stop_resting(self, trade_id: str, price: Optional[float] = None, side: Optional[str] = None) -> bool:
+        """Whether a stop rests at the broker for this trade, with the broker there to fill it: stops kept at the
+        broker, the broker connected, and a stop followed for the trade that is still working - no exit has asked for
+        its cancel, nor is a fill of it waiting to be saved. Given a ``price`` and the trade's ``side`` (LONG or
+        SHORT), also whether that price reaches the stop where it rests: one still at an older, looser trigger (a
+        ratchet not sent yet - a move goes at most every STOP_MOVE_S) can't fill there. On a stop cross the exit
+        manager gives a stop that would fill a moment to do so before it sends an exit of its own
+        (``broker_stop_grace_s``)."""
+        st = self._stops.get(trade_id)
+        if (st is None or st.unbooked or not self.native_stops_on()
+                or getattr(self.broker, "is_connected", True) is False or self._cancel_asked(trade_id)):
+            return False
+        if price is None:
+            return True
+        half = tick(st.price) / 2                        # (the trigger rests on the tick: less is the rounding)
+        return price <= st.price + half if side == "LONG" else price >= st.price - half
+
+    def fill_unbooked(self, trade_id: str) -> bool:
+        """Whether this trade's stop or target filled and the database refused the booking: it is followed again until
+        the next pass books it, and meanwhile nothing else is done for the trade - no exit, no move, no fresh pair."""
+        return any(o is not None and o.unbooked for o in (self._stops.get(trade_id), self._targets.get(trade_id)))
+
     def resting_filled(self, trade_id: str) -> Optional[float]:
         """Shares the stop and target resting for a trade have filled while still working. They are booked when
         the order finishes (_watch_stops), so nothing else may book them first. None when the broker can't say."""
@@ -251,6 +297,8 @@ class ProtectiveStops:
                     continue                             # booked or dropped meanwhile, or an exit is standing it down
                 try:
                     self._watch_one(book, fill, o)
+                except BookingFailed:
+                    pass                                 # back in its book: its fill is booked again on the next pass
                 finally:
                     self._release_resting(tid)
 
@@ -264,12 +312,15 @@ class ProtectiveStops:
         except Exception:  # noqa: BLE001
             return
         if res.status == "FILLED":
-            fill(o, res)
+            if self._take_resting(book, o):              # its fill is booked once, by whoever takes it out of its book
+                fill(o, res)
         elif _unconfirmed_cancel(res) and self._cancel_unconfirmed(o.order_id):
             # an exit asked for its cancel and the broker never said it went through: the stand-down settles it,
             # pass after pass, and until then it is followed like one working - it may yet fill
             return
         elif res.status in DONE_STATUSES:
+            if not self._take_resting(book, o):
+                return                                   # another caller has taken it, to book or drop it
             if float(res.filled_qty or 0.0) > 0:
                 fill(o, res)
             self._lose(book, o, f"the broker {res.status.lower()} it: {res.message or 'no reason given'}")
@@ -298,9 +349,9 @@ class ProtectiveStops:
     def _filled_unseen(self, book: Dict[str, _Stop], fill, o: _Stop) -> Optional[bool]:
         """Before a resting order the broker no longer knows is given up: whether the broker's executions show it
         filled while the app wasn't following it (the connection was down when it finished, say). What they show
-        is booked as the order's own fill would have been. Only the executions of this order count - every stop a
-        trade has had carries the same tag. False when they show none (or the record is closed already), None when
-        they can't be read."""
+        is booked as the order's own fill would have been - one still in its book is taken out of it first, so it is
+        booked once (_take_resting). Only the executions of this order count - every stop a trade has had carries the
+        same tag. False when they show none (or the record is closed already), None when they can't be read."""
         t = self.repo.get_trade(o.trade_id)
         if not t or t.get("status") == "CLOSED":
             return False
@@ -314,6 +365,8 @@ class ProtectiveStops:
                                        and (getattr(f, "tag", "") or tag) == tag])
         if qty <= 1e-9:
             return False
+        if book.get(o.trade_id) is o and not self._take_resting(book, o):
+            return True                                  # another caller took it out of its book just now, to book it
         log.warning("%s AT BROKER FILLED UNSEEN  %s order %s is no longer known to the broker, but its executions "
                     "show %s shares @ %.4f - booked", "STOP" if book is self._stops else "TARGET", o.symbol,
                     o.order_id, qty, price)
@@ -345,15 +398,16 @@ class ProtectiveStops:
         for book in (self._stops, self._targets):
             for tid in [k for k in book if k not in open_ids]:
                 # the record closed some other way (by hand in TWS, by the position check): nothing may outlive it
-                self._cancel_quietly(book.pop(tid).order_id)
+                gone = book.pop(tid)
+                self._cancel_quietly(gone.order_id, "its trade record closed some other way", gone)
         # a trade whose exit is working, or whose orders an exit is standing down this moment - or asked the broker to
         # cancel on an earlier try, with its word on that still to come - is the exit's
         exiting = self.pending_exit_trade_ids() | self._claimed()
         now, working, placed, unreadable = time.monotonic(), None, False, False
         for t in trades:
             tid, qty, price = t["id"], abs(float(t.get("quantity") or 0.0)), self._record_stop(t)
-            if tid in exiting or qty <= 0 or not price or self._cancel_asked(tid):
-                continue
+            if tid in exiting or qty <= 0 or not price or self._cancel_asked(tid) or self.fill_unbooked(tid):
+                continue                                 # (an order that filled is never moved or replaced unbooked)
             if tid in self._stops and self._pair_is_wrong(t, now):
                 # a pair is stood down only once the broker's orders have been read for its fresh one: never a stop
                 # cancelled that can't be placed afresh (the list is read again next pass)
@@ -362,6 +416,8 @@ class ProtectiveStops:
                     unreadable = working is None
                 if unreadable:
                     continue
+                if self._adopt_unknown_target(t, working):
+                    continue                             # the target that got no answer rests after all: followed
                 self._target_retry[tid] = now + self.TARGET_RETRY_S     # one try per while, whatever comes of it
                 placed = self._rebuild(t, working) or placed             # (it holds the trade's orders itself)
                 continue
@@ -494,30 +550,45 @@ class ProtectiveStops:
             return
         held = self._held_quantity(symbol)
         long = t["side"] == "LONG"
-        if held is not None and ((held > 0) != long or abs(held) < qty - 1e-9):
+        exit_side = Side.SHORT if long else Side.LONG
+        # shares other closing orders are selling this moment - the close of shares without a record, an exit of
+        # another record or one sent by hand - are no cover: a stop beside them could sell the same shares twice
+        selling = self._closing_quantity(symbol, exit_side, working) if held is not None else 0.0
+        if held is not None and ((held > 0) != long or abs(held) - selling < qty - 1e-9):
             # never rest an order the account can't cover - triggered, it would open a position the other way
-            self._note_once(tid, f"{symbol}: no stop placed - the broker shows {held:,.0f} shares, the record {qty:,.0f}")
+            self._note_once(tid, f"{symbol}: no stop placed - the broker shows {held:,.0f} shares"
+                                 + (f", {selling:,.0f} of them being sold by orders working there" if selling else "")
+                                 + f", the record {qty:,.0f}")
             arriving = (held > 0) == long and abs(held) > 0            # a fill still landing in pieces: look again soon
             self._stop_retry[tid] = time.monotonic() + (self.SHARES_RETRY_S if arriving else self.STOP_RETRY_S)
             return
         plan = self._target_plan(t)
         self._group_seq += 1                             # a group's name is never used twice: a finished one can't take orders
         group = f"oca:{tid}:{int(time.time())}:{self._group_seq}" if plan else ""
-        exit_side = Side.SHORT if long else Side.LONG
         req = OrderRequest(symbol=symbol, side=exit_side, quantity=qty, order_type=OrderType.STOP, stop_price=price,
                            tif=TimeInForce.GTC, is_entry=False, client_tag=stop_tag(tid), oca_group=group,
                            oca_type=OCA_REDUCE if group else 0)
+        sent_at = dt.datetime.now(dt.timezone.utc)
         try:
             res = self.broker.place_order(req)
+        except (OrderNotSent,) + OUTCOME_UNKNOWN as e:
+            # no refusal: it never went out, or may rest at the broker all the same - the next try, in a few seconds,
+            # first looks for it among the broker's orders by its tag and takes it over (_follow_left), never doubles it
+            self._audit("PLACE", req, {"error": str(e), "outcome": "not sent" if isinstance(e, OrderNotSent)
+                                       else "unknown"}, ok=False, trade_id=tid, msg=str(e), ts=sent_at)
+            self._stop_retry[tid] = time.monotonic() + self.SHARES_RETRY_S
+            log.warning("PROTECTIVE STOP  %s: the stop got no answer from the broker in time (%s) - looked for there "
+                        "before another is placed", symbol, e)
+            return
         except BrokerError as e:
-            self._audit("PLACE", req, {"error": str(e)}, ok=False, trade_id=tid, msg=str(e))
+            self._audit("PLACE", req, {"error": str(e)}, ok=False, trade_id=tid, msg=str(e), ts=sent_at)
             self._stop_retry[tid] = time.monotonic() + self.STOP_RETRY_S
             if group:
                 self._refused_pair(tid, symbol, str(e))
             else:
                 self._note_once(tid, f"{symbol}: the broker refused the protective stop: {e}")
             return
-        self._audit("PLACE", req, res.raw or {"status": res.status}, ok=True, trade_id=tid, msg="protective stop")
+        self._audit("PLACE", req, res, ok=True, trade_id=tid, msg="protective stop", ts=sent_at)
         self._stops[tid] = _Stop(res.order_id, tid, symbol, qty, price, moved_at=time.monotonic(), group=group)
         self._stop_notes.pop(tid, None)
         log.info("STOP AT BROKER  %s %s x%s @ %.2f (order %s)", symbol, "sell" if long else "buy", qty, price, res.order_id)
@@ -544,8 +615,8 @@ class ProtectiveStops:
             # one that has filled isn't followed - finishing, it would report the shares just booked again: the
             # pair is cancelled and, once the cancels have landed, placed afresh for what the record now holds
             self._left_looked.discard(tid)               # until the cancels show in a full list (see _drop_resting)
-            for oid in {o.order_id for o in left + targets}:
-                self._cancel_quietly(oid)
+            for oid, o in {o.order_id: o for o in left + targets}.items():
+                self._cancel_quietly(oid, "filled while the app was off - placed afresh for what the record holds", o)
             self._stop_retry[tid] = time.monotonic() + self.SHARES_RETRY_S
             log.info("the order(s) resting at the broker for %s filled while the app was off: booked, and "
                      "replaced by a fresh pair for what the record holds", tid)
@@ -560,7 +631,7 @@ class ProtectiveStops:
         kept = ({keep.order_id} if keep is not None else set()) | ({targets[0].order_id} if targets else set())
         extras = [o for o in left[1:] + targets[1:] if o.order_id not in kept]   # one listed twice is no second one
         for extra in extras:
-            self._cancel_quietly(extra.order_id)
+            self._cancel_quietly(extra.order_id, "a second copy of the trade's resting order", extra)
         if not extras:
             self._looked_for_left(tid)                   # all an earlier run left for it is this run's now
         followed = ([f"stop {keep.order_id}"] if keep is not None else []) + \
@@ -611,18 +682,49 @@ class ProtectiveStops:
         req = OrderRequest(symbol=symbol, side=exit_side, quantity=qty, order_type=OrderType.LIMIT, limit_price=price,
                            tif=TimeInForce.GTC, is_entry=False, client_tag=target_tag(tid), oca_group=group,
                            oca_type=OCA_REDUCE)
+        sent_at = dt.datetime.now(dt.timezone.utc)
         try:
             res = self.broker.place_order(req)
+        except (OrderNotSent,) + OUTCOME_UNKNOWN as e:
+            # no refusal: it never went out, or may rest at the broker in the stop's group - the next pass looks for it
+            # there by its tag before the pair is placed afresh (_adopt_unknown_target)
+            unknown = not isinstance(e, OrderNotSent)
+            self._audit("PLACE", req, {"error": str(e), "outcome": "unknown" if unknown else "not sent"}, ok=False,
+                        trade_id=tid, msg=str(e), ts=sent_at)
+            if unknown:
+                self._targets_unknown[tid] = group
+            self._target_retry[tid] = time.monotonic() + self.SHARES_RETRY_S
+            log.warning("TARGET AT BROKER  %s: the target got no answer from the broker in time (%s) - looked for "
+                        "there before another is placed", symbol, e)
+            return
         except BrokerError as e:
-            self._audit("PLACE", req, {"error": str(e)}, ok=False, trade_id=tid, msg=str(e))
+            self._audit("PLACE", req, {"error": str(e)}, ok=False, trade_id=tid, msg=str(e), ts=sent_at)
             self._target_retry[tid] = time.monotonic() + self.TARGET_RETRY_S
             log.warning("TARGET AT BROKER refused for %s: %s - the app works the target itself", symbol, e)
             return
-        self._audit("PLACE", req, res.raw or {"status": res.status}, ok=True, trade_id=tid, msg="resting target")
+        self._audit("PLACE", req, res, ok=True, trade_id=tid, msg="resting target", ts=sent_at)
         self._targets[tid] = _Stop(res.order_id, tid, symbol, qty, price, moved_at=time.monotonic(), group=group)
         log.info("TARGET AT BROKER  %s %s x%s @ %.2f (order %s, one-cancels-all with the stop)", symbol,
                  "sell" if exit_side is Side.SHORT else "buy", qty, price, res.order_id)
         self.bus.publish("target.placed", trade_id=tid, symbol=symbol, qty=qty, limit_price=price, order_id=res.order_id)
+
+    def _adopt_unknown_target(self, t: Dict[str, Any], working: List[OrderResult]) -> bool:
+        """A target whose placing got no answer in time (OrderOutcomeUnknown), found resting at the broker after all -
+        in the group of the stop it went out with, which still rests: followed from here, never doubled by a fresh
+        pair. Looked for once; not found, the pair is placed afresh as for any missing target."""
+        tid = t["id"]
+        group = self._targets_unknown.pop(tid, None)
+        st = self._stops.get(tid)
+        if group is None or st is None or not group or st.group != group or tid in self._targets:
+            return False
+        found = next((o for o in working if o.tag == target_tag(tid) and o.status not in DONE_STATUSES), None)
+        if found is None:
+            return False
+        self._targets[tid] = _Stop(found.order_id, tid, t["symbol"], float(found.submitted_qty or 0.0),
+                                   float(found.limit_price or 0.0), moved_at=time.monotonic(), group=group)
+        log.info("the target for %s that got no answer in time rests at the broker after all (order %s) - followed",
+                 tid, found.order_id)
+        return True
 
     def _rebuild(self, t: Dict[str, Any], working: List[OrderResult]) -> bool:
         """Stand down what rests for a trade and place the pair afresh, in a new group - an order
@@ -635,7 +737,7 @@ class ProtectiveStops:
             if tid in self.pending_exit_trade_ids():
                 return False                             # an exit came and went since the pass began: it is the exit's
             gone = {o.order_id for o in (self._stops.get(tid), self._targets.get(tid)) if o is not None}
-            if self._stand_down(tid) in ("filled", "busy"):
+            if self._stand_down(tid, "stood down to be placed afresh") in ("filled", "busy"):
                 return False                             # booked, or not confirmed yet: look again next pass
             fresh = self.repo.get_trade(tid)
             if not fresh or fresh.get("status") == "CLOSED":
@@ -656,19 +758,32 @@ class ProtectiveStops:
         modify an order, or refuses the change, has it cancelled; the next pass places a fresh one. One that
         can't change it until it says what became of it (OrderInDoubt: a change it refused a moment after
         seeming to take it, say) leaves it resting where it is - it may well still protect the position - and
-        its full order list, which settles it, is read on this pass: the move goes again after STOP_MOVE_S."""
+        its full order list, which settles it, is read on this pass: the move goes again after STOP_MOVE_S. So does a
+        move the broker didn't answer in time: the stop rests, moved or not, and the next pass reads where. Each
+        change asked for is audited (MODIFY): ok with what the broker holds the stop at, failed with why."""
+        req = {"order_id": st.order_id, "symbol": st.symbol, "type": OrderType.STOP.value, "qty": qty, "stop": price,
+               "from_stop": st.price, "tag": stop_tag(st.trade_id)}
+        asked_at = dt.datetime.now(dt.timezone.utc)
         try:
             res = self.broker.modify_stop(st.order_id, stop_price=price, quantity=qty)
-        except OrderInDoubt as e:
+        except (OrderInDoubt, OrderNotSent) + OUTCOME_UNKNOWN as e:
+            outcome = ("in doubt" if isinstance(e, OrderInDoubt) else "not sent" if isinstance(e, OrderNotSent)
+                       else "unknown")
+            self._audit("MODIFY", req, {"error": str(e), "outcome": outcome}, ok=False, trade_id=st.trade_id,
+                        msg=f"the stop rests where it is meanwhile: {e}", ts=asked_at)
             log.info("the stop for %s isn't moved yet (%s) - it rests where it is meanwhile", st.trade_id, e)
             st.moved_at = time.monotonic()
             self._swept_at = 0.0
             return False
         except Exception as e:  # noqa: BLE001 - no modify on this venue, or the broker refused
+            self._audit("MODIFY", req, {"error": str(e), "outcome": "refused"}, ok=False, trade_id=st.trade_id,
+                        msg=f"refused - the stop is placed afresh: {e}", ts=asked_at)
             log.warning("could not move the stop for %s (%s) - replacing it", st.trade_id, e)
-            self._drop_resting(st.trade_id)
+            self._drop_resting(st.trade_id, "its move was refused - placed afresh")
             self._stop_retry[st.trade_id] = time.monotonic() + 5.0      # let the cancel land before looking again
             return False
+        self._audit("MODIFY", req, res, ok=True, trade_id=st.trade_id,
+                    msg="protective stop moved" if qty is None else "protective stop resized", ts=asked_at)
         moved = abs(st.price - price) >= tick(price)
         held = float(getattr(res, "submitted_qty", 0.0) or 0.0)
         st.qty = float(qty) if qty is not None else (held or st.qty)  # in step with what the broker now holds
@@ -702,14 +817,14 @@ class ProtectiveStops:
                     size = held
         return size if size > 1e-9 else None
 
-    def _drop_resting(self, trade_id: str) -> None:
+    def _drop_resting(self, trade_id: str, why: str = "its position closed") -> None:
         """Cancel and forget whatever rests for a trade - until a full order list shows it gone, an exit that finds the
         list unreadable waits for it (_take_over_for_exit): the cancel may not land."""
         self._left_looked.discard(trade_id)
         for book in (self._targets, self._stops):
             o = book.pop(trade_id, None)
             if o is not None:
-                self._cancel_quietly(o.order_id)
+                self._cancel_quietly(o.order_id, why, o)
 
     def _lose(self, book: Dict[str, _Stop], o: _Stop, why: str) -> None:
         book.pop(o.trade_id, None)
@@ -734,7 +849,7 @@ class ProtectiveStops:
         target = self._targets.pop(tid, None)
         if target is not None:
             self._left_looked.discard(tid)               # its cancel may not land: see _drop_resting
-            self._cancel_quietly(target.order_id)
+            self._cancel_quietly(target.order_id, "the broker refused the stop-and-target pair", target)
         self._note_once(tid, f"{symbol}: the broker refused the stop-and-target pair ({why}) - resting a stop alone")
 
     def _note_once(self, tid: str, note: str) -> None:
@@ -752,9 +867,9 @@ class ProtectiveStops:
                 continue
             tid = o.tag[len(prefix):]
             if tid not in open_ids or tid in book:
-                log.warning("cancelling the resting order %s (%s): %s", o.order_id, o.symbol,
-                            "its trade is no longer open" if tid not in open_ids else "the trade already has one")
-                self._cancel_quietly(o.order_id)
+                why = "its trade is no longer open" if tid not in open_ids else "the trade already has one"
+                log.warning("cancelling the resting order %s (%s): %s", o.order_id, o.symbol, why)
+                self._cancel_quietly(o.order_id, why, o)
 
     # ------------------------------------------------------------------ #
     #  Before the app's own exits                                        #
@@ -763,7 +878,11 @@ class ProtectiveStops:
         """Take a trade's resting orders for an exit (or a rebuild) about to stand them down - False when another
         caller has them (still, after ``wait_s`` seconds). While claimed, the order sync neither moves, places, books
         nor loses them: a move the broker refused there would drop the stop from under the stand-down, which would
-        then take it for cancelled. The sync holds them itself only for the moment it places, moves or books one."""
+        then take it for cancelled. The sync holds them itself only for the moment it places, moves or books one.
+
+        A claim is only ever taken under the executor's lock (Executor._lock: the order sync, an exit), and let go
+        before it: the lock always comes first, so the two can't deadlock - and while a caller holds the lock, no
+        other thread holds a claim."""
         deadline = time.monotonic() + wait_s
         while True:
             with self._claims_lock:
@@ -782,7 +901,18 @@ class ProtectiveStops:
         with self._claims_lock:
             return set(self._standing_down)
 
-    def _stand_down(self, trade_id: str) -> str:
+    def _take_resting(self, book: Dict[str, _Stop], o: _Stop) -> bool:
+        """Take a resting order that is done out of its book, before what it filled is booked: True for the one
+        caller that takes it - the order sync's watch or an exit's stand-down - so a fill is booked once. False when
+        it is no longer there (another caller has taken it, to book or drop it), and then nothing else - another
+        order placed for the trade since - is touched."""
+        with self._claims_lock:
+            if book.get(o.trade_id) is not o:
+                return False
+            book.pop(o.trade_id, None)
+            return True
+
+    def _stand_down(self, trade_id: str, why: str = "stood down for the app's own exit") -> str:
         """Take a trade's resting orders out of the way of an exit the app is about to send.
         Returns "none" (nothing rested), "cancelled" (the way is clear), "filled" (one of them got
         there first and closed the position: send nothing) or "busy" (the broker hasn't confirmed:
@@ -794,7 +924,9 @@ class ProtectiveStops:
         without IBKR's word on it (``cancel_confirmed`` False) is waited for like one still working -
         on the next stand-down too, for up to ``CANCEL_UNCONFIRMED_S``. The orders it began with are
         read by their ids until each is done: one gone from the books meanwhile is no more cancelled
-        for that. One the broker no longer knows at all is looked for in its executions (_filled_unseen):
+        for that. A done one is taken out of its book before what it filled is booked (_take_resting): one
+        another caller took out first is theirs to book, and the exit waits for its next try. One the
+        broker no longer knows at all is looked for in its executions (_filled_unseen):
         what it filled is booked, and while they can't be read the exit waits. And before the way is
         called clear, each order found cancelled is read once more, for a fill that landed just behind
         the cancel."""
@@ -829,8 +961,14 @@ class ProtectiveStops:
                         continue                         # booked (popped from the books); the rest of it is gone
                 if done or res.status == "FILLED":
                     self._cancels_sent.pop(o.order_id, None)
-                    if book.get(trade_id) is o:
-                        book.pop(trade_id, None)
+                    if not self._take_resting(book, o):
+                        # another caller took it out of its book, to book what it filled or to drop it: theirs, never
+                        # booked twice. The exit waits for its next try, by when the record says what was booked
+                        t = self.repo.get_trade(trade_id)
+                        if not t or t.get("status") == "CLOSED":
+                            self._drop_resting(trade_id)
+                            return "filled"
+                        return self._still_resting(trade_id, still + left[i + 1:])
                 if res.status == "FILLED" or (done and float(res.filled_qty or 0.0) > 0):
                     fill(o, res)
                     t = self.repo.get_trade(trade_id)
@@ -842,7 +980,7 @@ class ProtectiveStops:
                     cleared.append((book, fill, o))
                     continue
                 if o.order_id not in asked:
-                    self._cancel_quietly(o.order_id)
+                    self._cancel_quietly(o.order_id, why, o)
                     asked.add(o.order_id)
                     self._cancels_sent.setdefault(o.order_id, time.monotonic())
                     just_asked = True
@@ -922,9 +1060,31 @@ class ProtectiveStops:
     # ------------------------------------------------------------------ #
     #  Booking what the broker filled                                    #
     # ------------------------------------------------------------------ #
+    def _book_resting(self, book: Dict[str, _Stop], o: _Stop, *booking: Any) -> None:
+        """Book what a resting order that is done filled (_book_exit with ``booking``). A booking the database refuses
+        puts the order back in its book, marked ``unbooked``, before BookingFailed goes on: the next pass reads it again
+        and books its fill then, and until it has, the trade is left as it is (fill_unbooked)."""
+        try:
+            self._book_exit(*booking)
+        except BookingFailed:
+            o.unbooked = True
+            book.setdefault(o.trade_id, o)
+            raise
+
+    def _record_to_book(self, book: Dict[str, _Stop], o: _Stop) -> Optional[Dict[str, Any]]:
+        """The record a resting order that is done books its fill on. The order is out of its book by now
+        (_take_resting), so a read the database refuses (busy, say) is handled as a booking it refuses (_book_resting):
+        the order goes back, marked ``unbooked``, and BookingFailed goes on - or nothing would ever book its fill."""
+        try:
+            return self.repo.get_trade(o.trade_id)
+        except Exception as e:  # noqa: BLE001
+            o.unbooked = True
+            book.setdefault(o.trade_id, o)
+            raise self._booking_failed(f"exit:{o.trade_id}", o.symbol, "exit", e) from e
+
     def _book_stop_fill(self, st: _Stop, res: OrderResult) -> None:
         self._stops.pop(st.trade_id, None)
-        t = self.repo.get_trade(st.trade_id)
+        t = self._record_to_book(self._stops, st)
         if not t or t.get("status") == "CLOSED":
             return
         price = float(res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0) or st.price)
@@ -932,18 +1092,19 @@ class ProtectiveStops:
         reason = stop_exit_reason(t.get("initial_stop_price"), st.price)
         partial = filled < abs(float(t["quantity"])) - 1e-9
         log.warning("STOP AT BROKER FILLED  %s x%s @ %.4f (%s)", st.symbol, filled, price, reason)
-        self._book_exit(st.symbol, st.trade_id, price, filled, reason, partial, {} if partial else None, st.price)
+        self._book_resting(self._stops, st, st.symbol, st.trade_id, price, filled, reason, partial,
+                           {} if partial else None, st.price)
         if not partial:
             target = self._targets.pop(st.trade_id, None)       # the broker cancels it with the stop; make sure
             if target is not None:
-                self._cancel_quietly(target.order_id)
+                self._cancel_quietly(target.order_id, "the stop filled", target)
 
     def _book_target_fill(self, tg: _Stop, res: OrderResult) -> None:
         """The broker filled the target: the scale-out when part of the position is left - the
         record gets the stop and target the rest now has, and the pair is placed afresh for it -
         or the whole exit."""
         self._targets.pop(tg.trade_id, None)
-        t = self.repo.get_trade(tg.trade_id)
+        t = self._record_to_book(self._targets, tg)
         if not t or t.get("status") == "CLOSED":
             return
         price = float(res.avg_fill_price or (res.fills[-1].price if res.fills else 0.0) or tg.price)
@@ -953,7 +1114,8 @@ class ProtectiveStops:
                     "part of the position" if partial else "the whole position")
         if partial:
             plan = scale_out_plan(t, getattr(self, "exit_cfg", None))
-            self._book_exit(tg.symbol, tg.trade_id, price, filled, "target-1", True, plan[1] if plan else {}, tg.price)
+            self._book_resting(self._targets, tg, tg.symbol, tg.trade_id, price, filled, "target-1", True,
+                               plan[1] if plan else {}, tg.price)
             st = self._stops.get(tg.trade_id)
             if st is not None:
                 # the broker's group has already shrunk the stop to what the position has left - some of it maybe
@@ -961,10 +1123,10 @@ class ProtectiveStops:
                 st.qty = min(st.qty, max(0.0, abs(float(t["quantity"])) - filled))
             self._target_retry.pop(tg.trade_id, None)    # the rest gets its own pair on the next pass
             return
-        self._book_exit(tg.symbol, tg.trade_id, price, filled, "target", False, None, tg.price)
+        self._book_resting(self._targets, tg, tg.symbol, tg.trade_id, price, filled, "target", False, None, tg.price)
         st = self._stops.pop(tg.trade_id, None)          # the broker cancels it with the target; make sure
         if st is not None:
-            self._cancel_quietly(st.order_id)
+            self._cancel_quietly(st.order_id, "the target filled", st)
 
     def _book_filled_while_off(self, t: Dict[str, Any], stop: Optional[OrderResult],
                                target: Optional[OrderResult]) -> bool:

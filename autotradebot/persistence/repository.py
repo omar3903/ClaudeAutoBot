@@ -755,11 +755,14 @@ class Repository:
 
     def record_order_audit(self, action: str, request: dict, response: dict, ok: bool,
                            broker: str, play_id: str = "", trade_id: str = "",
-                           message: str = "") -> None:
+                           message: str = "", ts: Optional[dt.datetime] = None) -> None:
+        """One row of the broker order audit (executor._audit): an order placed, a cancel or a change asked for, or
+        an error the broker sent about one. ``ts``: when it happened, when that was before now - a broker's error is
+        written on the order sync after it came, and is kept in its place among the rest."""
         with session_scope() as s:
             s.add(OrderAudit(action=action, request=request, response=response, ok=ok,
                              broker=broker, play_id=play_id or None, trade_id=trade_id or None,
-                             message=message[:400]))
+                             message=message[:400], **({"ts": ts} if ts is not None else {})))
 
 
 _PAIR_COLUMNS = {"first": "first_symbol", "second": "second_symbol"}

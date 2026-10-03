@@ -28,11 +28,13 @@ def _db():
 
 @pytest.fixture(autouse=True)
 def _regular_session(monkeypatch):
-    """The executor refuses exits while the exchange is closed; the tests run at any hour, so for them
-    the session is open unless a test says otherwise."""
+    """The executor refuses exits while the exchange is closed, and the exit manager moves stops only in the
+    regular session; the tests run at any hour, so for them the session is open unless a test says otherwise."""
     from autotradebot.execution.executor import Executor
+    from autotradebot.execution.exit_manager import ExitManager
     from autotradebot.util import clock
     monkeypatch.setattr(Executor, "_session_now", staticmethod(lambda: clock.Session.REGULAR))
+    monkeypatch.setattr(ExitManager, "_session_now", staticmethod(lambda: clock.Session.REGULAR))
 
 
 @pytest.fixture

@@ -34,7 +34,8 @@ from ..config import get_settings
 from ..core.enums import OrderType, Side, TimeInForce
 from ..core.models import Account, Fill, OrderRequest, OrderResult, Position, Quote
 from ..util.net import port_is_open
-from .base import DONE_STATUSES, AuthError, BrokerAdapter, BrokerError, OrderInDoubt, OrderRejected
+from .base import (DONE_STATUSES, AuthError, BrokerAdapter, BrokerError, OrderInDoubt, OrderNotSent,
+                   OrderOutcomeUnknown, OrderRejected)
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +77,9 @@ _CANCEL_REFUSED = frozenset({10148, 161})
 _CANCEL_CONFIRMED = 202
 # warnings that answer a modify with no: the order works on as it was (ib_async only marks errors as the order's end)
 _MODIFY_REFUSED_WARNINGS = frozenset({105, 110, 321, 329, 434})
+# what ib_async takes for a warning on an order (with 2100-2199): the order works on, so it is none of the order's
+# errors the audit keeps (_note_order_error) - unless it refuses a modify
+_IB_WARNINGS = frozenset({105, 110, 165, 321, 329, 399, 404, 434, 492, 10167})
 # the states ib_async counts as an order's end - it sends no change for an order in one
 _IB_DONE = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})
 
@@ -138,18 +142,39 @@ class _IBSession:
             fut.cancel()
             raise
 
-    def call(self, fn: Callable[[Any], Any], timeout: float = 15.0):
-        """``fn(ib)`` is a plain call run on the loop thread."""
+    def call(self, fn: Callable[[Any], Any], timeout: float = 15.0, order_ref: Optional[str] = None):
+        """``fn(ib)`` is a plain call run on the loop thread.
+
+        One not answered within ``timeout`` is abandoned: if the loop hasn't started it yet, it never will. For a
+        call that sends an order (``order_ref``: the order's tag, "" for none) that tells "not sent" from "not
+        known": one called off before it started raises OrderNotSent, one that had started raises
+        OrderOutcomeUnknown - the order may have reached IBKR, and is looked for there before another goes out.
+        Any other call raises the timeout."""
         done: Future = Future()
 
         def _run() -> None:
+            if not done.set_running_or_notify_cancel():
+                return                  # its caller gave up waiting before the loop got to it: never run late
             try:
                 done.set_result(fn(self.ib))
             except Exception as e:  # noqa: BLE001
                 done.set_exception(e)
 
         self._loop.call_soon_threadsafe(_run)
-        return done.result(timeout=timeout)
+        try:
+            return done.result(timeout=timeout)
+        except FutureTimeout:
+            if done.cancel():           # not started: called off, so it never runs
+                if order_ref is None:
+                    raise
+                raise OrderNotSent(f"IBKR's connection didn't get to the order within {timeout:g} s - it was not "
+                                   "sent") from None
+            if done.done():
+                return done.result()    # it finished just as the wait ran out
+            if order_ref is None:
+                raise
+            raise OrderOutcomeUnknown(f"IBKR didn't answer the order within {timeout:g} s - it may have reached "
+                                      "IBKR all the same", order_ref=order_ref) from None
 
     def stop(self) -> None:
         try:
@@ -273,6 +298,11 @@ class IbkrBroker(BrokerAdapter):
         #: before - see _true_status. Order id -> ...
         self._cancels_confirmed: Dict[str, float] = {}
         self._modifying: Dict[str, Tuple[str, int, float, Tuple[Any, Any]]] = {}
+        #: the orders the app asked IBKR to cancel -> when: IBKR's 202 for one of them is its word on that cancel, for
+        #: any other a cancel it made itself. And what IBKR said went wrong with the app's orders, till the executor
+        #: reads it for the order audit (order_errors) - noted on the loop thread, read on the executor's
+        self._cancels_asked: Dict[str, float] = {}
+        self._order_errors: Deque[Dict[str, Any]] = deque(maxlen=500)
         #: order id -> IBKR's permId, noted when an order is placed or read. An order that finishes while the
         #: connection is down comes back from IBKR's list of finished orders with no order id, only the permId
         self._perm_ids: Dict[str, int] = {}
@@ -566,6 +596,10 @@ class IbkrBroker(BrokerAdapter):
         }
 
     def _on_error(self, reqId, errorCode, errorString, contract=None) -> None:  # noqa: ANN001
+        try:
+            self._note_order_error(reqId, errorCode, errorString)     # first: before the move's note below may go
+        except Exception:  # noqa: BLE001 - the audit's note never stands in the way of the error's handling
+            log.debug("could not note IBKR's error %s on %s", errorCode, reqId, exc_info=True)
         if errorCode == _CANCEL_CONFIRMED or errorCode in _CANCEL_REFUSED:
             self._cancel_answer(reqId, errorCode, errorString)
             if errorCode in _CANCEL_REFUSED:
@@ -617,6 +651,56 @@ class IbkrBroker(BrokerAdapter):
         self._last_error = f"{errorCode}: {errorString}"
         if errorCode not in (162, 200):        # historical-data / unknown-contract noise
             log.debug("IBKR error %s: %s", errorCode, errorString)
+
+    def _note_order_error(self, req_id: Any, code: int, text: str) -> None:
+        """Keep what IBKR says went wrong with one of the app's orders, for the order audit (order_errors): a cancel
+        it refused (10148 / 161, with the state it names), a cancel it made without the app asking (a 202 for an
+        order no cancel was sent for: a DAY order at the close, its one-cancels-all group, a cancel by hand), a change
+        it refused, and any other error on an order - a rejection, or an order it ended. Its warnings (the order
+        works on) and the 202 that confirms the app's own cancel are none. An error that isn't on an order this
+        session knows is a request's (market data, candles) and is left out. Runs on the loop thread, from _on_error:
+        it only notes them - the executor writes them on its next order sync."""
+        try:
+            oid = int(req_id)
+        except (TypeError, ValueError):
+            return
+        if oid <= 0:
+            return
+        note = self._modifying.get(str(oid))
+        changing = note is not None and time.monotonic() - note[2] <= self.MODIFY_REFUSED_WITHIN_S
+        if code == _CANCEL_CONFIRMED:
+            if str(oid) in self._cancels_asked:
+                return                                   # the app's own cancel, confirmed
+            what = "cancelled by the broker, not by the app"
+        elif code in _CANCEL_REFUSED:
+            what = "cancel refused"
+        elif code in _IB_WARNINGS or 2100 <= code < 2200:
+            if not (changing and code in _MODIFY_REFUSED_WARNINGS):
+                return                                   # a warning: the order works on as it was
+            what = "change refused"
+        else:
+            what = "change refused" if changing else "error"
+        trade = next((t for t in self._ib.trades() if str(getattr(t.order, "orderId", "")) == str(oid)), None)
+        if trade is None:
+            return
+        message = " ".join(str(text or "").replace("<br>", " ").split())
+        error = {"order_id": str(oid), "code": int(code), "message": message[:300], "what": what,
+                 "tag": getattr(trade.order, "orderRef", "") or "",
+                 "symbol": getattr(getattr(trade, "contract", None), "symbol", "") or "",
+                 "at": dt.datetime.now(dt.timezone.utc)}
+        if code in _CANCEL_REFUSED:
+            error["state"] = _refused_state(message)
+        self._order_errors.append(error)
+
+    def order_errors(self) -> List[Dict[str, Any]]:
+        """What IBKR has said went wrong with the app's orders since the last call (_note_order_error), oldest
+        first - each told once."""
+        out: List[Dict[str, Any]] = []
+        while True:
+            try:
+                out.append(self._order_errors.popleft())
+            except IndexError:
+                return out
 
     def _cancel_answer(self, order_id: int, code: int, text: str) -> None:
         """IBKR's answer to a cancel: 202 confirms it; 10148 / 161 refuse it - the order is still working, or has
@@ -1210,7 +1294,9 @@ class IbkrBroker(BrokerAdapter):
             order.ocaGroup, order.ocaType = req.oca_group, int(req.oca_type or 3)
         if self.account_id:
             order.account = self.account_id
-        trade = self._session.call(lambda ib: ib.placeOrder(contract, order), timeout=10)
+        # an order IBKR doesn't answer in time may still have reached it: OrderOutcomeUnknown, never "not sent"
+        trade = self._session.call(lambda ib: ib.placeOrder(contract, order), timeout=10,
+                                   order_ref=req.client_tag or "")
         oid = str(getattr(trade.order, "orderId", "") or getattr(trade.order, "permId", ""))
         self._note_perm(oid, trade)                    # IBKR gives the permId a moment later: a read notes it then
         status = getattr(trade.orderStatus, "status", "") or "Submitted"
@@ -1272,7 +1358,15 @@ class IbkrBroker(BrokerAdapter):
 
         quiet = getattr(trade.orderStatus, "status", "") == "PreSubmitted"     # IBKR takes a change to it silently
         wait = min(self.MODIFY_QUIET_S, self.MODIFY_ANSWER_S) if quiet else self.MODIFY_ANSWER_S
-        changed, at = self._session.call(_send, timeout=10)
+        try:
+            changed, at = self._session.call(_send, timeout=10, order_ref=getattr(order, "orderRef", "") or "")
+        except OrderOutcomeUnknown:
+            raise                                       # it may have gone out: the order says what was sent
+        except Exception:
+            # never sent - called off before the loop got to it (OrderNotSent), or turned away on the way out: the
+            # order goes back to what IBKR still holds, or it would read as moved (get_order) though it never was
+            order.auxPrice, order.totalQuantity = before
+            raise
         if at is not None:
             refused = self._modify_answer(changed, str(order_id), at, wait)
             if refused:
@@ -1329,7 +1423,15 @@ class IbkrBroker(BrokerAdapter):
         if not int(getattr(trade.order, "orderId", 0) or 0):
             # rebuilt from IBKR's list of finished orders: a cancel would go out for order 0
             raise OrderRejected(f"IBKR: order {order_id} is finished - nothing to cancel")
-        self._session.call(lambda ib: ib.cancelOrder(trade.order), timeout=8)
+        # noted before it goes: IBKR's 202 can come back on the loop before this call returns
+        asked = str(trade.order.orderId)
+        _remember(self._cancels_asked, asked, time.monotonic())
+        try:
+            self._session.call(lambda ib: ib.cancelOrder(trade.order), timeout=8,
+                               order_ref=getattr(trade.order, "orderRef", "") or "")
+        except OrderNotSent:
+            self._cancels_asked.pop(asked, None)        # it never went: a 202 later is IBKR's own cancel
+            raise
 
     def get_order(self, order_id: str) -> OrderResult:
         if not self.is_connected:

@@ -2,12 +2,13 @@
 import { $ } from "./util.js";
 import { S } from "./state.js";
 
-export function toast(text, cls) {
+/** `ms`: how long it stays up - longer for the few that must not be missed. */
+export function toast(text, cls, ms = 6500) {
   const d = document.createElement("div");
   d.className = "toast " + (cls || "");
   d.textContent = text;
   $("#toasts").appendChild(d);
-  setTimeout(() => d.remove(), 6500);
+  setTimeout(() => d.remove(), ms);
 }
 export const toastResult = r =>
   toast(r.ok ? (r.note || "Done") : (r.reason || r.detail || "Failed"), r.ok ? "good" : "bad");

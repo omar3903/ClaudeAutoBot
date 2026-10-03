@@ -5,7 +5,7 @@ The exit routes follow the exit manager (execution/exit_manager.py). The stop an
 the target always apply. With automatic exits on, the stop moves to lock a small
 gain once the trade is ``breakeven_at_r`` in profit, trails the price past
 ``trail_start_r``, and a day trade is closed before the bell (a swing trade after
-``max_swing_hold_days``).
+``max_swing_hold_days`` trading days).
 
 A trade's chart spans from the session before its entry to today, in 5-minute
 candles while that fits IBKR's window (the scans' cached five sessions first,
@@ -99,7 +99,9 @@ def exit_routes(play: Play, cfg: Any) -> List[Dict[str, Any]]:
                        "how": f"Still open {flatten} minutes before the close: {close} at the market, whatever the price."})
     elif auto and play.timeframe is Timeframe.SWING and hold_days > 0:
         routes.append({"key": "time", "label": "Time stop", "price": None, "r": None,
-                       "how": f"Still open after {hold_days} days: {close} at the market, whatever the price."})
+                       "how": f"Still open after {hold_days} trading days, the entry's counted: {close} at the market "
+                              + (f"{flatten} minutes before the last one's close" if flatten > 0
+                                 else "at the next day's open") + ", whatever the price."})
     return routes
 
 
@@ -229,10 +231,11 @@ def trade_marks(t: Dict[str, Any], fills: Sequence[Dict[str, Any]]) -> List[Dict
 
 def stop_moves(t: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Every time the stop moved, from the exit manager's notes: the new stop and where the trade stood then.
-    None carries a time (``t``): the notes don't, and neither do the orders sent for the trade - a stop
-    resting at the broker is moved by modifying it, which leaves no order row, and a stop order placed
-    afresh is the same stop placed again (after a restart, a lost order, a refused pair), so its time is
-    the placement's, not a move's."""
+    None carries a time (``t``): the notes don't, and the orders sent for the trade don't stand in - a stop
+    resting at the broker is moved by modifying it, whose MODIFY row is when the broker was asked (at most
+    every STOP_MOVE_S, a resize, a try again), not when the stop moved, and a stop order placed afresh is the
+    same stop placed again (after a restart, a lost order, a refused pair), so its time is the placement's,
+    not a move's."""
     return [{"t": None, "price": round(float(price), 4), "r": float(r)}
             for price, r in _STOP_NOTE.findall(t.get("notes") or "")]
 

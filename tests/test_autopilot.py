@@ -1011,6 +1011,18 @@ def test_an_entry_that_ends_before_approve_returns_still_hands_its_slot_back():
     assert len(eng.approved) == 1 and ap.status()["auto_trades_today"] == 0 and ap._sent_today == 1
 
 
+def test_an_entry_the_broker_didnt_answer_in_time_counts_as_sent_and_keeps_its_slot_until_known_unsent():
+    eng, ap = _two_a_day()
+    eng.approve_play = lambda pid, operator="operator": {"ok": False, "sent_unknown": True,
+                                                         "reason": "IBKR didn't answer the order in time"}
+    play = mkplay(sym="AAA")
+    _run(ap, play)
+    assert ap.status()["auto_trades_today"] == 1 and ap._sent_today == 1 and play.id in ap._auto_play_ids
+    assert play.id not in ap._refused
+    assert ap.entry_unfilled(play.id) and ap.status()["auto_trades_today"] == 0   # it never went out, as it turns out
+    assert ap._sent_today == 1
+
+
 def test_an_approve_that_fails_takes_no_slot_and_one_that_crashes_keeps_it():
     eng, ap = _two_a_day()
     eng.approve_play = lambda pid, operator="operator": {"ok": False, "reason": "size rounds to zero"}

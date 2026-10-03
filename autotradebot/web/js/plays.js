@@ -492,6 +492,12 @@ async function approve(id) {
     mergePlay({ id, status: r.status === "FILLED" ? "FILLED" : "SUBMITTED", trade_id: r.trade_id || null });
     if (S.selected === id) selectPlay(id);            // another play picked meanwhile stays shown
     loadOpen();
+  } else if (r.sent_unknown) {
+    // IBKR didn't answer in time: the order may be working, and the app looks for it - the play counts as sent
+    toast(`Order for ${symbol} not confirmed: ` + (r.reason || "no answer from the broker in time"), "warn");
+    mergePlay({ id, status: "SUBMITTED", trade_id: null });
+    if (S.selected === id) selectPlay(id);
+    loadOpen();
   } else {
     toast("Not sent: " + (r.reason || "rejected"), "bad");
     if (r.already_executed) {

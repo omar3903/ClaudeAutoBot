@@ -82,6 +82,29 @@ def test_the_stop_and_the_first_targets_part_rest_together_in_one_reducing_group
     assert len(broker.orders) == 2                                             # once is enough
 
 
+def test_a_target_the_broker_didnt_answer_in_time_is_taken_over_when_found_never_placed_twice():
+    from autotradebot.brokers.base import OrderOutcomeUnknown
+
+    broker, _, ex, _ = _setup()
+    place = broker.place_order
+
+    def unanswered_target(req):                                                # the target reaches the broker all the same
+        res = place(req)
+        if req.client_tag.startswith("tgt:"):
+            raise OrderOutcomeUnknown("IBKR didn't answer the order within 10 s", order_ref=req.client_tag)
+        return res
+
+    broker.place_order = unanswered_target
+    ex.sync_open_orders()
+    assert len(broker.stops()) == len(broker.targets()) == 1 and not ex.target_resting("t1")
+    broker.place_order = place
+    ex._target_retry.clear()
+    ex.sync_open_orders()
+    assert ex.target_resting("t1") and ex.resting_targets()[0]["order_id"] == "2"
+    ex.sync_open_orders()
+    assert len(broker.orders) == 2 and broker.cancelled == [] and "t1" not in ex._plain   # nothing stood down or doubled
+
+
 def test_a_position_that_exits_whole_gets_a_target_for_all_of_it():
     broker, _, ex, _ = _setup(_trade(target_price=104.0))                      # no second target: no scale-out
     ex.sync_open_orders()

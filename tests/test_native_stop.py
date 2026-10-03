@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import threading
 import time
 from types import SimpleNamespace
 
 import pytest
 
-from test_order_follow_up import VENUE, _Broker, _executor, _Repo, _trade
+from test_order_follow_up import VENUE, _AuditedRepo, _Broker, _executor, _refuses_once, _Repo, _trade
 from autotradebot.brokers.base import BrokerError
-from autotradebot.core.enums import OrderType, Side, TimeInForce
+from autotradebot.core.enums import OrderType, PlayStatus, Side, TimeInForce
 from autotradebot.core.models import Fill, OrderResult
 
 
@@ -143,6 +144,73 @@ def test_a_venue_that_cannot_modify_has_the_stop_replaced():
     assert [s.stop_price for s in broker.stops()] == [98.0, 100.35]
 
 
+def test_a_stop_the_broker_didnt_answer_in_time_is_no_refusal_and_is_taken_over_never_doubled():
+    from autotradebot.brokers.base import OrderOutcomeUnknown
+
+    broker, repo, ex, heard = _setup()
+    place = broker.place_order
+
+    def unanswered(req):                                                       # it reaches the broker; the answer doesn't
+        place(req)
+        raise OrderOutcomeUnknown("IBKR didn't answer the order within 10 s", order_ref=req.client_tag)
+
+    broker.place_order = unanswered
+    ex.sync_open_orders()
+    assert len(broker.stops()) == 1 and ex.protective_stops() == [] and "stop.failed" not in [t for t, _ in heard]
+    broker.place_order = place
+    ex.sync_open_orders()                                                      # a few seconds' wait first
+    assert len(broker.stops()) == 1
+    ex._stop_retry.clear()
+    ex.sync_open_orders()
+    assert len(broker.stops()) == 1 and ex.protective_stops()[0]["order_id"] == "1"   # taken over, not placed again
+
+
+def test_a_stop_move_the_broker_didnt_answer_in_time_leaves_the_stop_resting_never_replaced():
+    from autotradebot.brokers.base import OrderOutcomeUnknown
+
+    broker, repo, ex, _ = _setup()
+    ex.STOP_MOVE_S = 0.0
+    ex.sync_open_orders()
+
+    def unanswered(order_id, stop_price=None, quantity=None):
+        raise OrderOutcomeUnknown("IBKR didn't answer the order within 10 s", order_ref="stop:t1")
+
+    broker.modify_stop = unanswered
+    repo.update_trade_risk("t1", stop_price=100.35)
+    ex.sync_open_orders()
+    assert broker.cancelled == [] and len(broker.stops()) == 1 and ex.protective_stops()[0]["order_id"] == "1"
+
+
+def test_every_stop_move_is_audited_and_one_refused_or_unanswered_as_failed():
+    from autotradebot.brokers.base import OrderOutcomeUnknown
+
+    broker, repo = _StopBroker({"AAA": 10}), _AuditedRepo([_trade()])
+    ex = _executor(broker, repo)
+    ex.STAND_DOWN_S = ex.STAND_DOWN_POLL_S = ex.STOP_MOVE_S = 0.0
+    ex.sync_open_orders()
+    [placed] = repo.rows("PLACE")
+    assert (placed["trade_id"], placed["response"]["order_id"], placed["response"]["stop"]) == ("t1", "1", 98.0)
+    repo.update_trade_risk("t1", stop_price=99.0)
+    ex.sync_open_orders()                                                      # moved in place
+
+    def unanswered(order_id, stop_price=None, quantity=None):
+        raise OrderOutcomeUnknown("IBKR didn't answer the order within 10 s", order_ref="stop:t1")
+
+    broker.modify_stop = unanswered
+    repo.update_trade_risk("t1", stop_price=99.5)
+    ex.sync_open_orders()                                                      # rests where it was
+    del broker.modify_stop
+    broker.can_modify = False
+    ex.sync_open_orders()                                                      # refused: placed afresh
+    moved, unknown, refused = repo.rows("MODIFY")
+    assert [r["trade_id"] for r in (moved, unknown, refused)] == ["t1"] * 3
+    assert (moved["ok"], moved["request"]["stop"], moved["request"]["from_stop"], moved["response"]["stop"]) ==         (True, 99.0, 98.0, 99.0)
+    assert (unknown["ok"], unknown["request"]["stop"], unknown["response"]["outcome"]) == (False, 99.5, "unknown")
+    assert (refused["ok"], refused["response"]["outcome"]) == (False, "refused") and "no modify" in refused["message"]
+    [dropped] = repo.rows("CANCEL")
+    assert (dropped["request"]["order_id"], dropped["trade_id"], dropped["message"]) ==         ("1", "t1", "its move was refused - placed afresh")
+
+
 def test_the_stop_stands_down_before_the_apps_own_exit_goes_out():
     broker, _, ex, _ = _setup()
     ex.sync_open_orders()
@@ -152,6 +220,122 @@ def test_the_stop_stands_down_before_the_apps_own_exit_goes_out():
     assert exit_order.quantity == 10 and exit_order.client_tag == "exit:t1"
     ex.sync_open_orders()
     assert len(broker.stops()) == 1                                            # no new stop while the exit is working
+
+
+def test_a_stop_counts_as_resting_only_while_followed_kept_at_the_broker_and_the_broker_connected():
+    broker, _, ex, _ = _setup()
+    assert not ex.stop_resting("t1")                                           # none placed yet
+    ex.sync_open_orders()
+    assert ex.stop_resting("t1") and not ex.stop_resting("t2")
+    broker.is_connected = False                                                # nobody there to fill it
+    assert not ex.stop_resting("t1")
+    broker.is_connected = True
+    broker.supports_native_stop = False
+    assert not ex.stop_resting("t1")
+
+
+@pytest.mark.parametrize("side, held, reached, short_of", [("LONG", 10, (98.0, 97.5), 98.01),
+                                                            ("SHORT", -10, (103.0, 103.5), 102.99)])
+def test_a_stop_rests_for_a_cross_only_where_the_price_reaches_it_and_till_an_exit_asks_for_its_cancel(side, held,
+                                                                                                    reached, short_of):
+    stop = 98.0 if side == "LONG" else 103.0
+    broker, _, ex, _ = _setup(_trade(side=side, stop_price=stop, initial_stop_price=stop), positions={"AAA": held})
+    ex.sync_open_orders()                                                      # the stop rests at the broker
+    assert all(ex.stop_resting("t1", price=px, side=side) for px in reached)
+    assert not ex.stop_resting("t1", price=short_of, side=side)                # it can't fill at this price
+    broker.slow_cancel = True
+    assert not ex.close_trade("t1", reason="stop")["ok"]                       # an exit asked for its cancel...
+    assert ex.protective_stops() and not ex.stop_resting("t1", price=reached[0], side=side)   # ...unconfirmed
+
+
+def test_a_cross_of_a_stop_ratcheted_past_where_it_rests_at_the_broker_exits_at_once(monkeypatch):
+    from test_order_follow_up import CFG, SILENT
+    from autotradebot.core.models import Quote
+    from autotradebot.execution import exit_manager as module
+    from autotradebot.execution.exit_manager import ExitManager
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: 1000.0)
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()                                                      # the stop rests at the broker at 98
+    repo.update_trade_risk("t1", stop_price=99.5)                              # the ratchet moved the record's stop...
+    ex.sync_open_orders()
+    assert ex.protective_stops()[0]["stop_price"] == 98.0                      # ...the broker's moves after STOP_MOVE_S
+    em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=99, ask=99, last=99),
+                     cfg=SimpleNamespace(**vars(CFG), broker_stop_grace_s=10), bus=SILENT, venue=VENUE)
+    em.run_once()                                                              # 99: under 99.5, over the broker's 98
+    assert broker.cancelled == ["1"]                                           # no grace for a stop that can't fill
+    assert [(o.quantity, o.client_tag) for o in broker.exits()] == [(10, "exit:t1")]
+
+
+def test_a_stop_crossed_before_the_open_gets_its_whole_grace_at_the_open(monkeypatch):
+    from test_order_follow_up import CFG, SILENT
+    from autotradebot.core.models import Quote
+    from autotradebot.execution import exit_manager as module
+    from autotradebot.execution.executor import Executor
+    from autotradebot.execution.exit_manager import ExitManager
+    from autotradebot.util import clock as clk
+
+    now, session = [1000.0], [clk.Session.PRE]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(Executor, "_session_now", staticmethod(lambda: session[0]))
+    monkeypatch.setattr(ExitManager, "_session_now", staticmethod(lambda: session[0]))
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()                                                      # the stop rests at the broker at 98
+    em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=95, ask=95, last=95),
+                     cfg=SimpleNamespace(**vars(CFG), broker_stop_grace_s=10), bus=SILENT, venue=VENUE)
+    em.run_once()                                       # a pre-market print under the stop: the broker's can't fill
+    now[0] += 3600.0
+    em.run_once()
+    assert broker.exits() == [] and broker.cancelled == []                     # nor can an exit: it waits for the open
+    session[0] = clk.Session.REGULAR                                           # the open, where IBKR's stop triggers
+    for _ in range(10):
+        em.run_once()
+        now[0] += 1.0
+    assert broker.exits() == [] and broker.cancelled == []                     # its whole grace to fill
+    em.run_once()
+    assert broker.cancelled == ["1"] and len(broker.exits()) == 1              # then the app's own exit
+
+
+def _crossing_stop(monkeypatch):
+    """The exit manager over a trade whose stop rests at the broker, the price under that 98 stop, on a clock of its
+    own: (broker, repo, executor, exit manager, clock)."""
+    from test_order_follow_up import CFG, SILENT
+    from autotradebot.core.models import Quote
+    from autotradebot.execution import exit_manager as module
+    from autotradebot.execution.exit_manager import ExitManager
+
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()
+    em = ExitManager(repo, ex, quote_fn=lambda s: Quote(symbol=s, bid=97, ask=97, last=97),
+                     cfg=SimpleNamespace(**vars(CFG), broker_stop_grace_s=10), bus=SILENT, venue=VENUE)
+    return broker, repo, ex, em, clock
+
+
+def test_a_stop_crossed_while_it_rests_is_left_to_fill_and_the_apps_exit_goes_only_after_the_grace(monkeypatch):
+    broker, _, _, em, clock = _crossing_stop(monkeypatch)
+    for _ in range(10):                                                        # a pass a second, 0 to 9 s after the cross
+        em.run_once()
+        clock[0] += 1.0
+    assert broker.exits() == [] and broker.cancelled == []                     # the broker's stop left to fill
+    em.run_once()                                                              # 10 s after the first cross
+    assert broker.cancelled == ["1"]                                           # stood down, then the app's own exit
+    assert [(o.quantity, o.client_tag) for o in broker.exits()] == [(10, "exit:t1")]
+
+
+def test_a_stop_that_fills_within_its_grace_is_booked_and_the_app_sends_no_exit(monkeypatch):
+    broker, repo, ex, em, clock = _crossing_stop(monkeypatch)
+    em.run_once()
+    clock[0] += 2.0
+    broker.live["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                   avg_fill_price=97.9)
+    ex.sync_open_orders()                                                      # the order sync books the stop's fill
+    clock[0] += 20.0
+    em.run_once()
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
+    assert broker.exits() == [] and broker.cancelled == []
 
 
 def test_no_exit_goes_out_until_the_broker_confirms_the_stop_is_cancelled():
@@ -435,6 +619,39 @@ def test_a_cancel_ibkr_answers_with_some_other_error_holds_the_exit_back_on_the_
     closed = repo.get_trade("t1")
     assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
     assert [t.order.orderType for t in orders.book.values()] == ["STP"]
+
+
+def test_ibkrs_refusal_of_a_cancel_is_audited_failed_with_the_orders_state_under_its_trade_when_it_came(monkeypatch):
+    from sqlalchemy import select
+
+    from autotradebot.persistence.db import session_scope
+    from autotradebot.persistence.models_orm import OrderAudit
+    from autotradebot.persistence.repository import Repository
+
+    broker, orders = _ibkr_broker(monkeypatch)
+    repo = _Repo([_trade(id="t_aud")])
+    repo.record_order_audit = Repository().record_order_audit                 # the real table
+    ex = _executor(broker, repo)
+    ex.STAND_DOWN_S = ex.STAND_DOWN_POLL_S = 0.0
+    ex.sync_open_orders()                                                      # the stop rests: order 1
+    orders.answer_cancel = (10148, "OrderId 1 that needs to be cancelled cannot be cancelled, state: Filled.")
+    assert ex.close_trade("t_aud", reason="stop")["wait"]                      # the stop is filling
+    refused_by = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    ex.sync_open_orders()                                                      # IBKR's words go into the audit
+
+    def rows():
+        with session_scope() as s:
+            return [(r.action, r.ok, r.request, r.response, r.message, r.ts) for r in s.execute(
+                select(OrderAudit).where(OrderAudit.trade_id == "t_aud").order_by(OrderAudit.ts)).scalars()]
+
+    assert [(action, ok) for action, ok, *_ in rows()] == [("PLACE", True), ("CANCEL", True), ("ERROR", False)]
+    placed, asked, refused = rows()
+    assert (placed[3]["order_id"], placed[3]["status"], placed[2]["tag"]) == ("1", "WORKING", "stop:t_aud")
+    assert (asked[2]["order_id"], asked[4]) == ("1", "stood down for the app's own exit")
+    assert (refused[2]["order_id"], refused[3]["code"], refused[3]["state"]) == ("1", 10148, "Filled")
+    assert refused[4].startswith("cancel refused (10148): OrderId 1") and refused[5] <= refused_by
+    ex.sync_open_orders()
+    assert len(rows()) == 3                                                    # written once
 
 
 def _moved_silently_at_ibkr(monkeypatch):
@@ -1174,3 +1391,360 @@ def test_an_exit_looks_in_the_executions_of_a_stop_the_broker_no_longer_knows_be
     else:                                                                      # not known whether it filled: it waits
         assert not out["ok"] and out["wait"] and broker.exits() == [] and t["status"] == "OPEN"
         assert ex.protective_stops()[0]["order_id"] == "1"
+
+
+def test_an_unanswered_exit_whose_stop_stood_down_is_said_at_once_and_every_few_minutes_while_it_cant_be_found(
+        monkeypatch):
+    from autotradebot.brokers.base import OrderOutcomeUnknown
+    from autotradebot.execution import executor as executor_module, protective_stops as stops_module
+
+    now = [1000.0]
+    for module in (executor_module, stops_module):
+        monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    broker, repo, ex, heard = _setup()
+    ex.sync_open_orders()                                                      # the stop rests: order 1
+    resting = broker.place_order
+
+    def unanswered(req):
+        if req.order_type is OrderType.STOP:
+            return resting(req)
+        broker.orders.append(req)                                              # it may have reached the broker
+        raise OrderOutcomeUnknown("IBKR didn't answer the order within 10 s", order_ref=req.client_tag)
+
+    broker.place_order = unanswered
+    out = ex.close_trade("t1", reason="stop")
+    assert out["wait"] and out["sent_unknown"] and broker.cancelled == ["1"]  # the stop stood down for it
+    [first] = [p for topic, p in heard if topic == "order.unconfirmed"]        # said at once
+    assert first["trade_id"] == "t1" and first["bare"] and "no stop there" in first["msg"]
+
+    def unreadable(status=None):                                               # the open orders keep timing out
+        raise BrokerError("IBKR's open orders didn't arrive within 10 s")
+
+    broker.list_orders, said = unreadable, []
+    for _ in range(int(ex.UNPROTECTED_WARN_S + ex.UNPROTECTED_REPEAT_S) // 4 + 1):     # passes 4 s apart
+        now[0] += 4.0
+        heard.clear()
+        ex.sync_open_orders()
+        said += [(now[0] - 1000.0, p) for topic, p in heard if topic == "order.unconfirmed"]
+    # the look for it settles nothing meanwhile, so it is said a minute and a half on, and again five minutes later
+    assert [round(at) for at, _ in said] == [92, 392]
+    assert all(p["bare"] and "no stop at the broker" in p["msg"] for _, p in said)
+    assert len(broker.exits()) == 1 and len(broker.stops()) == 1 and ex.pending_exit_trade_ids() == {"t1"}
+
+    broker.list_orders = lambda status=None: []                                # readable again: it never went out
+    heard.clear()
+    ex.sync_open_orders()
+    assert ex.pending_exit_trade_ids() == set() and "order.failed" in [topic for topic, _ in heard]
+    assert ex._unknown_said == {}
+
+
+# ---------------------------------------------------------------- shares closed without a record
+def test_closing_an_unbooked_entrys_shares_without_a_record_settles_it_so_no_record_stop_or_exit_follows():
+    from test_order_follow_up import _unbooked_entry
+
+    broker, repo = _StopBroker({"AAA": 10}), _Repo([])
+    ex, play, allow = _unbooked_entry(broker, repo)
+    out = ex.close_untracked("AAA", "LONG", 10)                                # the Exit under Shares without a record
+    unwind = broker.orders[-1]
+    assert out["ok"] and (unwind.client_tag, unwind.side, unwind.quantity) == ("unwind:AAA", Side.SHORT, 10)
+    # the entry is off the books in the same step: its play is never sent again, nor booked after a restart
+    assert ex.working_entries() == [] and ex._unbooked == {} and play.status is PlayStatus.ERROR
+    assert repo.settled[-1][:2] == (play.id, "ERROR") and repo.settled[-1][2]["status"] == "UNWOUND"
+    # the close works at the broker (held for the open, say) when the database takes bookings again
+    broker.working.append(OrderResult(order_id=out["order_id"], status="SUBMITTED", symbol="AAA", submitted_qty=10,
+                                      side=Side.SHORT, tag="unwind:AAA", raw={"mine": True}))
+    allow()
+    ex.sync_open_orders()
+    # no record for shares being sold - so no stop beside the close, and no exit of the record's own after it
+    assert repo.open_trades() == [] and broker.stops() == [] and len(broker.orders) == 2
+
+
+def test_shares_booked_since_they_were_listed_without_a_record_are_not_closed_again_by_that_exit():
+    from test_order_follow_up import _unbooked_entry
+
+    broker, repo = _StopBroker({"AAA": 10}), _Repo([])
+    ex, _, allow = _unbooked_entry(broker, repo)                               # listed under Shares without a record...
+    allow()
+    ex.sync_open_orders()                                                      # ...booked, with its stop, just before
+    [t] = repo.open_trades()                                                   # the Exit reaches the executor
+    out = ex.close_untracked("AAA", "LONG", 10)
+    assert not out["ok"] and "no AAA shares beyond the trade records" in out["reason"]
+    assert [o.client_tag for o in broker.orders if o.client_tag.startswith("unwind:")] == []
+    broker.positions["AAA"] = 15                                               # five more bought outside the app
+    out = ex.close_untracked("AAA", "LONG", 15)
+    assert out["ok"] and out["qty"] == 5 and broker.orders[-1].quantity == 5   # only those
+    assert repo.get_trade(t["id"])["status"] == "OPEN"
+
+
+def test_a_closing_order_working_at_the_broker_is_no_cover_for_a_stop_nor_room_for_an_exit():
+    # a close of shares without a record still working when a record for those shares appears
+    unwind = OrderResult(order_id="u1", status="SUBMITTED", symbol="AAA", submitted_qty=10, side=Side.SHORT,
+                         tag="unwind:AAA", raw={"mine": True})
+    broker, repo, ex, heard = _setup(working=[unwind])
+    ex.sync_open_orders()
+    assert broker.stops() == []                                                # it would sell the same shares twice
+    [why] = [p["reason"] for topic, p in heard if topic == "stop.failed"]
+    assert "10 of them being sold by orders working there" in why
+    out = ex.close_trade("t1", reason="stop")
+    assert not out["ok"] and "already working cover all" in out["reason"] and broker.exits() == []
+
+    broker.working.clear()                                                     # it went (or was called off)
+    ex._stop_retry.clear()
+    ex.sync_open_orders()
+    assert [(s.client_tag, s.quantity) for s in broker.stops()] == [("stop:t1", 10)]
+
+
+def _two_records():
+    """Two records of 10 AAA each (t1, t2), both stops resting on the 20 shares held. Returns what _setup does, and
+    t2's stop's order id."""
+    broker, repo, ex, heard = _setup(positions={"AAA": 20})
+    repo.t["t2"] = _trade(id="t2", entry_time="2026-09-03T09:50:00")
+    ex.STOP_RETRY_S = ex.SHARES_RETRY_S = 0.0
+    ex.sync_open_orders()
+    [stop_t2] = [s.order_id for s in broker.live.values() if s.tag == "stop:t2"]
+    return broker, repo, ex, heard, stop_t2
+
+
+def _resting(broker, tag):
+    return [s for s in broker.live.values() if s.tag == tag and s.status not in ("CANCELED", "FILLED")]
+
+
+def test_an_exit_filled_whose_booking_waits_sells_nothing_more_so_another_record_keeps_a_stop_and_its_exit():
+    broker, repo, ex, heard, stop_t2 = _two_records()
+    real_close = repo.close_trade
+
+    def refuse_t1(tid, *a, **k):                                               # the database won't take t1's close
+        if tid == "t1":
+            raise RuntimeError("database is locked")
+        return real_close(tid, *a, **k)
+
+    repo.close_trade = refuse_t1
+    out = ex.close_trade("t1", reason="stop")
+    broker.reports[out["order_id"]] = OrderResult(order_id=out["order_id"], status="FILLED", symbol="AAA",
+                                                  submitted_qty=10, filled_qty=10, avg_fill_price=97.8)
+    broker.positions["AAA"] = 10                                               # t1's ten are gone: t2's are left
+    ex.sync_open_orders()
+    assert ex.pending_exit_trade_ids() == {"t1"} and repo.get_trade("t1")["status"] == "OPEN"   # booked later
+    broker.live[stop_t2].status = "CANCELED"                                   # t2's stop dropped by the broker...
+    ex.sync_open_orders()
+    assert len(_resting(broker, "stop:t2")) == 1                               # ...is placed again on its 10 shares
+    assert "stop.failed" not in [topic for topic, _ in heard]
+    out = ex.close_trade("t2", reason="eod-flatten")                           # and t2's own exit goes out
+    assert out["ok"] and [(o.client_tag, o.quantity) for o in broker.exits()] == [("exit:t1", 10), ("exit:t2", 10)]
+
+
+def test_the_part_a_working_exit_has_sold_is_not_counted_again_against_the_shares_held():
+    broker, repo, ex, heard, stop_t2 = _two_records()
+    out = ex.close_trade("t1", reason="stop")
+    broker.reports[out["order_id"]] = OrderResult(order_id=out["order_id"], status="SUBMITTED", symbol="AAA",
+                                                  submitted_qty=10, filled_qty=4, avg_fill_price=97.8)
+    broker.positions["AAA"] = 16                                               # 4 sold, 6 still to sell
+    broker.live[stop_t2].status = "CANCELED"
+    ex.sync_open_orders()
+    assert len(_resting(broker, "stop:t2")) == 1 and "stop.failed" not in [topic for topic, _ in heard]
+    broker.positions["AAA"] = 15                                               # one more sold, not reported yet
+    broker.live[_resting(broker, "stop:t2")[0].order_id].status = "CANCELED"
+    ex.sync_open_orders()
+    assert _resting(broker, "stop:t2") == []                                   # 15 held less 6 to sell can't cover it
+
+
+# ---------------------------------------------------------------- one caller at a time: threads side by side
+def test_two_closes_sent_together_send_one_exit_and_the_second_hears_at_once():
+    broker, _, ex, _ = _setup()
+    ex.sync_open_orders()                                                      # stop 1 rests
+    ex.STAND_DOWN_S, ex.STAND_DOWN_POLL_S = 2.0, 0.01
+    sending, place = threading.Event(), broker.place_order
+
+    def place_order(req):                                                      # the first close's exit is on its way
+        sending.set()
+        time.sleep(0.5)
+        return place(req)
+
+    broker.place_order = place_order
+    first = []
+    closing = threading.Thread(target=lambda: first.append(ex.close_trade("t1", reason="stop")))
+    closing.start()
+    assert sending.wait(2)
+    began = time.monotonic()
+    second = ex.close_trade("t1", reason="manual")                             # the Close button, meanwhile
+    waited = time.monotonic() - began
+    closing.join(5)
+    assert first[0]["ok"] and [o.quantity for o in broker.exits()] == [10]
+    assert not second["ok"] and second["wait"] and second["reason"] == "An exit for this position is already being sent"
+    assert waited < 0.3                                                        # not queued behind the first
+
+
+def test_two_order_syncs_side_by_side_book_an_entry_filled_while_the_app_was_off_once_and_rest_one_stop():
+    broker, repo = _StopBroker({"AAA": 10}), _Repo([])
+    repo.submitted_plays = lambda since, until: [_sent("play_off", "AAA")]
+    filled = [Fill(order_id="11", symbol="AAA", side=Side.LONG, quantity=10, price=100.0, tag="play_off")]
+    broker.get_fills = lambda symbol=None: time.sleep(0.1) or list(filled)    # IBKR takes a moment to answer...
+    opened = repo.open_trade
+    repo.open_trade = lambda *a, **k: time.sleep(0.1) or opened(*a, **k)       # ...and so does the database
+    ex = _executor(broker, repo)
+    together = threading.Barrier(2)
+
+    def sync():                                                                # the sync loop, and the Refresh button
+        together.wait(2)
+        ex.sync_open_orders()
+
+    passes = [threading.Thread(target=sync) for _ in range(2)]
+    for p in passes:
+        p.start()
+    for p in passes:
+        p.join(10)
+    [t] = repo.open_trades()
+    assert (t["symbol"], t["quantity"]) == ("AAA", 10)
+    assert [(s.quantity, s.client_tag) for s in broker.stops()] == [(10, f"stop:{t['id']}")]
+
+
+def test_the_order_sync_books_nothing_of_a_stop_fill_an_exit_took_and_booked_first():
+    broker, repo, ex, heard = _setup()
+    ex.sync_open_orders()                                                      # stop 1 rests
+    stop = broker.live["1"]
+    stop.status, stop.filled_qty, stop.avg_fill_price = "CANCELED", 4, 97.9   # four filled, then it was cancelled
+    read, inside = broker.get_order, []
+
+    def get_order(order_id):                                                   # an exit's stand-down finds it done
+        if order_id == "1" and not inside:                                     # just as the pass reads it, and books
+            inside.append(1)                                                   # its fill first
+            ex._stand_down("t1")
+        return read(order_id)
+
+    broker.get_order = get_order
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["quantity"] == 6 and [t for t, _ in heard].count("trade.reduced") == 1
+
+
+def test_an_exit_books_nothing_of_a_stop_fill_the_order_sync_took_and_booked_first():
+    broker, repo, ex, heard = _setup()
+    ex.sync_open_orders()                                                      # stop 1 rests
+    stop = broker.live["1"]
+    stop.status, stop.filled_qty, stop.avg_fill_price = "CANCELED", 4, 97.9   # four filled, then it was cancelled
+    read, inside = broker.get_order, []
+
+    def get_order(order_id):                                                   # the order sync's watch finds it done
+        if order_id == "1" and not inside:                                     # just as the stand-down reads it, and
+            inside.append(1)                                                   # books its fill first
+            ex._watch_one(ex._stops, ex._book_stop_fill, ex._stops["t1"])
+        return read(order_id)
+
+    broker.get_order = get_order
+    out = ex.close_trade("t1", reason="manual")
+    assert repo.get_trade("t1")["quantity"] == 6 and [t for t, _ in heard].count("trade.reduced") == 1
+    assert not out["ok"] and out["wait"] and broker.exits() == []              # the rest goes on its next try
+    assert ex.close_trade("t1", reason="manual")["ok"] and [o.quantity for o in broker.exits()] == [6]
+
+
+
+def test_a_stop_fill_whose_booking_fails_is_booked_on_the_next_pass_and_nothing_else_is_done_meanwhile():
+    broker, repo, ex, heard = _setup()
+    ex.STOP_MOVE_S = 0.0
+    ex.sync_open_orders()                                                      # the stop rests: order 1
+    calls = _refuses_once(repo, "close_trade")
+    broker.live["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                   avg_fill_price=97.9)
+    repo.update_trade_risk("t1", stop_price=99.0)                              # the exit manager ratchets the record
+    ex.sync_open_orders()
+    assert repo.get_trade("t1")["status"] == "OPEN" and ex.fill_unbooked("t1")
+    assert len(broker.stops()) == 1 and broker.modified == []                  # never moved, nor placed afresh
+    out = ex.close_trade("t1", reason="stop")                                  # the exit manager sees the cross
+    assert not out["ok"] and out["wait"] and broker.exits() == []              # no exit of the app's own beside it
+    assert [t for t, _ in heard].count("order.unbooked") == 1
+
+    ex.sync_open_orders()
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
+    assert not ex.fill_unbooked("t1") and ex.protective_stops() == [] and len(calls) == 2
+    assert len(broker.orders) == 1 and broker.modified == []
+
+
+def test_a_stop_fill_an_exit_finds_whose_booking_fails_holds_the_exit_back_until_the_next_pass_books_it():
+    broker, repo, ex, _ = _setup()
+    ex.sync_open_orders()                                                      # the stop rests: order 1
+    calls = _refuses_once(repo, "close_trade")
+    broker.live["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                   avg_fill_price=97.9)
+    out = ex.close_trade("t1", reason="stop")                                  # its stand-down finds the stop filled
+    assert not out["ok"] and out["wait"] and broker.exits() == [] and ex.fill_unbooked("t1")
+    ex.sync_open_orders()
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
+    assert ex.close_trade("t1", reason="stop")["reason"] == "trade not open" and broker.exits() == []
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("found_by", ["the order sync", "an exit's stand-down"])
+def test_a_stop_fill_whose_record_the_database_wont_read_is_kept_and_booked_on_the_next_pass(found_by):
+    broker, repo, ex, heard = _setup()
+    ex.sync_open_orders()                                                      # the stop rests: order 1
+    broker.live["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                   avg_fill_price=97.9)
+    read, refused = repo.get_trade, []
+
+    def busy_while_booking(tid):                     # the database busy as the stop, out of its book, is booked
+        if not refused and "t1" not in ex._stops:
+            refused.append(tid)
+            raise RuntimeError("database is locked")
+        return read(tid)
+
+    repo.get_trade = busy_while_booking
+    if found_by == "the order sync":
+        ex.sync_open_orders()
+    else:
+        out = ex.close_trade("t1", reason="stop")
+        assert not out["ok"] and out["wait"]                                   # no exit of the app's own beside it
+    assert refused and repo.get_trade("t1")["status"] == "OPEN" and ex.fill_unbooked("t1")
+    assert [t for t, _ in heard].count("order.unbooked") == 1
+    ex.sync_open_orders()
+    closed = repo.get_trade("t1")
+    assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
+    assert ex.protective_stops() == [] and broker.exits() == []
+
+def test_syncs_exits_entries_take_overs_and_cancels_from_many_threads_never_deadlock():
+    from test_order_follow_up import PLAN
+    from autotradebot.core.enums import StrategyKind, Timeframe
+    from autotradebot.core.models import Account, Play
+
+    broker = _StopBroker({"AAA": 10, "BBB": 10, "CCC": 5, "EEE": 5})
+    repo = _Repo([_trade(id="t1"), _trade(id="t2", symbol="BBB")])
+    repo.submitted_plays = lambda since, until: [_sent("play_off", "EEE")]
+    ex = _executor(broker, repo)
+    ex.STAND_DOWN_S, ex.STAND_DOWN_POLL_S = 1.0, 0.01
+    ex._entries_due = False
+    ex.sync_open_orders()                                                      # both positions' stops rest
+    ex._entries_due = True                                                     # an entry filled while the app was off
+    filled = [Fill(order_id="11", symbol="EEE", side=Side.LONG, quantity=5, price=30.0, tag="play_off")]
+    broker.get_fills = lambda symbol=None: time.sleep(0.05) or [f for f in filled if symbol in (None, f.symbol)]
+    opened = repo.open_trade
+    repo.open_trade = lambda *a, **k: time.sleep(0.05) or opened(*a, **k)
+
+    def slow(fn):                                                              # every broker call takes a moment
+        return lambda *a, **k: time.sleep(0.005) or fn(*a, **k)
+
+    for name in ("place_order", "get_order", "cancel_order", "list_orders", "get_account", "modify_stop"):
+        setattr(broker, name, slow(getattr(broker, name)))
+    entry = Play(symbol="DDD", side=Side.LONG, strategy="vwap_reclaim", kind=StrategyKind.TECHNICAL,
+                 timeframe=Timeframe.SWING, entry=50.0, stop=48.0, targets=[56.0])
+    entry.suggested_qty = 10
+    jobs = [lambda: [ex.sync_open_orders() for _ in range(5)],                 # the sync loop...
+            lambda: [ex.sync_open_orders() for _ in range(5)],                 # ...a second one beside it...
+            lambda: [ex.sync_open_orders(wait=False) for _ in range(5)],       # ...and the Refresh button
+            lambda: ex.close_trade("t1", reason="manual"),                     # a click, and a quit, on one position
+            lambda: ex.close_trade("t1", reason="quit"),
+            lambda: ex.close_trade("t2", reason="quit"),
+            lambda: ex.close_untracked("CCC", "LONG", 5),
+            lambda: ex.execute_play(entry, Account(account_id="DU"), plan=PLAN),   # Autopilot
+            ex.adopt_working_orders,
+            lambda: ex.cancel_exits(reasons=("none",)),
+            lambda: ex.cancel_entries_for("play_none")]
+    together = threading.Barrier(len(jobs))
+    threads = [threading.Thread(target=lambda job=job: (together.wait(5), job()), daemon=True) for job in jobs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert not any(t.is_alive() for t in threads)                              # every one of them finished
+    assert sorted(o.client_tag for o in broker.exits() if o.client_tag.startswith("exit:")) == ["exit:t1", "exit:t2"]
+    [booked] = [t for t in repo.open_trades() if t["symbol"] == "EEE"]          # booked once, with one stop
+    assert [s.quantity for s in broker.stops() if s.client_tag == f"stop:{booked['id']}"] == [5]
