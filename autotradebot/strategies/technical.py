@@ -17,8 +17,7 @@ from ..analysis import read_row
 from ..core.enums import Side, StrategyKind, Timeframe
 from ..core.models import Play
 from ..indicators import ta
-from ..util import clock
-from .base import Strategy, StrategyContext, safe_last, swing_high, swing_low
+from .base import Strategy, StrategyContext, completed_daily, safe_last, swing_high, swing_low
 from .registry import register
 
 
@@ -351,7 +350,7 @@ class Rsi2MeanReversion(Strategy):
     def generate(self, ctx: StrategyContext) -> List[Play]:
         if not ctx.enough_daily(self.params["trend_sma"] + 5):
             return []
-        d = ctx.daily
+        d = completed_daily(ctx)
         c = d["close"]
         sma = ta.sma(c, self.params["trend_sma"])
         rsi = ta.rsi(c, self.params["rsi_len"])
@@ -419,7 +418,7 @@ class BollingerFade(Strategy):
     def generate(self, ctx: StrategyContext) -> List[Play]:
         if not ctx.enough_daily(self.params["length"] + 20):
             return []
-        d = ctx.daily
+        d = completed_daily(ctx)
         bb = ta.bollinger(d["close"], self.params["length"], self.params["mult"])
         adx = safe_last(ctx.daily_adx["adx"])
         atr = ctx.daily_atr
@@ -483,7 +482,7 @@ class AtrChannelBreakout(Strategy):
     def generate(self, ctx: StrategyContext) -> List[Play]:
         if not ctx.enough_daily(60):
             return []
-        d = ctx.daily
+        d = completed_daily(ctx)
         kc = ta.keltner(d, self.params["length"], self.params["mult"])
         adxdf = ctx.daily_adx
         adx = safe_last(adxdf["adx"])
@@ -613,20 +612,15 @@ class Week52Breakout(Strategy):
     def generate(self, ctx: StrategyContext) -> List[Play]:
         if not ctx.enough_daily(200):
             return []
-        d = ctx.daily.tail(252)
+        # the push and its volume are the last completed session's, as the replay reads them at the close:
+        # today's candle, still forming, is no new high yet and holds only part of a session's volume
+        d = completed_daily(ctx).tail(252)
         hi_52 = float(d["high"].max())
         lo_52 = float(d["low"].min())
         price = ctx.price
         atr = ctx.daily_atr
         vol = float(d["volume"].iloc[-1])
-        elapsed = ctx.minutes_since_open
-        if d.index[-1].date() == clock.session_date(ctx.now) and ctx.intraday is not None and 0 < elapsed < 390:
-            # today's candle is still forming: its volume so far, projected to the full session,
-            # against the twenty completed sessions before it
-            vol *= 390.0 / max(30.0, elapsed)
-            vol_avg = float(d["volume"].iloc[-21:-1].mean()) if len(d) > 21 else float("nan")
-        else:
-            vol_avg = float(d["volume"].tail(20).mean())
+        vol_avg = float(d["volume"].tail(20).mean())
         if math.isnan(atr) or atr <= 0 or math.isnan(vol_avg) or vol_avg <= 0:
             return []
         vmult = vol / vol_avg
@@ -693,7 +687,10 @@ class AbcdPattern(Strategy):
         w = int(self.params["window"])
         if today is None or len(today) < 6:
             return []
-        seg = today.tail(w)
+        # the pattern is drawn on closed candles only: the newest bar is still printing (live at the
+        # candle-close check, and in the replay's window), and its first seconds of low and volume
+        # must not make the pullback
+        seg = today.iloc[:-1].tail(w)
         if len(seg) < 6:
             return []
         atr = ctx.intraday_atr
@@ -703,13 +700,14 @@ class AbcdPattern(Strategy):
 
         highs = seg["high"].to_numpy()
         lows = seg["low"].to_numpy()
+        closes = seg["close"].to_numpy()
         volume = seg["volume"].to_numpy()
         b_i = int(highs.argmax())
         if b_i == 0 or b_i >= len(seg) - 1:
-            return []                       # need a leg before and a pullback after
+            return []                       # need a leg before and at least one closed pullback bar after
         a_i = int(lows[:b_i].argmin())
         B, A = float(highs[b_i]), float(lows[a_i])
-        C = float(lows[b_i:].min())
+        C = float(lows[b_i + 1:].min())     # the pullback's low, from the bars after B - not B's own low
         price = ctx.price
         if not (A < C < B):
             return []                       # C must be a HIGHER low than A
@@ -723,12 +721,16 @@ class AbcdPattern(Strategy):
             return []                       # sellers leaned on the pullback harder than buyers pushed
         if rvol < self.params["rvol_min"]:
             return []
-        # price must be back near C (defending it), not still up at B
-        if price > C * (1 + self.params["near_c_pct"] / 100.0) or price >= B:
+        # price must be back near C (defending it): not still up at B, and not already through C -
+        # C comes from closed bars, so the price now can stand below it
+        if price > C * (1 + self.params["near_c_pct"] / 100.0) or price >= B or price < C:
             return []
-        # last closed bar should not be collapsing through C
-        lc = _last_closed(today)
-        if lc is not None and float(lc["close"]) < C - 0.5 * atr:
+        # the last closed bar must not have collapsed through the low that stood before it (B's close
+        # when it is the first bar after B). C counts that bar's own low, so measured against C itself
+        # this check could never fire.
+        held = lows[b_i + 1:-1]
+        prior_low = float(held.min()) if len(held) else float(closes[b_i])
+        if float(closes[-1]) < prior_low - 0.5 * atr:
             return []
 
         entry = max(price, C)
@@ -1150,7 +1152,7 @@ class DivergenceReversal(Strategy):
         lb = int(self.params["lookback"])
         if not ctx.enough_daily(lb + 20):
             return []
-        d = ctx.daily
+        d = completed_daily(ctx)
         c = d["close"]
         rsi = ta.rsi(c, 14)
         atr = ctx.daily_atr

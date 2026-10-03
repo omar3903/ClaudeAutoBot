@@ -145,7 +145,17 @@ Settings so it's done before the bell):
    stock type (common stock, ADR, REIT…) and IBKR's industry, which maps onto the
    11 sectors. Kept in `data/symbols.json`, so only new listings cost a request.
 3. **Daily candles.** Each stock's daily candles live on disk (`data/bars/`); a
-   stock is downloaded in full once, then only the sessions it's missing.
+   stock is downloaded in full once, then only the sessions it's missing. The
+   ranking lets a stock miss one session, and a download can fail: during the
+   session such a stock's candle for yesterday is built from its 5-minute bars,
+   so its gap, its prior close and its intraday heat start from yesterday's
+   close and never an older one. When the 5-minute bars don't hold yesterday
+   either, its day-trade setups are skipped; the swing setups still run (the
+   first such stock each session is logged at INFO). Yesterday is the last
+   session the stock's 5-minute bars or the S&P 500 ETF's candles hold, so a
+   weekday the market was shut that the holiday calendar doesn't list isn't
+   taken for a missed session; the calendar decides only when no candles reach
+   today.
 4. **Daily heat** — no requests: relative volume in the last session, the size of
    its move against its ATR, a close near a 20-day high or low, volatility and
    dollar volume, each turned into a percentile across every **liquid** stock
@@ -178,6 +188,9 @@ buffer name looked at is:
 - **kept** — among the two best seen so far in its sector, waiting for a slot;
 - **dropped** — of less use than what's already hot or kept.
 
+A hot-list stock whose candles didn't come this cycle keeps the heat it had, so
+a missed request doesn't make it the coolest and cost it its slot.
+
 So each sector's buffer is worked through over the day for a handful of requests
 per cycle — about 60 every 15 minutes. While **Autopilot** is day-trading an
 open session, the hot list alone is also rescanned every minute.
@@ -192,7 +205,11 @@ the board within the half hour. Its intraday heat refreshes the hot list: a
 stock hotter than the coolest hot-list name by 10 % takes its slot (within the
 cap of a third per sector), and the best of the rest per sector are kept
 waiting. It takes two to three minutes of Gateway time and the 5-minute cycle
-waits for it. (The Gateway takes about half a second over a candle request
+waits for it. Between its chunks it steps aside for a candle-close check that
+has come due and for the 15-second re-check of the plays, each followed by
+Autopilot's pass, so neither waits out the sweep; a stock such a check read
+after the sweep did keeps the check's plays, which are on the newer candle.
+(The Gateway takes about half a second over a candle request
 whether it asks for an hour or a week, so the rate is set by how many are in
 flight: twelve at once read about 17 stocks a second, none refused in a test of
 700; thirty-two timed out.) The plays it finds stay on the board and are
@@ -226,8 +243,8 @@ next buffer names.
 
 Also in `config.yaml`: `gapper_symbols` (400), `gapper_min_gap_pct` (2), `gapper_min_volume`
 (50,000), `buffer_picks_per_sector` (2), `kept_per_sector` (2),
-`fast_cycle_seconds` (60), `close_check` (true) and `mover_atr` (1.0) (see
-**Candle-close check**), `live_scan` (10; see **Live scans**),
+`fast_cycle_seconds` (60), `close_check` (true), `close_grace_s` (8) and
+`mover_atr` (1.0) (see **Candle-close check**), `live_scan` (10; see **Live scans**),
 `fundamentals_leaders` (8), the liquidity `prefilter`,
 and `max_universe` (0 = every listing; `SCANNER_MAX_UNIVERSE` caps it without
 editing the file).
@@ -337,19 +354,26 @@ speed and show only: the setups, confirmations and the replay still run on
 IBKR's own 5-minute candles.
 
 **Candle-close check.** At every 5-minute close in regular hours (09:35 to
-15:55) the watch tier's setups are checked on IBKR's just-closed bars about 2
-seconds after the close - one request per stock for the last hour of bars - so
-a setup is typically published 5-8 seconds after its candle closes instead of
-up to a couple of minutes later. The check stands in for the fast cycle due
-then. Between closes, a watch stock whose streamed 1-minute candle spans at
-least `scanner.mover_atr` (1.0; 0 = off) of its 5-minute ATRs, or makes a new
+15:55) the watch tier's setups are checked on IBKR's just-closed bars
+`scanner.close_grace_s` (8; 0-30) seconds after the close - one request per
+stock for the last hour of bars - so a setup is typically published within a
+few seconds of that instead of up to a couple of minutes later. IBKR prints a
+stock's new bar a few seconds after the close, and a check much sooner finds
+few of them; the stocks whose new bar isn't in yet are asked once more about
+15 seconds after the check read (IBKR refuses the same request within 15 s),
+and any still missing then wait for the fast cycle or the next close. A check
+that read at least half its stocks stands in for the fast cycle due then; one
+that read fewer leaves the fast cycle to its second ask. Between closes, a
+watch stock whose streamed 1-minute candle spans at least
+`scanner.mover_atr` (1.0; 0 = off) of its 5-minute ATRs, or makes a new
 high or low of the day on 3x its average minute volume, gets an early-mover
 check at once (at most once per 5 minutes). An early-mover check can't add a
 candle confirmation - its 5-minute candle hasn't closed - so it catches
 price-level setups and refreshes the stock's plays. `scanner.close_check:
 false` turns both off (the fast cycle as before). The log says `close check
-10:05 ET: ... published 5.4 s after the candle closed` or `early-mover check
-10:07 ET (...)` for each one, and once a session `live candles vs IBKR
+10:05 ET: ... published 9.4 s after the candle closed` (`close check 10:05 ET
+(second ask): ...` for the second ask) or `early-mover check 10:07 ET (...)`
+for each one, and once a session `live candles vs IBKR
 5-minute bars` with the volume ratio that tells whether the stream counts
 shares or lots of 100.
 
@@ -358,7 +382,8 @@ live market scans - the biggest % gainers, the biggest % losers and the
 stocks hottest by volume (US stocks and ADRs at $3-600), one open at a time
 and each cancelled once it answers. The first `scanner.live_scan` (10; 0 =
 off) of their names that are ordinary shares in the sectors the filters
-allow, with daily candles and not on the hot list already, take watch-tier
+allow, with daily candles through yesterday (or 5-minute candles in hand that
+hold yesterday's session) and not on the hot list already, take watch-tier
 slots right after the hot list - so a stock that was quiet until today is
 streamed and checked at each close like the rest. Liquidity is judged on
 today's volume: after a candle-close check, a live name whose dollar volume
@@ -926,9 +951,11 @@ match too, so check the untracked shares first).
 trade record stores the fill against it: `decision_price`, `spread_bps`,
 `entry_slippage_bps`, and for exits `exit_decision_price`, `exit_slippage_bps` -
 the implementation shortfall. On live quotes an entry is refused when the spread
-is more than `execution.max_spread_r` (0.10) of the distance to the stop. The
-daily review averages the measured slippage and says when the account pays more
-than the replay charges.
+is more than `execution.max_spread_r` (0.10) of the distance to the stop. A look
+that refuses an entry keeps its quote with the play (`last_look`, the first
+refusal), and the daily review charges that spread to the play's shadow trade.
+The daily review averages the measured slippage and says when the account pays
+more than the replay charges.
 
 ---
 
@@ -1177,8 +1204,12 @@ taken, averaging at least `min_replay_expectancy_r` (+0.05R) — **and** at leas
 of them in the held-out latest third of the sessions, averaging more than 0R
 there. The statistical noise checks (`not_trending`, `not_mean_reverting`,
 `turbulent_market`) and the two news checks (`news_driven_move`,
-`move_without_news`) are skipped by themselves once the replay shows that the
-trades they remove did worse on every session and on the held-out ones. Each
+`move_without_news`) are skipped by themselves once the replay shows real
+evidence that the trades they remove are worse: over every session they averaged
+at least 0.05R a trade below the ones kept, two standard errors or more apart
+(Welch's t of -2 or lower), and they did worse on the held-out sessions too. A
+gap of a few hundredths of an R, or one inside the noise, would flip the skip on
+and off from one replay to the next. Each
 entry risks no more than `risk.max_risk_per_trade_pct`, lowered to **half-Kelly**
 when the strategy's record calls for less.
 
@@ -1207,7 +1238,8 @@ lists what is skipped now, and each trade keeps that list.
 the regular session is open, the hot list is rescanned every
 `scanner.fast_cycle_seconds` (60) between the regular cycles. The header button
 shows it (`Autopilot: day ⚡60s`). At each 5-minute close the candle-close check
-(see **Candle-close check**) takes the place of the fast cycle due then.
+(see **Candle-close check**) takes the place of the fast cycle due then, once it
+has read at least half the watch stocks.
 
 ---
 
@@ -1301,13 +1333,17 @@ A background service (`autotradebot/signals/`) watches what happens off the pric
 * **Connections** — paper platform, IB Gateway settings, **Test paper / Test
   live**, **Reconnect**.
 * **Settings** — the scan schedule and list sizes, the scan status, **Run full
-  scan now** and **Rescan hot list now**.
+  scan now** and **Rescan hot list now**. A setup that raised an error in a scan is
+  named in its status line with how many stocks it failed on (it found nothing on
+  them); its first failure each day is logged as a warning with the traceback, the
+  rest at DEBUG.
 * **Signals** — insider trades and company news, their sources and what they do to plays (see [Signals](#signals--insider-trades-and-company-news)).
 * **Reports** — each session's report (see [Reports](#reports--every-session-the-market-and-the-bot));
   a dot marks one you haven't opened.
 * **Scan now** — rescan the hot list and the next buffer names. The plays header
-  shows the last scan, a progress bar while one runs, when the next full
-  scan is due, and "replay running" while a replay runs in the background.
+  shows the last scan (and any setup that failed in it), a progress bar while one
+  runs, when the next full scan is due, and "replay running" while a replay runs in
+  the background.
 * **Long / Short / Intraday / Swing** and **Sectors** — what the bot scans for
   and may trade.
 * **Strategies** — switch setups on or off and weight them.
@@ -1466,11 +1502,13 @@ next replays go on from there until the sixty sessions are covered. A request th
 asked again; a session IBKR really has nothing for is remembered and isn't.
 
 Every day setup is followed twice: **entered on sight** (the record of all trades) and **entered
-after it has shown two bars in a row**, one bar later and once a session per setup - which is how
-Autopilot enters when it asks a day trade to be seen on two candles running. Autopilot's record,
-the one the proof rule reads, is built from the way in it really uses. Before, nearly every
-replayed day trade was entered on sight, so 27 of 1,466 counted and no day setup could ever
-reach the 30 trades proof asks for.
+after it has shown two bars in a row**, one bar later - which is how Autopilot enters when it asks a
+day trade to be seen on two candles running. Either way a setup is entered once a session, the way
+the board settles a setup it has acted on: one that shows again after its trade has closed isn't
+offered again, so it isn't a new trade (before, the entries on sight re-entered it every time it
+fired). Autopilot's record, the one the proof rule reads, is built from the way in it really uses.
+Before, nearly every replayed day trade was entered on sight, so 27 of 1,466 counted and no day
+setup could ever reach the 30 trades proof asks for.
 
 What the day-trade replay still can't know: it reads 5-minute candles, so a stop and a target
 inside one candle count as the stop, fills are the next candle's open with a flat slippage, the
@@ -1487,6 +1525,11 @@ follows every play the way the automatic exits would. Its settings are in
   worker process, and a day-trade replay is cut into jobs of `sessions_per_job` (10) sessions so the
   long ones don't leave workers idle at the end. Series that are the same for every bar of a session
   (the session VWAP, the opening range) are computed once per session.
+* **The candles live sees.** At each 5-minute close a day setup is handed the candle that has just begun
+  as well - priced at its open, no volume yet - the way the candle-close check reads IBKR's bars seconds
+  after a close. So a setup confirms on the bar that has just closed, on the same bar as live, and fills at
+  that new candle's open; before, the replayed candles stopped at the closed bar and every closed-bar
+  confirmation came a bar late.
 * **Only the plays the app would show and take.** A play under the scanner's reward:risk floor
   (`risk.min_reward_risk`) is never on the board, so the replay never trades it; and a strategy's
   Autopilot record counts only the trades Autopilot would take - its skipped flags, its confirmations,
@@ -1507,7 +1550,13 @@ follows every play the way the automatic exits would. Its settings are in
   after that the live store's candles keep it current for nothing. However long the
   history, a replayed setup sees the 300 sessions it would see live. Up to 120
   day-trade sessions can be asked for — 5-minute candles are downloaded once and kept.
-* **Costs**: 5 bps slippage on every market fill and 1 bp commission on every fill.
+* **Costs**: 5 bps slippage on every market fill and 1 bp commission on every fill, and on every
+  order IBKR's fixed commission as well - $0.005 a share, at least $1, at most 1% of the order's value
+  (`commission_per_share`, `commission_min`, `commission_max_pct`) - taken off the trade's R. The
+  replay counts in R and has no size, so the shares are the ones a trade risking
+  `nominal_risk_usd` ($1,000, 1% of a nominal $100k account) would buy. A share's commission over
+  its risk is the same R at any size; only the $1 minimum (a wide stop, or the half taken off at a
+  first target) and the 1% cap (a stock under 50 cents) depend on that assumption.
 * **Held out**: the latest third of the sessions. Every strategy record and every
   noise verdict is also given for those sessions alone, and Autopilot wants a
   strategy to have made money there too.
@@ -1541,7 +1590,7 @@ and they're added once it is. For each mover:
 * **what the bot made of it** — *traded* (with the move or against it, R and P/L),
   *sent, not filled* (an entry went out — Autopilot's or yours — and no trade came of it;
   the row it was sent from is listed beside the setup's first sighting, with what it would
-  have made followed on the candles),
+  have made had it filled, followed on the candles),
   *offered, not taken* (and what the setup would have made, followed on the candles),
   *watched, no setup* (on the hot list, adopted into it, or scanned from a sector buffer),
   or *not watched* — and why: the morning's ranking put it #412 of 2,950, it was too thin
@@ -1573,11 +1622,22 @@ ranking of the previous day's candles can't see them, and the report says so.
   before it was confirmed, going straight back into a stock that had just lost, a
   strategy without a proven record;
 * **the plays not taken**, each followed on the session's 5-minute candles as if
-  it had been, from the next bar after it was on the board with the values it was
-  recorded with (a play's row holds the last scan that wrote it, and a scan's plays
-  reach the board when it finishes); an entry sent that never filled (a sent row
-  no trade was booked from, even one still marked submitted) is followed
-  from the row it was sent from, from the moment it went out, however it scored —
+  it had been, the way Autopilot enters: from the next bar after its confirmations
+  first reached Autopilot's minimum, with the values and readings it had then (the
+  board keeps that moment and those values in the play's evidence, `confirmed_at`
+  and `as_confirmed` - each scan writes the play at its own prices, with readings
+  of the stock's run taken after the entry). A setup that left the board and came
+  back is logged again under a new play; when the comeback is the one that reached
+  the minimum, the comeback is followed from then. A play never
+  confirmed, or logged before that moment was kept, is followed from the next bar
+  after it was on the board with the values it was recorded with (a play's row
+  holds the last scan that wrote it, and a scan's plays reach the board when it
+  finishes). A play the last look refused pays the spread that look read, in R of
+  its risk - the refusal and its quote are kept with the play (`last_look`). An
+  entry sent that never filled (a sent row no trade was booked from, even one
+  still marked submitted) is followed from the row it was sent from, from the
+  moment it went out, however it scored, and counts as no fill: it made nothing,
+  and what it would have made had it filled is kept apart for the Reports page —
   grouped by noise flag and by whether Autopilot's checks passed
   it, so every check is tested on live plays every day. The checks are the ones in
   force that session, as the last Autopilot entry recorded them (a rebuild keeps
@@ -1679,10 +1739,15 @@ scales confidence by Aziz's session clock. **Every play's stop is floored**: a
 stop closer than ~0.6 % of price (or ~0.9 intraday ATRs) is widened, *then*
 reward:risk is re-checked. Indicators the setups share (ATRs, VWAP, relative
 volume, the S/R map, the daily trend) are computed once per stock per scan.
+Relative volume leaves out the 5-minute candle still printing: today's closed
+candles against earlier sessions' up to the same time. The swing setups read
+their signals on **completed daily candles** (during the session today's candle
+is still forming and is left out), the ones the replay signals on at each
+session's close, and enter at the price now.
 
 | key | timeframe | idea |
 |---|---|---|
-| `abcd_pattern` | intraday | hard push A→B, pullback to a **higher low C**; enter near C, target the B retest and measured move |
+| `abcd_pattern` | intraday | hard push A→B, pullback to a **higher low C**, drawn on **closed candles only** (the one still printing can't make the pullback, and a last candle that closed half an ATR through the pullback's low is refused); enter near C, never under it, target the B retest and measured move |
 | `bull_bear_flag` | intraday | near-vertical pole + tight sideways flag; enter on the flag break |
 | `opening_range_breakout` | intraday | break of the first N-min range **only when that range < the daily ATR**, VWAP-side stop |
 | `vwap_reclaim` | intraday | a **5-min close** back across session VWAP after ≥ 3 bars on the other side |

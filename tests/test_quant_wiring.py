@@ -177,11 +177,59 @@ def test_the_evidence_weight_is_shrunk_bounded_and_never_raises_a_record_that_fa
 
 # ---------------------------------------------------------------- the replay
 def test_every_fill_pays_commission_and_market_fills_pay_slippage_too():
-    costly = ReplaySettings(slippage_bps=0.0, commission_bps=10.0, breakeven_at_r=0.0, trail_start_r=0.0)
+    costly = ReplaySettings(slippage_bps=0.0, commission_bps=10.0, commission_per_share=0.0, breakeven_at_r=0.0,
+                            trail_start_r=0.0)
     session = _session(FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9)])
     [t] = replay_intraday([_LongAtBar()], "RPL", session, _daily(), costly, QUIET)
     assert t.exit_reason == "target" and t.entry == pytest.approx(100.1) and t.exit == pytest.approx(101.898)
     assert t.r == pytest.approx(1.798 / 1.1, abs=0.001) and t.mfe_r == pytest.approx(1.9 / 1.1, abs=0.001)
+
+
+def test_every_order_pays_ibkr_commission_per_share_off_the_trades_r():
+    import dataclasses
+
+    from test_replay import _LongTwoTargets
+
+    # the stop 1 below the fill: a nominal $1,000 at risk buys 1,000 shares, $5 an order - 0.005R in and out
+    ibkr = dataclasses.replace(EXACT, commission_per_share=0.005, commission_min=1.0, commission_max_pct=1.0,
+                               nominal_risk_usd=1000.0)
+    session = _session(FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9)])
+    [t] = replay_intraday([_LongAtBar()], "RPL", session, _daily(), ibkr, QUIET)
+    assert (t.exit_reason, t.entry, t.exit) == ("target", 100.0, 102.0)          # it comes off the R, not the prices
+    assert t.r == pytest.approx(1.99) and t.cost_r == pytest.approx(0.01)
+    # a small nominal size: 100 shares come to $0.50 an order, so each pays IBKR's $1 minimum - 0.01R
+    small = dataclasses.replace(ibkr, nominal_risk_usd=100.0)
+    [t] = replay_intraday([_LongAtBar()], "RPL", session, _daily(), small, QUIET)
+    assert t.r == pytest.approx(1.98) and t.cost_r == pytest.approx(0.02)
+    # half off at the first target is an order of its own: three orders, three minimums
+    bars = _session(FLAT + [(100.0, 100.1, 99.9, 100.0), (100.2, 102.1, 100.1, 101.9), (102.0, 104.2, 101.9, 104.0)])
+    [t] = replay_intraday([_LongTwoTargets()], "RPL", bars, _daily(), small, QUIET)
+    assert t.scaled and t.r == pytest.approx(2.97) and t.cost_r == pytest.approx(0.03)
+
+
+def test_the_commission_is_the_rate_a_share_at_any_ordinary_size_and_capped_on_a_cheap_stock():
+    import dataclasses
+
+    from autotradebot.config import ReplayCfg
+    from autotradebot.research.replay import _commission
+
+    s = ReplaySettings()
+    assert _commission(s, 1.0, 100.0) == pytest.approx(0.005)                      # per share of the position
+    assert _commission(dataclasses.replace(s, nominal_risk_usd=50_000.0), 1.0, 100.0) == pytest.approx(0.005)
+    # $0.40 a share risking $0.02: 50,000 nominal shares would pay $250, capped at 1% of $20,000
+    assert _commission(s, 0.02, 0.40) == pytest.approx(200.0 / 50_000)
+    assert _commission(dataclasses.replace(s, commission_per_share=0.0), 1.0, 100.0) == 0.0
+    # the config's replay settings carry it, and their defaults are the replay's
+    cfg = ReplayCfg(commission_per_share=0.01, commission_min=2.0, commission_max_pct=0.5, nominal_risk_usd=500.0)
+    exits = SimpleNamespace(breakeven_at_r=1.3, breakeven_lock_r=0.3, trail_start_r=2.0, trail_lock_ratio=0.5,
+                            flatten_intraday_before_close_min=10, max_swing_hold_days=10)
+    carried = ReplaySettings.from_exit_rules(exits, cfg)
+    assert (carried.commission_per_share, carried.commission_min, carried.commission_max_pct,
+            carried.nominal_risk_usd) == (0.01, 2.0, 0.5, 500.0)
+    defaults = ReplaySettings.from_exit_rules(exits, ReplayCfg())
+    assert (defaults.commission_per_share, defaults.commission_min, defaults.commission_max_pct,
+            defaults.nominal_risk_usd) == (s.commission_per_share, s.commission_min, s.commission_max_pct,
+                                           s.nominal_risk_usd)
 
 
 def _sim(r, day, noise=(), strategy="s"):
@@ -202,6 +250,38 @@ def test_records_and_noise_verdicts_are_also_given_for_the_held_out_sessions():
     assert report["not_trending"]["held_out"]["verdict"].startswith("helps")
     assert report["turbulent_market"]["held_out"]["verdict"].startswith("hurts")
     assert learned_skips(report) == ["not_trending"]                            # it has to hold up on both
+
+
+def _spread(avg, n, day, noise=(), spread=0.5):
+    """``n`` trades on ``day`` averaging ``avg``R, ``spread``R either side of it."""
+    return [_sim(avg + (spread if i % 2 else -spread), day, noise) for i in range(n)]
+
+
+def test_the_noise_report_says_how_many_standard_errors_apart_the_removed_and_kept_trades_are():
+    row = noise_report(_spread(-0.5, 10, "2026-08-20", ["not_trending"]) + _spread(0.5, 10, "2026-08-20"))["not_trending"]
+    assert row["t"] == -4.24                    # 1R apart over sqrt(2 x 0.5^2 x 10/9 / 10): Welch's t, removed minus kept
+    few = noise_report(_spread(-0.5, 4, "2026-08-20", ["not_trending"]) + _spread(0.5, 10, "2026-08-20"))
+    assert few["not_trending"]["verdict"] == "too few trades to tell" and few["not_trending"]["t"] is None
+
+
+def test_a_check_is_learned_only_on_a_gap_that_matters_stands_out_of_the_noise_and_holds_up_held_out():
+    split, early, late = {"INTRADAY": "2026-09-01", "SWING": None}, "2026-08-20", "2026-09-03"
+    kept = _spread(0.3, 40, early, spread=0.05) + _spread(0.3, 20, late, spread=0.05)
+
+    def removing(avg, spread, held_avg=None):
+        flagged = (_spread(avg, 30, early, ["not_trending"], spread)
+                   + _spread(avg if held_avg is None else held_avg, 16, late, ["not_trending"], spread))
+        report = noise_report(kept + flagged, split)
+        return learned_skips(report), report["not_trending"]
+
+    skips, row = removing(0.1, 0.5)                    # 0.2R worse, about 2.7 standard errors, and worse held out
+    assert skips == ["not_trending"] and row["t"] <= -2
+    skips, row = removing(0.27, 0.05)                  # far out of the noise, but 0.03R is too small a gap to matter
+    assert skips == [] and row["verdict"].startswith("helps") and row["t"] <= -2
+    skips, row = removing(0.0, 2.0)                    # 0.3R worse, but about one standard error: inside the noise
+    assert skips == [] and row["verdict"].startswith("helps") and -2 < row["t"] < 0
+    skips, row = removing(-0.3, 0.3, held_avg=0.5)     # clearly worse over every session, better on the held-out ones
+    assert skips == [] and row["t"] <= -2 and row["held_out"]["verdict"].startswith("hurts")
 
 
 def test_the_held_out_sessions_are_the_latest_third():

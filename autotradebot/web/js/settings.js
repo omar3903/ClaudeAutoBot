@@ -3,7 +3,7 @@
 import { $, $$, api, count, escapeHtml, fmtClock, plural, post } from "./util.js";
 import { S, emit, on } from "./state.js";
 import { busy, drawerOpen, openDrawer, toastResult, unbusy } from "./ui.js";
-import { currentRun, kindLabel, nextFullScanText, progressHTML, requestScan } from "./scan.js";
+import { currentRun, kindLabel, nextFullScanText, progressHTML, requestScan, setupErrorsText } from "./scan.js";
 
 async function openSettings() {
   openDrawer("settings", "Settings", `<p class="muted">Loading…</p>`);
@@ -73,7 +73,9 @@ function summary(label, sum) {
   const size = sum.kind === "full"
     ? `${count(sum.universe_size)} listed · ${count(sum.liquid)} liquid · hot list ${sum.hot.length}`
     : `${count(sum.scanned)} scanned`;
-  return `<span>${label}</span><span>${fmtClock(sum.finished_at)} · ${size} · ${plural(sum.n_plays, "play")} · ${sum.elapsed_s}s</span>`;
+  const failed = setupErrorsText(sum);
+  const errors = failed ? ` · <span class="warn-text" title="These setups raised an error and found nothing on the stocks they failed on - the app's log has the first error's traceback">${escapeHtml(failed)}</span>` : "";
+  return `<span>${label}</span><span>${fmtClock(sum.finished_at)} · ${size} · ${plural(sum.n_plays, "play")} · ${sum.elapsed_s}s${errors}</span>`;
 }
 
 function statusHTML(scan) {

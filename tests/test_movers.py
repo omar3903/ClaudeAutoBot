@@ -135,12 +135,19 @@ def test_an_entry_sent_and_never_filled_is_its_own_status():
         {**base, "symbol": "DROP", "side": "SHORT", "strategy": "orb", "entry": 48.0, "stop": 48.6, "id": "d1",
          "created_at": "2026-09-15T14:05:00", "status": "SUBMITTED", "decided_by": "operator"},
     ]
-    shadows = [{"play_id": "c3", "symbol": "CLMB", "r": 0.4, "filled": True},
+    # the review books the entry that never filled as no fill, and keeps what it would have made had it filled
+    shadows = [{"play_id": "c3", "symbol": "CLMB", "r": None, "filled": False, "if_filled_r": 0.4},
                {"play_id": "c2", "symbol": "CLMB", "r": 1.2, "filled": True}]
-    out = build_movers(market, per_side=3, sector_of=SECTORS.get, news={}, trades=trades, plays=plays, shadows=shadows,
-                       saved_watchlist={"hot": [], "queues": {}, "kept": {}, "decisions": []}, hot_size=2, queue_size=5,
-                       prefilter=PREFILTER)
+
+    def movers(shadows):
+        return build_movers(market, per_side=3, sector_of=SECTORS.get, news={}, trades=trades, plays=plays,
+                            shadows=shadows, saved_watchlist={"hot": [], "queues": {}, "kept": {}, "decisions": []},
+                            hot_size=2, queue_size=5, prefilter=PREFILTER)
+
+    out = movers(shadows)
     bot = {r["symbol"]: r["bot"] for r in out["gainers"] + out["losers"]}
+    saved = movers([{**shadows[0], "r": 0.4, "filled": True, "if_filled_r": None}, shadows[1]])   # a review saved before
+    assert next(r["bot"] for r in saved["gainers"] if r["symbol"] == "CLMB") == bot["CLMB"]
 
     climb = bot["CLMB"]
     assert climb["status"] == "sent" and climb["r"] == 0.4

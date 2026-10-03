@@ -62,7 +62,8 @@ LABELS = {
     "earnings_ahead": "an earnings report is due within the hold",
 }
 CHECKS = tuple(LABELS)
-#: the checks from the books' statistics; Autopilot also skips one once the replay shows it helps
+#: the checks from the books' statistics; Autopilot also skips one once the replay shows it clearly helps
+#: (replay.learned_skips)
 QUANT_CHECKS = ("not_trending", "not_mean_reverting", "turbulent_market")
 #: the checks from the news, measured by the replay from the headlines the app has stored
 NEWS_CHECKS = ("news_driven_move", "move_without_news")

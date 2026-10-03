@@ -115,9 +115,11 @@ class DayWatchlist:
     def apply_cycle(self, heat: Mapping[str, float], picks: Mapping[str, List[Candidate]],
                     kept_per_sector: int) -> List[Decision]:
         """Record this cycle's intraday heat, then adopt, keep or drop every
-        buffer stock looked at (the new picks and the ones already kept)."""
+        buffer stock looked at (the new picks and the ones already kept). A hot-list
+        name whose candles didn't come this cycle keeps the heat it had: a missed
+        request says nothing about the stock, so it isn't made the coolest for it."""
         for c in self.hot:
-            c.heat = heat.get(c.symbol, 0.0)
+            c.heat = heat.get(c.symbol, c.heat)
         for sector, chosen in picks.items():
             taken = {c.symbol for c in chosen}
             self.queues[sector] = [c for c in self.queues.get(sector, []) if c.symbol not in taken]
