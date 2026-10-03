@@ -432,7 +432,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         self._broker, self._venue = broker, venue
 
         cfg = self.settings.config
-        self.pdt = PdtGuard(cfg.account, trade_repo=self.repo, paper=self.mode == "paper")
+        self.pdt = PdtGuard(cfg.account, trade_repo=self.repo, paper=self.mode == "paper", venue=venue)
         if self.executor is None:
             self.executor = Executor(broker, self.repo, cfg.execution, bus=BUS, venue=venue)
             self.executor.scale_out = 0.0 < float(getattr(cfg.exit_manager, "scale_out_pct", 0.0) or 0.0) < 100.0
@@ -3038,9 +3038,13 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             "market_data": (status or {}).get("market_data", "none") if connected else "none",
         }
 
+    def pnl_summary(self) -> Dict[str, Any]:
+        """The P/L summary (repo.pnl_summary), today's and the week's for the account orders go to now."""
+        return self.repo.pnl_summary(venue=self._venue)
+
     def _pnl(self) -> Dict[str, Any]:
         try:
-            return self.repo.pnl_summary()
+            return self.pnl_summary()
         except Exception:  # noqa: BLE001
             return {}
 
@@ -3068,7 +3072,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             "positions": views.positions(acc, self._marks()),
             "untracked": self.untracked_positions(),
             "mismatches": self.position_check.mismatches,
-            "day_trades_5d": self.repo.count_day_trades(5),
+            "day_trades_5d": self.repo.count_day_trades(5, venue=self._venue),
             "day_trade_limit": cfg.account.max_day_trades_under_threshold,
             "pnl": self._pnl(),
             "scan": self.scan_status(),

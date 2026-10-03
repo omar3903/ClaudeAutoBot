@@ -274,6 +274,90 @@ def test_a_part_sold_on_the_session_the_trade_was_entered_makes_it_a_day_trade(r
         assert repo.close_trade(qid, 105.0, exit_reason="target")["is_day_trade"] is False, symbol
 
 
+def _unstamped(trade_id):
+    """Clears a trade's broker: a record with none on it is the simulator's."""
+    from autotradebot.persistence.db import session_scope
+    from autotradebot.persistence.models_orm import Trade
+
+    with session_scope() as s:
+        s.get(Trade, trade_id).broker = ""
+
+
+def test_day_trades_are_counted_for_the_venue_asked_for(repo):
+    from autotradebot.core.models import Account
+    from autotradebot.persistence.db import session_scope
+    from autotradebot.persistence.models_orm import AccountSnapshot
+    from sqlalchemy import select
+
+    venues = ("paper", "ibkr-paper", "ibkr-live", None)
+    before = {v: repo.count_day_trades(5, venue=v) for v in venues}   # other tests share this database
+
+    def day_trade(symbol, broker):
+        p = _play(symbol=symbol)
+        repo.record_play(p)
+        tid = repo.open_trade(p, 100.0, 1, broker)
+        repo.close_trade(tid, 101.0, "target")
+        return tid
+
+    day_trade("T60", "ibkr-live")
+    day_trade("T61", "ibkr-live")
+    _unstamped(day_trade("T62", "paper"))                       # no broker on it: the simulator's
+    p = _play(symbol="T63")                                     # an open day trade entered today
+    repo.record_play(p)
+    repo.open_trade(p, 100.0, 1, "ibkr-paper")
+
+    added = {v: repo.count_day_trades(5, venue=v) - before[v] for v in venues}
+    assert added == {"paper": 1, "ibkr-paper": 1, "ibkr-live": 2, None: 4}
+
+    # the account snapshot keeps its own venue's count
+    repo.snapshot_account(Account(account_id="t", equity=5000.0), "ibkr-live")
+    with session_scope() as s:
+        row = s.execute(select(AccountSnapshot).where(AccountSnapshot.broker == "ibkr-live")
+                        .order_by(AccountSnapshot.id.desc())).scalars().first()
+        assert row.day_trades_5d == repo.count_day_trades(5, venue="ibkr-live")
+        assert row.day_trades_5d != repo.count_day_trades(5)
+
+
+def test_todays_and_the_weeks_pl_are_the_trades_closed_then_on_the_venue_asked_for(repo):
+    import datetime as dt
+
+    from autotradebot.persistence.db import session_scope
+    from autotradebot.persistence.models_orm import Trade
+    from autotradebot.util import clock
+
+    venues = ("paper", "ibkr-live", None)
+    before = {v: repo.pnl_summary(venue=v) for v in venues}     # other tests share this database
+    sessions = clock.last_n_sessions(clock.session_date(), 8)
+
+    def at(day):
+        return dt.datetime.combine(day, dt.time(15, 0), tzinfo=clock.NY)
+
+    def closed(symbol, broker, exit_price, entered=None, exited=None):
+        p = _play(symbol=symbol, timeframe=Timeframe.SWING)
+        repo.record_play(p)
+        tid = repo.open_trade(p, 100.0, 10, broker)
+        if entered is not None:
+            with session_scope() as s:
+                t = s.get(Trade, tid)
+                t.entry_time, t.session_date = at(entered).astimezone(dt.timezone.utc).replace(tzinfo=None), entered
+        repo.close_trade(tid, exit_price, exit_reason="target", exit_time=None if exited is None else at(exited))
+        return tid
+
+    closed("T70", "ibkr-live", 103.0, entered=sessions[-7])                       # entered last week, closed today
+    closed("T71", "ibkr-live", 101.0, entered=sessions[-2], exited=sessions[-2])  # closed the session before
+    closed("T72", "ibkr-live", 105.0, entered=sessions[0], exited=sessions[-7])   # closed before the week
+    closed("T73", "paper", 98.0)                                                  # the simulator's, today
+    _unstamped(closed("T74", "paper", 99.5))                                      # no broker: the simulator's
+
+    def added(venue, key):
+        return round(repo.pnl_summary(venue=venue)[key] - before[venue][key], 2)
+
+    assert (added("ibkr-live", "realized_today"), added("ibkr-live", "realized_week")) == (30.0, 40.0)
+    assert (added("paper", "realized_today"), added("paper", "realized_week")) == (-25.0, -25.0)
+    assert (added(None, "realized_today"), added(None, "realized_week")) == (5.0, 15.0)
+    assert added("ibkr-live", "realized_total") == added("paper", "realized_total") == 65.0    # every venue's
+
+
 def test_a_part_taken_off_marks_the_trades_best_and_worst_prices(repo):
     p = _play(symbol="T98", targets=[104.0, 108.0])
     repo.record_play(p)

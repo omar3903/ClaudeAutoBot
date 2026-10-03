@@ -707,6 +707,12 @@ holding more shares than it, so two bookings of one record at once — the order
 sync's and the position check's, say — can't both land. A part's fill counts in
 the trade's best and worst prices (MFE, MAE, high-water mark) as the exit's does.
 
+The header's **P/L today** and the **P/L summary**'s *Realized today* and
+*Realized week* add up the trades closed this session and in the last five, by
+when they closed — a swing trade entered last week and closed today is today's —
+on the account orders go to now (the simulator, the IBKR paper account or the
+live one). The summary's other figures cover every closed trade.
+
 The reverse case is shown too: **shares without a record** — held at the broker
 beyond what the open-trade records cover, because they were bought or sold
 outside the app or a fill couldn't be booked — are listed under **Open
@@ -878,7 +884,10 @@ shown so you can see where live would stop you.
   closed same-session round-trips, trades with a part sold on the session they
   were entered (a day trade then, even while the rest is held or goes later;
   one per trade, however many parts) and still-open intraday trades opened
-  today, and **blocks the 4th**, warning from the 2nd–3rd.
+  today, and **blocks the 4th**, warning from the 2nd–3rd. It counts the trades
+  of the account orders go to now — the rule is per account, so the paper
+  account's or the simulator's day trades don't use up the live account's — and
+  the header's day-trade tally is the same count.
 - Every **intraday** play is treated as a *potential* day trade.
 - **Cash account** (`account.cash_account: true`) — PDT does not apply, but the
   guard warns about T+1 settlement / good-faith violations.

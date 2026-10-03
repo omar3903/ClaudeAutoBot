@@ -9,7 +9,8 @@ day-trading rules. So this guard:
 
 * refuses any new entry if equity < ``min_start_equity``
 * counts day trades (same-symbol open+close in one session) over the last
-  5 sessions - from the trade log if available, else the broker's own count
+  5 sessions on the account orders go to - from the trade log if available,
+  else the broker's own count
 * while equity < ``pdt_equity_threshold`` blocks a 4th day trade and warns
   from the 2nd/3rd
 * treats every INTRADAY play as a *potential* day trade (conservative)
@@ -19,7 +20,7 @@ day-trading rules. So this guard:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from ..core.models import Account, Play
 
@@ -38,7 +39,7 @@ class PdtDecision:
 
 
 class PdtGuard:
-    def __init__(self, cfg, trade_repo=None, paper: bool = False) -> None:
+    def __init__(self, cfg, trade_repo=None, paper: bool = False, venue: Optional[str] = None) -> None:
         self.min_start_equity = float(cfg.min_start_equity)
         self.pdt_threshold = float(cfg.pdt_equity_threshold)
         self.max_dt = int(cfg.max_day_trades_under_threshold)
@@ -48,12 +49,14 @@ class PdtGuard:
         #: in paper mode nothing is blocked - the counters/warnings are kept
         #: purely so the operator can see what live trading *would* do.
         self.paper = bool(paper)
+        #: the venue orders go to: the rule is per account, so only its trades are counted
+        self.venue = venue
 
     # ------------------------------------------------------------------ #
     def day_trades_last_5_sessions(self, account: Account) -> int:
         if self.repo is not None:
             try:
-                return int(self.repo.count_day_trades(lookback_sessions=5))
+                return int(self.repo.count_day_trades(lookback_sessions=5, venue=self.venue))
             except Exception:  # noqa: BLE001
                 pass
         return int(getattr(account, "round_trips", 0) or 0)

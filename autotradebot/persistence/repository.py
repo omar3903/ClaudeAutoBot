@@ -510,21 +510,24 @@ class Repository:
     # -------------------------------------------------------------- #
     #  PDT counter                                                  #
     # -------------------------------------------------------------- #
-    def count_day_trades(self, lookback_sessions: int = 5) -> int:
+    def count_day_trades(self, lookback_sessions: int = 5, venue: Optional[str] = None) -> int:
         """The day trades of the last ``lookback_sessions`` sessions: the closed trades that were one (closed on
         the session they were entered, or a part sold then), the open ones with a part sold on the session they were
         entered - a day trade already, whatever becomes of the rest - and the open day trades entered today, which
-        the session's end will make one. A trade counts once, however many parts it left in."""
+        the session's end will make one. A trade counts once, however many parts it left in. ``venue``: only the
+        trades booked there - the rule is counted per account, and the simulator's or the paper account's trades
+        say nothing about the live one's."""
         today = clock.session_date()
         lo = clock.last_n_sessions(today, lookback_sessions)[0]
+        here = _at_venue(venue)
         with session_scope() as s:
             closed = s.execute(
                 select(func.count()).select_from(Trade)
                 .where(Trade.is_day_trade.is_(True), Trade.status == "CLOSED",
-                       Trade.session_date >= lo)
+                       Trade.session_date >= lo, *here)
             ).scalar_one()
             still_open = s.execute(select(Trade.id, Trade.timeframe, Trade.session_date)
-                                   .where(Trade.status == "OPEN", Trade.session_date >= lo)).all()
+                                   .where(Trade.status == "OPEN", Trade.session_date >= lo, *here)).all()
             parted = _sold_on_entry_session(s, {r.id: r.session_date for r in still_open})
         return int(closed) + sum(1 for r in still_open
                                  if r.id in parted or (r.timeframe == "INTRADAY" and r.session_date == today))
@@ -734,9 +737,16 @@ class Repository:
     # -------------------------------------------------------------- #
     #  P/L analytics                                                #
     # -------------------------------------------------------------- #
-    def pnl_summary(self) -> Dict[str, Any]:
+    def pnl_summary(self, venue: Optional[str] = None) -> Dict[str, Any]:
+        """The closed trades' P/L figures. realized_today / realized_week are the trades closed this session and in
+        the last five, by when they closed - a swing trade entered last week and closed today is today's - and with
+        ``venue`` only those booked there, the account orders go to now. The rest covers every closed trade."""
         today = clock.session_date()
         wk = clock.last_n_sessions(today, 5)[0]
+        # a session runs to the next one's day: a close booked on a weekend or a holiday belongs to the session
+        # before it, as clock.session_date has it
+        day_from, week_from = _ny_bounds(today)[0], _ny_bounds(wk)[0]
+        until = _ny_bounds(clock.next_trading_day(today))[0]
         with session_scope() as s:
             closed = s.execute(select(Trade).where(Trade.status == "CLOSED")).scalars().all()
             pairs_open = set(s.execute(select(Trade.pair_id).where(Trade.status != "CLOSED",
@@ -758,10 +768,9 @@ class Repository:
             _count_outcome(by_type["PAIRS"], pl)
         wins = [x for x in pls if x > 0]
         losses = [x for x in pls if x < 0]
-        day = sum(float(t.realized_pl or 0) for t in closed
-                  if t.session_date and t.session_date >= today)
-        week = sum(float(t.realized_pl or 0) for t in closed
-                   if t.session_date and t.session_date >= wk)
+        here = [t for t in closed if t.exit_time and (not venue or (t.broker or SIMULATOR) == venue)]
+        day = sum(float(t.realized_pl or 0) for t in here if day_from <= t.exit_time < until)
+        week = sum(float(t.realized_pl or 0) for t in here if week_from <= t.exit_time < until)
         gross_win = sum(wins)
         gross_loss = abs(sum(losses))
         n = len(pls)
@@ -788,7 +797,7 @@ class Repository:
             s.add(AccountSnapshot(
                 broker=broker, equity=account.equity, cash=account.cash,
                 buying_power=account.buying_power,
-                day_trades_5d=self.count_day_trades(5),
+                day_trades_5d=self.count_day_trades(5, venue=broker),
                 open_positions=len([p for p in account.positions if abs(p.quantity) > 1e-9]),
                 unrealized_pl=sum(p.unrealized_pl for p in account.positions),
                 realized_pl_day=realized_day,
@@ -959,6 +968,16 @@ def _fold_fill(t: Trade, price: float, at: dt.datetime) -> None:
         t.mae = loss
     if t.hwm_price is None or (price - float(t.hwm_price)) * sign > 1e-6:
         t.hwm_price = price
+
+
+def _at_venue(venue: Optional[str]) -> tuple:
+    """The where-clause for the trades booked at ``venue`` - none, for every venue, when it isn't given. A record
+    with no broker on it (null or empty) is the simulator's, the column's default, as the engine reads it."""
+    if not venue:
+        return ()
+    if venue == SIMULATOR:
+        return (or_(Trade.broker == venue, Trade.broker.is_(None), Trade.broker == ""),)
+    return (Trade.broker == venue,)
 
 
 def _sold_on_entry_session(s, entered: Dict[str, dt.date]) -> set:

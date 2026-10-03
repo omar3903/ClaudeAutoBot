@@ -120,6 +120,23 @@ def test_paper_mode_never_blocks():
     assert d.day_trades_used == 9
 
 
+def test_the_pdt_guard_counts_only_the_day_trades_of_the_venue_orders_go_to():
+    class Repo:
+        asked = []
+
+        def count_day_trades(self, lookback_sessions=5, venue=None):
+            self.asked.append(venue)
+            return {"ibkr-live": 3, "ibkr-paper": 1}.get(venue, 4)
+
+    live = PdtGuard(ACC_CFG, trade_repo=Repo(), venue="ibkr-live")
+    blocked = live.assess(_acct(5000), _play(tf=Timeframe.INTRADAY))
+    assert not blocked.allowed and blocked.day_trades_used == 3
+    # the paper account's trades don't use up the live account's day trades
+    ok = PdtGuard(ACC_CFG, trade_repo=Repo(), venue="ibkr-paper").assess(_acct(5000), _play(tf=Timeframe.INTRADAY))
+    assert ok.allowed and ok.day_trades_used == 1
+    assert Repo.asked == ["ibkr-live", "ibkr-paper"]
+
+
 def test_one_stock_never_takes_more_than_its_share_of_equity():
     cfg = SimpleNamespace(**{**vars(RISK_CFG), "max_symbol_pct_of_equity": 15.0})
     p = _play(100, 90)                                   # $10 risk/share: 10 shares by risk alone

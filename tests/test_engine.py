@@ -198,6 +198,23 @@ def test_the_simulator_takes_only_prices_from_the_gateway(engine, port, gateway)
     assert engine.snapshot()["connection"]["label"] == "Simulator"
 
 
+def test_the_day_trades_and_todays_pl_shown_are_the_account_orders_go_to(engine):
+    for symbol, venue, exit_price in (("T01", "ibkr-paper", 104.0), ("T02", "ibkr-paper", 101.0),
+                                      ("T03", "paper", 98.0)):
+        engine.repo.close_trade(_open(engine, symbol, venue), exit_price=exit_price, exit_reason="target")
+    held = SimpleNamespace(round_trips=0)
+
+    def shown():
+        snap = engine.snapshot()
+        return (snap["day_trades_5d"], snap["pnl"]["realized_today"], engine.pnl_summary()["realized_today"],
+                engine.pdt.day_trades_last_5_sessions(held))
+
+    assert shown() == (1, -10.0, -10.0, 1)                               # on the simulator: its trade only
+    _on_ibkr(engine)
+    assert shown() == (2, 25.0, 25.0, 2)                                 # the IBKR paper account's two
+    assert engine.pnl_summary()["realized_total"] == 15.0                # the history keeps every venue's
+
+
 def test_auto_connect_never_moves_orders_away_from_open_positions(engine, port):
     tid = _open(engine, "AAPL")                                          # on the simulator
     engine.paper_platform = "ibkr"                                       # the switch says IBKR, the orders don't
