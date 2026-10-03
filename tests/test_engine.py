@@ -2903,7 +2903,7 @@ def test_a_last_look_that_refuses_an_entry_is_kept_with_its_play(engine, monkeyp
                         lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
     quotes = iter([(99.9, 100.1), (99.0, 101.0)])
 
-    def refuse(play, plan, seen):
+    def refuse(play, plan, seen, **_):
         bid, ask = next(quotes)
         seen.update(mid=(bid + ask) / 2, bid=bid, ask=ask, spread_bps=round((ask - bid) / 100.0 * 1e4, 2))
         return "the spread is too dear to cross"
