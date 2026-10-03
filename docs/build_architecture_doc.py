@@ -654,7 +654,7 @@ def fig_states() -> str:
 def fig_research() -> str:
     s = Svg(720, 420)
     a = s.box(20, 30, 200, 70, "Replay (backtest)", ["research/replay.py + runner.py",
-                                                    "5-bps slippage, 1-bp commission,", "latest third held out"],
+                                                    "5-bps slippage, IBKR commission,", "latest third held out"],
               lsize=8.5, fill="#f3f0ff")
     b = s.box(260, 30, 200, 70, "Records per strategy", ["trades, win rate, expectancy R,",
                                                         "out_of_sample block,", "learned noise skips"],
@@ -1018,8 +1018,12 @@ def build() -> str:
       '<li><b>Board.</b> <code>PlayBoard.replace()</code> keeps the top 80, notes what joined and left, and '
       'publishes <code>plays.updated</code>. A day play counts a confirmation only when it is seen on a newer '
       '5-minute candle (<code>evidence.bar_at</code>), whichever scan reads it; a sighting more than two candles '
-      'after the last one counted starts the count again. The plays it took are logged to <code>play_logs</code> '
-      '- not a setup already acted on this session, and never over a row that was sent, filled or dismissed.</li>'
+      'after the last one counted starts the count again. When a day play\'s confirmations first reach '
+      'Autopilot\'s minimum it keeps that moment and the play as it stood, readings and all '
+      '(<code>evidence.confirmed_at</code>, <code>as_confirmed</code>), which the daily review follows a play not '
+      'taken from. The plays it took are '
+      'logged to <code>play_logs</code> - not a setup already acted on this session, and never over a row that '
+      'was sent, filled or dismissed.</li>'
       '<li><b>Autopilot.</b> <code>AutoPilot.consider()</code> walks the board highest score first and applies '
       'the gates in the next table. The first failing gate is the reason shown on the dashboard: the play\'s own '
       'checks live in one <code>_play_check()</code>, which the gate and the play\'s robot badge both call.</li>'
@@ -1091,7 +1095,8 @@ def build() -> str:
          "higher of Autopilot's and risk.min_reward_risk for its entries, risk.min_reward_risk for a click); a "
          "day-trade entry unfilled "
          "after 10 minutes is cancelled; any entry filled in part 30 seconds ago and still working has the rest "
-         "cancelled, so the shares bought get their record and stop", "execution.max_spread_r, max_chase_r, "
+         "cancelled, so the shares bought get their record and stop; the first refusal and its quote are kept "
+         "with the play (evidence.last_look)", "execution.max_spread_r, max_chase_r, "
          "entry_timeout_min, partial_entry_wait_s"),
     ]))
     A(fig_states())
@@ -1126,8 +1131,8 @@ def build() -> str:
          "mean", "Murphy"),
         ("atr_channel_breakout", "Keltner / ATR Channel Breakout", "swing", "momentum", "a close outside the ATR "
          "channel", "Murphy"),
-        ("week52_breakout", "52-Week High/Low Momentum", "swing", "momentum", "a new 52-week high on projected "
-         "volume", "Murphy"),
+        ("week52_breakout", "52-Week High/Low Momentum", "swing", "momentum", "a push to a new 52-week high/low on "
+         "the last completed session's volume", "Murphy"),
         ("divergence_reversal", "Oscillator Divergence at a Level", "swing", "reversal", "RSI/MACD divergence at "
          "support or resistance", "Murphy"),
         ("failure_test", "Failure Test (spring / upthrust)", "swing", "reversal", "a probe through a swing level "
@@ -1205,7 +1210,9 @@ def build() -> str:
          "flag, and what the stock's own drift made (drift_r) and costs took (cost_r) while it was held",
          "the runner's sink -> repo.save_sim_trades"),
         ("shadow_trades", "one play shown and not taken, followed to its outcome on the session's candles, with "
-         "its features", "the 16:15 review -> repo.save_shadow_trades"),
+         "its features - from the moment it was confirmed, with the values it had then; an entry sent that never "
+         "filled is no fill, and a play the last look refused pays the spread it read",
+         "the 16:15 review -> repo.save_shadow_trades"),
     ]))
     A('<p>Three of the columns above are the learning storage: <code>trades.entry_context</code> holds the '
       'play\'s features at the fill (with <code>submitted_at</code> and <code>mfe_at</code>), and the two '
@@ -1255,8 +1262,12 @@ def build() -> str:
       'same strategy code propose plays as if it were live: day trades on 5-minute candles over the last 60 '
       'sessions, swings on three years of daily candles (700 sessions; each setup still sees the 300 it would see '
       'live), fills at the next bar or next open, 5 bps slippage '
-      'and 1 bp commission each way, the same exit rules as the exit manager (including scale-out), news flags '
-      'from the stored headlines, and the market regime as it was known that day. The latest third of sessions '
+      'and 1 bp commission each way plus IBKR\'s $0.005 a share on every order (at least $1, at most 1% of its '
+      'value; charged on the shares a nominal $1,000 at risk buys, since the replay counts in R and has no size), '
+      'the same exit rules as the exit manager (including scale-out), news flags '
+      'from the stored headlines, and the market regime as it was known that day. At each 5-minute close a day '
+      'setup\'s candles end in the one just begun (priced at its open, no volume yet), as they do at the live '
+      'candle-close check, so it confirms on the bar that has just closed. The latest third of sessions '
       'is <b>held out</b>: a strategy must also work on data it was not tuned on.</p>')
     A('<p><b>Which stocks, and which way in.</b> Day-trade setups only ever see the morning\'s hot list, so each '
       'past session is replayed on the stocks the scan would have picked <i>that morning</i> '
@@ -1264,14 +1275,16 @@ def build() -> str:
       'biggest opening gaps) - not on today\'s hot list, which is hot because of what it has just done and hands '
       'a momentum setup its own hindsight. Each day setup is followed twice: entered on sight '
       '(<code>entry_rule</code> first - the record of all trades) and entered once it has shown two bars in a row '
-      '(second - how Autopilot enters when it asks for two candles running); Autopilot\'s record, the one the '
+      '(second - how Autopilot enters when it asks for two candles running), either way once a session per '
+      'setup, as the board settles a setup it has acted on; Autopilot\'s record, the one the '
       'proof rule reads, uses the way in it really uses. The replay reads 5-minute candles with flat costs: it '
       'is good at throwing out a setup that loses, and a setup it likes still has to show it on paper.</p>')
     A('<p><b>Runner</b> (<code>research/runner.py</code>). Splits the work into jobs (one stock, or ten sessions '
       'of one stock for day trades), runs them on a <code>ProcessPoolExecutor</code> with every core but two, '
       'and merges the simulated trades into per-strategy records: trade count, win rate, expectancy in R, '
       'profit factor, worst drawdown, and the same block for the held-out sample. It also learns which noise '
-      'checks are worth skipping (<code>learned_skips</code>).</p>')
+      'checks are worth skipping (<code>learned_skips</code>): only one whose removed trades averaged 0.05R or '
+      'more worse than the kept ones, with a Welch t of -2 or lower, and worse on the held-out sessions too.</p>')
     A('<p><b>Proof rule.</b> Autopilot, with <code>require_proven</code> on, refuses a strategy whose record '
       'does not show at least 30 trades averaging +0.05R with a positive held-out sample of at least 10. That is '
       'why no swing trade was taken on 16 September: the records were negative or too thin. In <b>Live</b> the '
@@ -1436,9 +1449,10 @@ def build() -> str:
         ("execution/autopilot.py", "replay_loser(), replay_losers()", "with proof not asked for, a day setup with "
          "evidence it loses - its replay and held-out sessions, or its own trades - is skipped; listed for the "
          "settings and kept with each trade"),
-        ("engine/board.py", "PlayBoard.replace(new_candle=...), MAX_CANDLE_GAP", "a day play's confirmation counts "
-         "only on a newer 5-minute candle (evidence.bar_at), whichever scan reads it; more than 2 candles between "
-         "sightings starts the count again"),
+        ("engine/board.py", "PlayBoard.replace(new_candle=..., min_confirmations=...), MAX_CANDLE_GAP",
+         "a day play's confirmation counts only on a newer 5-minute candle (evidence.bar_at), whichever scan reads "
+         "it; more than 2 candles between sightings starts the count again; reaching Autopilot's minimum stamps "
+         "evidence.confirmed_at"),
         ("risk/position_sizing.py", "liquidity_cap()", "one order's shares are at most risk.max_adv_pct (1%) of the "
          "stock's median daily volume over 20 completed sessions (evidence.adv_shares); under one share the engine "
          "refuses the play as too thin"),
@@ -1535,7 +1549,8 @@ def build() -> str:
         ("Half-Kelly", "the Kelly criterion gives the bet fraction that maximises log growth from win rate and "
          "payoff; half of it is the conventional safe version. It can only lower the configured risk %."),
         ("Slippage, commission, bps", "the cost of a fill vs the quoted price, and the broker's fee. 1 bp = 0.01%. "
-         "The replay charges 5 bps slippage and 1 bp commission on every fill."),
+         "The replay charges 5 bps slippage and 1 bp commission on every fill, and IBKR's $0.005 a share "
+         "(at least $1, at most 1% of the order) on top."),
         ("Bracket order", "an entry order with a stop order and a target order attached; the broker cancels one "
          "when the other fills. IBKR supports it natively."),
         ("Day trade vs swing", "a day trade opens and closes the same session (and counts against the "

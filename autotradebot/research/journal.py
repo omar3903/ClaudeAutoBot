@@ -12,10 +12,13 @@ a strategy. After the close the review gathers, for one session:
   1R, a winner of 1R or more closed at a loss, a trade taken through a noise flag or before
   it was confirmed, going straight back into a stock that had just stopped out;
 - **the plays that weren't taken** and how each would have gone, followed on the session's
-  5-minute candles exactly the way the replay follows a trade, from the moment the play was
-  on the board with the values it was recorded with (an entry sent that never filled, from
-  the moment it was sent) - grouped by noise flag, so every check is tested on live plays
-  every day, and by whether Autopilot's checks passed them;
+  5-minute candles exactly the way the replay follows a trade, the way Autopilot enters: from
+  the moment its confirmations reached Autopilot's minimum, with the values it had then (one
+  never confirmed, from the moment it was on the board with the values it was recorded with).
+  An entry sent that never filled is no fill - what it would have made had it filled is kept
+  apart - and a play the last look refused pays the spread that look read. Grouped by noise
+  flag, so every check is tested on live plays every day, and by whether Autopilot's checks
+  passed them;
 - **each strategy's real record** over the last 20 sessions against its replay record,
   and the evidence weight that follows (research/weights.py);
 - **lessons** - plain sentences drawn from all of it.
@@ -28,9 +31,8 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-import math
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -40,6 +42,7 @@ from ..scanner.noise import LABELS as NOISE_LABELS
 from ..util import clock
 from .features import play_features
 from .replay import ReplaySettings, shadow_trade
+from .significance import welch_t
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +60,8 @@ MIN_T = 1.0                       # ... and by a standard error or more (Welch's
 SENT_UNFILLED = frozenset({"ACCEPTED", "SUBMITTED", "WORKING", "CANCELED", "ERROR"})
 TURBULENT = 0.7
 TAKEN = frozenset({"ACCEPTED", "SUBMITTED", "WORKING", "PARTIAL", "FILLED"})
+#: what the play board keeps in a play's evidence from one sighting to the next (engine/board.py KEPT_EVIDENCE)
+BOARD_NOTES = ("confirmed_at", "as_confirmed", "last_look")
 LABELS = {**NOISE_LABELS, "unconfirmed": "seen on only one candle"}
 
 
@@ -217,6 +222,11 @@ def _sent(row: Mapping[str, Any]) -> bool:
     return row.get("status") in SENT_UNFILLED
 
 
+def _stamped(row: Mapping[str, Any]) -> bool:
+    """Whether the row reached Autopilot's confirmations - the board stamped when (engine/board.py)."""
+    return bool((row.get("evidence") or {}).get("confirmed_at"))
+
+
 def _capped(ranked: Sequence[Mapping[str, Any]], limit: Optional[int]) -> List[Mapping[str, Any]]:
     """The ``limit`` highest-scoring of ``ranked``, and every entry sent among the rest: what became of an
     order that went out is worth knowing whatever its score."""
@@ -226,8 +236,10 @@ def _capped(ranked: Sequence[Mapping[str, Any]], limit: Optional[int]) -> List[M
 def first_sightings(plays: Sequence[Mapping[str, Any]], limit: Optional[int] = MAX_SHADOWS,
                     booked: Iterable[Any] = ()) -> List[Mapping[str, Any]]:
     """Each day-trade setup the first time it was offered, when it was never taken - or, when its
-    entry was sent and never filled, the row it was sent from, which holds what it was sent on. The
-    highest-scoring ones when there are too many to follow, and the entries sent past them all the
+    entry was sent and never filled, the row it was sent from, which holds what it was sent on; else,
+    when it first reached Autopilot's confirmations on a later row (a setup that leaves the board and
+    comes back is logged again under a new play), that row, which holds the moment and the values.
+    The highest-scoring ones when there are too many to follow, and the entries sent past them all the
     same (``limit=None``: every one). A setup was taken when an entry of it filled or a trade was
     booked from one of its rows (``booked``: those play ids) - a row still marked sent with no trade
     booked is an entry sent that never filled, as sent_unfilled counts it."""
@@ -237,7 +249,9 @@ def first_sightings(plays: Sequence[Mapping[str, Any]], limit: Optional[int] = M
     for p in sorted(plays, key=lambda p: p.get("created_at") or ""):
         if p.get("timeframe") != "INTRADAY" or p.get("kind") != "TECHNICAL" or _key(p) in traded:
             continue
-        if _key(p) not in chosen or (_sent(p) and not _sent(chosen[_key(p)])):
+        held = chosen.get(_key(p))
+        if (held is None or (_sent(p) and not _sent(held))
+                or (_stamped(p) and not _stamped(held) and not _sent(held))):
             chosen[_key(p)] = p
     return _capped(sorted(chosen.values(), key=lambda p: -float(p.get("score") or 0.0)), limit)
 
@@ -299,15 +313,39 @@ def _offered_at(row: Mapping[str, Any], seen_at: pd.Timestamp) -> pd.Timestamp:
     return max([seen_at, *(t for t in later if t is not None)])
 
 
-def _welch_t(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
-    """How many standard errors apart two groups' averages are (Welch's t, which doesn't assume the two
-    spreads are alike). None when either group has no spread to measure, so a difference must stand on its size."""
-    if len(a) < 2 or len(b) < 2:
-        return None
-    ma, mb = sum(a) / len(a), sum(b) / len(b)
-    se = math.sqrt(sum((x - ma) ** 2 for x in a) / (len(a) - 1) / len(a)
-                   + sum((x - mb) ** 2 for x in b) / (len(b) - 1) / len(b))
-    return (ma - mb) / se if se else None
+def _confirmed(row: Mapping[str, Any]) -> Tuple[Optional[pd.Timestamp], Mapping[str, Any]]:
+    """When a play row's confirmations first reached Autopilot's minimum - when Autopilot would have taken
+    it (engine/board.py stamps it) - and the row with the values the play had then: a row holds the last scan
+    that wrote it, and each scan prices the play at its own moment. (None, the row) for a play never confirmed
+    or logged before the moment was kept, and for an entry sent - its row holds what it was sent on. Its evidence
+    is the play's then too - the readings its features and time stop come from, which a later scan took after
+    the entry - with the notes the board keeps on the row (engine/board.py KEPT_EVIDENCE: the last look)."""
+    evidence = row.get("evidence") or {}
+    at, values = _ny(evidence.get("confirmed_at")), evidence.get("as_confirmed")
+    if at is None or not isinstance(values, Mapping) or _sent(row):
+        return None, row
+    then = values.get("evidence")
+    if not isinstance(then, Mapping):                 # stamped before its readings were kept with it
+        return at, {**row, **values}
+    notes = {k: evidence[k] for k in BOARD_NOTES if k in evidence}
+    return at, {**row, **values, "evidence": {**then, **notes}}
+
+
+def _spread_r(row: Mapping[str, Any], trade: Any, stop: float) -> float:
+    """The spread read by the last look that refused the play's entry (engine.approve_play), in R of its
+    shadow trade - a fill crosses it, half going in and half coming out, and the candles don't show it. 0 when
+    no last look refused it or the look read no spread."""
+    look = (row.get("evidence") or {}).get("last_look") or {}
+    if trade is None or not look:
+        return 0.0
+    try:
+        bid, ask = float(look.get("bid") or 0.0), float(look.get("ask") or 0.0)
+        bps, mid = float(look.get("spread_bps") or 0.0), float(look.get("mid") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    spread = ask - bid if 0 < bid < ask else bps * mid / 1e4
+    risk = abs(float(trade.entry) - float(stop))
+    return round(spread / risk, 4) if spread > 0 and risk > 0 else 0.0
 
 
 def _compare(flagged: Sequence[Mapping[str, Any]], rest: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -318,7 +356,7 @@ def _compare(flagged: Sequence[Mapping[str, Any]], rest: Sequence[Mapping[str, A
         out["verdict"] = "too few plays to tell"
         return out
     f_rs, r_rs = [r["r"] for r in flagged], [r["r"] for r in rest]
-    diff, t = sum(f_rs) / len(f_rs) - sum(r_rs) / len(r_rs), _welch_t(f_rs, r_rs)
+    diff, t = sum(f_rs) / len(f_rs) - sum(r_rs) / len(r_rs), welch_t(f_rs, r_rs)
     out["t"] = round(t, 2) if t is not None else None
     # a few hundredths of an R, or a gap one lucky play could make, is a session's noise, not the check's doing -
     # and only the first is told as the two sides doing about as well: a wide gap that noisy isn't a tie either
@@ -341,27 +379,37 @@ def shadow_outcomes(plays: Sequence[Mapping[str, Any]], bars: Mapping[str, pd.Da
     eligible = first_sightings(plays, limit=None, booked=booked)
     past_cap = 0
     for i, row in enumerate(_capped(eligible, MAX_SHADOWS)):
-        frame, play, seen_at = bars.get(row["symbol"]), _play(row), _ny(row.get("created_at"))
+        seen_at = _ny(row.get("created_at"))
+        confirmed_at, row = _confirmed(row)
+        frame, play = bars.get(row["symbol"]), _play(row)
         if frame is None or play is None or seen_at is None:
             continue
         past_cap += i >= MAX_SHADOWS                   # an entry sent that scored below the ones followed
-        # entered on the next bar after it was on the board as recorded, so its values, confirmations,
-        # features and checks all describe the moment it enters
-        offered_at = _offered_at(row, seen_at)
+        # entered on the next bar after the moment Autopilot would have taken it - its confirmations reached
+        # the minimum - with the values it had then; one never confirmed, after it was on the board as recorded.
+        # Either way its values, confirmations, features and checks all describe the moment it enters
+        offered_at = max(seen_at, confirmed_at) if confirmed_at is not None else _offered_at(row, seen_at)
         session = frame[frame.index.date == day]
         features = play_features(row, now=offered_at)
         trade = shadow_trade(play, session, offered_at, settings, features=features) if len(session) else None
+        spread_r = _spread_r(row, trade, play.stop)
+        r = round(trade.r - spread_r, 3) if trade else None
+        # an entry that went out and never filled made nothing: what it would have made had it filled is apart
+        sent = _sent(row)
+        took = None if sent else trade
         rows.append({"play_id": row.get("id"), "symbol": play.symbol, "side": play.side.value, "strategy": play.strategy,
                      "timeframe": play.timeframe.value, "seen_at": seen_at.isoformat(),
-                     "offered_at": offered_at.isoformat(), "sent": _sent(row), "noise": play.noise,
+                     "confirmed_at": confirmed_at.isoformat() if confirmed_at is not None else None,
+                     "offered_at": offered_at.isoformat(), "sent": sent, "noise": play.noise,
                      "confirmations": play.confirmations,
                      "score": row.get("score"), "confidence": row.get("confidence"),
                      "reward_risk": row.get("reward_risk"), "passed_checks": bool(passes(row)),
-                     "filled": trade is not None, "r": trade.r if trade else None,
-                     "mfe_r": trade.mfe_r if trade else None,
-                     "entered_at": trade.entered_at if trade else None, "exited_at": trade.exited_at if trade else None,
-                     "entry": trade.entry if trade else None, "exit": trade.exit if trade else None,
-                     "exit_reason": trade.exit_reason if trade else "no fill - the price had already moved away",
+                     "filled": took is not None, "r": r if took else None, "if_filled_r": r if sent else None,
+                     "spread_r": spread_r or None, "mfe_r": took.mfe_r if took else None,
+                     "entered_at": took.entered_at if took else None, "exited_at": took.exited_at if took else None,
+                     "entry": took.entry if took else None, "exit": took.exit if took else None,
+                     "exit_reason": (took.exit_reason if took else "no fill - the entry was sent and never filled"
+                                     if sent else "no fill - the price had already moved away"),
                      "features": features})
     filled = [r for r in rows if r["filled"]]
     flags = sorted({f for r in filled for f in r["noise"]})

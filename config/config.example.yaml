@@ -57,9 +57,11 @@ scanner:
   kept_per_sector: 2                   # promising buffer names kept waiting for a hot-list slot
   fast_cycle_seconds: 60               # hot list only, while Autopilot day-trades an open session
   plays_refresh_seconds: 15            # re-check the stocks with plays on the board this often (0 = off)
-  close_check: true                    # at each 5-minute candle close in regular hours, +2 s, check the watch
-                                       # tier's setups on IBKR's just-closed bars at once, in place of the fast
-                                       # cycle due then (false = off, the fast cycle as before)
+  close_check: true                    # at each 5-minute candle close in regular hours, +close_grace_s, check the
+                                       # watch tier's setups on IBKR's just-closed bars at once, in place of the
+                                       # fast cycle due then (false = off, the fast cycle as before)
+  close_grace_s: 8                     # ...this many seconds after the close, once IBKR has printed most stocks'
+                                       # new bars; those still without one are asked once more ~15 s later (0-30)
   mover_atr: 1.0                       # a watch stock whose streamed 1-minute candle spans this many 5-minute ATRs,
                                        # or makes a new high/low of the day on 3x its average minute volume, is
                                        # checked at once, at most once per 5 minutes (0-5; 0 = off)
@@ -230,6 +232,12 @@ replay:
                                       # just the day's watchlist (0 = watchlist only); their candles are on disk
   slippage_bps: 5.0                   # on every market fill, each way
   commission_bps: 1.0                 # on every fill
+  commission_per_share: 0.005         # IBKR's fixed commission on top, on every fill: this much a share...
+  commission_min: 1.0                 # ...at least this much an order...
+  commission_max_pct: 1.0             # ...and at most this % of the order's value (0 = no cap)
+  nominal_risk_usd: 1000              # the replay counts in R and has no size: the commission is charged on the
+                                      # shares a trade risking this much would buy (1% of a nominal $100k account);
+                                      # only the minimum and the cap depend on it
   held_out_fraction: 0.3334           # the latest sessions kept out of sample; Autopilot wants profits there too
   workers: 0                          # processes replaying stocks side by side; 0 = every core but two
   sessions_per_job: 10                # a day-trade job replays this many sessions of one stock (spreads the work)

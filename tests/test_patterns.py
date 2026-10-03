@@ -7,7 +7,8 @@ import pandas as pd
 import fakes
 from autotradebot.core.enums import Side
 from autotradebot.strategies import REGISTRY, build_context
-from autotradebot.strategies.patterns import completed_daily, pivots
+from autotradebot.strategies.base import completed_daily
+from autotradebot.strategies.patterns import pivots
 
 
 def _frame(closes, lows=None, highs=None, volume=None):

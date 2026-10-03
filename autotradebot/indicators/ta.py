@@ -112,13 +112,21 @@ def opening_range(df: pd.DataFrame, minutes: int = 15) -> pd.DataFrame:
 
 def rel_volume_intraday(intraday: pd.DataFrame, lookback_days: int = 20) -> float:
     """Today's volume so far against the average volume by the same time of
-    day over recent sessions. Above 1 means unusually active."""
+    day over recent sessions. Above 1 means unusually active.
+
+    The newest candle is taken as the one still printing, as the setups take it: it holds only the
+    seconds since it began, so both sides are measured through today's last closed candle - today's
+    closed candles against each earlier session's candles up to the same start. Counting it would
+    read a normal stock as quiet just after every close."""
     ny = intraday.index.tz_convert(_NY)
     day = np.asarray(ny.date)
     minute = np.asarray(ny.hour * 60 + ny.minute)
     volume = intraday["volume"].to_numpy(dtype=float)
     today = day == day[-1]
-    earlier = ~today & (minute <= minute[today].max())
+    today[-1] = False                       # the candle still printing
+    if not today.any():
+        return 1.0
+    earlier = (day != day[-1]) & (minute <= minute[today].max())
     by_session = pd.Series(volume[earlier]).groupby(day[earlier]).sum()
     by_session = by_session[by_session > 0].tail(lookback_days)
     if by_session.empty:

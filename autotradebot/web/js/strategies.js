@@ -1,5 +1,5 @@
 /* Strategies: switch setups on or off and set their weight. */
-import { $, $$, api, escapeHtml, num, post, pretty } from "./util.js";
+import { $, $$, api, escapeHtml, num, post, pretty, usd } from "./util.js";
 import { S, emit, on } from "./state.js";
 import { drawerOpen, openDrawer, toast, toastResult } from "./ui.js";
 
@@ -106,13 +106,16 @@ function replayHTML() {
         : (rp.intraday_symbols ? ` on ${rp.intraday_symbols} stocks` : "")) +
       `, swing setups over ${rp.swing_sessions}.` +
       (heldFrom.INTRADAY || heldFrom.SWING ? ` Held out to test on: day trades from ${escapeHtml(heldFrom.INTRADAY || "–")}, swing trades from ${escapeHtml(heldFrom.SWING || "–")}.` : "") +
-      (costs.commission_bps != null ? ` Costs: ${num(costs.slippage_bps, 1)} bps slippage on market fills, ${num(costs.commission_bps, 1)} bps commission on every fill.` : "")
+      (costs.commission_bps != null ? ` Costs: ${num(costs.slippage_bps, 1)} bps slippage on market fills, ${num(costs.commission_bps, 1)} bps commission on every fill` +
+        // the per-share commission came later: a replay saved before it says nothing of it
+        (costs.commission_per_share ? ` and IBKR's $${num(costs.commission_per_share, 3)} a share on every order (at least ${usd(costs.commission_min)}${costs.commission_max_pct ? `, at most ${num(costs.commission_max_pct, 1)}% of its value` : ""}), on the shares ${usd(costs.nominal_risk_usd)} at risk would buy` : "") +
+        "." : "")
     : "No replay yet. Autopilot only trades a strategy once the replay has proven it.";
   const learned = new Set(rp.learned_skips || []);
   const noise = rp.noise
     ? `<table class="ev-table replay-noise"><tr><th>Noise check</th><th class="num">Removes</th><th class="num">Their average</th><th class="num">Kept average</th><th>Verdict</th><th>Held-out sessions</th></tr>` +
-      Object.entries(rp.noise).map(([check, n]) => `<tr><td>${escapeHtml(labels[check] || check)}${learned.has(check) ? ` <span class="badge good" title="It removed losers on every session and on the held-out ones, so Autopilot skips it">Autopilot skips it</span>` : ""}</td><td class="num">${n.removes}</td>
-        <td class="num">${inR(n.removed_avg_r)}</td><td class="num">${inR(n.kept_avg_r)}</td><td>${escapeHtml(n.verdict)}</td><td>${escapeHtml((n.held_out || {}).verdict || "–")}</td></tr>`).join("") +
+      Object.entries(rp.noise).map(([check, n]) => `<tr><td>${escapeHtml(labels[check] || check)}${learned.has(check) ? ` <span class="badge good" title="The trades it removed averaged 0.05R or more worse over every session, two standard errors or more apart, and worse on the held-out sessions too, so Autopilot skips it">Autopilot skips it</span>` : ""}</td><td class="num">${n.removes}</td>
+        <td class="num">${inR(n.removed_avg_r)}</td><td class="num">${inR(n.kept_avg_r)}</td><td${n.t != null ? ` title="The two averages are ${num(Math.abs(n.t), 1)} standard errors apart (Welch's t ${num(n.t, 2)}); Autopilot learns a skip from -2 or lower"` : ""}>${escapeHtml(n.verdict)}</td><td>${escapeHtml((n.held_out || {}).verdict || "–")}</td></tr>`).join("") +
       `</table>`
     : "";
   return `<div class="replay-box">

@@ -121,9 +121,12 @@ class ScannerCfg(_Model):
     cycle_minutes: int = 5                # intraday rescan of the hot list + buffer (3-5)
     fast_cycle_seconds: int = 60          # hot list only, while Autopilot is day-trading
     plays_refresh_seconds: int = 15       # re-check the stocks with plays on the board (0 = off)
-    close_check: bool = True              # at each 5-minute candle close in regular hours, +2 s, check the watch
-                                          # tier's setups on IBKR's just-closed bars at once - it stands in for the
-                                          # fast cycle due then; false = off, the fast cycle as before
+    close_check: bool = True              # at each 5-minute candle close in regular hours, +close_grace_s, check the
+                                          # watch tier's setups on IBKR's just-closed bars at once - it stands in for
+                                          # the fast cycle due then; false = off, the fast cycle as before
+    close_grace_s: float = 8.0            # ...this many seconds after the close: IBKR prints a stock's new bar a few
+                                          # seconds on, and a check sooner finds few of them; the stocks still without
+                                          # one are asked once more about 15 s after it read (0-30)
     mover_atr: float = 1.0                # a watch stock whose streamed 1-minute candle spans at least this many of
                                           # its 5-minute ATRs, or makes a new high/low of the day on 3x its average
                                           # minute volume, is checked at once, at most once per 5 minutes (0-5; 0 = off)
@@ -153,6 +156,12 @@ class ScannerCfg(_Model):
     max_universe: int = 0                 # 0 = every listing (smoke tests cap it)
     sectors: list = Field(default_factory=list)
     prefilter: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("close_grace_s", mode="after")
+    @classmethod
+    def _within_the_grace(cls, value: float) -> float:
+        """A check later than 30 s, with its second ask after it, would near the minute a late check is dropped at."""
+        return max(0.0, min(30.0, value))
 
     @field_validator("mover_atr", mode="after")
     @classmethod
@@ -369,6 +378,13 @@ class ReplayCfg(_Model):
                                           # as the day's watchlist (0 = the watchlist only); costs no requests
     slippage_bps: float = 5.0             # on every market fill, each way
     commission_bps: float = 1.0           # on every fill
+    commission_per_share: float = 0.005   # IBKR's fixed commission on top, on every fill: this much a share...
+    commission_min: float = 1.0           # ...at least this much an order...
+    commission_max_pct: float = 1.0       # ...and at most this % of the order's value (0 = no cap)
+    nominal_risk_usd: float = 1000.0      # the replay counts in R and has no size, so the commission is charged on
+                                          # the shares a trade risking this much would buy (1% of a nominal $100k
+                                          # account). Only the minimum and the cap depend on it: $0.005 a share over
+                                          # the risk a share is the same R at any size
     held_out_fraction: float = 0.3334     # the latest sessions kept out of sample
     workers: int = 0                      # processes replaying stocks side by side; 0 = every core but two
     sessions_per_job: int = 10            # a day-trade job replays this many sessions of one stock, so the work spreads

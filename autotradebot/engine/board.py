@@ -16,6 +16,15 @@ that candle several times over before the next one closes. With
 newer candle than the one it last counted - from any scan, the quick re-check
 too - so "seen twice" means two candles running, the entry the replay tests.
 
+The moment a day play's confirmations first reach Autopilot's minimum - when
+Autopilot would take it - is kept in its evidence (``confirmed_at``) with the
+play as it stood then (``as_confirmed``), its readings too: each scan writes the
+play with the prices and readings of its own moment, and the daily review's
+shadow record follows a play not taken from that moment, with those values and
+the features they make (research/journal.py). The board
+carries these, and a last look that refused the entry (``last_look``, see
+engine.approve_play), on to the scans that find the setup again.
+
 Every change says why: a new setup was found, or a play left because its setup
 no longer shows on the latest candles, it expired, or a filter or strategy switch
 dropped it. The engine turns these into the dashboard's Autopilot notes.
@@ -45,6 +54,14 @@ SetupKey = Tuple[str, str, str, str, dt.date]
 #: between two counted sightings and still be seen "in a row" - a scan can land a candle late
 CANDLE = dt.timedelta(minutes=5)
 MAX_CANDLE_GAP = 2
+#: what the board learns about a setup, kept in its play's evidence from one scan's sighting to the next
+KEPT_EVIDENCE = ("confirmed_at", "as_confirmed", "last_look")
+#: the play's values kept as they stood when it was confirmed - what Autopilot would have entered on - with its
+#: evidence then: the readings the review's features (research/features.py) and its time stop are taken from
+AS_CONFIRMED = ("entry", "stop", "targets", "noise", "confirmations", "confidence", "reward_risk", "score",
+                "probability", "tags")
+#: the evidence not kept with it: the board's own notes, and the price strip the dashboard draws
+NOT_AS_CONFIRMED = (*KEPT_EVIDENCE, "spark")
 
 
 def setup_key(p: Play) -> SetupKey:
@@ -84,12 +101,15 @@ class PlayBoard:
 
     def replace(self, plays: Iterable[Play], scanned: Optional[Collection[str]] = None,
                 now: Optional[dt.datetime] = None, keep: Optional[Callable[[Play], bool]] = None,
-                confirm: bool = True, new_candle: bool = False) -> List[BoardChange]:
+                confirm: bool = True, new_candle: bool = False,
+                min_confirmations: Optional[int] = None) -> List[BoardChange]:
         """``scanned`` = the symbols the scan looked at; None = it looked at everything.
         ``keep`` spares the plays on those symbols that the scan doesn't re-evaluate
         (valuation setups, say). ``confirm`` = False when a quick re-check shouldn't count
         as another scan confirming a setup. ``new_candle``: a day play that knows its candle
-        counts by candles instead (see _confirmations). Returns what was added and removed, and why."""
+        counts by candles instead (see _confirmations). ``min_confirmations``: Autopilot's minimum -
+        a day play whose confirmations first reach it is stamped confirmed (None: none is).
+        Returns what was added and removed, and why."""
         now = now or dt.datetime.now(dt.timezone.utc)
         with self._lock:
             today = clock.session_date(now)
@@ -112,10 +132,16 @@ class PlayBoard:
                     p.id, p.created_at = old.id, old.created_at
                     p.scan_run_id = p.scan_run_id or old.scan_run_id
                     p.confirmations = _confirmations(old, p, confirm, new_candle)
+                    for name in KEPT_EVIDENCE:
+                        if name in old.evidence:
+                            p.evidence.setdefault(name, old.evidence[name])
                 else:
                     changes.append(BoardChange("added", p, p.rationale or "a new setup was found"))
                 kept[p.id] = p
             _flag_conflicts(kept.values())
+            if min_confirmations is not None:                 # after the conflicts: its flags as they're logged
+                for p in kept.values():
+                    _stamp_confirmed(p, now, min_confirmations)
             changes += [BoardChange("removed", p, _why_gone(p, scanned, now))
                         for pid, p in before.items() if pid not in kept and p.status is PlayStatus.PROPOSED]
             self._plays = kept
@@ -171,6 +197,21 @@ def _confirmations(old: Play, new: Play, confirm: bool, new_candle: bool) -> int
     if counted is None:                                    # saved before the candles were kept
         return old.confirmations + 1 if confirm else old.confirmations
     return old.confirmations + 1 if bar - counted <= MAX_CANDLE_GAP * CANDLE else 1
+
+
+def _stamp_confirmed(p: Play, now: dt.datetime, minimum: int) -> None:
+    """Keep the moment a day play's confirmations first reach Autopilot's ``minimum`` - when Autopilot would
+    take it - and the play as it stood then, readings and all: a later scan measures the stock's run after the
+    entry. Kept once: a count that starts again later doesn't move it."""
+    if (p.status is not PlayStatus.PROPOSED or not p.is_day_trade or p.confirmations < minimum
+            or "confirmed_at" in p.evidence):
+        return
+    row = p.to_row()
+    evidence = {name: value for name, value in p.evidence.items() if name not in NOT_AS_CONFIRMED}
+    # the hold the time stop runs on, kept the way the play log keeps it (persistence/repository.py _play_row)
+    evidence["expected_hold"] = [float(p.expected_hold_typical or 0.0), float(p.expected_hold_max or 0.0)]
+    p.evidence["confirmed_at"] = now.isoformat()
+    p.evidence["as_confirmed"] = {**{name: row[name] for name in AS_CONFIRMED}, "evidence": evidence}
 
 
 def _candle(value: object) -> Optional[pd.Timestamp]:

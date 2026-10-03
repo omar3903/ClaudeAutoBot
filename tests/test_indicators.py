@@ -67,6 +67,18 @@ def test_relative_volume_compares_the_same_time_of_day():
     assert ta.rel_volume_intraday(_session("2026-02-04", 10, 2000.0)) == 1.0      # no history: neutral
 
 
+def test_relative_volume_is_measured_through_the_last_closed_candle_on_both_sides():
+    # earlier sessions at 1,000 a bar but 50,000 in the 10:20 candle; today, the 10:20 candle has just begun
+    earlier = [_session(day, 78, 1000.0) for day in ("2026-02-02", "2026-02-03")]
+    for frame in earlier:
+        frame.iloc[10, frame.columns.get_loc("volume")] = 50_000.0
+    today = _session("2026-02-04", 11, 2000.0)
+    today.iloc[-1, today.columns.get_loc("volume")] = 30.0                       # its first seconds
+    assert ta.rel_volume_intraday(pd.concat([*earlier, today])) == pytest.approx(2.0)   # ten closed candles a side
+    # only the candle that has just begun: nothing closed today to compare
+    assert ta.rel_volume_intraday(pd.concat([*earlier, _session("2026-02-04", 1, 30.0)])) == 1.0
+
+
 def test_beta_measures_how_much_a_stock_moves_with_the_market():
     idx = pd.bdate_range("2025-01-01", periods=250, tz="America/New_York")
     market_returns = np.random.default_rng(3).normal(0, 0.01, len(idx))

@@ -157,8 +157,8 @@ class StrategyContext:
 
     @property
     def daily_adx(self) -> pd.DataFrame:
-        """ADX on the daily candles, shared by the swing setups that read the trend's strength."""
-        return self._cached("daily_adx", lambda: ta.adx(self.daily, 14))
+        """ADX on the completed daily candles, shared by the swing setups that read the trend's strength."""
+        return self._cached("daily_adx", lambda: ta.adx(completed_daily(self), 14))
 
     @property
     def vwap_series(self) -> pd.Series:
@@ -236,6 +236,19 @@ def build_context(symbol: str, intraday: Optional[pd.DataFrame], daily: pd.DataF
     return StrategyContext(symbol=symbol, intraday=intraday, daily=daily, quote=quote,
                            fundamentals=fundamentals, peers=peers, params=params or {},
                            account_equity=account_equity, activity=activity or {})
+
+
+def completed_daily(ctx: StrategyContext) -> pd.DataFrame:
+    """The daily candles without the one still forming (it is there only in a live session). The swing
+    setups read their signals on these and enter at the price now: a close beyond a band on a candle still
+    printing is no close at all, and the replay, which signals at each session's close, never sees one.
+    Their stops keep the shared daily ATR, the one Strategy._mk_play floors every technical stop with."""
+    def compute():
+        d = ctx.daily
+        forming = (len(d) and ctx.intraday is not None and d.index[-1].date() == clock.session_date(ctx.now)
+                   and 0 < ctx.minutes_since_open < 390)
+        return d.iloc[:-1] if forming else d
+    return ctx._cached("completed_daily", compute)
 
 
 class Strategy:

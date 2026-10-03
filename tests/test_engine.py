@@ -3191,6 +3191,65 @@ def test_any_scan_on_a_newer_candle_confirms_a_day_play_and_the_setting_turns_it
     assert count() == 4
 
 
+def test_a_day_play_reaching_autopilots_confirmations_is_stamped_and_logged_with_it(engine, monkeypatch):
+    """The scans stamp the moment a day play's confirmations reach Autopilot's minimum - when Autopilot would
+    take it - and the play-log row carries it, so the review follows a play not taken from then."""
+    import pandas as pd
+    from autotradebot.scanner.scanner import ScanResult
+
+    engine.autopilot.enabled, engine.autopilot.min_confirmations = False, 3
+    opened = pd.Timestamp("2026-03-02 10:00", tz="America/New_York")
+    candle = {"at": 0}
+
+    def seen(fast=False):
+        p = _play("AAA")
+        p.timeframe = Timeframe.INTRADAY
+        p.evidence["bar_at"] = (opened + pd.Timedelta(minutes=candle["at"])).isoformat()
+        return ScanResult(kind="cycle", symbols=["AAA"], plays=[p])
+
+    monkeypatch.setattr(engine.scanner, "run_cycle", seen)
+    for at in (0, 5):
+        candle["at"] = at
+        engine._run_scan("cycle")
+    [p] = engine.board.plays.values()
+    assert p.confirmations == 2 and "confirmed_at" not in p.evidence       # Autopilot asks for three
+    candle["at"] = 10
+    engine._run_scan("cycle")
+    [p] = engine.board.plays.values()
+    stamped = p.evidence["confirmed_at"]
+    assert p.confirmations == 3 and p.evidence["as_confirmed"]["confirmations"] == 3
+    assert engine.repo.get_play(p.id)["evidence"]["confirmed_at"] == stamped
+    candle["at"] = 15
+    engine._run_scan("cycle")
+    assert engine.repo.get_play(p.id)["evidence"]["confirmed_at"] == stamped   # the first time it got there
+
+
+def test_a_last_look_that_refuses_an_entry_is_kept_with_its_play(engine, monkeypatch):
+    """The quote a refusing last look read is logged with the play - the review charges the spread it saw -
+    and the first refusal is the one kept."""
+    p = _play("T07")
+    engine.board.replace([p])
+    monkeypatch.setattr(engine, "assess_play",
+                        lambda pid: {"ok": True, "can_execute": True, "reasons": [], "order_plan": {}})
+    quotes = iter([(99.9, 100.1), (99.0, 101.0)])
+
+    def refuse(play, plan, seen, **_):
+        bid, ask = next(quotes)
+        seen.update(mid=(bid + ask) / 2, bid=bid, ask=ask, spread_bps=round((ask - bid) / 100.0 * 1e4, 2))
+        return "the spread is too dear to cross"
+
+    monkeypatch.setattr(engine, "_chase_check", refuse)
+    monkeypatch.setattr(engine.executor, "execute_play", lambda *a, **k: pytest.fail("a refused entry never goes out"))
+    out = engine.approve_play(p.id, operator="autopilot")
+    assert not out["ok"] and out["reason"] == "the spread is too dear to cross"
+    look = engine.repo.get_play(p.id)["evidence"]["last_look"]
+    assert (look["by"], look["why"], look["bid"], look["ask"], look["spread_bps"]) == (
+        "autopilot", "the spread is too dear to cross", 99.9, 100.1, 20.0)
+    assert not engine.approve_play(p.id)["ok"]                              # a second refusal...
+    assert engine.repo.get_play(p.id)["evidence"]["last_look"] == look      # ...leaves the first
+    assert engine.repo.get_play(p.id)["status"] == "PROPOSED"
+
+
 def test_the_strategies_panel_says_when_a_day_setup_fires_on_one_candle(engine, monkeypatch):
     key = next(s.key for s in engine.scanner.strategies if s.timeframe is Timeframe.INTRADAY)
     monkeypatch.setattr(engine.replay, "one_candle_setups", lambda: [key])
