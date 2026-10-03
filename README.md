@@ -990,8 +990,8 @@ held on the active platform — **entries need your click, exits never do**:
 | tighten the stop to **lock a small profit** once green | at +1.3 R, lock +0.3 R | `breakeven_at_r`, `breakeven_lock_r` |
 | **trail** the stop, keeping a fraction of the open R | from +2.0 R, lock 50% | `trail_start_r`, `trail_lock_ratio` |
 | **close a day trade that isn't working** once its setup's window has passed | on | `intraday_time_stop` |
-| **flatten day trades** before the (holiday-aware) close | 10 min before | `flatten_intraday_before_close_min` |
-| force-close **stale swings** | 10 days | `max_swing_hold_days` |
+| **flatten day trades** before the (holiday-aware) close - one still open from an earlier session at the next regular-session pass | 10 min before | `flatten_intraday_before_close_min` |
+| force-close **stale swings** at the flatten on their last day | 10 trading days, the entry's counted | `max_swing_hold_days` |
 
 The stop only ever ratchets in your favour and never through the last price. R
 is measured against the **original** stop. Each open position has an **Auto
@@ -1002,6 +1002,15 @@ runs its stop and target checks, and moves its stop, within about a second. The
 note on the record and the message about a moved stop wait for the next full
 pass a few seconds later (or the exit, if one goes out first), and so do the time
 exits.
+
+The time exits read no price, so they go out even when a pass has no quote for
+the stock (or only one from before the entry). A day trade still open from an
+earlier session - the app was down at the flatten, say - is closed at the first
+pass of the next regular session, with the reason `eod-flatten`: the flatten it
+missed. A swing trade's limit counts trading days the way the replay counts its
+daily candles, the entry's day included, and it goes at the flatten on the last
+one (at the next open with the flatten off); the Open positions tab shows that
+day.
 
 Every strategy also declares how long its trade *should* take. The blotter shows
 an **Age / Expected** bar per position (green → amber **aging** → red **⏰

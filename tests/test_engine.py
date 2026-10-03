@@ -2089,6 +2089,24 @@ def test_each_open_position_says_what_rests_at_the_broker_to_close_it(engine):
     assert engine.snapshot()["exit_manager"]["intraday_time_stop"] is True     # the countdown shows only while it's on
 
 
+def test_a_swing_position_says_when_its_time_stop_closes_it_in_trading_days(engine, monkeypatch):
+    # the dashboard has no holiday calendar: the server counts the sessions, as the exit manager does - ten from a
+    # Thursday entry with Labor Day in between end on the second Thursday after, at the day trades' flatten
+    rules = engine.settings.config.exit_manager
+    monkeypatch.setattr(rules, "max_swing_hold_days", 10)
+    monkeypatch.setattr(rules, "flatten_intraday_before_close_min", 10)
+    held, by_hand = _open(engine, "AAA"), _open(engine, "BBB")
+    engine.repo.update_trade_risk(by_hand, managed_exit=False)
+    stored = engine.repo.open_trades
+    monkeypatch.setattr(engine.repo, "open_trades",
+                        lambda: [{**t, "entry_time": "2026-09-03T13:40:00"} for t in stored()])
+    rows = {t["id"]: t for t in engine.open_positions()}
+    assert dt.datetime.fromisoformat(rows[held]["time_stop_at"]) == dt.datetime(2026, 9, 17, 15, 50, tzinfo=clock.NY)
+    assert rows[by_hand]["time_stop_at"] is None                    # exits by hand: no time stop closes it
+    monkeypatch.setattr(rules, "enabled", False)                    # automatic exits off
+    assert {t["time_stop_at"] for t in engine.open_positions()} == {None}
+
+
 # ---------------------------------------------------------------- what became of a play, in the play log
 def test_the_executor_tells_autopilot_about_an_entry_that_bought_nothing_even_after_a_switch(engine):
     assert engine.executor.on_entry_unfilled == engine.autopilot.entry_unfilled

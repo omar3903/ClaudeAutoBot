@@ -64,7 +64,7 @@ from ..data.sectors import sector_allowed
 from ..data.symbols import SymbolMaster
 from ..execution.autopilot import AutoPilot
 from ..execution.executor import Executor
-from ..execution.exit_manager import ExitManager, scale_out_plan
+from ..execution.exit_manager import ExitManager, scale_out_plan, swing_time_stop_at
 from ..execution.order_builder import plan_order
 from ..execution.protective_stops import TAG as STOP_TAG, TARGET_TAG, stop_exit_reason
 from ..indicators import ta
@@ -529,16 +529,23 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         orders the executor keeps resting at the broker for it (Executor.protective_stops / resting_targets -
         the ones it placed and follows, the same the exit manager leaves the target to), and whether this venue
         rests them at all (``native``: IBKR does; on the simulator the app watches the price itself). None for
-        a trade held on another venue: nothing is placed for it while it's parked."""
+        a trade held on another venue: nothing is placed for it while it's parked. A swing trade the time stop
+        will close also has ``time_stop_at``, when it falls due (exit_manager.swing_time_stop_at): trading days,
+        which the dashboard can't count without the holiday calendar."""
         ex = self.executor
         native = bool(ex is not None and ex.native_stops_on())
         stops = {s["trade_id"]: s for s in ex.protective_stops()} if ex is not None else {}
         targets = {s["trade_id"]: s for s in ex.resting_targets()} if ex is not None else {}
+        rules = self.settings.config.exit_manager
+        hold = int(rules.max_swing_hold_days or 0) if rules.enabled else 0
         trades = self.repo.open_trades()
         for t in trades:
             here = (t.get("broker") or "paper") == self._venue
             t["protection"] = ({"native": native, "stop": stops.get(t["id"]), "target": targets.get(t["id"])}
                                if here else None)
+            due = (swing_time_stop_at(t.get("entry_time"), hold, float(rules.flatten_intraday_before_close_min or 0))
+                   if t.get("timeframe") == "SWING" and t.get("managed_exit", True) else None)
+            t["time_stop_at"] = due.isoformat() if due else None
         return trades
 
     def working_entries(self) -> List[Dict[str, Any]]:

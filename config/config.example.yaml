@@ -144,8 +144,10 @@ exit_manager:
   breakeven_buffer_bps: 5             # plus this nudge past the lock point
   trail_start_r: 2.0                  # begin trailing once past this R (0 = no trailing)
   trail_lock_ratio: 0.5               # keep the stop at this fraction of the open R
-  flatten_intraday_before_close_min: 10   # force-close day trades this many min before the bell
-  max_swing_hold_days: 10             # force-close swing trades held longer than this (0 = off)
+  flatten_intraday_before_close_min: 10   # force-close day trades this many min before the bell (one left open
+                                      # from an earlier session goes at the next regular-session pass)
+  max_swing_hold_days: 10             # force-close swing trades on this many TRADING days, the entry's counted,
+                                      # at the flatten on the last one - as the replay does (0 = off)
   scale_out_pct: 50                   # at the first target of a play with two, take this % off - Aziz: sell half,
   scale_out_lock_r: 0.0               # ...move the stop to the entry (+ this R), let the rest run to the second (0 = off)
 

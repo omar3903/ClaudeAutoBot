@@ -5,7 +5,7 @@ The exit routes follow the exit manager (execution/exit_manager.py). The stop an
 the target always apply. With automatic exits on, the stop moves to lock a small
 gain once the trade is ``breakeven_at_r`` in profit, trails the price past
 ``trail_start_r``, and a day trade is closed before the bell (a swing trade after
-``max_swing_hold_days``).
+``max_swing_hold_days`` trading days).
 
 A trade's chart spans from the session before its entry to today, in 5-minute
 candles while that fits IBKR's window (the scans' cached five sessions first,
@@ -99,7 +99,9 @@ def exit_routes(play: Play, cfg: Any) -> List[Dict[str, Any]]:
                        "how": f"Still open {flatten} minutes before the close: {close} at the market, whatever the price."})
     elif auto and play.timeframe is Timeframe.SWING and hold_days > 0:
         routes.append({"key": "time", "label": "Time stop", "price": None, "r": None,
-                       "how": f"Still open after {hold_days} days: {close} at the market, whatever the price."})
+                       "how": f"Still open after {hold_days} trading days, the entry's counted: {close} at the market "
+                              + (f"{flatten} minutes before the last one's close" if flatten > 0
+                                 else "at the next day's open") + ", whatever the price."})
     return routes
 
 
