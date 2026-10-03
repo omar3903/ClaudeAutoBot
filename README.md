@@ -267,6 +267,19 @@ Two switches, both in the dashboard and remembered in `data/runtime.json`
 | Paper | **IBKR paper account** | paper account, trading | your IBKR paper account |
 | Paper | **Built-in simulator** | paper account, read-only (prices only) | the built-in simulator |
 
+- **Live** also needs `account.allow_live_mode: true` in `config/config.yaml`
+  (off by default; read at start, and never set from the dashboard). With it off
+  the Live switch is refused and says why, and a Live choice saved in
+  `data/runtime.json` starts in Paper with a warning in the log.
+- The port is all that tells paper from live, so every connection (each nightly
+  reconnect too) checks the account behind it: the paper route only takes a paper
+  login (account ids starting with `D` - `DU…`, or `DF…` for an advisor) and the
+  live route only a live one. A live login on the paper port is refused with
+  `port 4002 is logged in to a LIVE account (…1234) - the paper route refuses it`,
+  and so is an `IBKR_ACCOUNT_ID` the login doesn't have; **Test paper** / **Test
+  live** show the same warning. The two ports must differ, 4001 / 7496 (IBKR's
+  live ports) can't be the paper port, and `IBKR_PORT` (one port for both) is
+  only accepted with `IBKR_READONLY=1`.
 - If the Gateway isn't reachable, orders stay pointed at the IBKR account the
   switches choose and are refused until it answers — never sent to the simulator
   in its place — and the header pill turns red with the fix; the app connects by
@@ -302,13 +315,17 @@ re-enters your login automatically, and the app reconnects on its own.
 2. Optional: **Settings → Market Data Subscriptions** (e.g. *US Securities
    Snapshot Bundle*, ~$10/mo). Without it quotes are delayed and labelled
    `delayed`.
-3. **IB Gateway → Configure → Settings → API → Settings**: socket port **4002**
+3. Log the paper Gateway in with the **paper username** (`DU…`), not your live
+   one - the app refuses a live account on the paper port. **IB Gateway →
+   Configure → Settings → API → Settings**: socket port **4002**
    (paper) / **4001** (live), *Allow connections from localhost only* with
-   Trusted IP `127.0.0.1`, and untick *Read-Only API*. (Older versions also have
-   an *Enable ActiveX and Socket Clients* box to tick; newer ones have the API
-   on already.) Then *Lock and Exit → Auto restart* (not *Auto logoff*) at
-   **9:00 PM New York time**: after-hours trading has ended at 8:00 PM, IBKR's
-   nightly maintenance (about 11:45 PM–12:45 AM ET) hasn't started, and
+   Trusted IP `127.0.0.1`. Untick *Read-Only API* on the **paper** login only;
+   on the **live** login keep it ticked until you deliberately trade live (the
+   app still reads prices and the account; IBKR refuses its orders). (Older
+   versions also have an *Enable ActiveX and Socket Clients* box to tick; newer
+   ones have the API on already.) Then *Lock and Exit → Auto restart* (not
+   *Auto logoff*) at **9:00 PM New York time**: after-hours trading has ended
+   at 8:00 PM, IBKR's nightly maintenance (about 11:45 PM–12:45 AM ET) hasn't started, and
    pre-market (4:00 AM) and the pre-market scan are hours away. The app
    reconnects on its own; IBKR still asks for a full login about once a week.
 4. For a hands-off daily login, set `IbLoginId` / `IbPassword` /
@@ -403,8 +420,8 @@ account and place orders, with no login. Two locks keep that port to this comput
 
 1. **In IB Gateway** (*Configure → Settings → API → Settings*): tick *Allow connections from localhost only*,
    keep `127.0.0.1` as the **only** entry under *Trusted IPs* (remove anything else), and use the standard
-   ports (4002 paper, 4001 live). If you only want to watch, leave *Read-Only API* ticked - the app then can't
-   trade. Leave *Master API client ID* empty.
+   ports (4002 paper, 4001 live). Untick *Read-Only API* on the paper login only (see below). Leave *Master
+   API client ID* empty.
 2. **In the operating system's firewall**, block those ports from the network, so even a Gateway setting
    changed by mistake can't expose them. On Windows, in PowerShell run as administrator:
 
@@ -417,6 +434,31 @@ account and place orders, with no login. Two locks keep that port to this comput
    Gateway's installer added. Check it with `Get-NetFirewallRule -DisplayName "IBKR API - block from network"`.
    On Linux: `sudo ufw deny 4001:4002/tcp` and `sudo ufw deny 7496:7497/tcp`.
 
+The **live** account needs more than a closed port, since this app - or anything else running on this
+computer - can still reach it:
+
+- **Keep the live login read-only until you deliberately trade live.** *Read-Only API* is set per Gateway
+  login: untick it on the paper login only. With it ticked on the live login the app still reads prices and
+  the account, but IBKR refuses every order sent through the API.
+- **Live mode is switched off in the file.** The dashboard's Live switch is refused until you set
+  `account.allow_live_mode: true` in `config/config.yaml` - nothing in the dashboard can set it - and a Live
+  choice saved in `data/runtime.json` starts in Paper without it. Autopilot also needs `autopilot.allow_live`
+  before it routes a real order. Leave both off until you mean to trade real money.
+- **The app checks which account is behind each port**, on every connection and reconnect: the paper route
+  refuses a live login and the live route a paper one (see *Where orders go*). A live login on the paper
+  port, or a paper port set to 4001, is never traded as paper, out of reach of `allow_live`, the $2,000 floor
+  and the day-trade cap.
+- **Turn on IB Key two-factor login for the live username** (*IBKR Mobile* → *Secure Login System*), so
+  nobody can log the live Gateway in without your phone. Keep IBC's automatic login to the paper username.
+- **Set IBKR's order precautions on the live login**, so IBKR itself rejects an order bigger than you would
+  ever place, whatever sent it: in TWS logged in with the live username, *Global Configuration → Presets →
+  Stocks → Precautionary Settings*, a *Size Limit* (shares per order) and a *Total Value Limit* (money per
+  order) a little above the biggest order the app's sizing places (see *Trading capital*), or IBKR refuses
+  its normal orders too. In the Gateway's *Configure → Settings → API → Precautions*, leave *Bypass Order
+  Precautions for API Orders* unticked so they apply to the app's orders.
+- **Log the live Gateway out when you're not trading live.** With nothing logged in behind port 4001, no
+  program can reach the live account through the API at all.
+
 And around it:
 
 - Keep `IBKR_HOST=127.0.0.1`. The API connection isn't encrypted, so never point the app at a Gateway on
@@ -424,36 +466,57 @@ And around it:
 - The app never stores your IBKR username or password - the Gateway holds the login. If you use IBC for the
   daily login, its `config.ini` holds your password in plain text: keep it in IBC's own folder (not in this
   repository), readable only by your Windows user, and never commit it.
-- Turn on two-factor login for IBKR (*IBKR Mobile* → *Secure Login System*) and for GitHub.
+- Turn on two-factor login for GitHub too.
 - Your keys live in `.env`, which is git-ignored - never commit it. On a public GitHub repository, turn on
   *secret scanning* and *push protection* (Settings → Code security) so a key pushed by mistake is blocked.
-- Keep `WEB_HOST=127.0.0.1` so the dashboard is only served to this computer (see below).
+  Book files (every PDF but the guides in `docs/`, and e-books) and stray logs and state files are
+  git-ignored wherever they land too.
+- Keep `WEB_HOST=127.0.0.1` so the dashboard is only served to this computer (see below). `run.py`
+  refuses to start on any other host (`0.0.0.0`, a network address) unless you pass `--allow-network`.
+- Never expose port 8787 through a tunnel or port forwarder (ngrok, Cloudflare Tunnel, Tailscale Funnel, VS
+  Code or `ssh` port forwarding, a router's port forward). One running on this computer hands outside
+  requests to the app from this computer itself, and whoever is at the other end can send the headers the
+  dashboard sends, so the same-machine check would let them in - and the dashboard has no password and can
+  place orders.
 
 ### Security of settings
 
 - The app only answers **this computer**. Every request needs a loopback
-  client, a `localhost`/`127.0.0.1` Host header and no foreign `Origin`; an
-  `/api/` request made by another website's page is refused, and anything that
+  client, a `localhost`/`127.0.0.1` Host header and, when the browser sends an
+  `Origin`, the dashboard's own: `http`, the same port, and `localhost`,
+  `127.0.0.1` or `[::1]`. An `/api/` or live-feed request the browser marks as
+  coming from any other page (`Sec-Fetch-Site` other than `same-origin` or
+  `none`) is refused, and anything that
   changes something needs the dashboard's own request header (the Connections,
   share-count and quit endpoints want it on reads too). The live feed's
   WebSocket gets the same check before it opens. So another website open in
-  your browser can't approve a play, close a position or read your account and
-  positions, and a device on your network can't open the dashboard. No other
+  your browser - or a page another program serves on this computer, such as a
+  dev server or a notebook on another port - can't approve a play, close a
+  position or read your account and positions, and a device on your network
+  can't open the dashboard. No other
   website can show the dashboard inside a frame either, so a hidden page can't
   line your clicks up with its buttons. And the page only runs the dashboard's
   own script files (a Content-Security-Policy), so a headline or filing that
   ever reached it unescaped still couldn't run as script.
+- The server goes by the address a request really came from: it never reads
+  proxy headers (`X-Forwarded-For`), so no header can make a request look
+  local. The API's generated docs (`/docs`, `/redoc`, `/openapi.json`) are
+  switched off, so the port doesn't hand out a map of every endpoint.
 - Only the IB Gateway settings can be written. Values are validated (no line
   breaks or hidden characters, no `$`, ports in range), `.env` is read without
   expanding `${...}` so one setting can't show another's value, it is replaced
   atomically with your comments and other lines preserved, and the account id
   is **never sent back** — the panel
   and the live feed only show that it's set and its last four characters.
-  `.env` is git-ignored.
+  The log masks it the same way (`…1234`), in ib_async's own warnings about
+  a rejected or cancelled order too. `.env` is git-ignored.
 - A stock's candle file is only named after it when the name looks like a
   stock symbol (capital letters and digits, a share class after a space), so a
   symbol from outside data, such as an insider filing, can't point the app at
   a file somewhere else.
+- The trained model is only opened when its card (`current.json`) names it
+  the way the app does (`gbm_` and 14 digits). Opening a model file can run
+  code, so an edited card can't point the app at a file somewhere else.
 
 ### MySQL (optional — SQLite is the default)
 
@@ -522,7 +585,8 @@ weighted 0.1.
 
 Filters, strategy switches, scan settings, Paper/Live and the paper platform are
 saved in `data/runtime.json`, so they survive a restart (`config.yaml` supplies
-the defaults), and are pushed over the WebSocket so every open tab updates.
+the defaults; a saved Live needs `account.allow_live_mode`), and are pushed over
+the WebSocket so every open tab updates.
 
 ---
 
@@ -632,7 +696,8 @@ The app is built to be left running:
 * **Sleep.** While the app runs it asks Windows not to go to sleep (the screen can still turn off);
   set `app.keep_awake: false` to stop that.
 * **Crashes.** `scripts\run_24_7.bat` starts the app and starts it again 30 seconds after it stops
-  unexpectedly; quitting from the dashboard ends it. A shortcut to it in the Startup folder
+  unexpectedly; quitting from the dashboard ends it. So does a refused start (a bad option, or a host
+  other than this computer), which starting again wouldn't fix. A shortcut to it in the Startup folder
   (`Win+R`, `shell:startup`) brings the app back after a reboot - Windows Update's included.
 
 ## Quitting
@@ -1211,7 +1276,7 @@ day / day+swing**, plus ⚙). Defaults live in `config/config.yaml → autopilot
 | gate | default | key |
 |---|---|---|
 | master switch | off | `enabled` (UI toggle) |
-| **route real orders** | **off** | `allow_live` — *config-file only*; with it off, Autopilot is armed for **paper only** even in Live mode, and says so |
+| **route real orders** | **off** | `allow_live` — *config-file only*; with it off, Autopilot is armed for **paper only** even in Live mode (or whenever orders go to the live account), and says so |
 | which trade types it may take | the **Intraday** / **Swing** boxes over the plays say what is scanned and shown; Autopilot's own **day / swing / pairs** boxes (⚙) say what it may take of that - untick day trades to keep day plays on the board for the review without trading them | `trade_types` |
 | which setups it may take | **Only these setups** (⚙): tick the ones Autopilot may take - none ticked means every setup; the others stay on the board for you to click (the Strategies panel switches a setup off everywhere) | `strategies` |
 | minimum strategy confidence, day trades | 0.5 | `min_confidence` (the replay found higher stated confidence went with worse trades) |
@@ -1344,7 +1409,8 @@ A background service (`autotradebot/signals/`) watches what happens off the pric
 - Headlines are scored from -1 (negative) to +1 (positive) by FinBERT on this computer when it is installed:
   `pip install transformers torch` (about 140 MB of packages); the model itself (ProsusAI/finbert, 438 MB) is
   downloaded from Hugging Face the first time a headline is scored and cached under `~/.cache/huggingface`.
-  Without it headlines carry no sentiment and the news nudge does nothing.
+  It is pinned to one upload of the model, and once that is in the cache it loads from there without
+  contacting Hugging Face. Without FinBERT headlines carry no sentiment and the news nudge does nothing.
 
 **What the signals do**
 - **Insider buying** (`insider_buying`, a swing setup): unusual buying in the last 10 days, while the stock is no
@@ -1395,7 +1461,7 @@ A background service (`autotradebot/signals/`) watches what happens off the pric
 
 ## Dashboard controls
 
-* **Paper / Live** — which side you're trading. Going Live asks for confirmation.
+* **Paper / Live** — which side you're trading. Going Live asks for confirmation, and is refused unless `account.allow_live_mode` is on in `config/config.yaml`.
 * **Data pill** — `data: IBKR`, `data: IBKR (delayed)` or `data: none`.
 * **Market pill** — `market: calm` or `market: turbulent`, from Hamilton's regime model on SPY; hover for the numbers.
 * **Connection pill** — what orders go to and whether it's healthy: `Simulator`,
@@ -1953,7 +2019,8 @@ pytest -m slow      # boots the engine on a synthetic Gateway: scan → approve 
 
 Tests run against a synthetic IB Gateway (`tests/fakes.py`: seeded random-walk
 candles, contract details and an account), with a throwaway `.env`, database,
-data folder and runtime file — never yours. Coverage includes the scans (full
+data folder, log folder (`ATB_LOG_DIR`) and runtime file — never yours.
+Coverage includes the scans (full
 scan ranking, hot list, cycle decisions), the schedule, the watchlist, heat,
 the listings directory, SEC financials, the daily bar store, the strategies, the
 Autopilot gate, the exit manager, the IBKR adapter against a fake `ib_async.IB`,

@@ -349,10 +349,11 @@ class AutoPilot:
         self.bus.publish("autopilot.config", **self.status())
 
     def _live_ok(self) -> bool:
-        """Real orders only when the config file explicitly allows it."""
-        if getattr(self.engine, "mode", "paper") != "live":
-            return True
-        return bool(getattr(self.cfg, "allow_live", False))
+        """Real orders only when the config file explicitly allows it. Judged by the venue orders actually go
+        to as well as the mode, so the live account is held to the switch however it was reached."""
+        live = (getattr(self.engine, "mode", "paper") == "live"
+                or getattr(self.engine, "_venue", None) == "ibkr-live")
+        return not live or bool(getattr(self.cfg, "allow_live", False))
 
     def day_mode_active(self, market_open: bool) -> bool:
         """True when the pilot is armed, cleared to act, day-trading is one of

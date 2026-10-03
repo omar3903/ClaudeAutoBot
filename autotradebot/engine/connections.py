@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .. import secrets_store
 from ..brokers import get_broker
-from ..brokers.base import AuthError, BrokerAdapter
+from ..brokers.base import AuthError, BrokerAdapter, WrongAccount
 from ..brokers.venues import VenuePlan
 from ..config import Settings
 from ..core.models import Account, Fill, OrderRequest, OrderResult, Quote
@@ -122,6 +122,8 @@ class Connections:
 
     def prereqs(self, plan: VenuePlan) -> List[str]:
         sec = self.settings.secrets
+        if sec.ibkr_port_problem():
+            return [sec.ibkr_port_problem()]
         port = sec.ibkr_port_for(plan.account)
         if self.port_open(port):
             return []
@@ -182,6 +184,9 @@ class Connections:
         sec = self.settings.secrets
         port = sec.ibkr_port_for(account)
         out: Dict[str, Any] = {"ok": False, "account_type": account, "host": sec.ibkr_host, "port": port}
+        if sec.ibkr_port_problem():
+            out["reason"] = sec.ibkr_port_problem()
+            return out
         if not self.port_open(port):
             out["reason"] = (f"Nothing is listening on {sec.ibkr_host}:{port}. Start IB Gateway logged "
                              f"in to your {account} account, with the API enabled on that port.")
@@ -203,6 +208,9 @@ class Connections:
                             f"{money(worth['equity'], worth['currency'])} - "
                             + ("real-time market data." if data == "live" else
                                "no real-time data subscription, so prices come from IBKR's delayed candles."))
+        except WrongAccount as e:
+            why = str(e)                       # the adapter's own words: which account is on which port
+            out["reason"] = why[:1].upper() + why[1:]
         except Exception as e:  # noqa: BLE001
             out["reason"] = f"The Gateway is up but the API connection failed: {e}"
         finally:

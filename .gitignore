@@ -40,6 +40,24 @@ Thumbs.db
 # top only: the package's own autotradebot/data/ is code
 /data/
 
-# the training books (copyrighted; never upload)
-Financial-Economic books/
+# the training books and any other e-book, wherever they land (copyrighted; never upload) - the only
+# PDFs in the repository are the generated guides in docs/
+Financial-Economic*/
+*.pdf
+!docs/AutoTradeBot-*.pdf
 *.epub
+*.mobi
+*.azw
+*.azw3
+*.djvu
+
+# state and logs the app or a script writes, should one land outside data/ or logs/
+*.log
+*.pkl
+day_state.bin
+runtime.json
+paper_state.json
+
+# Claude Code's own per-computer files
+.claude/settings.local.json
+.claude/worktrees/

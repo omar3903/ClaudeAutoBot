@@ -150,10 +150,11 @@ def test_orders_held_for_the_gateway_go_to_it_once_it_answers(engine, port, gate
 
 
 def test_live_stays_on_the_live_account_while_its_gateway_is_down_and_reconnects_by_itself(
-        engine, tmp_path, gateway, port):
+        engine, tmp_path, gateway, port, monkeypatch):
     import json
 
     engine.stop()
+    _allow_live(engine, monkeypatch)                                      # config.yaml allows Live
     (tmp_path / "runtime.json").write_text(json.dumps({"mode": "live", "paper_platform": "simulator"}))
     live = _started_again(tmp_path, gateway, port)                        # the app restarts with the Gateway down
     try:
@@ -226,12 +227,81 @@ def test_auto_connect_never_moves_orders_away_from_open_positions(engine, port):
     assert not engine._retry_connection(force=True)                   # never while quitting
 
 
-def test_live_is_refused_when_the_live_gateway_is_unreachable(engine):
+def _allow_live(engine, monkeypatch):
+    """config.yaml's account.allow_live_mode: true - the switch Live needs."""
+    monkeypatch.setattr(engine.settings.config.account, "allow_live_mode", True)
+
+
+def test_live_needs_the_switch_in_config_yaml(engine, port, monkeypatch):
+    port["open"] = True                                                   # the live Gateway answers
+    r = engine.set_mode("live")
+    assert not r["ok"] and "allow_live_mode" in r["reason"] and "dashboard" in r["reason"]
+    assert engine.mode == "paper" and engine._venue != "ibkr-live"
+    assert engine.runtime.read().get("mode", "paper") == "paper"
+    _allow_live(engine, monkeypatch)
+    r = engine.set_mode("live")
+    assert r["ok"] and engine.mode == "live" and engine._venue == "ibkr-live"
+
+
+def test_a_saved_live_choice_starts_in_paper_without_the_switch(tmp_path, gateway, port, monkeypatch, caplog):
+    import json
+    import logging
+
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text(json.dumps({"mode": "live", "paper_platform": "ibkr"}), encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="autotradebot.engine.engine"):
+        e = _new_engine(tmp_path, gateway, port)
+    assert e.mode == "paper" and "allow_live_mode" in caplog.text
+    # saved as paper at once: turning the switch on later doesn't reopen Live by itself
+    assert e.runtime.read() == {"mode": "paper", "paper_platform": "ibkr"}
+
+    runtime.write_text(json.dumps({"mode": "live"}), encoding="utf-8")
+    _allow_live(e, monkeypatch)
+    assert _new_engine(tmp_path, gateway, port).mode == "live"            # with the switch on, Live is restored
+
+
+def test_a_quit_of_the_live_account_isnt_resumed_on_paper_without_the_switch(tmp_path, gateway, port, caplog):
+    import json
+    import logging
+    from autotradebot.persistence.db import DB
+    from autotradebot.persistence.repository import Repository
+
+    DB.init(url=f"sqlite:///{(tmp_path / 'engine.sqlite').as_posix()}")
+    DB.create_all()
+    e = None
+    try:
+        held = SimpleNamespace(repo=Repository())
+        paper, live = _open(held, "T01", venue="ibkr-paper"), _open(held, "T02", venue="ibkr-live")
+        port["open"] = True                                               # both Gateways answer
+        (tmp_path / "runtime.json").write_text(json.dumps({"mode": "live", "paper_platform": "ibkr", "quit": {
+            "started_at": "2026-10-01T15:00:00+00:00", "mode": "live", "venue": "ibkr-live", "by": "operator",
+            "reset_sim": False, "keeping": []}}), encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger="autotradebot.engine.engine"):
+            e = _new_engine(tmp_path, gateway, port)
+        assert e.mode == "paper" and e.quit_state is None and "quit" not in e.runtime.read()
+        assert "1 live position(s) stay open" in caplog.text and "T02" in caplog.text
+        e._bind()
+        closed = _closes_fill(e)
+        e._quit_retry_at = 0
+        e._check_quit_progress()
+        # the paper account's positions aren't closed in its place, and nothing shuts down
+        assert closed == [] and e.quit_state is None and e._venue == "ibkr-paper"
+        assert {e.repo.get_trade(t)["status"] for t in (paper, live)} == {"OPEN"}
+    finally:
+        if e is not None:
+            e.stop()
+        DB.engine.dispose()
+        DB.init(url=os.environ["DATABASE_URL"])
+
+
+def test_live_is_refused_when_the_live_gateway_is_unreachable(engine, monkeypatch):
+    _allow_live(engine, monkeypatch)
     r = engine.set_mode("live")
     assert not r["ok"] and r["blockers"] and engine.mode == "paper"
 
 
 def test_switching_is_blocked_while_positions_are_open_here(engine, monkeypatch):
+    _allow_live(engine, monkeypatch)
     monkeypatch.setattr(engine.repo, "open_trades", lambda: [{"id": "trd_1", "symbol": "AAPL", "broker": "paper"}])
     r = engine.set_mode("live")
     assert not r["ok"] and "AAPL" in r["reason"] and engine.mode == "paper"

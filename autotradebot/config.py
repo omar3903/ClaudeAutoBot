@@ -29,6 +29,7 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 # overridable so tests never read or write yours
 DATA_DIR = Path(os.getenv("ATB_DATA_DIR") or (PROJECT_ROOT / "data"))
 ENV_PATH = Path(os.getenv("ATB_ENV_PATH") or (PROJECT_ROOT / ".env"))
+LOG_DIR = Path(os.getenv("ATB_LOG_DIR") or (PROJECT_ROOT / "logs"))
 #: the dashboard's remembered choices
 RUNTIME_PATH = Path(os.getenv("ATB_RUNTIME_PATH") or (DATA_DIR / "runtime.json"))
 
@@ -48,7 +49,7 @@ class Secrets(BaseSettings):
     ibkr_host: str = "127.0.0.1"
     ibkr_paper_port: int = 4002       # IB Gateway paper  (TWS paper = 7497)
     ibkr_live_port: int = 4001        # IB Gateway live   (TWS live  = 7496)
-    ibkr_port: int = 0               # non-zero = force this port for both accounts
+    ibkr_port: int = 0               # non-zero = force this port for both accounts (only with ibkr_readonly)
     ibkr_client_id: int = 11         # any int unique to this app on the Gateway
     ibkr_account_id: str = ""        # DUxxxxxxx (paper) / Uxxxxxxx (live); blank = first
     ibkr_market_data: str = "auto"   # auto | live | delayed | delayed-frozen
@@ -72,7 +73,19 @@ class Secrets(BaseSettings):
     open_browser_on_start: bool = True
 
     def ibkr_port_for(self, account: str) -> int:
-        return int(self.ibkr_port or (self.ibkr_live_port if account == "live" else self.ibkr_paper_port))
+        # a refused IBKR_PORT is never dialled; the places that connect say why (ibkr_port_problem)
+        forced = 0 if self.ibkr_port_problem() else self.ibkr_port
+        return int(forced or (self.ibkr_live_port if account == "live" else self.ibkr_paper_port))
+
+    def ibkr_port_problem(self) -> str:
+        """Why IBKR_PORT is refused, or "" when it isn't set or may be used. The app tells the paper account
+        from the live one by the port it dials, so one port for both is only allowed when it never sends an
+        order (IBKR_READONLY on)."""
+        if self.ibkr_port and not self.ibkr_readonly:
+            return (f"IBKR_PORT={self.ibkr_port} in .env forces one port for both your paper and live accounts, "
+                    "so the app couldn't tell which one it trades - it is only allowed with IBKR_READONLY=1 "
+                    "(data only). Remove IBKR_PORT and set IBKR_PAPER_PORT / IBKR_LIVE_PORT instead.")
+        return ""
 
     def resolved_database_url(self) -> str:
         if self.database_url:
@@ -90,6 +103,8 @@ class _Model(BaseModel):
 
 
 class AccountCfg(_Model):
+    allow_live_mode: bool = False             # HARD gate: Live (real orders) is refused unless true, and a saved Live
+                                              # choice starts in Paper. config.yaml only - the dashboard can't set it
     min_start_equity: float = 2000.0          # LIVE only - paper ignores this
     paper_start_cash: float = 100000.0        # opening balance for the built-in simulator
     pdt_equity_threshold: float = 25000.0
@@ -516,6 +531,6 @@ def _apply_env_overrides(cfg: AppConfig) -> None:
 def get_settings() -> Settings:
     cfg = AppConfig(**_load_yaml())
     _apply_env_overrides(cfg)
-    for d in (DATA_DIR, DATA_DIR / "cache", PROJECT_ROOT / "logs"):
+    for d in (DATA_DIR, DATA_DIR / "cache", LOG_DIR):
         d.mkdir(parents=True, exist_ok=True)
     return Settings(secrets=Secrets(), config=cfg)

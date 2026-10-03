@@ -11,6 +11,8 @@ app:
 
 account:
   # Day-trading guard rails. See autotradebot/risk/pdt_guard.py
+  allow_live_mode: false               # HARD gate - the dashboard's Live switch is refused, and a saved Live choice
+                                       # starts in Paper, unless true. It can only be set here, never from the dashboard
   min_start_equity: 2000.0              # LIVE only: refuse to arm below this. Ignored in paper mode.
   day_trade_pct: 75                   # of the trading capital, day trades may hold this % at once and swing
                                       # trades the rest - the dashboard's Trading capital dialog changes it

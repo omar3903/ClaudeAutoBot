@@ -23,6 +23,7 @@ import datetime as dt
 import json
 import logging
 import math
+import re
 import threading
 import time
 from pathlib import Path
@@ -37,6 +38,9 @@ from .validate import CATEGORICAL, NUMERIC, Design
 log = logging.getLogger(__name__)
 
 CARD = "current.json"
+# The only model names train() writes. Loading a model file can run code, so a card naming anything
+# else (a path, another folder) is never followed.
+MODEL_ID = re.compile(r"gbm_\d{14}", re.ASCII)
 DECAY = 0.5                        # the oldest row counts this much of the newest (AFML ch. 4.10)
 MIN_ROWS = 500
 TOP_FEATURES = 15
@@ -238,6 +242,10 @@ class Scorer:
             try:
                 card = json.loads((self.directory / CARD).read_text(encoding="utf-8"))
                 if card.get("id") == self._loaded_id:
+                    return
+                if not isinstance(card.get("id"), str) or not MODEL_ID.fullmatch(card["id"]):
+                    log.warning("the model card names %r, not a model this app trained - not loaded", card.get("id"))
+                    self._bundle, self._loaded_id = None, card.get("id")
                     return
                 import joblib
 

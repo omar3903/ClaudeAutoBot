@@ -33,9 +33,10 @@ import pandas as pd
 from ..config import get_settings
 from ..core.enums import OrderType, Side, TimeInForce
 from ..core.models import Account, Fill, OrderRequest, OrderResult, Position, Quote
+from ..secrets_store import mask
 from ..util.net import port_is_open
 from .base import (DONE_STATUSES, AuthError, BrokerAdapter, BrokerError, OrderInDoubt, OrderNotSent,
-                   OrderOutcomeUnknown, OrderRejected)
+                   OrderOutcomeUnknown, OrderRejected, WrongAccount)
 
 log = logging.getLogger(__name__)
 
@@ -263,6 +264,8 @@ class IbkrBroker(BrokerAdapter):
         self.port = int(port or s.ibkr_port_for(mode))
         self.client_id = int(client_id if client_id is not None else s.ibkr_client_id)
         self.account_id = (account_id if account_id is not None else s.ibkr_account_id) or ""
+        #: the account was named (IBKR_ACCOUNT_ID) rather than taken from the first login (_do_connect)
+        self._account_named = bool(self.account_id)
         self.readonly = bool(s.ibkr_readonly if readonly is None else readonly)
         self._md_pref = (market_data or s.ibkr_market_data or "auto").lower()
         self._data_type = _MARKET_DATA_TYPES.get(self._md_pref, 1)
@@ -371,6 +374,7 @@ class IbkrBroker(BrokerAdapter):
             await ib.connectAsync(self.host, self.port, clientId=self.client_id, timeout=8,
                                   readonly=self.readonly)
         self._session.run_coro(_connect, timeout=15)
+        accounts = self._check_accounts()
         if not self._account_loaded():
             # a restarting Gateway takes connections a little before it has loaded the account; trusting it
             # then would make the open positions look closed
@@ -405,14 +409,10 @@ class IbkrBroker(BrokerAdapter):
         self._connected = True
         self._servers_lost_at, self._servers_lost_code = None, 0
         if not self.account_id:
-            try:
-                accounts = list(self._session.call(lambda ib: ib.managedAccounts(), timeout=5) or [])
-                self.account_id = accounts[0] if accounts else ""
-            except Exception:  # noqa: BLE001
-                pass
+            self.account_id = accounts[0]
         self._check_data_entitlement()
         log.info("IBKR connected  %s:%s  account=%s  data=%s", self.host, self.port,
-                 self.account_id or "?", "delayed" if self._data_is_delayed else "live")
+                 mask(self.account_id) or "?", "delayed" if self._data_is_delayed else "live")
 
     def _check_data_entitlement(self) -> None:
         """One quick live quote at connect. Without a real-time subscription IBKR
@@ -500,6 +500,48 @@ class IbkrBroker(BrokerAdapter):
             self._session.stop()
         self._connected = False
 
+    def _check_accounts(self) -> List[str]:
+        """The accounts behind the port, once they are the kind this route is for; otherwise the socket is
+        dropped and the connection refused. The port is all that tells paper from live, so a live login on the
+        paper port would be traded as paper - past autopilot.allow_live, the equity floor and the day-trade cap.
+        IBKR's paper account ids start with D (DU..., DF... for an advisor's), live ones never do. Runs on every
+        connection, the nightly reconnect included: the Gateway may have been logged in to another account since.
+        ib_async has the list before connectAsync returns - its handshake waits for it."""
+        try:
+            accounts = [str(a) for a in (self._session.call(lambda ib: ib.managedAccounts(), timeout=5) or [])]
+        except Exception:  # noqa: BLE001
+            accounts = []
+        if not accounts:
+            self._drop_socket()
+            raise AuthError(f"IB Gateway on port {self.port} didn't say which account it is logged in to - "
+                            "trying again shortly")
+        live = [a for a in accounts if not a.upper().startswith("D")]
+        paper = [a for a in accounts if a.upper().startswith("D")]
+        problem = ""
+        if self.mode == "paper" and live:
+            problem = (f"port {self.port} is logged in to a LIVE account ({mask(live[0])}) - the paper route "
+                       "refuses it. Log the paper Gateway in with your paper username (DU...), or point "
+                       "IBKR_PAPER_PORT at the Gateway that is.")
+        elif self.mode == "live" and paper:
+            problem = (f"port {self.port} is logged in to a paper account ({mask(paper[0])}) - the live route "
+                       "refuses it. Log the live Gateway in with your live username, or point IBKR_LIVE_PORT "
+                       "at the Gateway that is.")
+        elif self.account_id and self.account_id not in accounts and self._account_named:
+            problem = (f"account {mask(self.account_id)} isn't on the login at port {self.port} (it has "
+                       f"{', '.join(mask(a) for a in accounts)}) - set IBKR_ACCOUNT_ID to one of those, or log "
+                       "IB Gateway in to that account.")
+        elif self.account_id and self.account_id not in accounts:
+            # taken from the first login, and the Gateway has been logged in to another account since: the open
+            # positions, their stops and the orders are the first one's, so the app keeps to it rather than send
+            # their exits to an account that doesn't hold them
+            problem = (f"the login at port {self.port} changed account since the app connected (it was "
+                       f"{mask(self.account_id)}, now {', '.join(mask(a) for a in accounts)}) - log IB Gateway back "
+                       "in to the first, or restart the app to trade the new one.")
+        if problem:
+            self._drop_socket()
+            raise WrongAccount(problem)
+        return accounts
+
     def _account_loaded(self) -> bool:
         """The account's values have arrived - a Gateway that is still starting up connects before they do."""
         try:
@@ -561,6 +603,8 @@ class IbkrBroker(BrokerAdapter):
                         log.info("IBKR reconnected")
                         return
                     except Exception as e:  # noqa: BLE001
+                        if isinstance(e, WrongAccount) and self._last_error != f"reconnect: {e}":
+                            log.warning("IBKR: %s", e)           # once, not at every retry
                         self._last_error = f"reconnect: {e}"
                 time.sleep(self.RECONNECT_DELAYS_S[min(attempt, len(self.RECONNECT_DELAYS_S) - 1)])
                 attempt += 1

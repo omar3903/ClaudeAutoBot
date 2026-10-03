@@ -90,9 +90,10 @@ def describe(path: Path = ENV_PATH, fields: Tuple[EnvField, ...] = FIELDS) -> Li
     return out
 
 
-def validate(updates: Mapping[str, Any]) -> Dict[str, str]:
+def validate(updates: Mapping[str, Any], path: Path = ENV_PATH) -> Dict[str, str]:
     """Normalise ``updates``; raise ``ValueError`` with a user-facing message.
-    ``None`` means "leave unchanged", ``""`` clears the setting."""
+    ``None`` means "leave unchanged", ``""`` clears the setting. ``path`` is the
+    file they'd be saved to, for the checks that read the other settings too."""
     clean: Dict[str, str] = {}
     for key, raw in (updates or {}).items():
         f = _BY_KEY.get(key)
@@ -112,7 +113,50 @@ def validate(updates: Mapping[str, Any]) -> Dict[str, str]:
         if len(v) > _MAX_LEN:
             raise ValueError(f"{f.label}: too long")
         clean[key] = _check(f, v) if v else v
+    _check_ports(clean, path)
     return clean
+
+
+#: IBKR's live ports - IB Gateway's and TWS's
+LIVE_PORTS = (4001, 7496)
+
+
+def _check_ports(clean: Mapping[str, str], path: Path) -> None:
+    """The app tells the paper account from the live one only by the port it dials: the two ports must differ,
+    a live port is never the paper one, and IBKR_PORT (one port for both) is only allowed read-only. Checked
+    against the values the settings would have after the save, when it changes a port or Read-only."""
+    ports, readonly_saved = {"IBKR_PAPER_PORT", "IBKR_LIVE_PORT"} & set(clean), "IBKR_READONLY" in clean
+    if not ports and not readonly_saved:
+        return
+    env = read_env(path)
+
+    def after(key: str) -> str:
+        # the value being saved, else the environment (which wins over the file, as in Secrets), else the
+        # file; a cleared or unset one is the default
+        value = clean[key] if key in clean else (os.environ.get(key) or env.get(key) or "").strip()
+        if value:
+            return value
+        default = Secrets.model_fields[key.lower()].default
+        return "" if default is None else str(default)
+
+    def port(key: str) -> Optional[int]:
+        try:
+            return int(after(key))
+        except ValueError:
+            return None                        # a hand-written value Secrets refuses by itself
+
+    if ports:
+        paper, live = port("IBKR_PAPER_PORT"), port("IBKR_LIVE_PORT")
+        if paper in LIVE_PORTS:
+            raise ValueError(f"Paper port: {paper} is IBKR's live port (IB Gateway live 4001, TWS live 7496) - "
+                             "the paper Gateway listens on 4002 (TWS 7497)")
+        if paper is not None and paper == live:
+            raise ValueError("Paper port and Live port can't be the same - the app tells your paper and live "
+                             "accounts apart by the port it dials")
+    readonly = after("IBKR_READONLY").lower() in ("1", "true", "yes", "on", "y", "t")
+    if readonly_saved and port("IBKR_PORT") and not readonly:
+        raise ValueError("Read-only can't be turned off while IBKR_PORT in .env forces one port for both "
+                         "accounts - remove IBKR_PORT and use the Paper and Live ports first")
 
 
 def _check(f: EnvField, v: str) -> str:
@@ -136,7 +180,7 @@ def _check(f: EnvField, v: str) -> str:
 
 def write(updates: Mapping[str, Any], path: Path = ENV_PATH) -> List[str]:
     """Validate and apply ``updates``. Returns the keys whose value changed."""
-    clean = validate(updates)
+    clean = validate(updates, path)
     if not clean:
         return []
     before = read_env(path)

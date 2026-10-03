@@ -11,7 +11,8 @@ from dotenv import dotenv_values
 
 from autotradebot import secrets_store as ss
 
-_TOUCHED = ("IBKR_HOST", "IBKR_ACCOUNT_ID", "IBKR_CLIENT_ID", "IBKR_PAPER_PORT", "IBKR_READONLY", "IBKR_MARKET_DATA")
+_TOUCHED = ("IBKR_HOST", "IBKR_ACCOUNT_ID", "IBKR_CLIENT_ID", "IBKR_PAPER_PORT", "IBKR_LIVE_PORT", "IBKR_PORT",
+            "IBKR_READONLY", "IBKR_MARKET_DATA")
 
 
 @pytest.fixture
@@ -76,6 +77,36 @@ def test_validation_rejects_and_writes_nothing(env, updates, msg):
     with pytest.raises(ValueError, match=msg):
         ss.write(updates, path=env)
     assert env.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize("updates,msg", [
+    ({"IBKR_PAPER_PORT": "4001"}, "4001 is IBKR's live port"),                  # IB Gateway's live port
+    ({"IBKR_PAPER_PORT": "7496"}, "7496 is IBKR's live port"),                  # TWS's
+    ({"IBKR_PAPER_PORT": "4005", "IBKR_LIVE_PORT": "4005"}, "can't be the same"),
+    ({"IBKR_LIVE_PORT": "4002"}, "can't be the same"),                          # the default paper port
+])
+def test_the_paper_and_live_ports_stay_apart(env, updates, msg):
+    before = env.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match=msg):
+        ss.write(updates, path=env)
+    assert env.read_text(encoding="utf-8") == before
+
+
+def test_a_port_already_in_the_file_counts(env):
+    env.write_text(env.read_text(encoding="utf-8") + "IBKR_LIVE_PORT=7497\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="can't be the same"):
+        ss.write({"IBKR_PAPER_PORT": "7497"}, path=env)
+    assert ss.write({"IBKR_PAPER_PORT": "7497", "IBKR_LIVE_PORT": "7496"}, path=env) == ["IBKR_LIVE_PORT",
+                                                                                        "IBKR_PAPER_PORT"]
+
+
+def test_read_only_stays_on_while_one_port_serves_both_accounts(env):
+    env.write_text(env.read_text(encoding="utf-8") + "IBKR_PORT=4002\nIBKR_READONLY=1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="remove IBKR_PORT"):
+        ss.write({"IBKR_READONLY": False}, path=env)
+    assert ss.read_env(env)["IBKR_READONLY"] == "1"
+    env.write_text(env.read_text(encoding="utf-8").replace("IBKR_PORT=4002\n", ""), encoding="utf-8")
+    assert ss.write({"IBKR_READONLY": False}, path=env) == ["IBKR_READONLY"]
 
 
 def test_bool_and_int_are_normalised(env):

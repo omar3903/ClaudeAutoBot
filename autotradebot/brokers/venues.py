@@ -65,10 +65,12 @@ def venue_label(vid: Optional[str]) -> str:
 
 IBKR_STEPS = (
     "In IBKR Client Portal, enable your paper trading account (its username starts with DU).",
-    "Install IB Gateway and log in - the paper user for the paper port, your normal user for live.",
-    "Gateway → Configure → Settings → API → Settings: set the socket port (4002 paper / 4001 live), "
-    "keep 127.0.0.1 in Trusted IPs and untick Read-Only API. (Older versions also have an Enable "
-    "ActiveX and Socket Clients box to tick; newer ones have the API on already.)",
+    "Install IB Gateway and log the paper Gateway in with the paper username (DU...), not your live one - "
+    "the app refuses a live account on the paper port. Your normal username is for the live Gateway only.",
+    "Gateway → Configure → Settings → API → Settings: set the socket port (4002 paper / 4001 live) and "
+    "keep 127.0.0.1 in Trusted IPs. Untick Read-Only API on the PAPER login only; on the LIVE login keep "
+    "it ticked until you deliberately trade live (the app still reads prices and the account). (Older "
+    "versions also have an Enable ActiveX and Socket Clients box to tick; newer ones have the API on already.)",
     "Configure → Settings → Lock and Exit → Auto restart (not Auto logoff), set to 9:00 PM New York time. "
     "After-hours trading has ended at 8:00 PM, IBKR's nightly maintenance (about 11:45 PM–12:45 AM ET) "
     "hasn't started, and pre-market (4:00 AM) and the pre-market scan are hours away. The app rides "
