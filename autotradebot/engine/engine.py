@@ -2431,7 +2431,10 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             if part.get("available", 1.0) <= 0 < state.get("available", 0.0):
                 return (f"{kind} trades already hold their {part.get('pct', 0):g}% share of the trading capital "
                         "(the day / swing split) - no room for another")
-        return "the trading capital is fully invested - no room for another position"
+        untracked = float(state.get("untracked") or 0.0)
+        return ("the trading capital is fully invested - no room for another position"
+                + (f" (that counts {capital.money(untracked, state.get('currency') or 'USD')} in shares the account "
+                   "holds without a trade record)" if untracked > 0 else ""))
 
     def _score_plays(self, plays) -> None:
         """The learned model's odds on each fresh play (research/model.py), kept in its evidence so

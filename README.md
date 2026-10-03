@@ -788,7 +788,10 @@ Either way:
 - Risk per trade, the open-risk ceiling and the per-position size limit are
   measured against the **account's value** (or the set amount), never against
   margin: margin only lets more positions be open at once. New positions only use
-  what's left of the trading capital after the bot's open positions.
+  what's left of the trading capital after the bot's open positions. Cash only or
+  with a set amount, that counts everything the broker holds on the account, entries
+  still working included - shares with no trade record (bought by hand, or left
+  untracked) use the same money. The day / swing split counts the bot's own trades.
 - The open-risk ceiling (`risk.max_open_risk_pct`, 4%) counts the risk already at
   work on the account: each open trade from its entry to the stop it opened with,
   times its shares, plus the entries still working (pair legs aside). A new

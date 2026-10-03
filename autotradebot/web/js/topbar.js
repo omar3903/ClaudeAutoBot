@@ -228,12 +228,14 @@ export function renderCapital(c) {
   b.classList.toggle("clipped", !!c.clipped);
   const sp = c.split;
   const split = sp && sp.on ? ` Day trades: up to ${money(sp.day.limit, c.currency)} (${sp.day.pct}%), swing trades: up to ${money(sp.swing.limit, c.currency)} (${sp.swing.pct}%).` : "";
+  // cash only or a set amount, shares the account holds with no trade record use the same money
+  const untracked = c.untracked > 0 ? ` Shares the account holds without a trade record count as invested: ${money(c.untracked, c.currency)}.` : "";
   b.title = (c.limit
     ? `The bot uses ${money(c.effective, c.currency)} of this ${money(c.account_value, c.currency)} account` +
       (c.clipped ? ` (you set ${money(c.limit, c.currency)}, but the account is worth less now)` : "") +
-      `. ${money(c.available, c.currency)} of it isn't invested.`
+      `. ${money(c.available, c.currency)} of it isn't invested.${untracked}`
     : cash
-      ? `Cash only: the bot's positions, long and short together, never hold more than the ${money(c.account_value, c.currency)} the account is worth - nothing is borrowed. ${money(c.available, c.currency)} of it isn't invested.`
+      ? `Cash only: the bot's positions, long and short together, never hold more than the ${money(c.account_value, c.currency)} the account is worth - nothing is borrowed. ${money(c.available, c.currency)} of it isn't invested.${untracked}`
       : `The whole account with margin: new positions may use the ${money(c.buying_power, c.currency)} of buying power IBKR reports (what's left after the open positions, margin included); the account is worth ${money(c.account_value, c.currency)}. Risk per trade is still measured against the account's value.`)
     + split + " Click to change.";
 }

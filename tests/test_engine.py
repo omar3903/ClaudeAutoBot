@@ -1398,6 +1398,35 @@ def test_trading_capital_shrinks_what_the_bot_uses_not_the_account(engine):
     assert engine.runtime.read()["capital"] == {}
 
 
+def test_a_set_amount_and_cash_only_count_shares_the_account_holds_without_a_record(engine, monkeypatch):
+    engine._refresh_account()
+    assert engine.set_filters(timeframes=["SWING"])["ok"]                  # one kind: no day / swing split here
+    held = [Position("AAA", 100, 95.0, market_price=100.0)]               # 10,000 the app has no record of
+    engine._account = dataclasses.replace(engine._account, positions=held)
+    monkeypatch.setattr(engine, "_refresh_account", lambda: True)          # keep this account
+    assert engine.set_capital(20_000)["ok"]
+    assert engine.sizing_account().raw["capital_room"] == pytest.approx(10_000)
+    state = engine.capital_state()
+    assert (state["invested"], state["available"], state["untracked"]) == (10_000, 10_000, 10_000)
+
+    _open(engine, "AAA", qty=100)                                          # now it has a record: counted once
+    _open(engine, "MSFT", qty=50)                                          # booked before the next account read
+    assert engine.sizing_account().raw["capital_room"] == pytest.approx(5_000)
+    assert engine.capital_state()["untracked"] == 0
+
+    held.append(Position("BBB", -50, 100.0, market_price=100.0))          # a 5,000 short with no record fills it
+    play = _tight_play()
+    engine.board.replace([play], None)
+    pre = engine.assess_play(play.id)
+    assert not pre["can_execute"] and "trading capital" in pre["order_preview"]["caps"]
+    assert ("the trading capital is fully invested - no room for another position (that counts $5,000 in shares "
+            "the account holds without a trade record)") in pre["reasons"]
+
+    assert engine.set_capital(None, mode="cash")["ok"]                     # cash only: the account's value, less all of it
+    assert engine.sizing_account().raw["capital_room"] == pytest.approx(engine._account.equity - 20_000)
+    assert engine.set_capital(None, mode="margin")["ok"] and engine.sizing_account() is engine._account
+
+
 def test_an_order_is_capped_at_a_slice_of_the_stocks_usual_volume_and_a_too_thin_stock_is_refused(engine, monkeypatch):
     engine._refresh_account()
     monkeypatch.setattr(engine.settings.config.risk, "max_adv_pct", 1.0)
