@@ -1802,9 +1802,12 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         removed_ids = {r["id"] for r in removed} | {c["id"] for c in closed}
         if account_age_s <= self.position_check.FRESH_ACCOUNT_S and connection_age_s >= self.position_check.SETTLE_S:
             self._settle_short([t for t in mine if t["id"] not in removed_ids], held)
+        # an entry that filled whose booking the database keeps refusing is no order in flight here: its shares are
+        # held for good, with no record and no stop until the booking takes, and these checks must see them
+        flying = self.executor.symbols_in_flight(unbooked=False)
         new = self.position_check.share_counts(
             venue, venue_label(venue), [t for t in mine if t["id"] not in removed_ids], held=held,
-            in_flight=self.executor.symbols_in_flight(),
+            in_flight=flying,
             account_age_s=account_age_s, connection_age_s=connection_age_s)
         for m in new:
             log.warning("share counts disagree: %s", m["note"])
@@ -1814,7 +1817,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         # minutes of the regular session: said, never unwound (the shares' Exit in Open positions is the operator's)
         drift = self.position_check.drift(
             venue, venue_label(venue), [t for t in mine if t["id"] not in removed_ids], held=held,
-            in_flight=self.executor.symbols_in_flight(), regular=clock.current_session() is clock.Session.REGULAR,
+            in_flight=flying, regular=clock.current_session() is clock.Session.REGULAR,
             account_age_s=account_age_s, connection_age_s=connection_age_s)
         for d in drift:
             log.warning("shares the records don't explain: %s", d["note"])
@@ -1930,7 +1933,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         """Shares the current venue's account holds beyond what its open-trade records cover:
         opened or changed outside the app, or a fill the app couldn't book. Shown so they can be
         exited - the app doesn't manage their exits. Shares an entry order is still working for
-        aren't counted (their record follows the fill)."""
+        aren't counted (their record follows the fill) - unless it has filled and the database refuses its booking:
+        those shares are held, with no record and no stop until it takes, and are listed meanwhile."""
         acc = self._account
         if acc is None or self._broker is None or not self._broker.is_connected:
             return []
@@ -1938,7 +1942,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         for t in self._positions_here():
             sign = -1.0 if t.get("side") == "SHORT" else 1.0
             recorded[t["symbol"]] = recorded.get(t["symbol"], 0.0) + sign * abs(float(t.get("quantity") or 0.0))
-        working = {w["symbol"] for w in self.working_entries()}
+        working = {w["symbol"] for w in self.working_entries() if not w.get("unbooked")}
         out: List[Dict[str, Any]] = []
         for p in acc.positions:
             if abs(p.quantity) < 1e-9 or p.symbol in working:

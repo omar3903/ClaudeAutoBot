@@ -233,8 +233,15 @@ function handle(topic, p) {
       loadOpen(); refreshState();
       break;
     case "order.unbooked":
-      // a fill the trade log couldn't save yet: the order stays followed and the next pass saves it
+      // a fill the trade log couldn't save yet: the order stays followed and the next pass saves it (said again
+      // every few minutes while it keeps failing)
       toast("⚠ " + p.msg, "bad");
+      break;
+    case "order.unconfirmed":
+      // an order the broker didn't answer in time, looked for there before anything goes out in its place: said
+      // when an exit's goes unanswered, and every few minutes while one stays unfound. One that leaves a position
+      // with no stop at the broker stays up longer
+      toast("⚠ " + p.msg, "bad", p.bare ? 30000 : undefined);
       break;
     case "positions.mismatch":
       (p.mismatches || []).forEach(m => toast("⚠ " + m.note, "bad"));

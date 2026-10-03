@@ -840,6 +840,30 @@ def test_an_entry_called_off_before_it_is_found_is_cancelled_as_it_is_found():
     assert broker.cancelled == ["1"] and [w["order_id"] for w in ex.working_entries()] == ["1"]   # followed to its end
 
 
+def test_an_unanswered_entry_still_not_found_while_the_broker_is_disconnected_is_said(monkeypatch):
+    from autotradebot.execution import executor as executor_module
+
+    now = [1000.0]
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: now[0])
+    broker, repo, heard = _Unanswered(lands="filled"), _Repo([]), []
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    play = _day_play()
+    assert ex.execute_play(play, Account(account_id="DU"), plan=PLAN)["sent_unknown"]   # (the approval says so)
+    broker.is_connected = False                                            # nothing can be looked for meanwhile
+    for _ in range(int(ex.UNPROTECTED_WARN_S) // 4 + 1):
+        assert [topic for topic, _ in heard if topic == "order.unconfirmed"] == []
+        now[0] += 4.0
+        ex.sync_open_orders()
+    [said] = [p for topic, p in heard if topic == "order.unconfirmed"]     # a minute and a half on
+    assert (said["kind"], said["play_id"], said["bare"]) == ("entry", play.id, False)
+    assert "no trade record and no stop" in said["msg"] and repo.open_trades() == []
+
+    broker.is_connected = True                                             # back: found filled, booked, no more said
+    ex.sync_open_orders()
+    [t] = repo.open_trades()
+    assert t["quantity"] == 10 and ex._unknown == {} and ex._unknown_said == {}
+
+
 def test_an_exit_the_broker_didnt_answer_in_time_waits_and_is_followed_once_found_never_sent_twice():
     broker, repo = _Unanswered({"AAA": 10}, lands="working"), _Repo([_trade()])
     ex = _executor(broker, repo)
@@ -946,6 +970,50 @@ def test_an_entry_fill_whose_booking_fails_keeps_counting_as_working_and_is_book
     [t] = repo.open_trades()
     assert (t["quantity"], t["entry_price"], t["entry_context"]) == (10, 100.02, {"schema": 1})
     assert ex.working_entries() == [] and len(calls) == 2 and play.status is PlayStatus.FILLED
+
+
+def test_an_entry_fill_whose_booking_keeps_failing_is_said_again_and_its_shares_are_no_order_in_flight(monkeypatch):
+    from autotradebot.engine.reconcile import PositionCheck
+    from autotradebot.execution import executor as executor_module
+
+    now = [1000.0]
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: now[0])
+    heard = []
+    broker, repo = _Broker({"AAA": 10}), _Repo([])
+    ex = _executor(broker, repo, bus=SimpleNamespace(publish=lambda topic, **p: heard.append((topic, p))))
+    real_open = repo.open_trade
+
+    def refuse(*a, **k):
+        raise RuntimeError("database or disk is full")
+
+    repo.open_trade = refuse
+    assert ex.execute_play(_day_play(), Account(account_id="DU"), plan=PLAN)["ok"]
+    assert ex.symbols_in_flight(unbooked=False) == {"AAA"}                 # working: its fills change the counts
+    broker.reports["1"] = OrderResult(order_id="1", status="FILLED", symbol="AAA", submitted_qty=10, filled_qty=10,
+                                      avg_fill_price=100.02)
+    for _ in range(int(ex.UNPROTECTED_REPEAT_S) // 4):                     # five minutes of order syncs, 4 s apart
+        ex.sync_open_orders()
+        now[0] += 4.0
+    unbooked = [p for topic, p in heard if topic == "order.unbooked"]
+    assert len(unbooked) == 1
+    ex.sync_open_orders()                                                  # still failing five minutes on: said again
+    unbooked = [p for topic, p in heard if topic == "order.unbooked"]
+    assert len(unbooked) == 2 and unbooked[1]["tries"] == 76 and "still couldn't be saved" in unbooked[1]["msg"]
+    assert "Shares without a record" in unbooked[1]["msg"]
+    # it keeps its place in Autopilot's caps, but its order is done: its shares are held, with no record and no stop,
+    # and the check on shares no record explains sees them
+    assert [(w["symbol"], w["unbooked"]) for w in ex.working_entries()] == [("AAA", True)]
+    assert ex.symbols_in_flight() == {"AAA"} and ex.symbols_in_flight(unbooked=False) == set()
+    check = PositionCheck()
+    said = [d for at in (0.0, check.DRIFT_ALERT_S) for d in check.drift(
+        VENUE, "IBKR paper", repo.open_trades(), {"AAA": 10.0}, in_flight=ex.symbols_in_flight(unbooked=False),
+        regular=True, account_age_s=0.0, connection_age_s=1e9, now=at)]
+    assert [d["symbol"] for d in said] == ["AAA"]
+
+    repo.open_trade = real_open                                            # the database takes it again
+    ex.sync_open_orders()
+    assert [t["quantity"] for t in repo.open_trades()] == [10] and ex.working_entries() == []
+    assert ex._unbooked == {} and ex._unbooked_said == {}
 
 
 def test_an_unanswered_entry_found_filled_whose_booking_fails_stays_looked_for_and_is_booked_on_the_next_sync():

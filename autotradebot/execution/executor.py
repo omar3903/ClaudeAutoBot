@@ -24,12 +24,17 @@ one not sent: it may be working, or have filled. The next order syncs look for i
 the broker by its tag (:meth:`Executor._look_for_unknown`) - it is followed if it
 works, booked if it filled, and taken as never sent only once the broker shows it
 neither working nor filled. Nothing is sent in its place meanwhile: an entry's play
-stays sent (Autopilot keeps its slot) and the position's exit waits.
+stays sent (Autopilot keeps its slot) and the position's exit waits. The dashboard
+hears of an exit's at once (order.unconfirmed) - its stop at the broker may be stood
+down already - and of any order still not found a minute and a half on, every few
+minutes, whether or not the broker can be read (:meth:`Executor._warn_unknown`).
 
 A fill whose booking the database refuses (busy with another writer, say) is never lost: the booking raises
-BookingFailed once it has been logged and the dashboard told (order.unbooked), and the order stays followed - in
-``_pending``, ``_unknown`` or its stop's book - so the next order sync books it. Meanwhile it counts as working: an
-entry keeps Autopilot's slot, and no second exit goes out for the position.
+BookingFailed once it has been logged and the dashboard told (order.unbooked, again every few minutes while it keeps
+failing), and the order stays followed - in ``_pending``, ``_unknown`` or its stop's book - so the next order sync
+books it. Meanwhile it counts as working: an entry keeps Autopilot's slot, and no second exit goes out for the
+position. An entry's shares are no longer in flight though (``symbols_in_flight(unbooked=False)``): its order is done,
+and the checks on shares no record explains see them.
 
 The order audit (``order_audit``, :meth:`Executor._audit`) records what happened to each order: every order placed,
 with the broker's order id, status and message (PLACE); every cancel the app asks for, and why (CANCEL); every move of
@@ -130,9 +135,13 @@ class Executor(ProtectiveStops):
         #: were sent for (no order id yet) and when (monotonic) the call gave up: looked for at the broker by the order
         #: syncs (_look_for_unknown), and nothing is sent in their place meanwhile
         self._unknown: Dict[str, Tuple[_Pending, float]] = {}
+        #: ...and, of those still not found a while on, when (monotonic) each was last said (_warn_unknown)
+        self._unknown_said: Dict[str, Tuple[_Pending, float]] = {}
         #: fills the database refused to book, by what they were for ("entry:<play id>", "exit:<trade id>") -> the
-        #: tries that failed so far: the dashboard hears of the first, the log of each, till one takes (_booking_failed)
+        #: tries that failed so far: the dashboard hears of the first, and again every few minutes while they keep
+        #: failing (when, monotonic: ``_unbooked_said``), the log of each, till one takes (_booking_failed)
         self._unbooked: Dict[str, int] = {}
+        self._unbooked_said: Dict[str, float] = {}
         self._open_by_symbol: Dict[str, str] = {}   # symbol -> trade_id
         #: the exit manager takes part of a position off at the first target, so a native bracket
         #: (the simulator's) carries the stop only - a take-profit child would close all of it there
@@ -163,7 +172,9 @@ class Executor(ProtectiveStops):
             self.venue = venue or broker.name
             self._pending.clear()
             self._unknown.clear()       # an entry's play stays sent: the look for entries sent before finds it
+            self._unknown_said.clear()
             self._unbooked.clear()
+            self._unbooked_said.clear()
             self._open_by_symbol.clear()
             self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
             self._entries_retry_at = 0.0
@@ -251,17 +262,25 @@ class Executor(ProtectiveStops):
         return {p.trade_id for p in self._sent() if p.kind == "exit" and p.trade_id}
 
     def working_entries(self) -> List[Dict[str, Any]]:
-        """Entry orders sent but not filled yet - one whose send got no answer in time too (no order id yet).
-        Anything that limits positions has to count these too, or a slow fill gets doubled up."""
+        """Entry orders sent but not filled yet - one whose send got no answer in time too (no order id yet), and one
+        that filled whose booking the database refused so far (``unbooked``: its shares are at the broker, with no
+        record yet). Anything that limits positions has to count these too, or a slow fill gets doubled up."""
         return [{"order_id": p.order_id, "play_id": p.play.id, "symbol": p.play.symbol,
                  "strategy": p.play.strategy, "timeframe": p.play.timeframe.value,
                  "qty": p.qty, "notional": p.play.entry * p.qty,
-                 "risk": abs(p.play.entry - p.play.stop) * p.qty}
+                 "risk": abs(p.play.entry - p.play.stop) * p.qty, "unbooked": self._entry_unbooked(p)}
                 for p in self._sent() if p.kind == "entry"]
 
-    def symbols_in_flight(self) -> set:
-        """Symbols with an order still working - their share counts are about to change."""
-        return {p.play.symbol for p in self._sent()}
+    def symbols_in_flight(self, unbooked: bool = True) -> set:
+        """Symbols with an order still working - their share counts are about to change. With ``unbooked`` False, an
+        entry that filled whose booking the database refused is left out: its order is done, so its shares are at the
+        broker for good - with no record and no stop until the booking takes - and the checks on shares no record
+        explains must see them, however long the database keeps refusing."""
+        return {p.play.symbol for p in self._sent() if unbooked or not self._entry_unbooked(p)}
+
+    def _entry_unbooked(self, p: _Pending) -> bool:
+        """Whether ``p`` is an entry that filled and whose booking the database has refused so far (_booking_failed)."""
+        return p.kind == "entry" and f"entry:{p.play.id}" in self._unbooked
 
     def active_orders(self) -> List[Dict[str, Any]]:
         """Every order still working at the broker and what it is for: an entry, an exit,
@@ -769,6 +788,14 @@ class Executor(ProtectiveStops):
                 time.monotonic())
             log.warning("EXIT NOT CONFIRMED  %s %s x%s (%s): %s - looked for at %s by its tag before another is sent",
                         t["symbol"], trade_id, qty, reason, why, venue_label(held_on))
+            # the dashboard is told now: the exit manager, the stop placing and the missing-stop warning all leave a
+            # trade with an exit that may be working to it - and a whole exit has stood the stop at the broker down
+            bare = self._stop_gone(trade_id)
+            self.bus.publish("order.unconfirmed", kind="exit", symbol=t["symbol"], trade_id=trade_id, play_id=None,
+                             minutes=0.0, bare=bare,
+                             msg=f"The {t['symbol']} exit ({reason}) got no answer from the broker in time - it may be "
+                                 f"working. The app looks for it at {venue_label(held_on)} before sending another"
+                                 + (", and until then the position has no stop there." if bare else "."))
             return {"ok": False, "wait": True, "sent_unknown": True,
                     "reason": f"{why}. The exit may be working - the app looks for it at the broker before sending "
                               f"another."}
@@ -915,6 +942,8 @@ class Executor(ProtectiveStops):
                 self._look_for_unknown()
             except Exception:  # noqa: BLE001
                 log.exception("looking for the orders the broker didn't answer in time failed")
+        # ...and say so of one still not found a while on - whatever holds the look up, every pass
+        self._warn_unknown()
 
         # 1) advance the simulator
         if hasattr(self.broker, "poll"):
@@ -1024,6 +1053,45 @@ class Executor(ProtectiveStops):
             self._found_unknown(p, f"filled at {venue_label(self.venue)} after all (order {p.order_id}): {got:,.0f} "
                                    f"of {p.qty:,.0f} shares @ {price:.4f} - booked")
         return settled
+
+    def _warn_unknown(self, now: Optional[float] = None) -> List[str]:
+        """Say so - in the log and on the dashboard (order.unconfirmed), and again every UNPROTECTED_REPEAT_S - of an
+        order whose send got no answer in time that is still not found UNPROTECTED_WARN_S after the call. The look for
+        it (_look_for_unknown) decides nothing while the broker is disconnected or reloading its orders, or its orders
+        or executions can't be read, and nothing goes out in its place meanwhile: the trade of an exit gets no other
+        exit - nor a stop at the broker, which a whole exit stood down, and which the stop placing and the missing-stop
+        warning leave to the exit - and the shares an entry may have bought have no record and no stop. Every order
+        sync, whether or not the broker can be read. Returns the tags said."""
+        now = time.monotonic() if now is None else now
+        said: List[str] = []
+        for ref, (p, at) in list(self._unknown.items()):
+            last = self._unknown_said.get(ref)
+            last_at = last[1] if last is not None and last[0] is p else float("-inf")   # (a tag an exit used before)
+            if now - at < self.UNPROTECTED_WARN_S or now - last_at < self.UNPROTECTED_REPEAT_S:
+                continue
+            self._unknown_said[ref] = (p, now)
+            said.append(ref)
+            where, minutes = venue_label(self.venue), (now - at) / 60.0
+            bare = p.kind == "exit" and self._stop_gone(p.trade_id or "")
+            if p.kind == "exit":
+                after = ("The position has no stop at the broker, and no other exit goes out until this one is found"
+                         if bare else "No other exit goes out for the position until it is found")
+            else:
+                after = "If it filled, its shares have no trade record and no stop at the broker until it is found"
+            msg = (f"The {p.play.symbol} {p.kind} order the broker didn't answer {minutes:.0f} min ago is still not "
+                   f"confirmed - {where} hasn't shown it working, filled or not sent (its orders or executions couldn't "
+                   f"be read, or it was reconnecting). {after}. Check it at {where}.")
+            log.warning("ORDER NOT CONFIRMED  %s", msg)
+            self.bus.publish("order.unconfirmed", kind=p.kind, symbol=p.play.symbol, trade_id=p.trade_id,
+                             play_id=p.play.id if p.kind == "entry" else None, minutes=round(minutes, 1), bare=bare,
+                             msg=msg)
+        for ref in [k for k in self._unknown_said if k not in self._unknown]:
+            del self._unknown_said[ref]
+        return said
+
+    def _stop_gone(self, trade_id: str) -> bool:
+        """Whether a trade that ought to have a stop resting at the broker (stops kept there) has none now."""
+        return self.native_stops_on() and trade_id not in self._stops
 
     def _filled_since(self, f: Any, sent_at: Optional[dt.datetime]) -> bool:
         """Whether an execution came after an exit was sent (CLOCK_SLACK_S allowed for the two clocks)."""
@@ -1341,22 +1409,32 @@ class Executor(ProtectiveStops):
 
     def _booking_failed(self, key: str, symbol: str, kind: str, e: BaseException) -> BookingFailed:
         """A fill the database refused to book (busy with another writer, say), called from inside the ``except``:
-        logged with its traceback each time, and the dashboard told the first time (order.unbooked). Returns the
-        BookingFailed to raise - its caller keeps the order followed, so the next pass books the fill again."""
+        logged with its traceback each time, and the dashboard told the first time (order.unbooked) - and again every
+        UNPROTECTED_REPEAT_S while it keeps failing (a full disk, a file another program holds): an entry's shares have
+        no record and no stop meanwhile, and a toast is soon gone. Returns the BookingFailed to raise - its caller keeps
+        the order followed, so the next pass books the fill again."""
         tries = self._unbooked[key] = self._unbooked.get(key, 0) + 1
         why = (str(e).strip().splitlines() or [type(e).__name__])[0][:200]    # the database's first line, not its SQL
         log.exception("BOOKING FAILED  the %s %s fill couldn't be saved (try %d) - its order stays followed and the "
                       "booking is tried again shortly", symbol, kind, tries)
-        if tries == 1:
+        now = time.monotonic()
+        if now - self._unbooked_said.get(key, float("-inf")) >= self.UNPROTECTED_REPEAT_S:
+            self._unbooked_said[key] = now
             after = ("until then its shares have no trade record, nor a stop at the broker" if kind == "entry"
                      else "no other exit goes out for the position meanwhile")
-            self.bus.publish("order.unbooked", kind=kind, symbol=symbol, reason=why,
-                             msg=f"The {symbol} {kind} fill couldn't be saved ({why}). The app keeps following the "
-                                 f"order and saves it shortly - {after}.")
+            if tries == 1:
+                msg = (f"The {symbol} {kind} fill couldn't be saved ({why}). The app keeps following the order and "
+                       f"saves it shortly - {after}.")
+            else:
+                msg = (f"The {symbol} {kind} fill still couldn't be saved after {tries} tries ({why}). The app keeps "
+                       f"trying - {after}" + (". Open positions lists them under Shares without a record, with their "
+                                              "own Exit." if kind == "entry" else "."))
+            self.bus.publish("order.unbooked", kind=kind, symbol=symbol, reason=why, tries=tries, msg=msg)
         return BookingFailed(f"the {symbol} {kind} fill couldn't be saved: {why}")
 
     def _booked(self, key: str, symbol: str, kind: str) -> None:
         """A fill booked: one whose booking failed before says so."""
+        self._unbooked_said.pop(key, None)
         tries = self._unbooked.pop(key, 0)
         if tries:
             log.warning("BOOKED  the %s %s fill, saved on try %d", symbol, kind, tries + 1)

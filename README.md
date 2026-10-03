@@ -560,12 +560,17 @@ The app is built to be left running:
   executions show it filled, and taken as never sent only once IBKR shows it neither, half a minute on.
   Nothing goes out in its place meanwhile: an entry's play stays sent and Autopilot keeps its slot
   (handed back if the order never went out), a position's exit waits, and a stop or target found resting
-  is taken over rather than placed twice.
+  is taken over rather than placed twice. The dashboard hears of an unanswered exit at once - its stop at
+  the broker may already be cancelled for it - and of any order still not found a minute and a half on,
+  again every five minutes, even while IBKR's orders can't be read or the Gateway is down.
 * **A fill the trade log can't save is saved on the next pass, never lost.** When the database refuses
   to book a fill (busy with another writer, say) - an entry, an exit, or a stop or target IBKR filled - the
-  app logs it, the dashboard says so once, and the order stays followed until the next order sync books
-  it. Meanwhile it still counts as working: an entry keeps Autopilot's slot, and nothing else is done for
-  the position - no second exit, and its stop is neither moved nor placed afresh.
+  app logs it, the dashboard says so (again every five minutes while it keeps failing), and the order stays
+  followed until the next order sync books it. Meanwhile it still counts as working: an entry keeps
+  Autopilot's slot, and nothing else is done for the position - no second exit, and its stop is neither
+  moved nor placed afresh. An entry's shares are no order in flight, though: until the booking takes they
+  have no record and no stop, so Shares without a record lists them, with their own Exit, and the warning
+  on shares the records don't explain counts them.
 * **A restart picks the day up where it left off.** The plays on the board, the setups already traded
   or dismissed this session, the pre-market levels the gap check read and the time of the last wide
   scan are saved as the day goes (`data/day_state.bin`: after a scan at most every two minutes, at once

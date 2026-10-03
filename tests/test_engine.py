@@ -1148,6 +1148,31 @@ def test_shares_the_records_dont_explain_are_logged_and_sent_to_the_dashboard_ne
     assert "URGENT - AAPL" in caplog.text and unwound == []
 
 
+def test_shares_of_an_entry_whose_booking_keeps_failing_are_listed_and_said_not_hidden_as_in_flight(engine,
+                                                                                                    monkeypatch):
+    from autotradebot.execution.executor import _Pending
+
+    play = _play("AAA")
+    engine.executor._pending["9"] = _Pending("9", play, "entry", qty=10)    # filled at the broker...
+    engine.executor._unbooked[f"entry:{play.id}"] = 3                       # ...and the database refused it three times
+    engine.position_check.SETTLE_S = engine.position_check.DRIFT_ALERT_S = 0.0
+    monkeypatch.setattr(clock, "current_session", lambda ts=None: clock.Session.REGULAR)
+    engine._refresh_account()
+    engine._account.positions = [Position(symbol="AAA", quantity=10, avg_price=100.0, market_price=101.0)]
+    heard = []
+    monkeypatch.setattr(engine, "_publish", lambda topic, **p: heard.append((topic, p)))
+    assert [w["symbol"] for w in engine.working_entries()] == ["AAA"]       # Autopilot's caps still count it
+    [row] = engine.untracked_positions()                                    # listed, with its own Exit
+    assert (row["symbol"], row["side"], row["qty"]) == ("AAA", "LONG", 10)
+    engine._reconcile_open_trades()
+    engine._reconcile_open_trades()
+    [alert] = [p for topic, p in heard if topic == "positions.drift"]
+    assert [a["symbol"] for a in alert["alerts"]] == ["AAA"]
+
+    del engine.executor._unbooked[f"entry:{play.id}"]                       # an entry still working: left alone
+    assert engine.untracked_positions() == []
+
+
 # ---------------------------------------------------------------- fixing a share count from its warning
 class _FixAccount(_StopBroker):
     """An IBKR account for the share-count fix: what it holds and marks, the executions it reports, and

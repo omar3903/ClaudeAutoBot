@@ -1393,6 +1393,51 @@ def test_an_exit_looks_in_the_executions_of_a_stop_the_broker_no_longer_knows_be
         assert ex.protective_stops()[0]["order_id"] == "1"
 
 
+def test_an_unanswered_exit_whose_stop_stood_down_is_said_at_once_and_every_few_minutes_while_it_cant_be_found(
+        monkeypatch):
+    from autotradebot.brokers.base import OrderOutcomeUnknown
+    from autotradebot.execution import executor as executor_module, protective_stops as stops_module
+
+    now = [1000.0]
+    for module in (executor_module, stops_module):
+        monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    broker, repo, ex, heard = _setup()
+    ex.sync_open_orders()                                                      # the stop rests: order 1
+    resting = broker.place_order
+
+    def unanswered(req):
+        if req.order_type is OrderType.STOP:
+            return resting(req)
+        broker.orders.append(req)                                              # it may have reached the broker
+        raise OrderOutcomeUnknown("IBKR didn't answer the order within 10 s", order_ref=req.client_tag)
+
+    broker.place_order = unanswered
+    out = ex.close_trade("t1", reason="stop")
+    assert out["wait"] and out["sent_unknown"] and broker.cancelled == ["1"]  # the stop stood down for it
+    [first] = [p for topic, p in heard if topic == "order.unconfirmed"]        # said at once
+    assert first["trade_id"] == "t1" and first["bare"] and "no stop there" in first["msg"]
+
+    def unreadable(status=None):                                               # the open orders keep timing out
+        raise BrokerError("IBKR's open orders didn't arrive within 10 s")
+
+    broker.list_orders, said = unreadable, []
+    for _ in range(int(ex.UNPROTECTED_WARN_S + ex.UNPROTECTED_REPEAT_S) // 4 + 1):     # passes 4 s apart
+        now[0] += 4.0
+        heard.clear()
+        ex.sync_open_orders()
+        said += [(now[0] - 1000.0, p) for topic, p in heard if topic == "order.unconfirmed"]
+    # the look for it settles nothing meanwhile, so it is said a minute and a half on, and again five minutes later
+    assert [round(at) for at, _ in said] == [92, 392]
+    assert all(p["bare"] and "no stop at the broker" in p["msg"] for _, p in said)
+    assert len(broker.exits()) == 1 and len(broker.stops()) == 1 and ex.pending_exit_trade_ids() == {"t1"}
+
+    broker.list_orders = lambda status=None: []                                # readable again: it never went out
+    heard.clear()
+    ex.sync_open_orders()
+    assert ex.pending_exit_trade_ids() == set() and "order.failed" in [topic for topic, _ in heard]
+    assert ex._unknown_said == {}
+
+
 # ---------------------------------------------------------------- one caller at a time: threads side by side
 def test_two_closes_sent_together_send_one_exit_and_the_second_hears_at_once():
     broker, _, ex, _ = _setup()
