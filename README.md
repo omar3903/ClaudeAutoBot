@@ -701,6 +701,12 @@ settled and no longer looked up. IBKR keeps only the current day's executions, s
 records booked before fees were recorded stay before commissions; the session
 review says so ("Fees not recorded before …") rather than making numbers up.
 
+Each booking checks and writes the record in one transaction: a close takes it
+from open in one conditional write, and a part comes off only a record still
+holding more shares than it, so two bookings of one record at once — the order
+sync's and the position check's, say — can't both land. A part's fill counts in
+the trade's best and worst prices (MFE, MAE, high-water mark) as the exit's does.
+
 The reverse case is shown too: **shares without a record** — held at the broker
 beyond what the open-trade records cover, because they were bought or sold
 outside the app or a fill couldn't be booked — are listed under **Open
@@ -869,8 +875,10 @@ shown so you can see where live would stop you.
 - **PDT** — FINRA flags a *pattern day trader* at **4 day trades in 5 business
   days** on a **margin** account; flagged accounts must hold **$25,000**. Below
   that line you get **3 day trades per rolling 5 sessions**. The guard counts
-  closed same-session round-trips (plus still-open intraday trades opened today)
-  and **blocks the 4th**, warning from the 2nd–3rd.
+  closed same-session round-trips, trades with a part sold on the session they
+  were entered (a day trade then, even while the rest is held or goes later;
+  one per trade, however many parts) and still-open intraday trades opened
+  today, and **blocks the 4th**, warning from the 2nd–3rd.
 - Every **intraday** play is treated as a *potential* day trade.
 - **Cash account** (`account.cash_account: true`) — PDT does not apply, but the
   guard warns about T+1 settlement / good-faith violations.

@@ -6,7 +6,7 @@ import datetime as dt
 import logging
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import and_, delete, func, insert, or_, select
+from sqlalchemy import and_, delete, func, insert, or_, select, update
 
 from ..core.models import Account, Play
 from ..util import clock
@@ -328,56 +328,17 @@ class Repository:
         measured against; ``submitted_at``: when the app's exit order went out, so the seconds it
         took to fill are kept (a stop or target resting at the broker has none - it waits for the
         price, not for the broker); ``broker_order_id``: the order that filled, which a fee the broker
-        reports later is put down to (add_fill_fees)."""
+        reports later is put down to (add_fill_fees). A record closed already is returned as it stands
+        and nothing more is booked: the close takes it from OPEN in one conditional write, so two closes
+        of the same record at once - the order sync's and the position check's, say - can't both book."""
         now = (exit_time.astimezone(dt.timezone.utc).replace(tzinfo=None) if exit_time and exit_time.tzinfo
                else exit_time) or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
-            t = s.get(Trade, trade_id)
-            if t is None or t.status == "CLOSED":
-                return trade_to_dict(t) if t else None
-            qty = float(exit_qty if exit_qty is not None else t.quantity)
-            sign = 1.0 if t.side == "LONG" else -1.0
-            gross = (exit_price - float(t.entry_price)) * qty * sign
-            fees = float(t.fees or 0.0) + commission
-            # what the part taken off earlier made joins the final P/L; R and % are on the shares entered with
-            banked = float(getattr(t, "banked_pl", 0.0) or 0.0)
-            # every fee comes off: the entry's, and this exit's - a part taken off earlier banked what it made after
-            # its own already, so the fees on record less those are the ones still to come off
-            parts_paid = float(s.execute(select(func.coalesce(func.sum(Fill.commission), 0.0))
-                                         .where(Fill.trade_id == trade_id, Fill.leg == "EXIT")).scalar() or 0.0)
-            pl = gross - commission - (float(t.fees or 0.0) - parts_paid) + banked
-            basis_qty = float(getattr(t, "initial_quantity", None) or qty) if exit_qty is None else qty
-            t.exit_price = exit_price
-            t.exit_time = now
-            t.exit_reason = exit_reason
-            # the fill is the last price the trade saw, and the passes that mark the excursions (the exit manager)
-            # never see it: a stop that fills through the worst point marked so far would leave the MAE short of the
-            # trade's own loss, a target that fills past the best point its MFE and high-water mark short
-            entry = float(t.entry_price)
-            gain, loss = (exit_price - entry) * sign, (entry - exit_price) * sign
-            if gain > float(t.mfe or 0.0) + 1e-6:
-                t.mfe, t.mfe_at = gain, now
-            if loss > float(t.mae or 0.0) + 1e-6:
-                t.mae = loss
-            if t.hwm_price is None or (exit_price - float(t.hwm_price)) * sign > 1e-6:
-                t.hwm_price = exit_price
-            if submitted_at is not None and (t.broker or SIMULATOR) != SIMULATOR:
-                t.exit_submitted_at = _naive(submitted_at)
-                t.exit_latency_s = _took(submitted_at, now)
-            if decision_price and float(decision_price) > 0:
-                t.exit_decision_price = float(decision_price)
-                t.exit_slippage_bps = round((float(decision_price) - exit_price) * sign / float(decision_price) * 1e4, 2)
-            t.fees = fees
-            _score(t, pl, basis_qty)
-            # day-trade if entry and exit fall on the same NY session
-            if t.entry_time:
-                t.is_day_trade = clock.session_date(_as_utc(t.entry_time)) == clock.session_date(_as_utc(now))
-            t.status = "CLOSED"
-            s.add(Fill(trade_id=trade_id, broker_order_id=broker_order_id or "", ts=now,
-                       side=("SHORT" if t.side == "LONG" else "LONG"), leg="EXIT", quantity=qty, price=exit_price,
-                       commission=commission))
-            out = trade_to_dict(t)
-        log.info("trade closed %s: P/L %.2f (%s)", trade_id, out["realized_pl"], exit_reason)
+            out, closed = _close(s, trade_id, exit_price, exit_reason, now, commission=commission, exit_qty=exit_qty,
+                                 decision_price=decision_price, submitted_at=submitted_at,
+                                 broker_order_id=broker_order_id)
+        if closed:
+            log.info("trade closed %s: P/L %.2f (%s)", trade_id, out["realized_pl"], exit_reason)
         return out
 
     def reduce_trade(self, trade_id: str, exit_qty: float, exit_price: float, exit_reason: str = "target-1",
@@ -386,42 +347,55 @@ class Repository:
         """Book part of a position taken off - the scale-out at the first target: those shares
         leave the record, what they made after their fee is banked toward the trade's final P/L, and
         the stop and target move on to what the rest of the position now has to do (the stop only ever
-        in the trade's favour). A part covering the whole position closes the trade instead."""
-        with session_scope() as s:
-            t = s.get(Trade, trade_id)
-            if t is None or t.status == "CLOSED":
-                return trade_to_dict(t) if t else None
-            qty, held = float(exit_qty), float(t.quantity)
-            if qty <= 0:
-                return trade_to_dict(t)
-            whole = qty >= held - 1e-9
-        if whole:
-            return self.close_trade(trade_id, exit_price, exit_reason=exit_reason, commission=commission,
-                                    broker_order_id=broker_order_id)
+        in the trade's favour). A part covering the whole position closes the trade instead. The check
+        and the booking are one transaction, so two bookings at once can't both take the same shares off,
+        nor one take a part off a record another has just closed. A part sold on the session the trade
+        was entered makes it a day trade - one buy and a sale the same day - whatever becomes of the rest."""
+        qty = float(exit_qty)
         now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
         with session_scope() as s:
+            # the shares come off first, in one conditional write: only from an OPEN record holding more than them.
+            # The write also locks the record (SQLite: the database) until this commits, so what is read below stays
+            # as read
+            cut = qty > 0 and s.execute(
+                update(Trade).where(Trade.id == trade_id, Trade.status == "OPEN", Trade.quantity > qty + 1e-9)
+                .values(quantity=Trade.quantity - qty,
+                        initial_quantity=func.coalesce(Trade.initial_quantity, Trade.quantity))
+                .execution_options(synchronize_session=False)).rowcount == 1
             t = s.get(Trade, trade_id)
-            sign = 1.0 if t.side == "LONG" else -1.0
-            gross = (exit_price - float(t.entry_price)) * qty * sign - commission
-            if t.initial_quantity is None:
-                t.initial_quantity = t.quantity
-            t.banked_pl = float(t.banked_pl or 0.0) + gross
-            t.fees = float(t.fees or 0.0) + commission
-            t.quantity = float(t.quantity) - qty
-            if stop_price is not None:
-                current = t.stop_price
-                better = current is None or (stop_price > float(current) if sign > 0 else stop_price < float(current))
-                if better:
-                    t.stop_price = stop_price
-            if target_price is not None:
-                t.target_price = target_price
-            note = f"took {qty:g} off at {exit_price:.2f} ({exit_reason}), {gross:+.2f} banked"
-            t.notes = ((t.notes + " | ") if t.notes else "") + note
-            s.add(Fill(trade_id=trade_id, broker_order_id=broker_order_id or "", ts=now,
-                       side=("SHORT" if t.side == "LONG" else "LONG"), leg="EXIT", quantity=qty, price=exit_price,
-                       commission=commission))
-            out = trade_to_dict(t)
-        log.info("trade reduced %s: %s, %s left", trade_id, note, out["quantity"])
+            if not cut:
+                if t is None or t.status != "OPEN" or qty <= 0:
+                    return trade_to_dict(t) if t else None
+                # the part is the whole position: it closes the trade, in this same transaction
+                out, closed = _close(s, trade_id, exit_price, exit_reason, now, commission=commission,
+                                     broker_order_id=broker_order_id)
+            else:
+                closed = False
+                sign = 1.0 if t.side == "LONG" else -1.0
+                gross = (exit_price - float(t.entry_price)) * qty * sign - commission
+                t.banked_pl = float(t.banked_pl or 0.0) + gross
+                t.fees = float(t.fees or 0.0) + commission
+                if stop_price is not None:
+                    current = t.stop_price
+                    better = current is None or (stop_price > float(current) if sign > 0
+                                                 else stop_price < float(current))
+                    if better:
+                        t.stop_price = stop_price
+                if target_price is not None:
+                    t.target_price = target_price
+                _fold_fill(t, exit_price, now)
+                if t.entry_time and clock.session_date(_as_utc(t.entry_time)) == clock.session_date(_as_utc(now)):
+                    t.is_day_trade = True
+                note = f"took {qty:g} off at {exit_price:.2f} ({exit_reason}), {gross:+.2f} banked"
+                t.notes = ((t.notes + " | ") if t.notes else "") + note
+                s.add(Fill(trade_id=trade_id, broker_order_id=broker_order_id or "", ts=now,
+                           side=("SHORT" if t.side == "LONG" else "LONG"), leg="EXIT", quantity=qty, price=exit_price,
+                           commission=commission))
+                out = trade_to_dict(t)
+        if closed:
+            log.info("trade closed %s: P/L %.2f (%s)", trade_id, out["realized_pl"], exit_reason)
+        elif cut:
+            log.info("trade reduced %s: %s, %s left", trade_id, note, out["quantity"])
         return out
 
     # -------------------------------------------------------------- #
@@ -537,20 +511,23 @@ class Repository:
     #  PDT counter                                                  #
     # -------------------------------------------------------------- #
     def count_day_trades(self, lookback_sessions: int = 5) -> int:
-        window = list(clock.last_n_sessions(clock.session_date(), lookback_sessions))
-        lo = window[0]
+        """The day trades of the last ``lookback_sessions`` sessions: the closed trades that were one (closed on
+        the session they were entered, or a part sold then), the open ones with a part sold on the session they were
+        entered - a day trade already, whatever becomes of the rest - and the open day trades entered today, which
+        the session's end will make one. A trade counts once, however many parts it left in."""
+        today = clock.session_date()
+        lo = clock.last_n_sessions(today, lookback_sessions)[0]
         with session_scope() as s:
             closed = s.execute(
                 select(func.count()).select_from(Trade)
                 .where(Trade.is_day_trade.is_(True), Trade.status == "CLOSED",
                        Trade.session_date >= lo)
             ).scalar_one()
-            open_today = s.execute(
-                select(func.count()).select_from(Trade)
-                .where(Trade.status == "OPEN", Trade.timeframe == "INTRADAY",
-                       Trade.session_date == clock.session_date())
-            ).scalar_one()
-        return int(closed) + int(open_today)
+            still_open = s.execute(select(Trade.id, Trade.timeframe, Trade.session_date)
+                                   .where(Trade.status == "OPEN", Trade.session_date >= lo)).all()
+            parted = _sold_on_entry_session(s, {r.id: r.session_date for r in still_open})
+        return int(closed) + sum(1 for r in still_open
+                                 if r.id in parted or (r.timeframe == "INTRADAY" and r.session_date == today))
 
     # -------------------------------------------------------------- #
     #  Pair trades (pairs/desk.py)                                   #
@@ -916,6 +893,81 @@ def _keeping_refusal(row: Optional[PlayLog], new: PlayLog) -> PlayLog:
     if note and REFUSAL not in (new.evidence or {}):
         new.evidence = {**(new.evidence or {}), REFUSAL: note}
     return new
+
+
+def _close(s, trade_id: str, exit_price: float, exit_reason: str, now: dt.datetime, commission: float = 0.0,
+           exit_qty: Optional[float] = None, decision_price: Optional[float] = None,
+           submitted_at: Optional[dt.datetime] = None, broker_order_id: str = ""):
+    """Repository.close_trade's booking, in the session ``s`` - reduce_trade's too, when the part it was given is the
+    whole position. Returns (the record, whether this call closed it)."""
+    # the record is taken from OPEN first, in one conditional write: a second close of it - one running at the same
+    # time, or one retried after the first went through - changes no row and books nothing. The write also locks the
+    # record (SQLite: the database) until this commits, so nothing read below can change meanwhile
+    claimed = s.execute(update(Trade).where(Trade.id == trade_id, Trade.status == "OPEN").values(status="CLOSED")
+                        .execution_options(synchronize_session=False)).rowcount == 1
+    t = s.get(Trade, trade_id)
+    if not claimed:
+        return (trade_to_dict(t) if t else None), False
+    qty = float(exit_qty if exit_qty is not None else t.quantity)
+    sign = 1.0 if t.side == "LONG" else -1.0
+    gross = (exit_price - float(t.entry_price)) * qty * sign
+    fees = float(t.fees or 0.0) + commission
+    # what the part taken off earlier made joins the final P/L; R and % are on the shares entered with
+    banked = float(getattr(t, "banked_pl", 0.0) or 0.0)
+    # every fee comes off: the entry's, and this exit's - a part taken off earlier banked what it made after
+    # its own already, so the fees on record less those are the ones still to come off
+    parts_paid = float(s.execute(select(func.coalesce(func.sum(Fill.commission), 0.0))
+                                 .where(Fill.trade_id == trade_id, Fill.leg == "EXIT")).scalar() or 0.0)
+    pl = gross - commission - (float(t.fees or 0.0) - parts_paid) + banked
+    basis_qty = float(getattr(t, "initial_quantity", None) or qty) if exit_qty is None else qty
+    t.exit_price = exit_price
+    t.exit_time = now
+    t.exit_reason = exit_reason
+    _fold_fill(t, exit_price, now)
+    if submitted_at is not None and (t.broker or SIMULATOR) != SIMULATOR:
+        t.exit_submitted_at = _naive(submitted_at)
+        t.exit_latency_s = _took(submitted_at, now)
+    if decision_price and float(decision_price) > 0:
+        t.exit_decision_price = float(decision_price)
+        t.exit_slippage_bps = round((float(decision_price) - exit_price) * sign / float(decision_price) * 1e4, 2)
+    t.fees = fees
+    _score(t, pl, basis_qty)
+    # day-trade if entry and exit fall on the same NY session - or a part was sold on the session it was entered,
+    # which made it one then, whenever the rest went
+    if t.entry_time:
+        entered = clock.session_date(_as_utc(t.entry_time))
+        t.is_day_trade = (entered == clock.session_date(_as_utc(now))
+                          or trade_id in _sold_on_entry_session(s, {trade_id: entered}))
+    t.status = "CLOSED"             # written above already; this keeps the object (and what is returned) in step
+    s.add(Fill(trade_id=trade_id, broker_order_id=broker_order_id or "", ts=now,
+               side=("SHORT" if t.side == "LONG" else "LONG"), leg="EXIT", quantity=qty, price=exit_price,
+               commission=commission))
+    return trade_to_dict(t), True
+
+
+def _fold_fill(t: Trade, price: float, at: dt.datetime) -> None:
+    """An exit fill into the record's excursions - the whole position's or a part's. The fill is a price the trade
+    saw, and the passes that mark the excursions (the exit manager) never see it: a stop that fills through the worst
+    point marked so far would leave the MAE short of the trade's own loss, a target that fills past the best point its
+    MFE and high-water mark short."""
+    sign = 1.0 if t.side == "LONG" else -1.0
+    entry = float(t.entry_price)
+    gain, loss = (price - entry) * sign, (entry - price) * sign
+    if gain > float(t.mfe or 0.0) + 1e-6:
+        t.mfe, t.mfe_at = gain, at
+    if loss > float(t.mae or 0.0) + 1e-6:
+        t.mae = loss
+    if t.hwm_price is None or (price - float(t.hwm_price)) * sign > 1e-6:
+        t.hwm_price = price
+
+
+def _sold_on_entry_session(s, entered: Dict[str, dt.date]) -> set:
+    """Of the trades in ``entered`` (id -> the New York session it was entered on), the ones with a part sold on
+    that session - an exit fill on record then: a buy and a sale the same day, which makes a day trade."""
+    if not entered:
+        return set()
+    rows = s.execute(select(Fill.trade_id, Fill.ts).where(Fill.leg == "EXIT", Fill.trade_id.in_(list(entered)))).all()
+    return {tid for tid, ts in rows if ts and clock.session_date(_as_utc(ts)) == entered[tid]}
 
 
 def _score(t: Trade, pl: float, basis_qty: float) -> None:

@@ -228,6 +228,123 @@ def test_day_trade_counter(repo):
     assert repo.count_day_trades(5) >= 2
 
 
+def _entered_last_session(trade_id):
+    """Moves a trade's entry back to the session before today's."""
+    import datetime as dt
+
+    from autotradebot.persistence.db import session_scope
+    from autotradebot.persistence.models_orm import Trade
+    from autotradebot.util import clock
+
+    prev = clock.prev_trading_day(clock.session_date())
+    with session_scope() as s:
+        t = s.get(Trade, trade_id)
+        t.entry_time = (dt.datetime.combine(prev, dt.time(15, 0), tzinfo=clock.NY)
+                        .astimezone(dt.timezone.utc).replace(tzinfo=None))
+        t.session_date = prev
+
+
+def test_a_part_sold_on_the_session_the_trade_was_entered_makes_it_a_day_trade(repo):
+    import datetime as dt
+
+    from autotradebot.util import clock
+
+    before = repo.count_day_trades(5)                # other tests share this database: count what this one adds
+    p = _play(symbol="T95", timeframe=Timeframe.SWING, targets=[104.0, 108.0])
+    repo.record_play(p)
+    tid = repo.open_trade(p, 100.0, 10, "ibkr-paper")
+    assert repo.get_trade(tid)["is_day_trade"] is False
+    assert repo.reduce_trade(tid, 5, 104.0)["is_day_trade"] is True
+    assert repo.count_day_trades(5) == before + 1    # a day trade already, while the rest is still held
+    repo.reduce_trade(tid, 2, 105.0, exit_reason="exit")
+    assert repo.count_day_trades(5) == before + 1    # one trade, however many parts it leaves in
+    later = dt.datetime.combine(clock.next_trading_day(clock.session_date()), dt.time(10, 0), tzinfo=clock.NY)
+    out = repo.close_trade(tid, 106.0, exit_reason="target", exit_time=later)
+    assert out["is_day_trade"] is True               # the rest went on a later session: it was one all the same
+    assert repo.count_day_trades(5) == before + 1
+
+    # entered on the session before: a part sold today is no day trade, whatever kind of trade it is
+    for timeframe, symbol in ((Timeframe.SWING, "T96"), (Timeframe.INTRADAY, "T97")):
+        q = _play(symbol=symbol, timeframe=timeframe, targets=[104.0, 108.0])
+        repo.record_play(q)
+        qid = repo.open_trade(q, 100.0, 10, "ibkr-paper")
+        _entered_last_session(qid)
+        repo.reduce_trade(qid, 5, 104.0)
+        assert repo.count_day_trades(5) == before + 1, symbol
+        assert repo.close_trade(qid, 105.0, exit_reason="target")["is_day_trade"] is False, symbol
+
+
+def test_a_part_taken_off_marks_the_trades_best_and_worst_prices(repo):
+    p = _play(symbol="T98", targets=[104.0, 108.0])
+    repo.record_play(p)
+    tid = repo.open_trade(p, 100.0, 10, "paper")
+    part = repo.reduce_trade(tid, 4, 104.5)                          # past the best point marked so far
+    assert (part["mfe"], part["hwm_price"]) == (pytest.approx(4.5), 104.5) and part["mfe_at"]
+    part = repo.reduce_trade(tid, 3, 103.0, exit_reason="exit")      # short of it: the marks stay
+    assert (part["mfe"], part["hwm_price"]) == (pytest.approx(4.5), 104.5) and not part["mae"]
+
+    q = _play(symbol="T99", side=Side.SHORT, entry=50.0, stop=52.0, targets=[46.0, 44.0])
+    repo.record_play(q)
+    qid = repo.open_trade(q, 50.0, 10, "paper")
+    repo.update_trade_risk(qid, mae=0.5)
+    part = repo.reduce_trade(qid, 5, 51.25, exit_reason="exit")      # through the worst point marked so far
+    assert part["mae"] == pytest.approx(1.25) and part["hwm_price"] == 50.0 and not part["mfe"]
+
+
+def _race(monkeypatch, other):
+    """Runs ``other`` on a second thread the first time a trade is read, and gives it up to a second to finish before
+    the read returns. A booking that reads the record and writes it in two steps lets it in between them; one that
+    takes the record in a conditional write first holds the database's write lock, so ``other`` waits for its commit.
+    Returns (the thread, a list that gets what ``other`` returned)."""
+    import threading
+
+    from sqlalchemy.orm import Session
+
+    real, runs, results = Session.get, [], []
+
+    def get(self, *args, **kwargs):
+        found = real(self, *args, **kwargs)
+        if not runs:
+            runs.append(threading.Thread(target=lambda: results.append(other()), daemon=True))
+            runs[0].start()
+            runs[0].join(timeout=1.0)
+        return found
+
+    monkeypatch.setattr(Session, "get", get)
+    return runs, results
+
+
+def test_two_closes_of_one_record_at_once_book_it_once(repo, monkeypatch):
+    p = _play(symbol="T90")
+    repo.record_play(p)
+    tid = repo.open_trade(p, 100.0, 10, "paper")
+    runs, results = _race(monkeypatch, lambda: repo.close_trade(tid, 103.0, exit_reason="target"))
+    first = repo.close_trade(tid, 101.0, exit_reason="stop")
+    runs[0].join(timeout=30)
+    exits = [f for f in repo.trade_record(tid)["fills"] if f["leg"] == "EXIT"]
+    assert [(f["quantity"], f["price"]) for f in exits] == [(10.0, 101.0)]
+    t = repo.get_trade(tid)
+    assert (t["status"], t["exit_reason"], t["realized_pl"]) == ("CLOSED", "stop", 10.0)
+    assert first["realized_pl"] == 10.0
+    assert results == [t]                            # the second close found it closed, and booked nothing
+
+
+def test_two_parts_taken_off_one_record_at_once_never_take_off_more_than_it_holds(repo, monkeypatch):
+    p = _play(symbol="T91", targets=[104.0, 108.0])
+    repo.record_play(p)
+    tid = repo.open_trade(p, 100.0, 10, "paper")
+    runs, results = _race(monkeypatch, lambda: repo.reduce_trade(tid, 6, 104.0, exit_reason="exit"))
+    mine = repo.reduce_trade(tid, 6, 103.0, exit_reason="exit")
+    runs[0].join(timeout=30)
+    assert (mine["status"], mine["quantity"], mine["banked_pl"]) == ("OPEN", 4.0, 18.0)
+    # the other found four shares left - the whole position - so it closed the trade with them
+    exits = [f for f in repo.trade_record(tid)["fills"] if f["leg"] == "EXIT"]
+    assert [(f["quantity"], f["price"]) for f in exits] == [(6.0, 103.0), (4.0, 104.0)]
+    t = repo.get_trade(tid)
+    assert (t["status"], t["quantity"], t["realized_pl"]) == ("CLOSED", 4.0, 18.0 + 16.0)
+    assert results == [t]
+
+
 def test_the_startup_migration_quotes_names_and_writes_defaults_the_databases_way(tmp_path, monkeypatch):
     """An older database missing a column gets it at start-up with its default in place, even when the
     name is an SQL keyword and the default holds both kinds of quote."""
