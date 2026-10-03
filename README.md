@@ -1101,7 +1101,11 @@ record or a pair leg, and - the exit only - while the market is closed. More sha
 exited from **Shares without a record**, as before.
 
 The Open orders panel lists them as **stop** and **target** with their trade. The
-simulator keeps its own bracket and gets no such orders.
+simulator keeps its own bracket and gets no such orders. A fill of the bracket's stop or
+target closes the trade whose entry it was attached to, once, and never another trade of the
+stock. An exit the app sends for the whole position cancels what is left of the bracket
+first, and so does a record closed because its position is gone, so the bracket can't fill
+later and open the other side.
 
 `autotradebot/execution/exit_manager.py` runs every few seconds on every open trade
 held on the active platform — **entries need your click, exits never do**:

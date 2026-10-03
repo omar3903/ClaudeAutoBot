@@ -1898,7 +1898,7 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
                                         broker_order_id=fill["order_id"])
             if out:
                 if self.executor is not None:
-                    self.executor.forget_open(t["symbol"])
+                    self.executor.forget_open(t["symbol"], t["id"])
                 closed.append({**row, "exit_price": fill["price"], "fills": fill["fills"], "reason": reason,
                                "realized_pl": out.get("realized_pl")})
                 self._publish("trade.closed", trade=out,

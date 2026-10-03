@@ -61,7 +61,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..brokers.base import OUTCOME_UNKNOWN, DONE_STATUSES, BrokerAdapter, BrokerError, OrderNotSent
@@ -104,6 +104,19 @@ class _Pending:
                                         # yet - all of ``qty``); 0 once it is done, its booking waiting or not
     sized_at: Optional[Tuple[float, float]] = None  # an entry: the price it was sized at and its risk per share there,
                                                     # as it was sent (_sized_at) - its play may be sized again since
+
+
+@dataclass
+class _Bracket:
+    """The stop and target a venue holding native brackets (the simulator) attached to the entry that opened a trade."""
+    symbol: str
+    entry_id: str                   # the entry's order id - the children's parent
+    play_id: str                    # ...and its play's id, which the children's tags start with
+    children: List[str] = field(default_factory=list)   # their order ids, as listed when the entry was booked
+
+    def holds(self, o: OrderResult) -> bool:
+        """Whether ``o`` is one of them: noted at the entry's booking, or a child of that entry by its parent or tag."""
+        return o.order_id in self.children or _bracket_of(o, self.entry_id, self.play_id)
 
 
 class Executor(ProtectiveStops):
@@ -165,7 +178,13 @@ class Executor(ProtectiveStops):
         #: failing (when, monotonic: ``_unbooked_said``), the log of each, till one takes (_booking_failed)
         self._unbooked: Dict[str, int] = {}
         self._unbooked_said: Dict[str, float] = {}
-        self._open_by_symbol: Dict[str, str] = {}   # symbol -> trade_id
+        #: the stop and target the simulator holds for each trade's entry (its native bracket), by trade id: a fill of one
+        #: closes that trade and no other (_maybe_close_from_bracket), and the app's own close of the trade cancels them
+        #: (_cancel_brackets). Kept across a rebind: the simulator is the same one when the app comes back to it, and
+        #: they are still working there. Let go once the trade is closed
+        self._brackets: Dict[str, _Bracket] = {}
+        #: the bracket orders whose fill has been booked - each closes its trade once
+        self._bracket_fills: set = set()
         #: the exit manager takes part of a position off at the first target, so a native bracket
         #: (the simulator's) carries the stop only - a take-profit child would close all of it there
         self.scale_out: bool = False
@@ -191,7 +210,8 @@ class Executor(ProtectiveStops):
     def rebind(self, broker: BrokerAdapter, venue: Optional[str] = None) -> None:
         """Point at a different broker (paper <-> live / platform switch).
         In-flight order tracking is broker-specific, so it is dropped; open
-        trades in the database are untouched."""
+        trades in the database are untouched, and so are the simulator's brackets
+        (``_brackets``) - it is the same simulator when the app comes back to it."""
         with self._lock:                # never under an order sync's feet, nor an exit's
             self._audit_order_errors()  # what the broker left behind said, written before it is let go
             self.broker = broker
@@ -201,7 +221,6 @@ class Executor(ProtectiveStops):
             self._unknown_said.clear()
             self._unbooked.clear()
             self._unbooked_said.clear()
-            self._open_by_symbol.clear()
             self._entries_due, self._bound_at = True, dt.datetime.now(dt.timezone.utc)
             self._entries_retry_at = 0.0
             self._fees_due_at = 0.0     # the new venue's fills are looked up on the next pass
@@ -319,9 +338,14 @@ class Executor(ProtectiveStops):
         self._unbooked.pop(f"entry:{p.play.id}", None)
         self._unbooked_said.pop(f"entry:{p.play.id}", None)
 
-    def forget_open(self, symbol: str) -> None:
-        """Drop the note that ``symbol`` is held - its record was closed without an exit going through here."""
-        self._open_by_symbol.pop(symbol, None)
+    def forget_open(self, symbol: str, trade_id: str = "") -> None:
+        """A record of ``symbol`` (``trade_id``) was closed without an exit going through here - its position is gone
+        from the broker. The stop and target the simulator still holds for its entry are cancelled: with no shares
+        left, one that filled would open the other side."""
+        if trade_id in self._brackets and self._holds_brackets():
+            with self._lock:
+                self._cancel_brackets(trade_id, "its position is gone")
+                self._brackets.pop(trade_id, None)
         self._swept_at = 0.0            # ...so its stop at the broker goes on the very next pass
 
     def cancel_entries_for(self, play_id: str) -> int:
@@ -879,6 +903,9 @@ class Executor(ProtectiveStops):
                 if stood == "filled" or t["status"] == "CLOSED":
                     return {"ok": True, "status": "FILLED", "trade": t, "by": "broker-stop"}
                 wanted = abs(float(t["quantity"]))
+            # ...and the stop and target the simulator holds for the entry (its native bracket): left working, one
+            # would fill after this exit and open the other side of the position
+            self._cancel_brackets(trade_id, "stood down for the app's own exit")
         qty = min(float(qty), wanted) if partial else wanted
         held = self._held_quantity(t["symbol"])
         if held is not None:
@@ -985,7 +1012,10 @@ class Executor(ProtectiveStops):
         if partial and out and out.get("status") == "OPEN":
             self.bus.publish("trade.reduced", trade=out, reason=reason, qty=qty, price=round(price, 4))
             return out, False
-        self._open_by_symbol.pop(symbol, None)
+        if trade_id in self._brackets:
+            # the simulator's bracket for the entry: what is left of it goes with the trade
+            self._cancel_brackets(trade_id, "its trade is closed")
+            self._brackets.pop(trade_id, None)
         self.bus.publish("trade.closed", trade=out, reason=reason)
         return out, True
 
@@ -1140,7 +1170,7 @@ class Executor(ProtectiveStops):
         except Exception:  # noqa: BLE001
             log.exception("protective stops check failed")
 
-        # 5) detect broker-side bracket exits (child order filled against an open trade)
+        # 5) the simulator's bracket stops and targets that filled: each closes the trade whose entry it was attached to
         try:
             for o in self.broker.list_orders(status="FILLED"):
                 self._maybe_close_from_bracket(o)
@@ -1624,20 +1654,64 @@ class Executor(ProtectiveStops):
                      ", ".join(sorted(set(changed))))
         return changed
 
-    def _maybe_close_from_bracket(self, o) -> None:
-        sym = o.symbol
-        tid = self._open_by_symbol.get(sym)
-        if not tid:
+    def _maybe_close_from_bracket(self, o: OrderResult) -> None:
+        """A stop or target the simulator held for an entry (its native bracket) that filled: the trade that entry
+        opened is closed at its price - that trade only, never another of the stock (a filled order stays in the
+        simulator's list, so the stock's next trade would be closed by it too), and each fill once. One the database
+        refuses to book is booked on the next pass. Under the executor's lock (the order sync)."""
+        tag = str((o.raw or {}).get("client_tag") or o.tag or "")
+        if not self._brackets or o.order_id in self._bracket_fills or not tag.endswith((":TP", ":SL")):
             return
-        tag = (o.raw or {}).get("client_tag", "")
-        if ":TP" in tag or ":SL" in tag:
-            reason = "target" if ":TP" in tag else "stop"
-            px = o.avg_fill_price or (o.fills[-1].price if o.fills else 0.0)
-            if px:
-                out = self.repo.close_trade(tid, float(px), exit_reason=reason, commission=order_fees(o),
-                                            broker_order_id=str(o.order_id or ""))
-                self._open_by_symbol.pop(sym, None)
-                self.bus.publish("trade.closed", trade=out, reason=reason)
+        tid = next((tid for tid, b in list(self._brackets.items()) if b.holds(o)), None)
+        if tid is None:
+            return                  # not noted: its trade is closed and its bracket let go, or its entry not booked yet
+        t = self.repo.get_trade(tid)
+        if not t or t["status"] != "OPEN":
+            self._brackets.pop(tid, None)           # closed meanwhile - by the position check, say
+            self._bracket_fills.add(o.order_id)
+            return
+        px = o.avg_fill_price or (o.fills[-1].price if o.fills else 0.0)
+        if not px:
+            return
+        reason = "target" if tag.endswith(":TP") else "stop"
+        try:
+            self._book_exit(t["symbol"], tid, float(px), abs(float(t["quantity"])), reason,
+                            commission=order_fees(o), order_id=str(o.order_id or ""))
+        except BookingFailed:
+            return                  # said as it failed: the order stays in the simulator's list for the next pass
+        self._bracket_fills.add(o.order_id)
+
+    def _holds_brackets(self) -> bool:
+        """Whether the venue holds native brackets - the stop and target attached to an entry (the simulator)."""
+        return bool(getattr(self.broker, "supports_bracket_native", False))
+
+    def _note_brackets(self, trade_id: str, play: Play, order_id: str) -> None:
+        """Note the stop and target the simulator attached to the entry ``order_id`` that opened ``trade_id``: a fill
+        of one closes this trade and no other (_maybe_close_from_bracket), and the app's own close of it cancels them
+        (_cancel_brackets)."""
+        if not self._holds_brackets():
+            return
+        b = self._brackets[trade_id] = _Bracket(play.symbol, str(order_id or ""), play.id)
+        try:
+            b.children = [o.order_id for o in self.broker.list_orders(status="WORKING") if b.holds(o)]
+        except Exception:  # noqa: BLE001 - known by their parent and tag all the same
+            log.debug("could not list the orders attached to the entry of %s", trade_id, exc_info=True)
+
+    def _cancel_brackets(self, trade_id: str, why: str) -> int:
+        """Cancel the stop and target the simulator still holds for a trade's entry (its native bracket): the app is
+        closing the trade itself, or it is closed - left working, one would fill and open the other side. The trade
+        stays noted (a fill of one already, whose booking waits on the database, is still booked to it). Under the
+        executor's lock. Returns how many were asked to cancel."""
+        b = self._brackets.get(trade_id)
+        if b is None or not self._holds_brackets():
+            return 0
+        try:
+            working = [(o.order_id, o) for o in self.broker.list_orders(status="WORKING") if b.holds(o)]
+        except Exception:  # noqa: BLE001 - which still work isn't known: each one noted is asked
+            working = [(oid, None) for oid in b.children]
+        for oid, o in working:
+            self._cancel_quietly(oid, why, o)
+        return len(working)
 
     # ------------------------------------------------------------------ #
     def _open_trade(self, play: Play, price: float, qty: float, order_id: str,
@@ -1658,7 +1732,7 @@ class Executor(ProtectiveStops):
         except Exception as e:  # noqa: BLE001 - the database busy, say
             raise self._booking_failed(key, play.symbol, "entry", e) from e
         self._booked(key, play.symbol, "entry")
-        self._open_by_symbol[play.symbol] = tid
+        self._note_brackets(tid, play, order_id)
         self._left_looked.add(tid)                      # a record this run made: no earlier run left orders for it
         play.status = PlayStatus.FILLED
         play.trade_id = tid
@@ -1808,6 +1882,17 @@ def _may_close(o: OrderResult) -> bool:
     untagged one (sent by hand, or before orders were tagged). Never a bracket's target or stop
     child - that belongs to its entry."""
     return o.tag.startswith(("exit:", "unwind:")) or (not o.tag and not (o.raw or {}).get("parent_id"))
+
+
+def _bracket_of(o: OrderResult, entry_id: str, play_id: str) -> bool:
+    """Whether ``o`` is the stop or target (``<play id>:SL`` / ``:TP``) the simulator attached to the entry ``entry_id``
+    of the play ``play_id``: that entry is its parent, or its tag starts with that play's id."""
+    raw = o.raw or {}
+    tag = str(raw.get("client_tag") or o.tag or "")
+    if not tag.endswith((":TP", ":SL")):
+        return False
+    return bool(entry_id and str(raw.get("parent_id") or "") == entry_id) or bool(
+        play_id and tag.startswith(f"{play_id}:"))
 
 
 def _closing_left(working: List[OrderResult], symbol: str, side: Side, skip: Optional[set] = None) -> float:
