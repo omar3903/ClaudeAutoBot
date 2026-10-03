@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from test_order_follow_up import VENUE, _Broker, _executor, _refuses_once, _Repo, _trade
+from test_order_follow_up import VENUE, _AuditedRepo, _Broker, _executor, _refuses_once, _Repo, _trade
 from autotradebot.brokers.base import BrokerError
 from autotradebot.core.enums import OrderType, Side, TimeInForce
 from autotradebot.core.models import Fill, OrderResult
@@ -179,6 +179,36 @@ def test_a_stop_move_the_broker_didnt_answer_in_time_leaves_the_stop_resting_nev
     repo.update_trade_risk("t1", stop_price=100.35)
     ex.sync_open_orders()
     assert broker.cancelled == [] and len(broker.stops()) == 1 and ex.protective_stops()[0]["order_id"] == "1"
+
+
+def test_every_stop_move_is_audited_and_one_refused_or_unanswered_as_failed():
+    from autotradebot.brokers.base import OrderOutcomeUnknown
+
+    broker, repo = _StopBroker({"AAA": 10}), _AuditedRepo([_trade()])
+    ex = _executor(broker, repo)
+    ex.STAND_DOWN_S = ex.STAND_DOWN_POLL_S = ex.STOP_MOVE_S = 0.0
+    ex.sync_open_orders()
+    [placed] = repo.rows("PLACE")
+    assert (placed["trade_id"], placed["response"]["order_id"], placed["response"]["stop"]) == ("t1", "1", 98.0)
+    repo.update_trade_risk("t1", stop_price=99.0)
+    ex.sync_open_orders()                                                      # moved in place
+
+    def unanswered(order_id, stop_price=None, quantity=None):
+        raise OrderOutcomeUnknown("IBKR didn't answer the order within 10 s", order_ref="stop:t1")
+
+    broker.modify_stop = unanswered
+    repo.update_trade_risk("t1", stop_price=99.5)
+    ex.sync_open_orders()                                                      # rests where it was
+    del broker.modify_stop
+    broker.can_modify = False
+    ex.sync_open_orders()                                                      # refused: placed afresh
+    moved, unknown, refused = repo.rows("MODIFY")
+    assert [r["trade_id"] for r in (moved, unknown, refused)] == ["t1"] * 3
+    assert (moved["ok"], moved["request"]["stop"], moved["request"]["from_stop"], moved["response"]["stop"]) ==         (True, 99.0, 98.0, 99.0)
+    assert (unknown["ok"], unknown["request"]["stop"], unknown["response"]["outcome"]) == (False, 99.5, "unknown")
+    assert (refused["ok"], refused["response"]["outcome"]) == (False, "refused") and "no modify" in refused["message"]
+    [dropped] = repo.rows("CANCEL")
+    assert (dropped["request"]["order_id"], dropped["trade_id"], dropped["message"]) ==         ("1", "t1", "its move was refused - placed afresh")
 
 
 def test_the_stop_stands_down_before_the_apps_own_exit_goes_out():
@@ -527,6 +557,39 @@ def test_a_cancel_ibkr_answers_with_some_other_error_holds_the_exit_back_on_the_
     closed = repo.get_trade("t1")
     assert (closed["status"], closed["exit_price"], closed["exit_reason"]) == ("CLOSED", 97.9, "stop")
     assert [t.order.orderType for t in orders.book.values()] == ["STP"]
+
+
+def test_ibkrs_refusal_of_a_cancel_is_audited_failed_with_the_orders_state_under_its_trade_when_it_came(monkeypatch):
+    from sqlalchemy import select
+
+    from autotradebot.persistence.db import session_scope
+    from autotradebot.persistence.models_orm import OrderAudit
+    from autotradebot.persistence.repository import Repository
+
+    broker, orders = _ibkr_broker(monkeypatch)
+    repo = _Repo([_trade(id="t_aud")])
+    repo.record_order_audit = Repository().record_order_audit                 # the real table
+    ex = _executor(broker, repo)
+    ex.STAND_DOWN_S = ex.STAND_DOWN_POLL_S = 0.0
+    ex.sync_open_orders()                                                      # the stop rests: order 1
+    orders.answer_cancel = (10148, "OrderId 1 that needs to be cancelled cannot be cancelled, state: Filled.")
+    assert ex.close_trade("t_aud", reason="stop")["wait"]                      # the stop is filling
+    refused_by = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    ex.sync_open_orders()                                                      # IBKR's words go into the audit
+
+    def rows():
+        with session_scope() as s:
+            return [(r.action, r.ok, r.request, r.response, r.message, r.ts) for r in s.execute(
+                select(OrderAudit).where(OrderAudit.trade_id == "t_aud").order_by(OrderAudit.ts)).scalars()]
+
+    assert [(action, ok) for action, ok, *_ in rows()] == [("PLACE", True), ("CANCEL", True), ("ERROR", False)]
+    placed, asked, refused = rows()
+    assert (placed[3]["order_id"], placed[3]["status"], placed[2]["tag"]) == ("1", "WORKING", "stop:t_aud")
+    assert (asked[2]["order_id"], asked[4]) == ("1", "stood down for the app's own exit")
+    assert (refused[2]["order_id"], refused[3]["code"], refused[3]["state"]) == ("1", 10148, "Filled")
+    assert refused[4].startswith("cancel refused (10148): OrderId 1") and refused[5] <= refused_by
+    ex.sync_open_orders()
+    assert len(rows()) == 3                                                    # written once
 
 
 def _moved_silently_at_ibkr(monkeypatch):

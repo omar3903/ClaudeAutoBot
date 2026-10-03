@@ -159,7 +159,7 @@ def test_the_marks_show_the_parts_taken_off_the_best_point_and_every_stop_move(e
     engine.repo.update_trade_risk(tid, mfe=3.0, hwm_price=103.0)          # the exit manager saw +0.6R
     engine.repo.reduce_trade(tid, 2, 103.0)                                # the scale-out
     _stop_placed(engine, tid, 95.0)                                        # the stop at the broker
-    # the exit manager moved it by modifying the resting order, which leaves no order row - only its note
+    # the exit manager moved it by modifying the resting order - the move's time is its note's, not an order row's
     engine.repo.update_trade_risk(tid, stop_price=101.0, note_append="stop->101.00 @ 1.4R")
     _stop_placed(engine, tid, 101.0)                                       # lost later, and placed again
     chart = engine.trade_chart(tid)

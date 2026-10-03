@@ -9,7 +9,7 @@ from __future__ import annotations
 import abc
 import asyncio
 from concurrent.futures import TimeoutError as FutureTimeout
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from ..core.models import Account, Fill, OrderRequest, OrderResult, Quote
 
@@ -121,4 +121,11 @@ class BrokerAdapter(abc.ABC):
     def get_fills(self, symbol: Optional[str] = None) -> List[Fill]:
         """The fills the venue reports for the current session, oldest first - what books a
         position that was closed outside the app. Venues that can't say return []."""
+        return []
+
+    def order_errors(self) -> List[Dict[str, Any]]:
+        """What the venue has said went wrong with the app's orders since the last call, oldest first, each told
+        once: ``order_id``, ``code``, ``message``, ``what`` (in words), ``tag``, ``symbol``, ``at`` (UTC) and, for a
+        cancel it refused, the ``state`` it named the order in. The executor writes them into the order audit.
+        Venues that answer every order call on the spot have nothing more to tell."""
         return []

@@ -231,10 +231,11 @@ def trade_marks(t: Dict[str, Any], fills: Sequence[Dict[str, Any]]) -> List[Dict
 
 def stop_moves(t: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Every time the stop moved, from the exit manager's notes: the new stop and where the trade stood then.
-    None carries a time (``t``): the notes don't, and neither do the orders sent for the trade - a stop
-    resting at the broker is moved by modifying it, which leaves no order row, and a stop order placed
-    afresh is the same stop placed again (after a restart, a lost order, a refused pair), so its time is
-    the placement's, not a move's."""
+    None carries a time (``t``): the notes don't, and the orders sent for the trade don't stand in - a stop
+    resting at the broker is moved by modifying it, whose MODIFY row is when the broker was asked (at most
+    every STOP_MOVE_S, a resize, a try again), not when the stop moved, and a stop order placed afresh is the
+    same stop placed again (after a restart, a lost order, a refused pair), so its time is the placement's,
+    not a move's."""
     return [{"t": None, "price": round(float(price), 4), "r": float(r)}
             for price, r in _STOP_NOTE.findall(t.get("notes") or "")]
 

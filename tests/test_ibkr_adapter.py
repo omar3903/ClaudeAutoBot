@@ -954,6 +954,41 @@ def test_a_cancel_reads_confirmed_only_on_ibkrs_word(broker):
     assert confirmed == [True, True, False]
 
 
+def test_ibkrs_errors_on_the_apps_orders_are_told_once_for_the_audit_but_its_warnings_and_confirmations_are_not(
+        broker):
+    orders = IbOrders(broker._session.ib)
+    first, second, third, fourth = (_resting_stop(broker) for _ in range(4))
+    orders.answer_cancel = (10148, "OrderId 1 that needs to be cancelled cannot be cancelled, state: Filled.")
+    broker.cancel_order(first.order_id)                                        # refused: the stop is filling
+    orders.answer_cancel = (202, "Order Canceled - reason:")
+    broker.cancel_order(second.order_id)                                       # the app's own cancel, confirmed
+    orders.error(3, 399, "Order Message: the order is held until the open")    # a warning: it works on
+    orders.error(3, 202, "Order Canceled - reason:")                           # IBKR cancelled it, unasked
+    orders.error(4, 201, "Order rejected - reason:<br>not allowed for this account")
+    broker._on_error(77, 162, "Historical Market Data Service error message:no data", None)   # a request's error
+    broker._on_error(-1, 2104, "Market data farm connection is OK", None)
+    errors = broker.order_errors()
+    assert [(e["order_id"], e["code"], e["what"]) for e in errors] == [
+        ("1", 10148, "cancel refused"), ("3", 202, "cancelled by the broker, not by the app"), ("4", 201, "error")]
+    assert (errors[0]["state"], errors[0]["tag"], errors[0]["symbol"]) == ("Filled", "stop:trd_1", "AAA")
+    assert "state" not in errors[1] and errors[2]["message"] == "Order rejected - reason: not allowed for this account"
+    assert all(isinstance(e["at"], dt.datetime) for e in errors)
+    assert broker.order_errors() == []                                         # each told once
+
+
+def test_a_change_ibkr_refuses_is_told_for_the_audit_only_while_it_answers_the_change(broker):
+    orders = IbOrders(broker._session.ib)
+    res = _resting_stop(broker, price=98.5)
+    orders.answer_modify = (110, "The price does not conform to the minimum price variation for this contract.")
+    with pytest.raises(OrderRejected):
+        broker.modify_stop(res.order_id, stop_price=99.004, quantity=10)
+    [refused] = broker.order_errors()
+    assert (refused["order_id"], refused["code"], refused["what"]) == ("1", 110, "change refused")
+    _a_minute_on(broker, res.order_id)                     # long after the change, a warning is the order's own
+    orders.error(1, 110, "The price does not conform to the minimum price variation for this contract.")
+    assert broker.order_errors() == []
+
+
 @pytest.mark.parametrize("code,text", [
     (201, "Order rejected - reason:The order would exceed a limit"),            # an error: ib_async says Cancelled
     (321, "Error validating request.-'bN' : cause - The order can't be changed"),   # a warning

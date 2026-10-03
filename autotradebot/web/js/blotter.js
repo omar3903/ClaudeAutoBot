@@ -486,6 +486,7 @@ function orderSummary(req) {
   const parts = [req.side, req.qty, req.symbol, req.type].filter(v => v != null && v !== "");
   if (req.limit != null) parts.push(`@ ${num(req.limit)}`);
   if (req.stop != null) parts.push(`stop ${num(req.stop)}`);
+  if (req.order_id) parts.push(`order ${req.order_id}`);   // a cancel, a stop move or a broker's error names its order
   return parts.join(" ");
 }
 

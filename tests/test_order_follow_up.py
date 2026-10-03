@@ -1013,3 +1013,61 @@ def test_the_order_sync_skips_an_order_the_broker_cant_read_but_logs_any_other_f
     with caplog.at_level(logging.WARNING):
         ex.sync_open_orders()
     assert "following order 1 failed" in caplog.text and "a report the app can't read" in caplog.text
+
+
+# ---------------------------------------------------------------- the order audit
+class _AuditedRepo(_Repo):
+    """The fake repository, keeping the order audit's rows as the real one is handed them."""
+
+    def __init__(self, trades):
+        super().__init__(trades)
+        self.audit = []
+
+    def record_order_audit(self, action, request, response, ok, broker, play_id="", trade_id="", message="",
+                           ts=None):
+        self.audit.append(dict(action=action, request=request, response=response, ok=ok, play_id=play_id,
+                               trade_id=trade_id, message=message, ts=ts))
+
+    def rows(self, action):
+        return [r for r in self.audit if r["action"] == action]
+
+
+def test_the_order_audit_keeps_the_brokers_order_id_status_and_message_for_each_order_placed():
+    from dataclasses import replace
+
+    broker, repo = _Broker({"AAA": 10}), _AuditedRepo([_trade()])
+    placed = broker.place_order
+    broker.place_order = lambda req: replace(placed(req), message="held until the open")
+    ex = _executor(broker, repo)
+    play = _entry(ex, symbol="BBB")
+    assert ex.close_trade("t1", reason="stop")["ok"]
+    entry, exit_ = repo.rows("PLACE")
+    assert (entry["play_id"], entry["request"]["tag"], entry["ok"]) == (play.id, play.id, True)
+    assert (exit_["trade_id"], exit_["request"]["tag"], exit_["ok"]) == ("t1", "exit:t1", True)
+    assert [(r["response"]["order_id"], r["response"]["status"], r["response"]["message"]) for r in (entry, exit_)] \
+        == [("1", "SUBMITTED", "held until the open"), ("2", "SUBMITTED", "held until the open")]
+
+
+def test_every_cancel_the_app_asks_for_is_audited_with_why_and_one_the_broker_refused_as_failed():
+    import datetime as dt
+
+    broker, repo = _Broker(), _AuditedRepo([])
+    broker.account_id = "DU1234567"
+    ex = _executor(broker, repo)
+    day, swing = _entry(ex), _entry(ex, symbol="BBB", timeframe=Timeframe.SWING)
+    late = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=11)
+    assert ex.expire_entries(now=late) == ["1"]                    # the day trade's entry, not filled in time
+
+    def refused(order_id):
+        raise BrokerError(f"account DU1234567: order {order_id} can't be cancelled now")
+
+    broker.cancel_order = refused
+    assert ex.cancel_entries_for(swing.id) == 1                    # the pairs desk calls the other off
+    timed_out, called_off = repo.rows("CANCEL")
+    assert (timed_out["request"]["order_id"], timed_out["play_id"], timed_out["ok"]) == ("1", day.id, True)
+    assert timed_out["message"].startswith("not filled within 10 minutes") and timed_out["request"]["symbol"] == "AAA"
+    assert (called_off["request"]["order_id"], called_off["play_id"], called_off["ok"]) == ("2", swing.id, False)
+    assert called_off["response"]["outcome"] == "refused"
+    # the broker's words are kept, the account number isn't
+    assert called_off["message"] == "called off by the pairs desk: account <account>: order 2 can't be cancelled now"
+    assert "DU1234567" not in str(repo.audit)

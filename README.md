@@ -649,6 +649,16 @@ one candle to another shades the span green or red for what the move would have
 made or lost this position, with the two closes and the change; a click clears
 it.
 
+The orders in a record are the **broker order audit** (`order_audit`), which
+keeps what happened to each order: every order placed, with the broker's order
+id, status and message; every cancel the app asked for, and why; every move of
+a stop resting at the broker; and every error the broker sent about one of the
+app's orders — a rejection, a cancel it refused (IBKR's 10148, with the state it
+names: the stop may be filling), a cancel it made without being asked (a DAY
+order at the close, say) — marked failed. A call the broker refused or didn't
+answer in time is marked failed too, with the reason. The account number is
+never written into it.
+
 An open-trade record whose position no longer exists where it was opened —
 closed in the broker's own app, or by an exit that filled while the app was down
 — is **closed from the broker's fills**: the exit-side fills of the stock since
@@ -1690,9 +1700,11 @@ Implement `autotradebot/brokers/base.py::BrokerAdapter`, register it in
 `autotradebot/brokers/venues.py` and `autotradebot/engine/connections.py`. To use it as a
 price source too, give it the `PriceSource` methods from
 `autotradebot/data/market_data.py` (`history_many`, `contract_details_many`,
-`get_quote`, `quotes_from_bars`). Shipped: `paper_adapter.py` (simulator) and
-`ibkr_adapter.py` (`ib_async`, own asyncio-loop thread, auto-reconnect, paper +
-live by port).
+`get_quote`, `quotes_from_bars`). A venue that reports order errors after the
+call (a rejection, a refused cancel) hands them over through `order_errors()`,
+which the executor writes into the order audit. Shipped: `paper_adapter.py`
+(simulator) and `ibkr_adapter.py` (`ib_async`, own asyncio-loop thread,
+auto-reconnect, paper + live by port).
 
 ---
 

@@ -30,18 +30,27 @@ A fill whose booking the database refuses (busy with another writer, say) is nev
 BookingFailed once it has been logged and the dashboard told (order.unbooked), and the order stays followed - in
 ``_pending``, ``_unknown`` or its stop's book - so the next order sync books it. Meanwhile it counts as working: an
 entry keeps Autopilot's slot, and no second exit goes out for the position.
+
+The order audit (``order_audit``, :meth:`Executor._audit`) records what happened to each order: every order placed,
+with the broker's order id, status and message (PLACE); every cancel the app asks for, and why (CANCEL); every move of
+a stop resting at the broker (MODIFY, protective_stops.py); and every error the broker sends about one of the app's
+orders - a rejection, a cancel it refused with the state it names (IBKR's 10148), a cancel it made without the app
+asking (an unrequested 202) - written failed on the next order sync (ERROR, :meth:`Executor._audit_order_errors`). A
+call that failed or got no answer in time is written failed, with why. Nothing secret goes in: the order's details,
+the broker's answer, and its words with the account number taken out.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import threading
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from ..brokers.base import OUTCOME_UNKNOWN, DONE_STATUSES, BrokerAdapter, BrokerError
+from ..brokers.base import OUTCOME_UNKNOWN, DONE_STATUSES, BrokerAdapter, BrokerError, OrderNotSent
 from ..brokers.venues import venue_label
 from ..core.enums import PlayStatus, Side, StrategyKind, Timeframe
 from ..core.eventbus import BUS
@@ -149,6 +158,7 @@ class Executor(ProtectiveStops):
         In-flight order tracking is broker-specific, so it is dropped; open
         trades in the database are untouched."""
         with self._lock:                # never under an order sync's feet, nor an exit's
+            self._audit_order_errors()  # what the broker left behind said, written before it is let go
             self.broker = broker
             self.venue = venue or broker.name
             self._pending.clear()
@@ -166,7 +176,7 @@ class Executor(ProtectiveStops):
             for oid, p in list(self._pending.items()):
                 if p.kind != "entry":
                     continue
-                self._cancel_quietly(oid)
+                self._cancel_quietly(oid, "cancelled when quitting", p)
                 self._pending.pop(oid, None)
                 n += 1
             n += self._call_off_unknown(lambda p: True, "cancelled when quitting")
@@ -191,23 +201,23 @@ class Executor(ProtectiveStops):
         """Send the market order that closes ``qty`` shares held without a record, and say how it went."""
         req = build_exit_order(symbol, position_side, qty, cfg=self.cfg, tag=f"unwind:{symbol}")
         with self._lock:                # not beside an order sync, nor an exit counting the shares held
+            sent_at = dt.datetime.now(dt.timezone.utc)
             try:
                 res = self.broker.place_order(req)
             except OUTCOME_UNKNOWN as e:
                 # it may have reached the broker: another sent now could close the shares twice, and open a position
                 # the other way - the account says, once it shows whether these went
                 why = str(e) or "no answer from the broker in time"
-                self._audit("PLACE", req, {"error": why, "outcome": "unknown"}, ok=False, msg=why)
+                self._audit("PLACE", req, {"error": why, "outcome": "unknown"}, ok=False, msg=why, ts=sent_at)
                 log.error("the order closing %s %s shares without a trade record got no answer in time - it may have "
                           "reached the broker: %s", qty, symbol, why)
                 return {"ok": False, "sent_unknown": True,
                         "reason": f"{why}. Check the {symbol} position before closing it again."}
             except BrokerError as e:
-                self._audit("PLACE", req, {"error": str(e)}, ok=False, msg=str(e))
+                self._audit("PLACE", req, {"error": str(e)}, ok=False, msg=str(e), ts=sent_at)
                 log.error("could not close %s %s shares that have no trade record: %s", qty, symbol, e)
                 return {"ok": False, "reason": str(e)}
-            self._audit("PLACE", req, res.raw or {"status": res.status}, ok=True,
-                        msg="closing shares without a trade record")
+            self._audit("PLACE", req, res, ok=True, msg="closing shares without a trade record", ts=sent_at)
         log.warning("closing %s %s shares held without a trade record (order %s, %s)", qty, symbol, res.order_id,
                     res.status)
         return {"ok": True, "status": res.status or "WORKING", "order_id": res.order_id}
@@ -223,7 +233,7 @@ class Executor(ProtectiveStops):
         with self._lock:
             for oid, p in list(self._pending.items()):
                 if p.kind == "entry" and p.play.id == play_id:
-                    self._cancel_quietly(oid)
+                    self._cancel_quietly(oid, "called off by the pairs desk", p)
                     self._pending.pop(oid, None)
                     p.play.status = PlayStatus.CANCELED
                     n += 1
@@ -494,7 +504,7 @@ class Executor(ProtectiveStops):
             if o.tag.startswith((STOP_TAG, TARGET_TAG)):
                 continue                                 # a resting stop or target is not an exit; protective_stops.py owns it
             if self._exiting_quantity(o.symbol) + _remaining(o) > recorded[o.symbol] + 1e-9:
-                self._cancel_quietly(o.order_id)
+                self._cancel_quietly(o.order_id, "a second exit for shares another exit already sells", o)
                 extra.append(o)
         return extra
 
@@ -532,12 +542,12 @@ class Executor(ProtectiveStops):
             except OUTCOME_UNKNOWN as e:
                 return self._entry_unknown(play, entry, qty, ot, osess, context, submitted_at, decision, e)
             except BrokerError as e:
-                self._audit("PLACE", entry, {"error": str(e)}, ok=False, play_id=play.id, msg=str(e))
+                self._audit("PLACE", entry, {"error": str(e)}, ok=False, play_id=play.id, msg=str(e),
+                            ts=submitted_at)
                 play.status = PlayStatus.ERROR
                 return {"ok": False, "reason": str(e)}
 
-            self._audit("PLACE", entry, res.raw or {"status": res.status}, ok=True,
-                        play_id=play.id, msg=res.message)
+            self._audit("PLACE", entry, res, ok=True, play_id=play.id, msg=res.message, ts=submitted_at)
             play.status = PlayStatus.SUBMITTED
 
             # immediate fill (paper / marketable) -> open the trade now
@@ -572,7 +582,8 @@ class Executor(ProtectiveStops):
         first - so a restart looks for it too - and the next order syncs look for it at the broker by its tag (the
         play's id): followed if it works, booked if it filled (_look_for_unknown). Under the executor's lock."""
         why = str(e) or "no answer from the broker in time"
-        self._audit("PLACE", entry, {"error": why, "outcome": "unknown"}, ok=False, play_id=play.id, msg=why)
+        self._audit("PLACE", entry, {"error": why, "outcome": "unknown"}, ok=False, play_id=play.id, msg=why,
+                    ts=submitted_at)
         p = _Pending("", play, "entry", qty=qty, order_type=ot, order_session=osess, context=context,
                      submitted_at=submitted_at, decision=decision)
         self._note(play, PlayStatus.SUBMITTED)
@@ -750,7 +761,8 @@ class Executor(ProtectiveStops):
             # goes out for the trade until the order syncs have looked for it at the broker by its tag - the exit
             # manager waits meanwhile (a wait, not a failed try)
             why = str(e) or "no answer from the broker in time"
-            self._audit("PLACE", req, {"error": why, "outcome": "unknown"}, ok=False, trade_id=trade_id, msg=why)
+            self._audit("PLACE", req, {"error": why, "outcome": "unknown"}, ok=False, trade_id=trade_id, msg=why,
+                        ts=sent_at)
             self._unknown[req.client_tag or exit_tag(trade_id)] = (
                 _Pending("", Play(**_min_play(t)), "exit", trade_id=trade_id, qty=qty, reason=reason,
                          partial=partial, after_fill=after_fill, decision_price=decision_price, submitted_at=sent_at),
@@ -761,9 +773,9 @@ class Executor(ProtectiveStops):
                     "reason": f"{why}. The exit may be working - the app looks for it at the broker before sending "
                               f"another."}
         except BrokerError as e:
-            self._audit("PLACE", req, {"error": str(e)}, ok=False, trade_id=trade_id, msg=str(e))
+            self._audit("PLACE", req, {"error": str(e)}, ok=False, trade_id=trade_id, msg=str(e), ts=sent_at)
             return {"ok": False, "reason": str(e)}
-        self._audit("PLACE", req, res.raw or {"status": res.status}, ok=True, trade_id=trade_id)
+        self._audit("PLACE", req, res, ok=True, trade_id=trade_id, ts=sent_at)
 
         if res.status == "FILLED" or res.filled_qty > 0:
             px = res.avg_fill_price or (res.fills[-1].price if res.fills else limit_price)
@@ -827,7 +839,7 @@ class Executor(ProtectiveStops):
         with self._lock:
             for oid, p in list(self._pending.items()):
                 if p.kind == "exit" and p.reason in reasons:
-                    self._cancel_quietly(oid)
+                    self._cancel_quietly(oid, "the quit that sent it was stopped", p)
                     n += 1
         return n
 
@@ -838,7 +850,7 @@ class Executor(ProtectiveStops):
         with self._lock:                # an order being placed is followed first, and a stop placed now is kept
             counts = {"entries": 0, "exits": 0, "others": 0, "stops_kept": len(self._stops)}
             for oid, p in list(self._pending.items()):
-                self._cancel_quietly(oid)
+                self._cancel_quietly(oid, "every working order cancelled", p)
                 counts["entries" if p.kind == "entry" else "exits"] += 1
             counts["stops_kept"] += len(self._targets)   # a target resting with a stop is part of the same protection
             followed = set(self._pending) | {s.order_id for book in (self._stops, self._targets)
@@ -849,7 +861,7 @@ class Executor(ProtectiveStops):
                 if o.tag.startswith((STOP_TAG, TARGET_TAG)):
                     counts["stops_kept"] += 1
                     continue
-                self._cancel_quietly(o.order_id)
+                self._cancel_quietly(o.order_id, "every working order cancelled", o)
                 counts["others"] += 1
         log.warning("cancelled the working orders: %s", counts)
         return counts
@@ -947,6 +959,9 @@ class Executor(ProtectiveStops):
         except Exception:  # noqa: BLE001
             pass
 
+        # 6) what the broker has said went wrong with the app's orders since the last pass, into the order audit
+        self._audit_order_errors()
+
     def _look_for_unknown(self) -> List[str]:
         """Look for the orders whose send got no answer in time (OrderOutcomeUnknown) at the broker, by their tag. One
         working is followed from here like any other (one called off meanwhile - a quit, the pairs desk - is cancelled
@@ -973,7 +988,7 @@ class Executor(ProtectiveStops):
                     self._pending[order.order_id] = p
                     if p.expired:
                         p.cancel_at = time.monotonic()
-                        self._cancel_quietly(order.order_id)      # its answer books whatever part filled
+                        self._cancel_quietly(order.order_id, p.expired, p)   # its answer books what part filled
                     self._found_unknown(p, f"is working at {venue_label(self.venue)} after all (order "
                                            f"{order.order_id}) - followed" + (", and cancelled" if p.expired else ""))
                 continue
@@ -1067,7 +1082,7 @@ class Executor(ProtectiveStops):
             if p.expired:
                 if p.cancel_at and mono - p.cancel_at >= self.CANCEL_AGAIN_S:
                     p.cancel_at = mono
-                    self._cancel_quietly(oid)           # still working: the first cancel didn't take
+                    self._cancel_quietly(oid, p.expired, p)     # still working: the first cancel didn't take
                 continue
             if wait > 0 and p.first_fill_at is not None and mono - p.first_fill_at >= wait and not _pair_leg(p.play):
                 p.expired = (f"filled in part and not complete {wait:g} seconds later - the rest is cancelled so "
@@ -1080,7 +1095,7 @@ class Executor(ProtectiveStops):
             else:
                 continue
             p.cancel_at = mono
-            self._cancel_quietly(oid)
+            self._cancel_quietly(oid, p.expired, p)
             log.warning("%s  %s %s order %s: %s", label, p.play.symbol, p.play.side.value, oid, p.expired)
             out.append(oid)
         return out
@@ -1188,7 +1203,7 @@ class Executor(ProtectiveStops):
                 if res.status in ("CANCELED", "EXPIRED", "REJECTED") and not res.fills:
                     self._entry_unfilled(p.play.id)
         if res.status == "REJECTED":
-            self._cancel_quietly(res.order_id)          # an inactive order must stay dead
+            self._cancel_quietly(res.order_id, "rejected - an inactive order must stay dead", p)
         what = "is no longer known to the broker" if res.status == "UNKNOWN" else f"was {res.status.lower()}"
         part = f" after {filled:,.0f} of {p.qty:,.0f} shares filled" if filled else ""
         msg = f"{p.play.symbol} {p.kind} order {res.order_id} {what}{part}: {reason}"
@@ -1223,11 +1238,67 @@ class Executor(ProtectiveStops):
         since = float(getattr(self.broker, "connected_since", 0.0) or 0.0)
         return since > 0 and time.monotonic() - since < self.RESYNC_GRACE_S
 
-    def _cancel_quietly(self, order_id: str) -> None:
+    def _cancel_quietly(self, order_id: str, why: str = "", of: Any = None) -> None:
+        """Ask the broker to cancel an order; a failure is logged, never raised. Each ask is audited (CANCEL, with
+        ``why``): ok once the broker has taken the ask - its word on it comes later, and a cancel it refuses is an
+        ERROR row of its own (_audit_order_errors) - failed, with the reason, when it hasn't. ``of``: what the caller
+        holds for the order (a _Pending, a resting _Stop, the broker's OrderResult), which says what it was for -
+        else what follows it here says."""
+        play_id, trade_id, symbol = self._order_for(order_id, of)
+        req, asked_at = {"order_id": order_id, "symbol": symbol, "why": why}, dt.datetime.now(dt.timezone.utc)
         try:
             self.broker.cancel_order(order_id)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             log.debug("cancel %s failed", order_id, exc_info=True)
+            outcome = ("not sent" if isinstance(e, OrderNotSent) else "unknown" if isinstance(e, OUTCOME_UNKNOWN)
+                       else "refused")
+            self._audit("CANCEL", req, {"error": str(e), "outcome": outcome}, ok=False, play_id=play_id,
+                        trade_id=trade_id, msg=f"{why}: {e}" if why else str(e), ts=asked_at)
+            return
+        self._audit("CANCEL", req, {"status": "sent"}, ok=True, play_id=play_id, trade_id=trade_id, msg=why,
+                    ts=asked_at)
+
+    def _order_for(self, order_id: str, of: Any = None) -> Tuple[str, str, str]:
+        """The play id, trade id and symbol of an order, for its audit rows: from ``of`` (a _Pending, a _Stop or an
+        OrderResult), else from the order followed here under that id. "" for what isn't known."""
+        if of is None:
+            of = self._pending.get(order_id) or next(
+                (o for book in (self._stops, self._targets) for o in list(book.values()) if o.order_id == order_id),
+                None)
+        if of is None:
+            return "", "", ""
+        if isinstance(of, _Pending):
+            return (of.play.id if of.kind == "entry" else ""), of.trade_id or "", of.play.symbol
+        play_id, trade_id = _tag_ids(getattr(of, "tag", "") or "")
+        return play_id, getattr(of, "trade_id", "") or trade_id, getattr(of, "symbol", "") or ""
+
+    def _audit_order_errors(self) -> int:
+        """Write what the broker has said went wrong with the app's orders since the last look (order_errors:
+        IBKR's rejections, the cancels it refused - with the state it names the order in - the cancels it made
+        without the app asking, the changes it refused) into the order audit: an ERROR row each, failed, under the
+        play or trade the order was for, at the time the broker said it. Returns how many."""
+        take = getattr(self.broker, "order_errors", None)
+        if not callable(take):
+            return 0
+        try:
+            errors = list(take() or [])
+        except Exception:  # noqa: BLE001
+            log.debug("could not read the broker's order errors", exc_info=True)
+            return 0
+        for e in errors:
+            oid, tag = str(e.get("order_id") or ""), str(e.get("tag") or "")
+            play_id, trade_id = _tag_ids(tag)
+            if not (play_id or trade_id):
+                play_id, trade_id, _ = self._order_for(oid)
+            what, code, text = e.get("what") or "error", e.get("code"), str(e.get("message") or "")
+            answer = {"code": code, "message": text, "what": what}
+            if "state" in e:
+                answer["state"] = e["state"]
+            at = e.get("at")
+            self._audit("ERROR", {"order_id": oid, "symbol": e.get("symbol") or "", "tag": tag}, answer, ok=False,
+                        play_id=play_id, trade_id=trade_id, msg=f"{what} ({code}): {text}",
+                        ts=at if isinstance(at, dt.datetime) else None)
+        return len(errors)
 
     def _maybe_close_from_bracket(self, o) -> None:
         sym = o.symbol
@@ -1290,12 +1361,22 @@ class Executor(ProtectiveStops):
         if tries:
             log.warning("BOOKED  the %s %s fill, saved on try %d", symbol, kind, tries + 1)
 
-    def _audit(self, action: str, req: OrderRequest, response: dict, ok: bool,
-               play_id: str = "", trade_id: str = "", msg: str = "") -> None:
+    def _audit(self, action: str, req: Any, response: Any, ok: bool,
+               play_id: str = "", trade_id: str = "", msg: str = "", ts: Optional[dt.datetime] = None) -> None:
+        """One row of the order audit: what was asked of the broker (``req``: the OrderRequest, or a dict - a cancel,
+        a change, an error's order) and what came back (``response``: the broker's OrderResult - its order id,
+        status and message - or a dict). ``ts``: when it happened - when the call went out (the broker's answer, or
+        its error on the order, can come back before the row is written), or when the broker said it. The account
+        number is taken out of the broker's words, and anything the database can't keep as JSON is kept as text.
+        Never raises: the order goes on whether or not its row could be written."""
         try:
+            row = [_req_dict(req) if isinstance(req, OrderRequest) else dict(req),
+                   response if isinstance(response, dict) else _answer(response), msg]
+            text, account = json.dumps(row, default=str), str(getattr(self.broker, "account_id", "") or "")
+            request, answer, msg = json.loads(text.replace(account, "<account>") if account else text)
             self.repo.record_order_audit(
-                action, _req_dict(req), response, ok, self.broker.name,
-                play_id=play_id, trade_id=trade_id, message=msg,
+                action, request, answer, ok, self.broker.name,
+                play_id=play_id, trade_id=trade_id, message=msg, **({"ts": ts} if ts is not None else {}),
             )
         except Exception:  # noqa: BLE001
             log.debug("order audit failed", exc_info=True)
@@ -1306,6 +1387,30 @@ def _req_dict(r: OrderRequest) -> dict:
             "type": r.order_type.value, "limit": r.limit_price, "stop": r.stop_price,
             "tif": r.tif.value, "is_entry": r.is_entry, "tp": r.take_profit,
             "sl": r.stop_loss, "tag": r.client_tag}
+
+
+def _answer(res: Any) -> dict:
+    """The broker's answer to an order call, for the audit: its order id, status and message - and what it filled,
+    the shares and prices it holds the order at, when it says - beside the venue's own details (``raw``)."""
+    out = dict(getattr(res, "raw", None) or {})
+    out.update(order_id=str(getattr(res, "order_id", "") or ""), status=getattr(res, "status", "") or "",
+               message=getattr(res, "message", "") or "")
+    filled = float(getattr(res, "filled_qty", 0.0) or 0.0)
+    if filled > 0:
+        out.update(filled_qty=filled, avg_fill_price=float(getattr(res, "avg_fill_price", 0.0) or 0.0))
+    for key, name in (("submitted_qty", "qty"), ("limit_price", "limit"), ("stop_price", "stop")):
+        if getattr(res, key, None):
+            out[name] = float(getattr(res, key))
+    return out
+
+
+def _tag_ids(tag: str) -> Tuple[str, str]:
+    """The play id and trade id an order's tag names: an entry's is its play's id, an exit's, stop's or target's
+    ``exit:`` / ``stop:`` / ``tgt:`` and the trade's id. ("", "") for any other."""
+    for prefix in ("exit:", STOP_TAG, TARGET_TAG):
+        if tag.startswith(prefix):
+            return "", tag[len(prefix):]
+    return (tag.split(":")[0], "") if tag.startswith("play_") else ("", "")
 
 
 def _min_play(t: dict) -> dict:
