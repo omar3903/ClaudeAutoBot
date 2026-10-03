@@ -1027,7 +1027,8 @@ def build() -> str:
       'trader rule (live only), and calls <code>risk/position_sizing.py size_play()</code>: risk 1% of equity per '
       'trade, lowered by the strategy\'s half-Kelly (a quarter of the risk until the replay has proven the '
       'strategy), the mid-day factor, the open-risk ceiling (4%, less the risk the open trades and working '
-      'entries already carry - <code>open_risk_usd()</code>), the per-'
+      'entries already carry - <code>open_risk_usd()</code>; none at all while the open trades can\'t be read), '
+      'the per-'
       'position cap (12% of equity), the per-symbol cap (15%) and the liquidity cap: one order takes at most 1% of '
       'the stock\'s median daily volume over its last 20 completed sessions (<code>evidence.adv_shares</code>), and '
       'a stock too thin for one share is refused with that reason. The order card lists the caps that bound under '
@@ -1079,14 +1080,16 @@ def build() -> str:
         ("the learned model", "in gate or size mode, and only while its own walk-forward verdict calls it usable: "
          "plays it gives under 55% are refused; shadow (the default) only logs its odds",
          "model_mode, model_min_p"),
-        ("engine assessment", "session valid, PDT ok, size > 0, R:R ok, open-risk and gross-exposure ceilings",
+        ("engine assessment", "session valid, PDT ok, size > 0, R:R ok, open-risk and gross-exposure ceilings; a "
+         "play refused for want of room under the open-risk ceiling alone is asked again on the next pass",
          "risk.*, max_gross_exposure_pct"),
         ("the last look", "at the live quote (a stream's when it ticked in the last 2 s, else a snapshot - the log "
          "says which, and how old): refused when the price is already at or through the stop, the spread is "
          "over 0.10R of the risk or the price has run 0.25R past the entry; within that the limit is priced off "
-         "the quote and judged again there - re-sized at that price, and refused when it sizes to nothing or its "
-         "reward:risk to the first target falls under the floor (Autopilot's, or risk.min_reward_risk for a "
-         "click); a day-trade entry unfilled "
+         "the quote and judged again there - re-sized at that price (never above the order preview's shares), "
+         "and refused when it sizes to nothing or its reward:risk to the first target falls under the floor (the "
+         "higher of Autopilot's and risk.min_reward_risk for its entries, risk.min_reward_risk for a click); a "
+         "day-trade entry unfilled "
          "after 10 minutes is cancelled; any entry filled in part 30 seconds ago and still working has the rest "
          "cancelled, so the shares bought get their record and stop", "execution.max_spread_r, max_chase_r, "
          "entry_timeout_min, partial_entry_wait_s"),

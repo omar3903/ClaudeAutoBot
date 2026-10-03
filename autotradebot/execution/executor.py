@@ -336,13 +336,19 @@ class Executor(ProtectiveStops):
         """Entry orders sent but not filled yet - one whose send got no answer in time too (no order id yet), and one
         that filled whose booking the database refused so far (``unbooked``: its shares are at the broker, with no
         record yet). Anything that limits positions has to count these too, or a slow fill gets doubled up.
-        ``pair_leg``: one leg of a pair trade, whose stop - and so its ``risk`` - is a placeholder."""
-        return [{"order_id": p.order_id, "play_id": p.play.id, "symbol": p.play.symbol,
-                 "strategy": p.play.strategy, "timeframe": p.play.timeframe.value,
-                 "qty": p.qty, "notional": p.play.entry * p.qty,
-                 "risk": abs(p.play.entry - p.play.stop) * p.qty, "unbooked": self._entry_unbooked(p),
-                 "pair_leg": _pair_leg(p.play)}
-                for p in self._sent() if p.kind == "entry"]
+        ``notional`` and ``risk`` are at the price the entry was sized at (_sized_at): the limit the last look
+        re-priced it to, if it did. ``pair_leg``: one leg of a pair trade, whose stop - and so its ``risk`` - is a
+        placeholder."""
+        out = []
+        for p in self._sent():
+            if p.kind != "entry":
+                continue
+            price, per_share = _sized_at(p.play)
+            out.append({"order_id": p.order_id, "play_id": p.play.id, "symbol": p.play.symbol,
+                        "strategy": p.play.strategy, "timeframe": p.play.timeframe.value,
+                        "qty": p.qty, "notional": price * p.qty, "risk": per_share * p.qty,
+                        "unbooked": self._entry_unbooked(p), "pair_leg": _pair_leg(p.play)})
+        return out
 
     def symbols_in_flight(self, unbooked: bool = True) -> set:
         """Symbols with an order still working - their share counts are about to change. With ``unbooked`` False, an
@@ -1607,6 +1613,17 @@ def _play_from_row(row: dict) -> Play:
                 targets=[float(x) for x in (row.get("targets") or [])],
                 confidence=float(row.get("confidence") or 0.5), sector=row.get("sector") or "",
                 tags=list(row.get("tags") or []), id=row["id"], status=PlayStatus.SUBMITTED)
+
+
+def _sized_at(play: Play) -> Tuple[float, float]:
+    """The price an entry was sized at, and its risk per share there: the play's entry - or, for an entry the last
+    look re-priced, its limit, where engine._repriced_check sized it again, leaving the play's entry as it was and
+    its risk per share from that limit to the stop. A play never sized (a pair leg, one taken back after a restart)
+    is at its entry."""
+    base = abs(play.entry - play.stop)
+    per_share = float(play.risk_per_share or 0.0) or base
+    sign = 1.0 if play.side is Side.LONG else -1.0
+    return round(play.entry + sign * (per_share - base), 4), per_share
 
 
 def _pair_leg(play: Play) -> bool:

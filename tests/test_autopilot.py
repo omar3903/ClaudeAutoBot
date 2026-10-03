@@ -812,6 +812,20 @@ def test_a_daily_stop_survives_a_restart_the_same_day_only():
     assert len(_run(fresh, mkplay(sym="DDD"))) == 1 and not fresh.status()["daily_loss_stop"]
 
 
+def test_a_daily_stop_is_lifted_by_moving_a_limit_not_by_the_on_switch_or_other_settings():
+    eng = FakeEngine(equity=10_000.0)                      # 2% of equity = $200
+    eng.repo._closed = [_closed("AAA", -250.0)]
+    ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0, max_giveback_pct=30.0), bus=SILENT)
+    assert _run(ap, mkplay(sym="BBB")) == [] and ap.stopped_for_the_day
+    eng.repo._closed = []                                  # however the day reads now
+    ap._realized = (float("-inf"), 0.0)
+    ap.configure(enabled=True)                             # the on/off switch in the header
+    ap.configure(min_confidence=0.7, max_daily_loss_pct=2.0, max_giveback_pct=30.0)   # a save that keeps the limits
+    assert ap.stopped_for_the_day and _run(ap, mkplay(sym="CCC")) == [] and eng.approved == []
+    ap.configure(max_daily_loss_pct=2.5)                   # moving one lifts it
+    assert not ap.stopped_for_the_day and len(_run(ap, mkplay(sym="DDD"))) == 1
+
+
 def test_the_give_back_peak_counts_day_trades_only_and_the_loss_limit_counts_everything():
     eng = FakeEngine(equity=10_000.0)                      # give-back floor $25; daily limit $200
     ap = AutoPilot(eng, _cfg(max_daily_loss_pct=2.0, max_giveback_pct=30.0, giveback_floor_pct=0.25), bus=SILENT)
@@ -930,6 +944,63 @@ def test_a_read_of_the_open_trades_that_fails_part_way_through_a_pass_ends_the_p
     first, second = mkplay(sym="AAA"), mkplay(sym="BBB")
     assert [a["play_id"] for a in _run(ap, first, second)] == [first.id]
     assert eng.approved_ids() == [first.id] and "positions could not be read" in ap.verdict(second)
+
+
+def test_open_trades_that_go_on_failing_to_read_are_warned_of_once_until_they_read_again(caplog):
+    """consider() runs on every scan and every 15 s: a database locked for minutes warns once, not on each pass."""
+    import logging
+
+    eng = FakeEngine()
+    eng.repo = FailingRepo("open_trades")
+    ap = AutoPilot(eng, _cfg(), bus=SILENT)
+    p = mkplay()
+
+    def warnings():
+        return [r for r in caplog.records
+                if r.levelname == "WARNING" and "positions could not be read" in r.getMessage()]
+
+    with caplog.at_level(logging.INFO, logger="autotradebot.execution.autopilot"):
+        for _ in range(3):
+            assert _run(ap, p) == []
+        assert len(warnings()) == 1 and "positions could not be read" in ap.verdict(p)   # still said on the play
+        eng.repo.failing.clear()
+        assert len(_run(ap, mkplay(sym="BBB"))) == 1
+        assert "can read its open trades again" in caplog.text
+        eng.repo.failing.add("open_trades")                # failing again is a new episode: warned again
+        _run(ap, mkplay(sym="CCC"))
+        assert len(warnings()) == 2
+
+
+def test_a_play_refused_only_for_want_of_room_under_the_open_risk_ceiling_is_taken_once_room_frees():
+    """A full ceiling frees as trades close: the play is asked about again on the next pass, not dropped for the
+    day like a refusal for any other reason."""
+    heard = []
+    eng = FakeEngine()
+    full = {"on": True}
+    assess = eng.assess_play
+
+    def ceiling(pid):
+        out = assess(pid)
+        if full["on"]:                                     # as engine.assess_play answers with the ceiling full
+            out.update(can_execute=False, transient=True, reasons=["the open trades and working entries already "
+                                                                   "risk $3,990 of the $4,000 the ceiling allows"])
+        return out
+
+    eng.assess_play = ceiling
+    ap = AutoPilot(eng, _cfg(), bus=SimpleNamespace(publish=lambda topic, **kw: heard.append(topic)))
+    p = mkplay()
+    assert _run(ap, p) == [] and "already risk $3,990" in ap.verdict(p)
+    assert _run(ap, p) == [] and "autopilot.skipped" not in heard   # asked again, and not reported as refused
+    full["on"] = False                                     # a trade stopped out: room again
+    assert [a["play_id"] for a in _run(ap, p)] == [p.id]
+
+    other = FakeEngine()
+    other.can_execute = False                              # any other refusal: dropped for the day
+    ap2 = AutoPilot(other, _cfg(), bus=SILENT)
+    q = mkplay()
+    _run(ap2, q)
+    other.can_execute = True
+    assert _run(ap2, q) == [] and other.assess_calls == [q.id]
 
 
 def test_a_failed_read_of_todays_trades_keeps_the_last_figures_and_the_stop(monkeypatch):

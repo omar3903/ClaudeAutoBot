@@ -135,6 +135,7 @@ class AutoPilot:
         self._count_today: int = 0
         self._last_reason: Dict[str, str] = {}  # play_id -> why skipped (for the UI)
         self._blocked_note: str = ""
+        self._unread: bool = False              # its open trades couldn't be read on the last try (_skip_pass)
         self._loss_stop_day: str = ""           # the session the daily loss limit was reached on
         self._loss_stop_reason: str = ""        # ...and why, in the words of daily_loss_reason, for the status strip
         self._peak_realized: float = 0.0        # the best the day trades' realized P/L has been today
@@ -666,8 +667,12 @@ class AutoPilot:
 
     def _skip_pass(self, plays: Iterable[Any], why: str) -> None:
         """Autopilot's own state couldn't be read: the rest of the pass is skipped rather than judged on
-        nothing, and the plays not yet handled say why. Nothing is marked handled - the next pass tries again."""
-        log.warning("autopilot skipped the pass: %s", why)
+        nothing, and the plays not yet handled say why. Nothing is marked handled - the next pass tries again.
+        The log warns once, when the reads start failing, not on every pass (a scan and every 15 s) while they
+        go on failing; consider() logs when they work again."""
+        if not self._unread:
+            self._unread = True
+            log.warning("autopilot skipped the pass: %s", why)
         for p in plays:
             if p.id not in self._acted:
                 self._last_reason[p.id] = why
@@ -742,6 +747,9 @@ class AutoPilot:
         if self._open_auto_trades() is None:
             self._skip_pass(plays.values(), self.UNREAD_POSITIONS)
             return []
+        if self._unread:
+            self._unread = False
+            log.info("autopilot can read its open trades again - entries resume")
 
         # highest-conviction first; the records the checks read are read once for the pass
         self._pass_cache = (time.monotonic(), {}, [])
@@ -794,6 +802,10 @@ class AutoPilot:
             if not pre.get("ok") or not pre.get("can_execute"):
                 reason = "; ".join(pre.get("reasons", [])) or pre.get("reason") or "not executable"
                 self._last_reason[p.id] = reason
+                if pre.get("transient"):
+                    # refused for nothing but a full open-risk ceiling (or open trades it couldn't read): room frees
+                    # as trades close, so it is asked again on the next pass, like the open-risk check below
+                    continue
                 self._note_refusal(p, "assessment", reason)
                 self.bus.publish("autopilot.skipped", play_id=p.id, symbol=p.symbol,
                                  strategy=p.strategy, reason=reason)

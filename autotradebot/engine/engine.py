@@ -119,6 +119,9 @@ ORDERS_MAX_AGE_S = 8.0
 #: the session a price was traded in, as a stock's price line says it
 SESSION_WORDS = {clock.Session.PRE: "pre-market", clock.Session.REGULAR: "regular",
                  clock.Session.POST: "after-hours", clock.Session.CLOSED: "closed"}
+#: why an entry is refused while the open trades can't be read (open_risk_usd)
+OPEN_RISK_UNREAD = ("the open trades couldn't be read, so the risk already open is unknown - nothing is sized "
+                    "until they can be")
 
 
 def tick_exit_wait(now: float, last_exit: float, deadline: float, gap: float) -> Tuple[float, bool]:
@@ -615,22 +618,36 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
     def gross_exposure(self) -> float:
         return sum(self.exposure_by_symbol().values())
 
-    def open_risk_usd(self) -> float:
+    def open_risk_usd(self) -> Optional[float]:
         """The risk already at work on the account orders go to, in US dollars - what risk.max_open_risk_pct caps,
         so sizing (size_play's open_risk_used) gives a new trade only what's left under that ceiling. An open trade
         risks the distance from its entry to the stop it was opened with, times its shares - a stop moved since
         doesn't hand its risk back; an entry order still working risks what it was sized for. Pair legs are left
         out: their stops are placeholders, the desk closes the legs together. A trade's prices are dollars and so
-        is the account sizing sees (Account: US stocks are sized in dollars), so nothing needs converting."""
+        is the account sizing sees (Account: US stocks are sized in dollars), so nothing needs converting.
+        None when the open trades can't be read: no trades read would hand a new trade the whole ceiling, so the
+        callers size nothing instead (_risk_used)."""
+        try:
+            opens = self.repo.open_trades()
+        except Exception:  # noqa: BLE001
+            log.debug("could not read the open trades for the open risk", exc_info=True)
+            return None
         total = 0.0
-        for t in self._positions_here():
-            if t.get("pair_id"):
+        for t in opens:
+            if t.get("pair_id") or (t.get("broker") or "paper") != self._venue:
                 continue
             entry = float(t.get("entry_price") or 0.0)
             stop = float(t.get("initial_stop_price") or t.get("stop_price") or 0.0)
             if entry and stop:
                 total += abs(entry - stop) * abs(float(t.get("quantity") or 0.0))
         return total + sum(float(w.get("risk") or 0.0) for w in self.working_entries() if not w.get("pair_leg"))
+
+    def _risk_used(self, open_risk: Optional[float], sized_on: Account) -> float:
+        """open_risk_usd() as sizing takes it: when the open trades couldn't be read (None), the whole open-risk
+        ceiling of ``sized_on`` - no room for a new trade, rather than all of it."""
+        if open_risk is not None:
+            return open_risk
+        return float(sized_on.equity) * float(self.settings.config.risk.max_open_risk_pct) / 100.0
 
     def active_orders(self, max_age_s: Optional[float] = None) -> Dict[str, Any]:
         """The orders still working at the broker orders go to, and what each is for (see
@@ -2277,16 +2294,20 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         if acc is None:
             return {"ok": False, "reason": "no account data"}
         cfg = self.settings.config
-        # sized against the trading capital, less the risk already at work; the PDT rule and the floor see the
-        # real account
+        # sized against the trading capital, less the risk already at work (all of it, when that can't be read);
+        # the PDT rule and the floor see the real account
         sized_on, open_risk = self.sizing_account(p.timeframe) or acc, self.open_risk_usd()
-        sizing = self._size_entry(p, sized_on, open_risk)
+        sizing = self._size_entry(p, sized_on, self._risk_used(open_risk, sized_on))
         decision = self.pdt.assess(acc, p)
         session = clock.current_session()
         plan = plan_order(p, session, cfg.execution)
         acted_on = p.status in _ACTED_ON
 
         reasons: List[str] = []
+        # a refusal that clears by itself - room under the open-risk ceiling frees as trades close, a read that
+        # failed is tried again: a play refused for that alone is ``transient``, and Autopilot asks again on its next
+        # pass rather than dropping it for the day
+        waits = ""
         locked = self._locked()
         if locked:
             reasons.append(locked)
@@ -2300,17 +2321,21 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
             reasons.append(decision.reason)
         if not acc.usd_per_base:
             reasons.append(f"no {acc.base_currency}->USD exchange rate yet, so the trade can't be sized")
+        elif open_risk is None:
+            waits = OPEN_RISK_UNREAD
+            reasons.append(waits)
         elif p.suggested_qty <= 0:
+            full = (self._open_risk_full_reason(open_risk, sized_on.equity, cfg.risk)
+                    if "portfolio open-risk ceiling" in sizing.caps_hit
+                    and "risk budget too small for one share" in sizing.caps_hit else "")
             reasons.append("the position size factor is 0, so new positions are sized at nothing"
                            if self.size_factor <= 0
                            else f"{p.symbol} already takes up the {cfg.risk.max_symbol_pct_of_equity:.0f}% of equity "
                            "allowed in one stock" if "max exposure per stock" in sizing.caps_hit
                            else self._too_thin_reason(p, cfg.risk) if liquidity_cap(p, cfg.risk) == 0
                            else self._no_room_reason(p) if "trading capital" in sizing.caps_hit
-                           else self._open_risk_full_reason(open_risk, sized_on.equity, cfg.risk)
-                           if "portfolio open-risk ceiling" in sizing.caps_hit
-                           and "risk budget too small for one share" in sizing.caps_hit
-                           else "position size rounds to zero for this risk budget")
+                           else full or "position size rounds to zero for this risk budget")
+            waits = full if reasons[-1] == full else ""
         if p.reward_risk < cfg.risk.min_reward_risk and p.kind.value != "FUNDAMENTAL":
             reasons.append(f"reward:risk {p.reward_risk:.1f} below minimum")
         filtered = self.filters.refusal(p.side.value, p.timeframe.value, p.sector)
@@ -2320,7 +2345,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         hold_unit = "min" if p.timeframe is Timeframe.INTRADAY else "trading days"
         return {
             "ok": True, "can_execute": not reasons, "already_executed": acted_on,
-            "reasons": reasons, "mode": self.mode, "session": session.value,
+            "reasons": reasons, "transient": bool(waits) and reasons == [waits],
+            "mode": self.mode, "session": session.value,
             "noise": [NOISE_LABELS.get(n, n) for n in p.noise],
             "play": self._decorate(p), "pdt": decision.as_dict(), "order_plan": plan,
             "order_preview": {
@@ -2351,7 +2377,8 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         """How an entry was sized, for the entry context its trade keeps (_entry_context): the shares, their risk
         and cost, the position size factor, the limit the share count stopped at (``decided_by``: the risk budget,
         the open-risk ceiling, the per-position %, the cap on one stock, the slice of its daily volume, buying power
-        or the trading capital's room) and every limit's value - so a review can tell a trade the risk budget sized
+        or the trading capital's room - or, re-sized at the last look, the preview's count: _repriced_check) and
+        every limit's value - so a review can tell a trade the risk budget sized
         from one a cap cut down, and by how much."""
         return {"qty": sizing.qty, "est_risk": sizing.dollar_risk, "est_cost": sizing.notional,
                 "size_factor": float(self.size_factor), "decided_by": sizing.decided_by,
@@ -2560,35 +2587,51 @@ class TradingEngine(ResearchOps, JournalOps, PairsOps, CapitalOps, QuitOps, DayS
         """A limit entry the last look re-priced off the quote, judged again at that price - where the order
         fills, not the play's entry: the further it runs, the more the risk to the stop and the less the reward to
         the target. Refused when the reward:risk to the first target falls below the floor the entry was judged by
-        (Autopilot's own for its entries, risk.min_reward_risk for a click), or when the size at that price - the
-        risk budget over the wider stop distance, the per-position cap at the dearer price - comes to nothing.
-        Otherwise the play takes that size, so the shares sent, and the risk and cost the trade records, are the
-        re-priced entry's - and so is ``sized``, the sizing record its entry context keeps. None when it passes."""
+        (risk.min_reward_risk for a click; for Autopilot's entries that or its own, whichever is higher - assess_play
+        held them to both), or when the size at that price - the risk budget over the wider stop distance, the
+        per-position cap at the dearer price - comes to nothing. Otherwise the play takes that size, never more
+        shares than the order preview sized it at (``decided_by`` "preview" when that count is what held it), so the
+        shares sent, and the risk and cost the trade records, are the re-priced entry's - and so is ``sized``, the
+        sizing record its entry context keeps. None when it passes."""
         sign = 1.0 if p.side is Side.LONG else -1.0
         risk = (limit - float(p.stop)) * sign
         target = p.primary_target
         if target is not None and p.kind.value != "FUNDAMENTAL":     # assess_play leaves a valuation play's alone too
-            auto = operator == "autopilot"
-            floor = float(self.autopilot.min_reward_risk if auto else self.settings.config.risk.min_reward_risk)
+            floor, own = float(self.settings.config.risk.min_reward_risk), float(self.autopilot.min_reward_risk)
+            whose = "the minimum of {:g} (risk.min_reward_risk)"
+            if operator == "autopilot" and own > floor:
+                floor, whose = own, "Autopilot's minimum of {:g} (autopilot.min_reward_risk)"
             rr = (float(target) - limit) * sign / risk if risk > 0 else 0.0
             if rr < floor:
-                whose = ("Autopilot's minimum of {:g} (autopilot.min_reward_risk)" if auto
-                         else "the minimum of {:g} (risk.min_reward_risk)").format(floor)
                 return (f"re-priced to {limit:.2f}, the entry's reward:risk to the first target {float(target):.2f} is "
-                        f"only {max(rr, 0.0):.2f} - below {whose}")
+                        f"only {max(rr, 0.0):.2f} - below {whose.format(floor)}")
         sized_on = self.sizing_account(p.timeframe) or self._account
         if sized_on is None:
             return f"no account data - the entry re-priced to {limit:.2f} can't be sized"
+        open_risk = self.open_risk_usd()
+        if open_risk is None:
+            return f"re-priced to {limit:.2f}, the entry can't be sized again: {OPEN_RISK_UNREAD}"
+        previewed = int(p.suggested_qty or 0)               # the shares the order preview sized it at
         at_limit = dataclasses.replace(p, entry=limit)      # sized on a copy: a refusal leaves the play's size
-        sizing = self._size_entry(at_limit, sized_on, self.open_risk_usd())
-        if sizing.qty <= 0:
+        sizing = self._size_entry(at_limit, sized_on, open_risk)
+        # never more than the preview's shares - what a click confirmed and Autopilot's checks were made on. A short
+        # re-priced under its entry would buy more: every dollar cap goes further at the lower price
+        qty = min(sizing.qty, previewed)
+        if qty <= 0:
             return (f"re-priced to {limit:.2f}, the position sizes to nothing ("
                     f"{', '.join(sizing.caps_hit) or 'risk budget too small for one share'}) - not entering")
-        p.suggested_qty, p.risk_per_share = at_limit.suggested_qty, at_limit.risk_per_share
-        p.dollar_risk, p.notional = at_limit.dollar_risk, at_limit.notional
+        p.suggested_qty, p.risk_per_share = qty, at_limit.risk_per_share
+        if qty == sizing.qty:
+            p.dollar_risk, p.notional = at_limit.dollar_risk, at_limit.notional
+        else:
+            p.dollar_risk, p.notional = round(qty * at_limit.risk_per_share, 2), round(qty * limit, 2)
         if sized is not None:
+            record = self._sizing_record(sizing)
+            if qty < sizing.qty:
+                record.update(qty=qty, est_risk=p.dollar_risk, est_cost=p.notional, decided_by="preview")
+                record["limits"]["preview"] = {"shares": previewed}
             sized.clear()
-            sized.update(self._sizing_record(sizing), repriced_to=limit)
+            sized.update(record, repriced_to=limit)
         return None
 
     def reject_play(self, play_id: str, operator: str = "operator") -> Dict[str, Any]:

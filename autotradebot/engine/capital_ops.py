@@ -219,12 +219,14 @@ class CapitalOps:
 
     def _size_plays(self, plays: Iterable[Play]) -> None:
         """Suggested sizes for plays on the board, each against its own share of the trading capital and what's left
-        under the open-risk ceiling after the trades and entries already at work."""
+        under the open-risk ceiling after the trades and entries already at work - none, while the open trades
+        can't be read (_risk_used)."""
         accounts = {kind: self.sizing_account(kind) for kind in (capital.DAY, capital.SWING)}
         if accounts[capital.DAY] is None:
             return
         exposure, open_risk = self.exposure_by_symbol(), self.open_risk_usd()
         for p in plays:
-            size_play(p, accounts[capital.kind_of(p.timeframe)], self.settings.config.risk, open_risk_used=open_risk,
+            account = accounts[capital.kind_of(p.timeframe)]
+            size_play(p, account, self.settings.config.risk, open_risk_used=self._risk_used(open_risk, account),
                       symbol_notional=exposure.get(p.symbol, 0.0), risk_pct=self._play_risk_pct(p),
                       risk_why=self.strategy_risk_why(p.strategy), size_factor=self.size_factor)
